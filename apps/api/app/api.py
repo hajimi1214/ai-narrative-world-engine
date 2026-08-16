@@ -227,7 +227,7 @@ def reject_director_proposal(project_id: str, proposal_id: str, payload: Payload
     if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
     proposal.status = ProposalStatus.REJECTED; db.add(proposal); db.commit(); db.refresh(proposal)
     reason = payload.model_dump().get("reason", "Proposal rejected by user.")
-    db.add(DirectorDecisionLog(project_id=project_id, context_version="director-context-v1", proposal_id=proposal.id, decision_type=DecisionType.REJECT, brief_reason=reason, validation_result={})); db.commit()
+    db.add(DirectorDecisionLog(project_id=project_id, context_version=proposal.context_fingerprint, proposal_id=proposal.id, decision_type=DecisionType.REJECT, brief_reason=reason, validation_result={})); db.commit()
     return record_dict(proposal)
 
 @router.get("/projects/{project_id}/reveal-constraints")

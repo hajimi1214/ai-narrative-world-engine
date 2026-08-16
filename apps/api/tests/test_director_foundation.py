@@ -7,7 +7,7 @@ from app.db import Base
 from app.director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector, RECENT_SCENE_LIMIT, extract_entity_references
 from app.main import app
 import app.api as api
-from app.models import CanonFact, CanonType, Character, CharacterKnowledge, KnowledgeStatus, Project, ProposalStatus, ProposalType, RevealConstraint, RevealStatus, Scene, SceneProposal, StoryThread, WorldEntity
+from app.models import CanonFact, CanonType, Character, CharacterKnowledge, DecisionType, DirectorDecisionLog, KnowledgeStatus, Project, ProposalStatus, ProposalType, RevealConstraint, RevealStatus, Scene, SceneProposal, SceneStatus, StoryThread, WorldEntity
 
 @pytest.fixture()
 def session():
@@ -37,7 +37,7 @@ def proposal(project, lead, thread=None, **changes):
 
 def test_context_is_selective_and_limits_recent_scenes(session):
     project, location, unrelated, lead, _, thread, _, _ = seed(session)
-    session.add_all([Scene(project_id=project.id, sequence=index, location=location.id, participants=[lead.id], story_threads=[thread.id], summary=f"Scene {index}") for index in range(15)])
+    session.add_all([Scene(project_id=project.id, sequence=index, location=location.id, participants=[lead.id], story_threads=[thread.id], summary=f"Scene {index}", status=SceneStatus.OCCURRED) for index in range(15)])
     session.commit()
     context = DirectorContextBuilder().build(session, project.id)
     assert len(context["recent_scenes"]) == RECENT_SCENE_LIMIT
@@ -174,3 +174,39 @@ def test_stale_proposal_cannot_be_approved(session, monkeypatch):
 
 def test_entity_references_ignore_unstructured_strings():
     assert extract_entity_references({"summary": "city-id", "unknown": {"entity_id": "ignored"}}, [{"entity_ids": ["one"], "location_id": "two"}]) == {"one", "two"}
+
+def test_recent_history_uses_only_occurred_scenes(session):
+    project, location, _, lead, _, thread, _, _ = seed(session)
+    occurred = Scene(project_id=project.id, sequence=3, status=SceneStatus.OCCURRED, intent="Occurred intent", facts=[{"entity_ids": [location.id]}])
+    planned = Scene(project_id=project.id, sequence=2, status=SceneStatus.PLANNED, intent="Verify the register", facts=[{"entity_ids": ["planned-only"]}])
+    void = Scene(project_id=project.id, sequence=1, status=SceneStatus.VOID, intent="Void intent", facts=[{"entity_ids": ["void-only"]}])
+    session.add_all([occurred, planned, void]); session.commit()
+    context = DirectorContextBuilder().build(session, project.id)
+    assert [scene["id"] for scene in context["recent_scenes"]] == [occurred.id]
+    report = DirectorConstraintChecker().validate(session, context, proposal(project, lead, thread))
+    assert not any(issue.code == "DUPLICATE_NARRATIVE_FUNCTION" for issue in report.issues)
+
+def test_heuristic_uses_existing_location_id(session):
+    project, location, _, _, _, _, _, _ = seed(session)
+    proposal_data = HeuristicDirector().propose(DirectorContextBuilder().build(session, project.id))
+    assert proposal_data["location_id"] == location.id
+    assert proposal_data["proposed_location"] is None
+
+def test_foreign_or_missing_location_id_blocks_proposal(session):
+    project, _, _, lead, _, thread, _, _ = seed(session)
+    foreign = Project(name="Foreign location project"); session.add(foreign); session.flush()
+    foreign_location = WorldEntity(project_id=foreign.id, entity_type="LOCATION", name="Foreign location")
+    session.add(foreign_location); session.commit()
+    context = DirectorContextBuilder().build(session, project.id)
+    foreign_report = DirectorConstraintChecker().validate(session, context, proposal(project, lead, thread, location_id=foreign_location.id, proposed_location=None))
+    missing_report = DirectorConstraintChecker().validate(session, context, proposal(project, lead, thread, location_id="missing-location", proposed_location=None))
+    assert all(any(issue.code == "INVALID_ENTITY_REFERENCE" and issue.severity == "BLOCKING" for issue in report.issues) for report in (foreign_report, missing_report))
+
+def test_reject_log_uses_proposal_context_fingerprint(session, monkeypatch):
+    project, _, _, _, _, _, _, _ = seed(session)
+    client = client_for(session, monkeypatch)
+    proposal_data = client.post(f"/projects/{project.id}/director/dry-run").json()["proposal"]
+    response = client.post(f"/projects/{project.id}/director/proposals/{proposal_data['id']}/reject", json={"reason": "Direction rejected."})
+    assert response.status_code == 200
+    log = session.scalar(select(DirectorDecisionLog).where(DirectorDecisionLog.proposal_id == proposal_data["id"], DirectorDecisionLog.decision_type == DecisionType.REJECT))
+    assert log.context_version == proposal_data["context_fingerprint"]
