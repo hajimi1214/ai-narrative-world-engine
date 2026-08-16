@@ -7,7 +7,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .db import SessionLocal
 from .director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector
-from .character_mind import CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor
+from .character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor
+from .ai.errors import ModelProviderError
+from .ai.factory import get_model_provider
+from .llm_actor import LLMCharacterActor
+from .settings import get_settings
 from .models import AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, StoryArc, StoryThread, WorldEntity, WritingBible
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
@@ -250,8 +254,7 @@ def create_reveal_constraint(project_id: str, payload: Payload, db: Session = De
 def character_context_summary(context: dict[str, Any]) -> dict[str, Any]:
     return {"fingerprint": context["fingerprint"], "character": context["character"], "scene": context["scene"], "knowledge": context["knowledge"], "memories": context["memories"], "relationships": context["relationships"], "abilities": context["abilities"], "inventory": context["inventory"]}
 
-@router.post("/projects/{project_id}/director/proposals/{proposal_id}/characters/{character_id}/dry-run", status_code=status.HTTP_201_CREATED)
-def character_dry_run(project_id: str, proposal_id: str, character_id: str, db: Session = Depends(get_db)):
+def require_character_simulation_inputs(db: Session, project_id: str, proposal_id: str, character_id: str) -> tuple[SceneProposal, Character]:
     require_project(db, project_id)
     proposal = db.get(SceneProposal, proposal_id)
     character = db.get(Character, character_id)
@@ -260,12 +263,35 @@ def character_dry_run(project_id: str, proposal_id: str, character_id: str, db: 
     if character_id not in proposal.participants: raise HTTPException(status_code=409, detail={"code": "NOT_SCENE_PARTICIPANT", "message": "Character is not a participant in this Scene Proposal."})
     director_context = DirectorContextBuilder().build(db, project_id)
     if proposal.context_fingerprint != director_context["fingerprint"]: raise HTTPException(status_code=409, detail={"code": "STALE_SCENE_PROPOSAL", "message": "Scene Proposal is stale. Run Director again."})
+    return proposal, character
+
+@router.post("/projects/{project_id}/director/proposals/{proposal_id}/characters/{character_id}/dry-run", status_code=status.HTTP_201_CREATED)
+def character_dry_run(project_id: str, proposal_id: str, character_id: str, db: Session = Depends(get_db)):
+    proposal, character = require_character_simulation_inputs(db, project_id, proposal_id, character_id)
     context = CharacterContextBuilder().build(db, project_id, character_id, proposal)
     decision = CharacterDecision(project_id=project_id, scene_proposal_id=proposal.id, character_id=character_id, context_fingerprint=context["fingerprint"], **HeuristicCharacterActor().decide(context))
     report = CharacterDecisionConstraintChecker().validate(db, context, decision)
     decision.status = CharacterDecisionStatus.VALID if report.valid else CharacterDecisionStatus.REJECTED
     db.add(decision); db.commit(); db.refresh(decision)
     return {"character_context_summary": character_context_summary(context), "decision": record_dict(decision), "validation_report": report.as_dict()}
+
+@router.post("/projects/{project_id}/director/proposals/{proposal_id}/characters/{character_id}/ai-dry-run", status_code=status.HTTP_201_CREATED)
+def character_ai_dry_run(project_id: str, proposal_id: str, character_id: str, db: Session = Depends(get_db)):
+    proposal, character = require_character_simulation_inputs(db, project_id, proposal_id, character_id)
+    context = CharacterContextBuilder().build(db, project_id, character_id, proposal)
+    actor_view = ActorPerceptionSanitizer().sanitize(context)
+    settings = get_settings()
+    try:
+        payload, model_result = LLMCharacterActor(get_model_provider(settings), settings.ai_character_model).decide(actor_view)
+    except ModelProviderError as exc:
+        raise HTTPException(status_code=502, detail={"code": exc.code, "message": "Character model request could not be completed."}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail={"code": "MODEL_AUTH_FAILED", "message": "Character model credentials are not configured."}) from exc
+    decision = CharacterDecision(project_id=project_id, scene_proposal_id=proposal.id, character_id=character.id, context_fingerprint=context["fingerprint"], **payload)
+    report = CharacterDecisionConstraintChecker().validate(db, context, decision)
+    decision.status = CharacterDecisionStatus.VALID if report.valid else CharacterDecisionStatus.REJECTED
+    db.add(decision); db.commit(); db.refresh(decision)
+    return {"character_context_summary": actor_view, "decision": record_dict(decision), "validation_report": report.as_dict(), "model_metadata": {"provider": model_result.provider, "model": model_result.model, "latency_ms": model_result.latency_ms, "request_id": model_result.request_id}}
 
 @router.get("/projects/{project_id}/character-decisions")
 def list_character_decisions(project_id: str, db: Session = Depends(get_db)):

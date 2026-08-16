@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 from .models import Character, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType, CharacterKnowledge, CharacterMemory, KnowledgeStatus, ProposalType, SceneProposal, WorldEntity
 
 MAX_CHARACTER_MEMORIES = 12
-PRIVATE_PROPOSAL_FIELDS = {"director_reasoning_summary", "possible_outcomes", "forbidden_reveals", "allowed_reveals", "required_canon", "risk_flags"}
 
 def character_context_fingerprint(context: dict[str, Any]) -> str:
     payload = {key: value for key, value in context.items() if key not in {"fingerprint", "version"}}
@@ -35,8 +34,8 @@ class CharacterContextBuilder:
         memories = self._memories(session, character, proposal, other_participants)
         relationships = {item["id"]: character.relationships.get(item["id"], {}) for item in other_participants}
         context = {
-            "character": {"id": character.id, "name": character.name, "personality": character.personality, "core_values": character.core_values, "boundaries": character.boundaries, "goals": character.goals, "current_state": character.current_state, "physical_state": character.physical_state, "emotional_state": character.emotional_state, "narrative_relevance": character.narrative_relevance},
-            "scene": {"proposal_id": proposal.id, "location": {"id": location.id, "name": location.name} if location else None, "proposed_location": proposal.proposed_location, "visible_goal": proposal.scene_goal, "visible_pressure": proposal.planned_pressure, "other_participants": other_participants, "current_situation": proposal.entry_state.get("visible_context", {})},
+            "character": {"id": character.id, "name": character.name, "personality": character.personality, "core_values": character.core_values, "boundaries": character.boundaries, "goals": character.goals, "current_state": character.current_state, "physical_state": character.physical_state, "emotional_state": character.emotional_state},
+            "scene": {"proposal_id": proposal.id, "location": {"id": location.id, "name": location.name} if location else None, "other_participants": other_participants, "visible_context": proposal.entry_state.get("visible_context", {}), "actor_visible_context": proposal.entry_state.get("actor_visible_context", {}).get(character.id, {})},
             "knowledge": self._knowledge(knowledge),
             "memories": memories,
             "relationships": relationships,
@@ -70,6 +69,27 @@ class CharacterContextBuilder:
             if isinstance(ability, dict): result.append({key: value for key, value in ability.items() if key != "director_only"})
             else: result.append(ability)
         return result
+
+
+class ActorPerceptionSanitizer:
+    """White-list the only data an external character model may receive."""
+    def sanitize(self, context: dict[str, Any]) -> dict[str, Any]:
+        character = context["character"]
+        scene = context["scene"]
+        return {
+            "character": {key: character.get(key) for key in ("name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state")},
+            "scene": {
+                "location": scene.get("location"),
+                "other_participants": scene.get("other_participants", []),
+                "visible_context": scene.get("visible_context", {}),
+                "actor_visible_context": scene.get("actor_visible_context", {}),
+            },
+            "knowledge": context.get("knowledge", {}),
+            "memories": context.get("memories", []),
+            "relationships": context.get("relationships", {}),
+            "abilities": context.get("abilities", []),
+            "inventory": context.get("inventory", []),
+        }
 
 @dataclass
 class CharacterDecisionIssue:
