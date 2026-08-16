@@ -18,6 +18,10 @@ class EntityType(str, enum.Enum): CITY = "CITY"; LOCATION = "LOCATION"; SECT = "
 class KnowledgeStatus(str, enum.Enum): KNOWN = "KNOWN"; SUSPECTED = "SUSPECTED"; FALSE_BELIEF = "FALSE_BELIEF"; UNKNOWN = "UNKNOWN"
 class ThreadStatus(str, enum.Enum): OPEN = "OPEN"; PAUSED = "PAUSED"; RESOLVED = "RESOLVED"; ABANDONED = "ABANDONED"
 class SceneStatus(str, enum.Enum): PLANNED = "PLANNED"; OCCURRED = "OCCURRED"; VOID = "VOID"
+class ProposalType(str, enum.Enum): CONTINUE_THREAD = "CONTINUE_THREAD"; CHARACTER_DRIVEN = "CHARACTER_DRIVEN"; CONSEQUENCE = "CONSEQUENCE"; REVEAL = "REVEAL"; ESCALATION = "ESCALATION"; RELATIONSHIP = "RELATIONSHIP"; TRANSITION = "TRANSITION"; NEW_THREAD = "NEW_THREAD"
+class ProposalStatus(str, enum.Enum): DRAFT = "DRAFT"; VALID = "VALID"; REJECTED = "REJECTED"; APPROVED = "APPROVED"; EXECUTED = "EXECUTED"
+class RevealStatus(str, enum.Enum): LOCKED = "LOCKED"; AVAILABLE = "AVAILABLE"; REVEALED = "REVEALED"
+class DecisionType(str, enum.Enum): DRY_RUN = "DRY_RUN"; APPROVE = "APPROVE"; REJECT = "REJECT"
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
@@ -179,3 +183,47 @@ class Chapter(Base):
     word_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     quality_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="DRAFT", nullable=False)
+
+class RevealConstraint(TimestampMixin, Base):
+    __tablename__ = "reveal_constraints"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    canon_fact_id: Mapped[str] = mapped_column(ForeignKey("canon_facts.id"), nullable=False)
+    status: Mapped[RevealStatus] = mapped_column(Enum(RevealStatus), default=RevealStatus.LOCKED, nullable=False)
+    minimum_condition: Mapped[str | None] = mapped_column(Text)
+    allowed_character_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+class SceneProposal(TimestampMixin, Base):
+    __tablename__ = "scene_proposals"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    proposal_type: Mapped[ProposalType] = mapped_column(Enum(ProposalType), nullable=False)
+    primary_thread_id: Mapped[str | None] = mapped_column(ForeignKey("story_threads.id"))
+    location_id: Mapped[str | None] = mapped_column(String(36))
+    proposed_location: Mapped[str | None] = mapped_column(String(200))
+    participants: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    scene_goal: Mapped[str] = mapped_column(Text, nullable=False)
+    character_motivations: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    entry_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    planned_pressure: Mapped[str | None] = mapped_column(Text)
+    expected_progress: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    allowed_reveals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    forbidden_reveals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    required_canon: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    possible_outcomes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    new_entity_requests: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    risk_flags: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    director_reasoning_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[ProposalStatus] = mapped_column(Enum(ProposalStatus), default=ProposalStatus.DRAFT, nullable=False)
+
+class DirectorDecisionLog(Base):
+    __tablename__ = "director_decision_logs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    context_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    proposal_id: Mapped[str | None] = mapped_column(ForeignKey("scene_proposals.id"))
+    decision_type: Mapped[DecisionType] = mapped_column(Enum(DecisionType), nullable=False)
+    brief_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    validation_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

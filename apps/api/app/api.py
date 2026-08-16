@@ -6,7 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .db import SessionLocal
-from .models import AntiAIBible, CanonFact, Character, CharacterKnowledge, CharacterMemory, Chapter, Project, ProjectTemplate, Scene, StoryArc, StoryThread, WorldEntity, WritingBible
+from .director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector
+from .models import AntiAIBible, CanonFact, Character, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, StoryArc, StoryThread, WorldEntity, WritingBible
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -180,3 +181,59 @@ def character_memories(character_id: str, db: Session = Depends(get_db)):
 def create_character_memory(character_id: str, payload: Payload, db: Session = Depends(get_db)):
     if not db.get(Character, character_id): raise HTTPException(status_code=404, detail="Character not found")
     return record_dict(create_record(db, CharacterMemory, payload.model_dump() | {"character_id": character_id}))
+
+def context_summary(context: dict[str, Any]) -> dict[str, Any]:
+    return {"version": context["version"], "project": context["project"], "current_story_arc": context["current_story_arc"], "active_story_threads": context["active_story_threads"], "active_characters": context["active_characters"], "recent_scene_count": len(context["recent_scenes"]), "world_entity_count": len(context["world_entities"]), "canon_count": len(context["canon"])}
+
+@router.post("/projects/{project_id}/director/dry-run", status_code=status.HTTP_201_CREATED)
+def director_dry_run(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    context = DirectorContextBuilder().build(db, project_id)
+    proposal = SceneProposal(project_id=project_id, **HeuristicDirector().propose(context))
+    report = DirectorConstraintChecker().validate(db, context, proposal)
+    proposal.status = ProposalStatus.VALID if report.valid else ProposalStatus.REJECTED
+    db.add(proposal); db.commit(); db.refresh(proposal)
+    log = DirectorDecisionLog(project_id=project_id, context_version=context["version"], proposal_id=proposal.id, decision_type=DecisionType.DRY_RUN, brief_reason=proposal.director_reasoning_summary, validation_result=report.as_dict())
+    db.add(log); db.commit()
+    return {"context_summary": context_summary(context), "proposal": record_dict(proposal), "validation_report": report.as_dict()}
+
+@router.get("/projects/{project_id}/director/proposals")
+def list_director_proposals(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [record_dict(item) for item in db.scalars(select(SceneProposal).where(SceneProposal.project_id == project_id).order_by(SceneProposal.created_at.desc())).all()]
+
+@router.get("/projects/{project_id}/director/proposals/{proposal_id}")
+def get_director_proposal(project_id: str, proposal_id: str, db: Session = Depends(get_db)):
+    proposal = db.get(SceneProposal, proposal_id)
+    if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
+    return record_dict(proposal)
+
+@router.post("/projects/{project_id}/director/proposals/{proposal_id}/approve")
+def approve_director_proposal(project_id: str, proposal_id: str, db: Session = Depends(get_db)):
+    proposal = db.get(SceneProposal, proposal_id)
+    if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
+    context = DirectorContextBuilder().build(db, project_id)
+    report = DirectorConstraintChecker().validate(db, context, proposal)
+    if not report.valid: raise HTTPException(status_code=409, detail={"message": "Blocking validation issues prevent approval.", "validation_report": report.as_dict()})
+    proposal.status = ProposalStatus.APPROVED; db.add(proposal); db.commit(); db.refresh(proposal)
+    db.add(DirectorDecisionLog(project_id=project_id, context_version=context["version"], proposal_id=proposal.id, decision_type=DecisionType.APPROVE, brief_reason="Proposal approved after constraint validation.", validation_result=report.as_dict())); db.commit()
+    return {"proposal": record_dict(proposal), "validation_report": report.as_dict()}
+
+@router.post("/projects/{project_id}/director/proposals/{proposal_id}/reject")
+def reject_director_proposal(project_id: str, proposal_id: str, payload: Payload, db: Session = Depends(get_db)):
+    proposal = db.get(SceneProposal, proposal_id)
+    if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
+    proposal.status = ProposalStatus.REJECTED; db.add(proposal); db.commit(); db.refresh(proposal)
+    reason = payload.model_dump().get("reason", "Proposal rejected by user.")
+    db.add(DirectorDecisionLog(project_id=project_id, context_version="director-context-v1", proposal_id=proposal.id, decision_type=DecisionType.REJECT, brief_reason=reason, validation_result={})); db.commit()
+    return record_dict(proposal)
+
+@router.get("/projects/{project_id}/reveal-constraints")
+def list_reveal_constraints(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [record_dict(item) for item in db.scalars(select(RevealConstraint).where(RevealConstraint.project_id == project_id)).all()]
+
+@router.post("/projects/{project_id}/reveal-constraints", status_code=status.HTTP_201_CREATED)
+def create_reveal_constraint(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return record_dict(create_record(db, RevealConstraint, payload.model_dump(), project_id))
