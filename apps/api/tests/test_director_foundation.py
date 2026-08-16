@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from app.db import Base
-from app.director import DirectorConstraintChecker, DirectorContextBuilder, RECENT_SCENE_LIMIT
+from app.director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector, RECENT_SCENE_LIMIT, extract_entity_references
 from app.main import app
 import app.api as api
 from app.models import CanonFact, CanonType, Character, CharacterKnowledge, KnowledgeStatus, Project, ProposalStatus, ProposalType, RevealConstraint, RevealStatus, Scene, SceneProposal, StoryThread, WorldEntity
@@ -22,8 +22,8 @@ def seed(session):
     location = WorldEntity(project_id=project.id, entity_type="LOCATION", name="Archive")
     unrelated = WorldEntity(project_id=project.id, entity_type="CITY", name="Far City")
     session.add_all([location, unrelated]); session.flush()
-    lead = Character(project_id=project.id, name="Ning Mo", current_state={"location": location.id}, goals={"current": "verify the register"}, narrative_relevance={"score": 9}, core_values=["truth"], boundaries=["will not harm innocents"])
-    other = Character(project_id=project.id, name="Gu", current_state={"location": location.id}, narrative_relevance={"score": 2})
+    lead = Character(project_id=project.id, name="Ning Mo", current_state={"location_id": location.id}, goals={"current": "verify the register"}, narrative_relevance={"score": 9}, core_values=["truth"], boundaries=["will not harm innocents"])
+    other = Character(project_id=project.id, name="Gu", current_state={"location_id": location.id}, narrative_relevance={"score": 2})
     thread = StoryThread(project_id=project.id, title="Archive identity", type="MYSTERY", weight=5, goal="identify the forged register")
     core = CanonFact(project_id=project.id, fact_type=CanonType.CORE_CANON, proposition="The archive has one sealed register", locked=True)
     secret = CanonFact(project_id=project.id, fact_type=CanonType.SECRET_CANON, proposition="The register was forged")
@@ -31,7 +31,7 @@ def seed(session):
     return project, location, unrelated, lead, other, thread, core, secret
 
 def proposal(project, lead, thread=None, **changes):
-    data = {"project_id": project.id, "proposal_type": ProposalType.CONTINUE_THREAD, "primary_thread_id": thread.id if thread else None, "proposed_location": lead.current_state["location"], "participants": [lead.id], "scene_goal": "Verify the register", "character_motivations": {lead.id: {"reason": "verify the register"}}, "entry_state": {}, "planned_pressure": "The keeper refuses access", "expected_progress": {"thread": thread.id} if thread else {"character_arc": True}, "allowed_reveals": [], "forbidden_reveals": [], "required_canon": [], "possible_outcomes": ["A clue is found", "Access is denied"], "new_entity_requests": [], "risk_flags": [], "director_reasoning_summary": "The lead's current goal aligns with the active thread."}
+    data = {"project_id": project.id, "context_fingerprint": "test-context", "proposal_type": ProposalType.CONTINUE_THREAD, "primary_thread_id": thread.id if thread else None, "proposed_location": lead.current_state["location_id"], "participants": [lead.id], "scene_goal": "Verify the register", "character_motivations": {lead.id: {"reason": "verify the register"}}, "entry_state": {}, "planned_pressure": "The keeper refuses access", "expected_progress": {"thread": thread.id} if thread else {"character_arc": True}, "allowed_reveals": [], "forbidden_reveals": [], "required_canon": [], "possible_outcomes": ["A clue is found", "Access is denied"], "new_entity_requests": [], "risk_flags": [], "director_reasoning_summary": "The lead's current goal aligns with the active thread."}
     data.update(changes)
     return SceneProposal(**data)
 
@@ -109,3 +109,68 @@ def test_proposal_can_be_rejected(session, monkeypatch):
     response = client.post(f"/projects/{project.id}/director/proposals/{proposal_data['id']}/reject", json={"reason": "Not the intended direction."})
     assert response.status_code == 200
     assert response.json()["status"] == "REJECTED"
+
+def test_paused_thread_is_contextual_but_not_selected(session):
+    project, _, _, _, _, open_thread, _, _ = seed(session)
+    paused = StoryThread(project_id=project.id, title="Paused but heavy", type="MYSTERY", status="PAUSED", weight=99)
+    session.add(paused); session.commit()
+    context = DirectorContextBuilder().build(session, project.id)
+    assert [item["id"] for item in context["active_story_threads"]] == [open_thread.id]
+    assert [item["id"] for item in context["paused_story_threads"]] == [paused.id]
+    assert HeuristicDirector().propose(context)["primary_thread_id"] == open_thread.id
+
+def test_knowledge_statuses_are_not_interchangeable(session):
+    project, _, _, lead, _, thread, _, _ = seed(session)
+    session.add_all([CharacterKnowledge(character_id=lead.id, proposition="confirmed", status=KnowledgeStatus.KNOWN), CharacterKnowledge(character_id=lead.id, proposition="rumor", status=KnowledgeStatus.SUSPECTED), CharacterKnowledge(character_id=lead.id, proposition="wrong theory", status=KnowledgeStatus.FALSE_BELIEF)])
+    session.commit(); context = DirectorContextBuilder().build(session, project.id)
+    confirmed = proposal(project, lead, thread, character_motivations={lead.id: {"reason": "act", "required_knowledge": [{"proposition": "confirmed", "accepted_statuses": ["KNOWN"]}]}})
+    suspected_as_known = proposal(project, lead, thread, character_motivations={lead.id: {"reason": "act", "required_knowledge": [{"proposition": "rumor", "accepted_statuses": ["KNOWN"]}]}})
+    false_belief_allowed = proposal(project, lead, thread, character_motivations={lead.id: {"reason": "act", "required_knowledge": [{"proposition": "wrong theory", "accepted_statuses": ["FALSE_BELIEF"]}]}})
+    assert not any(issue.code == "KNOWLEDGE_LEAK" for issue in DirectorConstraintChecker().validate(session, context, confirmed).issues)
+    assert any(issue.code == "KNOWLEDGE_LEAK" for issue in DirectorConstraintChecker().validate(session, context, suspected_as_known).issues)
+    assert not any(issue.code == "KNOWLEDGE_LEAK" for issue in DirectorConstraintChecker().validate(session, context, false_belief_allowed).issues)
+
+def test_fingerprint_changes_for_director_inputs(session):
+    project, _, _, lead, _, thread, _, _ = seed(session)
+    before = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    assert DirectorContextBuilder().build(session, project.id)["fingerprint"] == before
+    session.add(CharacterKnowledge(character_id=lead.id, proposition="new clue", status=KnowledgeStatus.KNOWN)); session.commit()
+    after_knowledge = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    lead.current_state = {"location_id": "new-location"}; session.add(lead); session.commit()
+    after_state = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    session.add(Scene(project_id=project.id, sequence=1, status="OCCURRED", facts=[{"entity_ids": ["new-location"]}])); session.commit()
+    after_scene = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    thread.progress = 0.5; session.add(thread); session.commit()
+    after_thread = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    assert len({before, after_knowledge, after_state, after_scene, after_thread}) == 5
+
+def test_irrelevant_secret_canon_is_not_in_context(session):
+    project, _, _, _, _, _, _, secret = seed(session)
+    context = DirectorContextBuilder().build(session, project.id)
+    assert secret.id not in {fact["id"] for fact in context["canon"]}
+    secret.data = {"global_director_required": True}; session.add(secret); session.commit()
+    assert secret.id in {fact["id"] for fact in DirectorContextBuilder().build(session, project.id)["canon"]}
+
+def test_reveal_constraint_rejects_cross_project_references(session, monkeypatch):
+    project, _, _, lead, _, _, _, local_secret = seed(session)
+    foreign = Project(name="Foreign"); session.add(foreign); session.flush()
+    foreign_canon = CanonFact(project_id=foreign.id, fact_type=CanonType.SECRET_CANON, proposition="Foreign secret")
+    foreign_character = Character(project_id=foreign.id, name="Foreign character")
+    session.add_all([foreign_canon, foreign_character]); session.commit()
+    client = client_for(session, monkeypatch)
+    bad_canon = client.post(f"/projects/{project.id}/reveal-constraints", json={"canon_fact_id": foreign_canon.id, "allowed_character_ids": [lead.id]} )
+    bad_character = client.post(f"/projects/{project.id}/reveal-constraints", json={"canon_fact_id": local_secret.id, "allowed_character_ids": [foreign_character.id]} )
+    assert bad_canon.status_code == 409
+    assert bad_character.status_code == 409
+
+def test_stale_proposal_cannot_be_approved(session, monkeypatch):
+    project, _, _, lead, _, _, _, _ = seed(session)
+    client = client_for(session, monkeypatch)
+    proposal_data = client.post(f"/projects/{project.id}/director/dry-run").json()["proposal"]
+    lead.goals = {"current": "different goal"}; session.add(lead); session.commit()
+    response = client.post(f"/projects/{project.id}/director/proposals/{proposal_data['id']}/approve")
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "STALE_PROPOSAL"
+
+def test_entity_references_ignore_unstructured_strings():
+    assert extract_entity_references({"summary": "city-id", "unknown": {"entity_id": "ignored"}}, [{"entity_ids": ["one"], "location_id": "two"}]) == {"one", "two"}

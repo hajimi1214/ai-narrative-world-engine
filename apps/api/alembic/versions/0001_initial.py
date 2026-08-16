@@ -1,17 +1,43 @@
 """initial novel world core schema"""
 from alembic import op
-from app.db import Base
-from app import models  # noqa: F401
+import sqlalchemy as sa
 
 revision = "0001_initial"
 down_revision = None
 branch_labels = None
 depends_on = None
 
+project_status = sa.Enum("DRAFT", "ACTIVE", "ARCHIVED", name="projectstatus")
+creation_mode = sa.Enum("AUTONOMOUS", "GUIDED", "PERFORMANCE", name="creationmode")
+canon_type = sa.Enum("TEMPORARY", "WORLD_FACT", "CORE_CANON", "SECRET_CANON", name="canontype")
+entity_type = sa.Enum("CITY", "LOCATION", "SECT", "FACTION", "COUNTRY", "ITEM", "SYSTEM", "HISTORY", "CUSTOM", name="entitytype")
+knowledge_status = sa.Enum("KNOWN", "SUSPECTED", "FALSE_BELIEF", "UNKNOWN", name="knowledgestatus")
+thread_status = sa.Enum("OPEN", "PAUSED", "RESOLVED", "ABANDONED", name="threadstatus")
+scene_status = sa.Enum("PLANNED", "OCCURRED", "VOID", name="scenestatus")
+
+def ident(): return sa.Column("id", sa.String(36), primary_key=True, nullable=False)
+def audit(): return [sa.Column("created_at", sa.DateTime(), server_default=sa.text("now()"), nullable=False), sa.Column("updated_at", sa.DateTime(), server_default=sa.text("now()"), nullable=False)]
+
 def upgrade() -> None:
-    bind = op.get_bind()
-    Base.metadata.create_all(bind=bind)
+    op.create_table("projects", ident(), sa.Column("name", sa.String(200), nullable=False), sa.Column("status", project_status, nullable=False, server_default="DRAFT"), sa.Column("creation_mode", creation_mode, nullable=False, server_default="AUTONOMOUS"), sa.Column("story_seed", sa.Text()), sa.Column("target_chapter_words", sa.Integer(), nullable=False, server_default="3000"), sa.Column("min_chapter_words", sa.Integer()), sa.Column("max_chapter_words", sa.Integer()), sa.Column("autonomy_settings", sa.JSON(), nullable=False), sa.Column("research_settings", sa.JSON(), nullable=False), sa.Column("current_world_time", sa.DateTime()), *audit())
+    op.create_table("project_templates", ident(), sa.Column("name", sa.String(200), nullable=False), sa.Column("story_dna", sa.JSON(), nullable=False), sa.Column("writing_defaults", sa.JSON(), nullable=False), sa.Column("anti_ai_defaults", sa.JSON(), nullable=False), sa.Column("autonomy_defaults", sa.JSON(), nullable=False), sa.Column("research_defaults", sa.JSON(), nullable=False), *audit())
+    op.create_table("writing_bibles", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("version", sa.Integer(), nullable=False), sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.false()), sa.Column("rules", sa.JSON(), nullable=False), *audit(), sa.UniqueConstraint("project_id", "version", name="uq_writing_bibles_project_version"))
+    op.create_table("anti_ai_bibles", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("version", sa.Integer(), nullable=False), sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.false()), sa.Column("disabled_expressions", sa.JSON(), nullable=False), sa.Column("warning_expressions", sa.JSON(), nullable=False), sa.Column("frequency_limits", sa.JSON(), nullable=False), sa.Column("writing_principles", sa.JSON(), nullable=False), sa.Column("future_risk_labels", sa.JSON(), nullable=False), *audit(), sa.UniqueConstraint("project_id", "version", name="uq_anti_ai_bibles_project_version"))
+    op.create_table("canon_facts", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("fact_type", canon_type, nullable=False), sa.Column("proposition", sa.Text(), nullable=False), sa.Column("data", sa.JSON(), nullable=False), sa.Column("locked", sa.Boolean(), nullable=False, server_default=sa.false()), *audit())
+    op.create_table("world_entities", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("entity_type", entity_type, nullable=False), sa.Column("name", sa.String(200), nullable=False), sa.Column("profile", sa.JSON(), nullable=False), sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.true()), *audit())
+    op.create_table("characters", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("name", sa.String(200), nullable=False), sa.Column("profile", sa.JSON(), nullable=False), sa.Column("personality", sa.JSON(), nullable=False), sa.Column("core_values", sa.JSON(), nullable=False), sa.Column("boundaries", sa.JSON(), nullable=False), sa.Column("goals", sa.JSON(), nullable=False), sa.Column("current_state", sa.JSON(), nullable=False), sa.Column("physical_state", sa.JSON(), nullable=False), sa.Column("emotional_state", sa.JSON(), nullable=False), sa.Column("abilities", sa.JSON(), nullable=False), sa.Column("voice_profile", sa.JSON(), nullable=False), sa.Column("relationships", sa.JSON(), nullable=False), sa.Column("inventory", sa.JSON(), nullable=False), sa.Column("secrets", sa.JSON(), nullable=False), sa.Column("narrative_relevance", sa.JSON(), nullable=False), sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.true()), *audit())
+    op.create_table("character_knowledge", ident(), sa.Column("character_id", sa.String(36), sa.ForeignKey("characters.id"), nullable=False), sa.Column("proposition", sa.Text(), nullable=False), sa.Column("status", knowledge_status, nullable=False), sa.Column("source", sa.String(200)), sa.Column("confidence", sa.Float(), nullable=False, server_default="1.0"), sa.Column("acquired_at", sa.DateTime(), server_default=sa.text("now()"), nullable=False))
+    op.create_table("character_memories", ident(), sa.Column("character_id", sa.String(36), sa.ForeignKey("characters.id"), nullable=False), sa.Column("content", sa.Text(), nullable=False), sa.Column("importance", sa.Float(), nullable=False, server_default="0.5"), sa.Column("emotional_weight", sa.Float(), nullable=False, server_default="0.0"), sa.Column("confidence", sa.Float(), nullable=False, server_default="1.0"), sa.Column("distortion", sa.JSON(), nullable=False), sa.Column("source_scene", sa.String(36)), sa.Column("happened_at", sa.DateTime()))
+    op.create_table("story_threads", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("title", sa.String(200), nullable=False), sa.Column("type", sa.String(100), nullable=False), sa.Column("status", thread_status, nullable=False, server_default="OPEN"), sa.Column("weight", sa.Float(), nullable=False, server_default="1.0"), sa.Column("goal", sa.Text()), sa.Column("progress", sa.Float(), nullable=False, server_default="0.0"), sa.Column("state", sa.JSON(), nullable=False))
+    op.create_table("story_arcs", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("title", sa.String(200), nullable=False), sa.Column("core_question", sa.Text()), sa.Column("core_conflict", sa.Text()), sa.Column("status", sa.String(50), nullable=False, server_default="ACTIVE"), sa.Column("progress", sa.Float(), nullable=False, server_default="0.0"), sa.Column("source_scene_ids", sa.JSON(), nullable=False))
+    op.create_table("scenes", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("sequence", sa.Integer(), nullable=False), sa.Column("world_time", sa.DateTime()), sa.Column("location", sa.String(200)), sa.Column("participants", sa.JSON(), nullable=False), sa.Column("intent", sa.Text()), sa.Column("facts", sa.JSON(), nullable=False), sa.Column("result", sa.JSON(), nullable=False), sa.Column("summary", sa.Text()), sa.Column("story_threads", sa.JSON(), nullable=False), sa.Column("status", scene_status, nullable=False, server_default="PLANNED"))
+    op.create_table("chapters", ident(), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False), sa.Column("number", sa.Integer(), nullable=False), sa.Column("title", sa.String(200)), sa.Column("source_scene_ids", sa.JSON(), nullable=False), sa.Column("content", sa.Text()), sa.Column("word_count", sa.Integer(), nullable=False, server_default="0"), sa.Column("quality_report", sa.JSON(), nullable=False), sa.Column("status", sa.String(50), nullable=False, server_default="DRAFT"))
+    for table in ("writing_bibles", "anti_ai_bibles", "canon_facts", "world_entities", "characters", "story_threads", "story_arcs", "scenes", "chapters"): op.create_index(f"ix_{table}_project_id", table, ["project_id"])
+    op.create_index("ix_character_knowledge_character_id", "character_knowledge", ["character_id"])
+    op.create_index("ix_character_memories_character_id", "character_memories", ["character_id"])
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    Base.metadata.drop_all(bind=bind)
+    for index, table in (("ix_character_memories_character_id", "character_memories"), ("ix_character_knowledge_character_id", "character_knowledge")): op.drop_index(index, table_name=table)
+    for table in ("writing_bibles", "anti_ai_bibles", "canon_facts", "world_entities", "characters", "story_threads", "story_arcs", "scenes", "chapters"): op.drop_index(f"ix_{table}_project_id", table_name=table)
+    for table in ("chapters", "scenes", "story_arcs", "story_threads", "character_memories", "character_knowledge", "characters", "world_entities", "canon_facts", "anti_ai_bibles", "writing_bibles", "project_templates", "projects"): op.drop_table(table)
+    for enum in (scene_status, thread_status, knowledge_status, entity_type, canon_type, creation_mode, project_status): enum.drop(op.get_bind(), checkfirst=True)

@@ -198,6 +198,7 @@ class SceneProposal(TimestampMixin, Base):
     __tablename__ = "scene_proposals"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    context_fingerprint: Mapped[str] = mapped_column(String(100), nullable=False)
     proposal_type: Mapped[ProposalType] = mapped_column(Enum(ProposalType), nullable=False)
     primary_thread_id: Mapped[str | None] = mapped_column(ForeignKey("story_threads.id"))
     location_id: Mapped[str | None] = mapped_column(String(36))

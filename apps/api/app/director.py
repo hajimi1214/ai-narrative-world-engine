@@ -1,11 +1,32 @@
 """Deterministic Director protocol. This module deliberately has no LLM dependency."""
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .models import AntiAIBible, CanonFact, CanonType, Character, CharacterKnowledge, KnowledgeStatus, Project, ProposalStatus, ProposalType, RevealConstraint, RevealStatus, Scene, SceneProposal, StoryArc, StoryThread, ThreadStatus, WorldEntity, WritingBible
 
 RECENT_SCENE_LIMIT = 10
+
+def extract_entity_references(*values: Any) -> set[str]:
+    """Extract only documented entity reference keys; never infer from arbitrary text."""
+    references: set[str] = set()
+    def collect(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value: collect(item)
+        elif isinstance(value, dict):
+            for key in ("entity_id", "location_id"):
+                if isinstance(value.get(key), str): references.add(value[key])
+            if isinstance(value.get("entity_ids"), list):
+                references.update(item for item in value["entity_ids"] if isinstance(item, str))
+    for value in values: collect(value)
+    return references
+
+def context_fingerprint(context: dict[str, Any]) -> str:
+    payload = {key: value for key, value in context.items() if key not in {"version", "fingerprint"}}
+    stable = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return f"director-context-v1:{hashlib.sha256(stable.encode()).hexdigest()}"
 
 @dataclass
 class ValidationIssue:
@@ -33,24 +54,25 @@ class DirectorContextBuilder:
             raise ValueError("Project not found")
         characters = session.scalars(select(Character).where(Character.project_id == project_id, Character.active.is_(True))).all()
         character_ids = [character.id for character in characters]
-        threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status.in_([ThreadStatus.OPEN, ThreadStatus.PAUSED])).order_by(StoryThread.weight.desc())).all()
+        open_threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status == ThreadStatus.OPEN).order_by(StoryThread.weight.desc(), StoryThread.id)).all()
+        paused_threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status == ThreadStatus.PAUSED).order_by(StoryThread.weight.desc(), StoryThread.id)).all()
         recent_scenes = session.scalars(select(Scene).where(Scene.project_id == project_id).order_by(Scene.sequence.desc()).limit(RECENT_SCENE_LIMIT)).all()
         active_arc = session.scalar(select(StoryArc).where(StoryArc.project_id == project_id, StoryArc.status == "ACTIVE").order_by(StoryArc.id.desc()))
         knowledge = session.scalars(select(CharacterKnowledge).where(CharacterKnowledge.character_id.in_(character_ids), CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF]))).all() if character_ids else []
-        related_ids = self._related_entity_ids(characters, threads, recent_scenes)
-        entities = session.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True))).all()
+        related_ids = self._related_entity_ids(characters, open_threads + paused_threads, recent_scenes)
+        entities = session.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True)).order_by(WorldEntity.id)).all()
         selected_entities = [entity for entity in entities if entity.id in related_ids or entity.name in related_ids]
-        canon = session.scalars(select(CanonFact).where(CanonFact.project_id == project_id)).all()
+        canon = session.scalars(select(CanonFact).where(CanonFact.project_id == project_id).order_by(CanonFact.id)).all()
         selected_canon = [fact for fact in canon if fact.fact_type == CanonType.CORE_CANON or (fact.fact_type == CanonType.WORLD_FACT and fact.locked) or fact.id in related_ids]
         if include_secret_canon:
-            selected_canon.extend(fact for fact in canon if fact.fact_type == CanonType.SECRET_CANON and fact not in selected_canon)
+            selected_canon.extend(self._relevant_secret_canon(session, project_id, canon, related_ids, character_ids, [thread.id for thread in open_threads + paused_threads], active_arc.id if active_arc else None))
         writing = session.scalar(select(WritingBible).where(WritingBible.project_id == project_id, WritingBible.active.is_(True)))
         anti_ai = session.scalar(select(AntiAIBible).where(AntiAIBible.project_id == project_id, AntiAIBible.active.is_(True)))
-        return {
-            "version": f"director-context-v1:{project.updated_at.isoformat() if project.updated_at else 'unknown'}",
+        context = {
             "project": {"id": project.id, "creation_mode": project.creation_mode.value, "story_seed": project.story_seed, "autonomy_settings": project.autonomy_settings, "current_world_time": project.current_world_time.isoformat() if project.current_world_time else None, "chapter_words": {"target": project.target_chapter_words, "min": project.min_chapter_words, "max": project.max_chapter_words}},
             "current_story_arc": self._arc(active_arc),
-            "active_story_threads": [self._thread(thread) for thread in threads],
+            "active_story_threads": [self._thread(thread) for thread in open_threads],
+            "paused_story_threads": [self._thread(thread) for thread in paused_threads],
             "active_characters": [self._character(character) for character in characters],
             "character_knowledge": self._knowledge(knowledge),
             "recent_scenes": [self._scene(scene) for scene in recent_scenes],
@@ -59,16 +81,28 @@ class DirectorContextBuilder:
             "writing_constraints": self._writing_constraints(writing.rules if writing else {}),
             "anti_ai_constraints": {"avoid_repeated_conclusions": True, "avoid_static_delay": True, "principles": (anti_ai.writing_principles[:3] if anti_ai else [])},
         }
+        context["fingerprint"] = context_fingerprint(context)
+        context["version"] = context["fingerprint"]
+        return context
 
     def _related_entity_ids(self, characters, threads, scenes) -> set[str]:
         ids: set[str] = set()
-        for character in characters: ids.update(str(value) for value in character.current_state.values() if isinstance(value, str))
-        for thread in threads: ids.update(str(value) for value in thread.state.get("entity_ids", []))
-        for scene in scenes: ids.update(str(value) for value in scene.participants + scene.story_threads + scene.facts)
+        for character in characters: ids.update(extract_entity_references(character.current_state))
+        for thread in threads: ids.update(extract_entity_references(thread.state))
+        for scene in scenes: ids.update(extract_entity_references(scene.facts))
         return ids
+    def _relevant_secret_canon(self, session, project_id, canon, related_ids, character_ids, thread_ids, arc_id):
+        reveal_ids = {lock.canon_fact_id for lock in session.scalars(select(RevealConstraint).where(RevealConstraint.project_id == project_id)).all() if set(lock.allowed_character_ids).intersection(character_ids)}
+        relevant = related_ids | set(character_ids) | set(thread_ids) | ({arc_id} if arc_id else set())
+        result = []
+        for fact in canon:
+            if fact.fact_type != CanonType.SECRET_CANON: continue
+            data_refs = extract_entity_references(fact.data) | set(fact.data.get("thread_ids", [])) | set(fact.data.get("arc_ids", []))
+            if fact.data.get("global_director_required") is True or fact.id in reveal_ids or data_refs.intersection(relevant): result.append(fact)
+        return result
     def _arc(self, arc): return None if not arc else {"id": arc.id, "title": arc.title, "core_question": arc.core_question, "core_conflict": arc.core_conflict, "progress": arc.progress, "state": arc.status}
     def _thread(self, thread): return {"id": thread.id, "title": thread.title, "type": thread.type, "weight": thread.weight, "goal": thread.goal, "progress": thread.progress, "state": thread.state}
-    def _character(self, character): return {"id": character.id, "name": character.name, "role_level": character.profile.get("role_level", "SUPPORTING"), "current_location": character.current_state.get("location"), "current_goals": character.goals, "core_values": character.core_values, "boundaries": character.boundaries, "physical_state": character.physical_state, "emotional_state": character.emotional_state, "relevant_abilities": character.abilities, "narrative_relevance": character.narrative_relevance}
+    def _character(self, character): return {"id": character.id, "name": character.name, "role_level": character.profile.get("role_level", "SUPPORTING"), "current_location": character.current_state.get("location_id", character.current_state.get("location")), "current_goals": character.goals, "core_values": character.core_values, "boundaries": character.boundaries, "physical_state": character.physical_state, "emotional_state": character.emotional_state, "relevant_abilities": character.abilities, "narrative_relevance": character.narrative_relevance}
     def _knowledge(self, knowledge):
         result: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for item in knowledge: result.setdefault(item.character_id, {"KNOWN": [], "SUSPECTED": [], "FALSE_BELIEF": []})[item.status.value].append({"id": item.id, "proposition": item.proposition, "confidence": item.confidence})
@@ -109,8 +143,12 @@ class DirectorConstraintChecker:
     def _knowledge(self, proposal, knowledge, issues):
         for character_id, motivation in proposal.character_motivations.items():
             required = motivation.get("required_knowledge", []) if isinstance(motivation, dict) else []
-            known = {item["proposition"] for status in ("KNOWN", "SUSPECTED", "FALSE_BELIEF") for item in knowledge.get(character_id, {}).get(status, [])}
-            missing = [item for item in required if item not in known]
+            available = {status: {item["proposition"] for item in knowledge.get(character_id, {}).get(status, [])} for status in ("KNOWN", "SUSPECTED", "FALSE_BELIEF")}
+            missing = []
+            for requirement in required:
+                if isinstance(requirement, str): proposition, accepted = requirement, ["KNOWN"]
+                else: proposition, accepted = requirement.get("proposition"), requirement.get("accepted_statuses", ["KNOWN"])
+                if not proposition or not any(proposition in available.get(status, set()) for status in accepted): missing.append(proposition or "unspecified proposition")
             if missing: self._add(issues, "KNOWLEDGE_LEAK", "BLOCKING", "Character motivation relies on information this character has not acquired.", [character_id], "Use known clues, suspicion, or add a prior discovery Scene.")
     def _motivation_and_boundaries(self, proposal, characters, issues):
         for character_id in proposal.participants:
@@ -126,6 +164,9 @@ class DirectorConstraintChecker:
         if not proposal.allowed_reveals: return
         locks = session.scalars(select(RevealConstraint).where(RevealConstraint.project_id == proposal.project_id, RevealConstraint.canon_fact_id.in_(proposal.allowed_reveals), RevealConstraint.status == RevealStatus.LOCKED)).all()
         for lock in locks:
+            fact = session.get(CanonFact, lock.canon_fact_id)
+            invalid_allowed = [character_id for character_id in lock.allowed_character_ids if not session.get(Character, character_id) or session.get(Character, character_id).project_id != proposal.project_id]
+            if not fact or fact.project_id != proposal.project_id or invalid_allowed: self._add(issues, "INVALID_ENTITY_REFERENCE", "BLOCKING", "Reveal Constraint crosses project boundaries.", [lock.id], "Repair the Reveal Constraint references.")
             unauthorized = [character_id for character_id in proposal.participants if character_id not in lock.allowed_character_ids]
             if unauthorized: self._add(issues, "PREMATURE_REVEAL", "BLOCKING", "Proposal reveals a locked Canon fact before its condition is met.", [lock.canon_fact_id] + unauthorized, "Remove this reveal or update its Reveal Constraint through the appropriate workflow.")
         forbidden = set(proposal.forbidden_reveals).intersection(proposal.allowed_reveals)

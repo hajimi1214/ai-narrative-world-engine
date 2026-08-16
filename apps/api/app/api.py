@@ -183,13 +183,13 @@ def create_character_memory(character_id: str, payload: Payload, db: Session = D
     return record_dict(create_record(db, CharacterMemory, payload.model_dump() | {"character_id": character_id}))
 
 def context_summary(context: dict[str, Any]) -> dict[str, Any]:
-    return {"version": context["version"], "project": context["project"], "current_story_arc": context["current_story_arc"], "active_story_threads": context["active_story_threads"], "active_characters": context["active_characters"], "recent_scene_count": len(context["recent_scenes"]), "world_entity_count": len(context["world_entities"]), "canon_count": len(context["canon"])}
+    return {"version": context["version"], "fingerprint": context["fingerprint"], "project": context["project"], "current_story_arc": context["current_story_arc"], "active_story_threads": context["active_story_threads"], "paused_story_threads": context["paused_story_threads"], "active_characters": context["active_characters"], "recent_scene_count": len(context["recent_scenes"]), "world_entity_count": len(context["world_entities"]), "canon_count": len(context["canon"])}
 
 @router.post("/projects/{project_id}/director/dry-run", status_code=status.HTTP_201_CREATED)
 def director_dry_run(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
     context = DirectorContextBuilder().build(db, project_id)
-    proposal = SceneProposal(project_id=project_id, **HeuristicDirector().propose(context))
+    proposal = SceneProposal(project_id=project_id, context_fingerprint=context["fingerprint"], **HeuristicDirector().propose(context))
     report = DirectorConstraintChecker().validate(db, context, proposal)
     proposal.status = ProposalStatus.VALID if report.valid else ProposalStatus.REJECTED
     db.add(proposal); db.commit(); db.refresh(proposal)
@@ -213,6 +213,8 @@ def approve_director_proposal(project_id: str, proposal_id: str, db: Session = D
     proposal = db.get(SceneProposal, proposal_id)
     if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
     context = DirectorContextBuilder().build(db, project_id)
+    if proposal.context_fingerprint != context["fingerprint"]:
+        raise HTTPException(status_code=409, detail={"code": "STALE_PROPOSAL", "message": "World state changed after this proposal was generated. Run Director again."})
     report = DirectorConstraintChecker().validate(db, context, proposal)
     if not report.valid: raise HTTPException(status_code=409, detail={"message": "Blocking validation issues prevent approval.", "validation_report": report.as_dict()})
     proposal.status = ProposalStatus.APPROVED; db.add(proposal); db.commit(); db.refresh(proposal)
@@ -236,4 +238,10 @@ def list_reveal_constraints(project_id: str, db: Session = Depends(get_db)):
 @router.post("/projects/{project_id}/reveal-constraints", status_code=status.HTTP_201_CREATED)
 def create_reveal_constraint(project_id: str, payload: Payload, db: Session = Depends(get_db)):
     require_project(db, project_id)
-    return record_dict(create_record(db, RevealConstraint, payload.model_dump(), project_id))
+    values = payload.model_dump()
+    fact = db.get(CanonFact, values.get("canon_fact_id"))
+    if not fact or fact.project_id != project_id: raise HTTPException(status_code=409, detail="canon_fact_id must belong to this project")
+    character_ids = values.get("allowed_character_ids", [])
+    invalid = [character_id for character_id in character_ids if not db.get(Character, character_id) or db.get(Character, character_id).project_id != project_id]
+    if invalid: raise HTTPException(status_code=409, detail={"message": "allowed_character_ids must belong to this project", "invalid_ids": invalid})
+    return record_dict(create_record(db, RevealConstraint, values, project_id))
