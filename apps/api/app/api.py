@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .db import SessionLocal
 from .director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector
-from .models import AntiAIBible, CanonFact, Character, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, StoryArc, StoryThread, WorldEntity, WritingBible
+from .character_mind import CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor
+from .models import AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, StoryArc, StoryThread, WorldEntity, WritingBible
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -245,3 +246,34 @@ def create_reveal_constraint(project_id: str, payload: Payload, db: Session = De
     invalid = [character_id for character_id in character_ids if not db.get(Character, character_id) or db.get(Character, character_id).project_id != project_id]
     if invalid: raise HTTPException(status_code=409, detail={"message": "allowed_character_ids must belong to this project", "invalid_ids": invalid})
     return record_dict(create_record(db, RevealConstraint, values, project_id))
+
+def character_context_summary(context: dict[str, Any]) -> dict[str, Any]:
+    return {"fingerprint": context["fingerprint"], "character": context["character"], "scene": context["scene"], "knowledge": context["knowledge"], "memories": context["memories"], "relationships": context["relationships"], "abilities": context["abilities"], "inventory": context["inventory"]}
+
+@router.post("/projects/{project_id}/director/proposals/{proposal_id}/characters/{character_id}/dry-run", status_code=status.HTTP_201_CREATED)
+def character_dry_run(project_id: str, proposal_id: str, character_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    proposal = db.get(SceneProposal, proposal_id)
+    character = db.get(Character, character_id)
+    if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
+    if not character or character.project_id != project_id: raise HTTPException(status_code=404, detail="Character not found")
+    if character_id not in proposal.participants: raise HTTPException(status_code=409, detail={"code": "NOT_SCENE_PARTICIPANT", "message": "Character is not a participant in this Scene Proposal."})
+    director_context = DirectorContextBuilder().build(db, project_id)
+    if proposal.context_fingerprint != director_context["fingerprint"]: raise HTTPException(status_code=409, detail={"code": "STALE_SCENE_PROPOSAL", "message": "Scene Proposal is stale. Run Director again."})
+    context = CharacterContextBuilder().build(db, project_id, character_id, proposal)
+    decision = CharacterDecision(project_id=project_id, scene_proposal_id=proposal.id, character_id=character_id, context_fingerprint=context["fingerprint"], **HeuristicCharacterActor().decide(context))
+    report = CharacterDecisionConstraintChecker().validate(db, context, decision)
+    decision.status = CharacterDecisionStatus.VALID if report.valid else CharacterDecisionStatus.REJECTED
+    db.add(decision); db.commit(); db.refresh(decision)
+    return {"character_context_summary": character_context_summary(context), "decision": record_dict(decision), "validation_report": report.as_dict()}
+
+@router.get("/projects/{project_id}/character-decisions")
+def list_character_decisions(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [record_dict(item) for item in db.scalars(select(CharacterDecision).where(CharacterDecision.project_id == project_id).order_by(CharacterDecision.created_at.desc(), CharacterDecision.id.desc())).all()]
+
+@router.get("/projects/{project_id}/character-decisions/{decision_id}")
+def get_character_decision(project_id: str, decision_id: str, db: Session = Depends(get_db)):
+    decision = db.get(CharacterDecision, decision_id)
+    if not decision or decision.project_id != project_id: raise HTTPException(status_code=404, detail="Character Decision not found")
+    return record_dict(decision)

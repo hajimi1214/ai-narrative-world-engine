@@ -22,6 +22,8 @@ class ProposalType(str, enum.Enum): CONTINUE_THREAD = "CONTINUE_THREAD"; CHARACT
 class ProposalStatus(str, enum.Enum): DRAFT = "DRAFT"; VALID = "VALID"; REJECTED = "REJECTED"; APPROVED = "APPROVED"; EXECUTED = "EXECUTED"
 class RevealStatus(str, enum.Enum): LOCKED = "LOCKED"; AVAILABLE = "AVAILABLE"; REVEALED = "REVEALED"
 class DecisionType(str, enum.Enum): DRY_RUN = "DRY_RUN"; APPROVE = "APPROVE"; REJECT = "REJECT"
+class CharacterDecisionType(str, enum.Enum): ACT = "ACT"; WAIT = "WAIT"; ASK = "ASK"; INVESTIGATE = "INVESTIGATE"; CONFRONT = "CONFRONT"; WITHDRAW = "WITHDRAW"; REFUSE = "REFUSE"; HELP = "HELP"; HIDE = "HIDE"; NEGOTIATE = "NEGOTIATE"; OBSERVE = "OBSERVE"; CUSTOM = "CUSTOM"
+class CharacterDecisionStatus(str, enum.Enum): DRAFT = "DRAFT"; VALID = "VALID"; REJECTED = "REJECTED"; SUPERSEDED = "SUPERSEDED"
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
@@ -227,4 +229,33 @@ class DirectorDecisionLog(Base):
     decision_type: Mapped[DecisionType] = mapped_column(Enum(DecisionType), nullable=False)
     brief_reason: Mapped[str] = mapped_column(Text, nullable=False)
     validation_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class CharacterDecision(Base):
+    __tablename__ = "character_decisions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    scene_proposal_id: Mapped[str] = mapped_column(ForeignKey("scene_proposals.id"), nullable=False)
+    character_id: Mapped[str] = mapped_column(ForeignKey("characters.id"), nullable=False)
+    context_fingerprint: Mapped[str] = mapped_column(String(100), nullable=False)
+    decision_type: Mapped[CharacterDecisionType] = mapped_column(Enum(CharacterDecisionType), nullable=False)
+    intent: Mapped[str] = mapped_column(Text, nullable=False)
+    chosen_action: Mapped[str] = mapped_column(Text, nullable=False)
+    target_character_id: Mapped[str | None] = mapped_column(String(36))
+    target_entity_id: Mapped[str | None] = mapped_column(String(36))
+    motivation: Mapped[str] = mapped_column(Text, nullable=False)
+    goal_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    knowledge_used: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    memory_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    ability_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    inventory_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    relationship_factors: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    perceived_risk: Mapped[str | None] = mapped_column(Text)
+    accepted_cost: Mapped[str | None] = mapped_column(Text)
+    expected_personal_result: Mapped[str | None] = mapped_column(Text)
+    uncertainties: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    refused_options: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    boundary_override_reason: Mapped[str | None] = mapped_column(Text)
+    decision_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[CharacterDecisionStatus] = mapped_column(Enum(CharacterDecisionStatus), default=CharacterDecisionStatus.DRAFT, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
