@@ -12,9 +12,10 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus
 from .performance import HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
+from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -304,6 +305,47 @@ def get_character_decision(project_id: str, decision_id: str, db: Session = Depe
     decision = db.get(CharacterDecision, decision_id)
     if not decision or decision.project_id != project_id: raise HTTPException(status_code=404, detail="Character Decision not found")
     return record_dict(decision)
+
+@router.post("/projects/{project_id}/revisions", status_code=status.HTTP_201_CREATED)
+def create_revision(project_id: str, payload: RevisionCreatePayload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    # Creation validates only target existence/ownership; patch semantics are preview-only.
+    try: RevisionChangeNormalizer().normalize(db, project_id, payload.changes)
+    except ValueError as exc: raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+    revision = WorldRevision(project_id=project_id, title=payload.title, description=payload.description, status=RevisionStatus.DRAFT, change_set=[item.model_dump() for item in payload.changes])
+    db.add(revision); db.commit(); db.refresh(revision)
+    return record_dict(revision)
+
+@router.get("/projects/{project_id}/revisions")
+def list_revisions(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [record_dict(item) for item in db.scalars(select(WorldRevision).where(WorldRevision.project_id == project_id).order_by(WorldRevision.created_at.desc(), WorldRevision.id)).all()]
+
+@router.get("/projects/{project_id}/revisions/{revision_id}")
+def get_revision(project_id: str, revision_id: str, db: Session = Depends(get_db)):
+    revision = db.get(WorldRevision, revision_id)
+    if not revision or revision.project_id != project_id: raise HTTPException(status_code=404, detail="World Revision not found")
+    value = record_dict(revision); value["is_stale"] = bool(revision.base_state_fingerprint and revision.base_state_fingerprint != RevisionStateFingerprintBuilder().build(db, project_id))
+    return value
+
+@router.post("/projects/{project_id}/revisions/{revision_id}/preview")
+def preview_revision(project_id: str, revision_id: str, db: Session = Depends(get_db)):
+    revision = db.get(WorldRevision, revision_id)
+    if not revision or revision.project_id != project_id: raise HTTPException(status_code=404, detail="World Revision not found")
+    if revision.status == RevisionStatus.CANCELLED: raise HTTPException(status_code=409, detail={"code":"REVISION_CANCELLED"})
+    try:
+        changes = RevisionChangeNormalizer().normalize(db, project_id, [__import__("app.revision", fromlist=["RevisionChangePayload"]).RevisionChangePayload.model_validate(item) for item in revision.change_set])
+    except ValueError as exc: raise HTTPException(status_code=409, detail={"code":str(exc)}) from exc
+    revision.normalized_changes = changes; revision.impact_report = RevisionImpactAnalyzer().analyze(db, project_id, changes); revision.base_state_fingerprint = RevisionStateFingerprintBuilder().build(db, project_id); revision.status = RevisionStatus.PREVIEWED
+    db.add(revision); db.commit(); db.refresh(revision)
+    return record_dict(revision)
+
+@router.post("/projects/{project_id}/revisions/{revision_id}/cancel")
+def cancel_revision(project_id: str, revision_id: str, db: Session = Depends(get_db)):
+    revision = db.get(WorldRevision, revision_id)
+    if not revision or revision.project_id != project_id: raise HTTPException(status_code=404, detail="World Revision not found")
+    revision.status = RevisionStatus.CANCELLED; db.add(revision); db.commit(); db.refresh(revision)
+    return record_dict(revision)
 
 def _performance_payload(performance: ScenePerformance, turns: list[ScenePerformanceTurn], db: Session):
     value = record_dict(performance)

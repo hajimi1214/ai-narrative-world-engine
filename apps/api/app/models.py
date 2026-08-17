@@ -30,6 +30,7 @@ class ActionVisibility(str, enum.Enum): PUBLIC = "PUBLIC"; TARGETED = "TARGETED"
 class ResolverMode(str, enum.Enum): HEURISTIC = "HEURISTIC"; LLM = "LLM"
 class ResolutionStatus(str, enum.Enum): VALID = "VALID"; REJECTED = "REJECTED"; UNRESOLVED = "UNRESOLVED"
 class ResolutionOutcome(str, enum.Enum): SUCCESS = "SUCCESS"; PARTIAL = "PARTIAL"; FAILURE = "FAILURE"; NO_EFFECT = "NO_EFFECT"; INTERRUPTED = "INTERRUPTED"; UNRESOLVED = "UNRESOLVED"
+class RevisionStatus(str, enum.Enum): DRAFT = "DRAFT"; PREVIEWED = "PREVIEWED"; STALE = "STALE"; CANCELLED = "CANCELLED"
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
@@ -322,3 +323,15 @@ class WorldResolution(Base):
     resolution_basis_summary: Mapped[str | None] = mapped_column(Text)
     missing_information: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class WorldRevision(TimestampMixin, Base):
+    __tablename__ = "world_revisions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[RevisionStatus] = mapped_column(Enum(RevisionStatus), default=RevisionStatus.DRAFT, nullable=False)
+    base_state_fingerprint: Mapped[str | None] = mapped_column(String(100))
+    change_set: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    normalized_changes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    impact_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
