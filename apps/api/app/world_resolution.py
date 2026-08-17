@@ -74,10 +74,21 @@ class WorldResolutionContextBuilder:
             refs = {data.get("entity_id"), data.get("location_id"), data.get("character_id"), data.get("subject_id")} | set(data.get("entity_ids", [])) | set(data.get("character_ids", []))
             refs.discard(None)
             if fact.fact_type == CanonType.SECRET_CANON:
-                return bool(refs & scope_ids)
+                return bool(refs & scope_ids) or bool(data.get("global_world_rule"))
             return bool(refs & scope_ids) or bool(data.get("global_world_rule"))
-        context = {"scope": scope, "project": {"current_world_time": project.current_world_time.isoformat() if project and project.current_world_time else None}, "forbidden_reveals": list(proposal.forbidden_reveals or []), "request": request, "attempt": {"actor_character_id": turn.actor_character_id, "observable_action": turn.observable_action, "target_entity_id": request.get("target_entity_id"), "target_character_id": request.get("target_character_id")}, "location": _entity_view(location), "target_entity": _entity_view(target_entity), "target_character": {"id": target_character.id, "current_state": target_character.current_state, "physical_state": target_character.physical_state, "abilities": target_character.abilities, "inventory": target_character.inventory} if target_character else None, "actor": {"id": actor.id, "current_state": actor.current_state, "physical_state": actor.physical_state, "abilities": actor.abilities, "inventory": actor.inventory} if actor else None, "allowed_world_entity_ids": sorted(allowed_entities), "canon": [{"id": item.id, "proposition": item.proposition, "fact_type": item.fact_type.value, "locked": item.locked, "data": item.data} for item in canon if relevant(item)], "take_state": PerformanceWorldStateBuilder().build(session, performance.id)}
-        context["fingerprint"] = world_context_fingerprint(context)
+        context = {"scope": scope, "project": {"current_world_time": project.current_world_time.isoformat() if project and project.current_world_time else None}, "request": request, "attempt": {"actor_character_id": turn.actor_character_id, "observable_action": turn.observable_action, "target_entity_id": request.get("target_entity_id"), "target_character_id": request.get("target_character_id")}, "location": _entity_view(location), "target_entity": _entity_view(target_entity), "target_character": {"id": target_character.id, "current_state": target_character.current_state, "physical_state": target_character.physical_state, "abilities": target_character.abilities, "inventory": target_character.inventory} if target_character else None, "actor": {"id": actor.id, "current_state": actor.current_state, "physical_state": actor.physical_state, "abilities": actor.abilities, "inventory": actor.inventory} if actor else None, "allowed_world_entity_ids": sorted(allowed_entities), "canon": [{"id": item.id, "proposition": item.proposition, "fact_type": item.fact_type.value, "locked": item.locked, "data": item.data} for item in canon if relevant(item)], "take_state": PerformanceWorldStateBuilder().build(session, performance.id)}
+        canon_by_id = {item.id: item for item in canon}
+        forbidden_ids, forbidden_propositions = set(), set()
+        for value in proposal.forbidden_reveals or []:
+            fact = canon_by_id.get(value)
+            if fact:
+                forbidden_ids.add(fact.id); forbidden_propositions.add(fact.proposition)
+            else:
+                forbidden_propositions.add(value)
+        context["forbidden_canon_ids"] = sorted(forbidden_ids)
+        context["forbidden_propositions"] = sorted(forbidden_propositions)
+        resolver_view = WorldContextSanitizer().sanitize(context)
+        context["fingerprint"] = world_context_fingerprint({"resolver_view": resolver_view, "constraints": {"forbidden_canon_ids": context["forbidden_canon_ids"], "forbidden_propositions": context["forbidden_propositions"], "locked_structured_canon": sorted([{"id": item["id"], "data": WorldContextSanitizer()._clean(item["data"])} for item in context["canon"] if item["locked"] and isinstance(item["data"], dict) and {"subject_id", "predicate", "value"}.issubset(item["data"])], key=lambda item: item["id"])}})
         return context
 
 
@@ -157,11 +168,11 @@ class WorldResolutionConstraintChecker:
                 if fact.subject_id == data["subject_id"] and fact.predicate == data["predicate"] and (not data.get("subject_type") or fact.subject_type == data["subject_type"]) and fact.value != data["value"]:
                     add("CANON_CONTRADICTION", "Objective fact conflicts with locked structured Canon.", [canon["id"]])
         locked = session.scalars(select(CanonFact).join(RevealConstraint, RevealConstraint.canon_fact_id == CanonFact.id).where(RevealConstraint.project_id == project_id, RevealConstraint.status == RevealStatus.LOCKED)).all()
-        forbidden = set(context.get("forbidden_reveals", []))
+        forbidden_ids = set(context.get("forbidden_canon_ids", []))
+        forbidden = set(context.get("forbidden_propositions", []))
         for secret in locked:
-            if secret.proposition in forbidden or secret.id in forbidden or any(secret.proposition and secret.proposition in (text or "") for text in (payload.actor_observation, payload.public_observation)):
-                if any(secret.proposition and secret.proposition in (text or "") for text in (payload.actor_observation, payload.public_observation)):
-                    add("OBSERVATION_LEAK", "Observation exposes a locked secret proposition.", [secret.id])
+            if any(secret.proposition and secret.proposition in (text or "") for text in (payload.actor_observation, payload.public_observation)):
+                add("OBSERVATION_LEAK", "Observation exposes a locked secret proposition.", [secret.id])
         for text in (payload.actor_observation, payload.public_observation):
             if any(item and item in (text or "") for item in forbidden):
                 add("OBSERVATION_LEAK", "Observation exposes a forbidden reveal.")

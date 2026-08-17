@@ -173,3 +173,26 @@ def test_research_settings_do_not_enter_world_context_or_fingerprint(session, mo
     second = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
     assert "provider" not in json.dumps(first) and "provider" not in json.dumps(second)
     assert first["fingerprint"] == second["fingerprint"]
+
+
+def test_forbidden_reveal_id_is_normalized_to_proposition_without_lock(session, monkeypatch):
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    fact = CanonFact(project_id=project.id, fact_type=CanonType.SECRET_CANON, proposition="The king is already dead.", data={"entity_id":location.id}, locked=False)
+    session.add(fact); session.commit(); proposal.forbidden_reveals = [fact.id]; session.add(proposal); session.commit()
+    from app.director import DirectorContextBuilder
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]; session.add(proposal); session.commit()
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    context = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
+    payload = WorldResolutionPayload(outcome="FAILURE", outcome_summary="x", objective_facts=[], actor_observation="The king is already dead.", public_observation=None, canon_fact_ids_used=[], world_entity_ids_used=[], resolution_basis_summary=None, missing_information=[])
+    report = WorldResolutionConstraintChecker().validate(session, context, payload, project.id)
+    assert any(item["code"] == "OBSERVATION_LEAK" for item in report["issues"])
+
+
+def test_global_secret_world_rule_enters_context_but_narrative_metadata_does_not(session, monkeypatch):
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    fact = CanonFact(project_id=project.id, fact_type=CanonType.SECRET_CANON, proposition="Dead people cannot naturally return.", data={"global_world_rule":True, "director_only":{"plot":"hidden"}}, locked=True)
+    session.add(fact); session.commit(); proposal.context_fingerprint = __import__("app.director", fromlist=["DirectorContextBuilder"]).DirectorContextBuilder().build(session, project.id)["fingerprint"]; session.add(proposal); session.commit()
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    context = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
+    rendered = json.dumps(context)
+    assert fact.id in rendered and "Dead people cannot naturally return." in rendered and "plot" not in json.dumps(WorldContextSanitizer().sanitize(context))
