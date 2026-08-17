@@ -8,6 +8,7 @@ from app.main import app
 import app.api as api
 from app.models import CanonFact, CharacterKnowledge, Scene, WorldRevision
 from test_scene_performance import approved_setup
+from app.revision import StructuredReferenceScanner, RevisionStateFingerprintBuilder
 
 @pytest.fixture()
 def session():
@@ -62,3 +63,14 @@ def test_pointer_and_target_schema_are_strict(session, monkeypatch):
     project, _, actor, _, _, _=approved_setup(session,monkeypatch); client=client_for(session,monkeypatch)
     for change, code in [({"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/name","value":None},"INVALID_TARGET_STATE"),({"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/abilities/99","value":{}},"INVALID_PATH"),({"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/profile/~2bad","value":1},"INVALID_PATH")]:
         response=client.post(f"/projects/{project.id}/revisions",json={"title":"x","changes":[change]}); assert response.json()["detail"]["code"]==code
+
+def test_impact_scanner_exact_values_keys_and_pointer_escape():
+    target="id/with~chars"; value={"relationships":{target:{"note":"x"}},"text":f"owner is {target}","items":[target]}
+    paths=StructuredReferenceScanner().paths(value,target)
+    assert "/relationships/id~1with~0chars" in paths and "/items/0" in paths and not any(path.startswith("/text") for path in paths)
+
+def test_revision_state_fingerprint_ignores_revision_and_prose_derivatives(session, monkeypatch):
+    project, _, actor, _, _, _=approved_setup(session,monkeypatch)
+    first=RevisionStateFingerprintBuilder().build(session,project.id)
+    revision=WorldRevision(project_id=project.id,title="x",change_set=[],normalized_changes=[],impact_report={}); session.add(revision); session.commit()
+    assert RevisionStateFingerprintBuilder().build(session,project.id)==first

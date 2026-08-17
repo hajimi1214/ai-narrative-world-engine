@@ -41,16 +41,22 @@ class StructuredReferenceScanner:
     KEYS = {"character_id", "entity_id", "canon_fact_id", "location_id"}
     PLURAL = {"character_ids", "entity_ids", "canon_fact_ids"}
     def paths(self, value: Any, target_id: str, path="") -> list[str]:
+        """IMPACT_EXACT mode: exact scalar/list values and dict keys only."""
         found=[]
         if isinstance(value, dict):
             for key, item in value.items():
-                child = f"{path}/{key}"
-                if key in self.KEYS and item == target_id: found.append(child)
-                elif key in self.PLURAL and isinstance(item, list): found.extend(f"{child}/{index}" for index, entry in enumerate(item) if entry == target_id)
+                escaped_key = str(key).replace("~", "~0").replace("/", "~1")
+                child = f"{path}/{escaped_key}"
+                if key == target_id: found.append(child)
+                if isinstance(item, str) and item == target_id: found.append(child)
+                elif isinstance(item, list): found.extend(f"{child}/{index}" for index, entry in enumerate(item) if isinstance(entry, str) and entry == target_id)
                 found.extend(self.paths(item, target_id, child))
         elif isinstance(value, list):
-            for index, item in enumerate(value): found.extend(self.paths(item, target_id, f"{path}/{index}"))
-        return found
+            for index, item in enumerate(value):
+                child=f"{path}/{index}"
+                if isinstance(item, str) and item == target_id: found.append(child)
+                found.extend(self.paths(item, target_id, child))
+        return sorted(set(found))
 
 class RevisionStateFingerprintBuilder:
     MODELS = (CanonFact, WorldEntity, Character, CharacterKnowledge, CharacterMemory, RevealConstraint, StoryThread, StoryArc, Scene, Chapter, SceneProposal, ScenePerformance, ScenePerformanceTurn, CharacterDecision, WorldResolution)
@@ -93,6 +99,7 @@ class RevisionChangeNormalizer:
                 else: raise ValueError("INVALID_PATH")
             leaf=parts[-1]
             if isinstance(parent,list) and (not leaf.isdigit() or int(leaf)<0 or int(leaf)>=len(parent)): raise ValueError("INVALID_PATH")
+            if isinstance(parent,dict) and leaf not in parent and change.operation == "REMOVE": raise ValueError("INVALID_PATH")
             previous=parent.get(leaf) if isinstance(parent,dict) and leaf in parent else parent[int(leaf)] if isinstance(parent,list) else None
             if change.operation == "MERGE":
                 if not isinstance(previous,dict) or not isinstance(change.value,dict): raise ValueError("INVALID_MERGE_TARGET")
@@ -119,6 +126,7 @@ class RevisionChangeNormalizer:
         required={"CANON_FACT":{"proposition":str,"data":dict,"locked":bool},"WORLD_ENTITY":{"name":str,"profile":dict,"active":bool},"CHARACTER":{"name":str,"profile":dict,"personality":dict,"core_values":list,"boundaries":list,"goals":dict,"current_state":dict,"physical_state":dict,"emotional_state":dict,"abilities":list,"voice_profile":dict,"relationships":dict,"inventory":list,"secrets":list,"active":bool}}
         for field, expected in required[target_type].items():
             if field not in value or value[field] is None or not isinstance(value[field], expected): raise ValueError("INVALID_TARGET_STATE")
+            if field in {"name", "proposition"} and not value[field].strip(): raise ValueError("INVALID_TARGET_STATE")
         if target_type=="CANON_FACT" and value.get("fact_type") not in {"TEMPORARY","WORLD_FACT","CORE_CANON","SECRET_CANON"}: raise ValueError("INVALID_TARGET_STATE")
         if target_type=="WORLD_ENTITY" and value.get("entity_type") not in {"CITY","LOCATION","SECT","FACTION","COUNTRY","ITEM","SYSTEM","HISTORY","CUSTOM"}: raise ValueError("INVALID_TARGET_STATE")
 
@@ -128,7 +136,9 @@ class RevisionChangeNormalizer:
             if isinstance(node,dict):
                 for key,item in node.items():
                     if key in key_types:
+                        if key.endswith("s") and not isinstance(item, list): raise ValueError("INVALID_REFERENCE_TYPE")
                         values=item if key.endswith("s") else [item]
+                        if not key.endswith("s") and item is None: values=[]
                         for ref in values:
                             if not isinstance(ref,str): raise ValueError("UNKNOWN_REFERENCE")
                             model={"character":Character,"entity":WorldEntity,"canon":CanonFact}[key_types[key]]; found=session.get(model,ref)
@@ -142,10 +152,12 @@ class RevisionChangeNormalizer:
 class RevisionImpactAnalyzer:
     def analyze(self, session: Session, project_id: str, normalized: list[dict[str, Any]]) -> dict[str, Any]:
         impacts=[]; scenes={}; scanner=StructuredReferenceScanner()
-        def add(category,severity,resource_type,resource_id,relation,evidence,action): impacts.append({"category":category,"severity":severity,"certainty":"EXACT" if relation.startswith("DIRECT") else "STRUCTURED","resource_type":resource_type,"resource_id":resource_id,"relation":relation,"evidence":evidence,"recommended_action":action})
+        def add(category,severity,resource_type,resource_id,relation,evidence,action,certainty=None): impacts.append({"category":category,"severity":severity,"certainty":certainty or ("MANUAL" if category=="MANUAL_REVIEW" else "EXACT" if relation.startswith("DIRECT") else "STRUCTURED"),"resource_type":resource_type,"resource_id":resource_id,"relation":relation,"evidence":evidence,"recommended_action":action})
         for change in normalized:
             target_id=change["target_id"]
-            add("DIRECT_TARGET", "CRITICAL" if change["target_type"]=="CANON_FACT" and session.get(CanonFact,target_id).locked else "HIGH", change["target_type"], target_id, "DIRECT_CHANGE", {"path":change["path"]}, "RETCON_REVIEW")
+            direct_target=session.get(CanonFact,target_id) if change["target_type"]=="CANON_FACT" else None
+            direct_severity="CRITICAL" if direct_target and direct_target.locked and getattr(direct_target.fact_type,"value",direct_target.fact_type) in {"CORE_CANON","SECRET_CANON"} else "HIGH" if direct_target and direct_target.locked else "MEDIUM" if direct_target else "HIGH"
+            add("DIRECT_TARGET", direct_severity, change["target_type"], target_id, "DIRECT_CHANGE", {"path":change["path"]}, "RETCON_REVIEW", "EXACT")
             if change["target_type"] == "CANON_FACT":
                 old=change["before_value"] if change["path"]=="/proposition" else None
                 if old:
@@ -161,12 +173,14 @@ class RevisionImpactAnalyzer:
                 if target_id in (proposal.participants or []) or target_id==proposal.location_id or target_id in (proposal.required_canon or []) or target_id in (proposal.allowed_reveals or []) or target_id in (proposal.forbidden_reveals or []) or proposal_refs:
                     affected_proposals.add(proposal.id); add("REHEARSAL_ARTIFACT","LOW","SCENE_PROPOSAL",proposal.id,"DIRECT_REFERENCE",{"reference_paths":proposal_refs},"INVALIDATE_REHEARSAL")
             for decision in session.scalars(select(CharacterDecision).where(CharacterDecision.project_id==project_id)).all():
-                if target_id in {decision.character_id,decision.target_character_id,decision.target_entity_id}: add("CHARACTER_DECISION","LOW","CHARACTER_DECISION",decision.id,"DIRECT_REFERENCE",{},"INVALIDATE_REHEARSAL")
+                decision_refs=scanner.paths({"knowledge_used":decision.knowledge_used,"memory_refs":decision.memory_refs,"ability_refs":decision.ability_refs,"inventory_refs":decision.inventory_refs,"relationship_factors":decision.relationship_factors},target_id)
+                old_prop_hit=change["target_type"]=="CANON_FACT" and any(isinstance(item,dict) and item.get("proposition")==change["before_value"] for item in (decision.knowledge_used or []))
+                if target_id in {decision.character_id,decision.target_character_id,decision.target_entity_id} or decision_refs or old_prop_hit: add("CHARACTER_DECISION","LOW","CHARACTER_DECISION",decision.id,"DIRECT_REFERENCE" if target_id in {decision.character_id,decision.target_character_id,decision.target_entity_id} or old_prop_hit else "STRUCTURED_REFERENCE",{"reference_paths":decision_refs},"INVALIDATE_REHEARSAL","EXACT" if old_prop_hit else "STRUCTURED")
             for resolution in session.scalars(select(WorldResolution).where(WorldResolution.project_id==project_id)).all():
                 if target_id in (resolution.canon_fact_ids_used or []) or target_id in (resolution.world_entity_ids_used or []) or scanner.paths(resolution.objective_facts,target_id): add("WORLD_RESOLUTION","LOW","WORLD_RESOLUTION",resolution.id,"STRUCTURED_REFERENCE",{},"INVALIDATE_REHEARSAL")
             for memory in session.scalars(select(CharacterMemory).join(Character).where(Character.project_id==project_id)).all():
                 paths=scanner.paths(memory.distortion,target_id)
-                if memory.source_scene == target_id or paths or (change["target_type"]=="CANON_FACT" and memory.content == change["before_value"]): add("MEMORY_DEPENDENCY","MEDIUM","CHARACTER_MEMORY",memory.id,"STRUCTURED_REFERENCE",{"reference_paths":paths},"REVIEW_MEMORY")
+                if memory.source_scene in scenes or paths or (change["target_type"]=="CANON_FACT" and memory.content == change["before_value"]): add("MEMORY_DEPENDENCY","MEDIUM","CHARACTER_MEMORY",memory.id,"STRUCTURED_REFERENCE",{"reference_paths":paths},"REVIEW_MEMORY","EXACT" if memory.source_scene in scenes or memory.content == change["before_value"] else "STRUCTURED")
             for character in session.scalars(select(Character).where(Character.project_id==project_id)).all():
                 paths=scanner.paths(character.relationships,target_id)
                 if paths or (isinstance(character.relationships,dict) and target_id in character.relationships): add("RELATIONSHIP_DEPENDENCY","MEDIUM","CHARACTER",character.id,"STRUCTURED_REFERENCE",{"reference_paths":paths},"REVIEW_RELATIONSHIP")
@@ -192,5 +206,6 @@ class RevisionImpactAnalyzer:
                 old=unique[key]; paths=set(old.get("evidence",{}).get("reference_paths",[])); paths.update(item.get("evidence",{}).get("reference_paths",[])); old.setdefault("evidence",{})["reference_paths"]=sorted(paths)
         impacts=list(unique.values())
         earliest=min(scenes.values(), key=lambda item:(item.sequence,item.id)) if scenes else None
-        summary={"total_impacts":len(impacts),"critical":sum(item["severity"]=="CRITICAL" for item in impacts),"high":sum(item["severity"]=="HIGH" for item in impacts),"medium":sum(item["severity"]=="MEDIUM" for item in impacts),"manual_review":0}
-        return {"summary":summary,"impacts":impacts,"earliest_affected_scene":{"id":earliest.id,"sequence":earliest.sequence} if earliest else None,"rehearsal_invalidations":[item for item in impacts if item["recommended_action"]=="INVALIDATE_REHEARSAL"],"author_override_required":summary["critical"]>0}
+        summary={"total_impacts":len(impacts),"critical":sum(item["severity"]=="CRITICAL" for item in impacts),"high":sum(item["severity"]=="HIGH" for item in impacts),"medium":sum(item["severity"]=="MEDIUM" for item in impacts),"manual_review":sum(item["certainty"]=="MANUAL" or item["category"]=="MANUAL_REVIEW" for item in impacts)}
+        override=any(change["target_type"]=="CANON_FACT" and (session.get(CanonFact,change["target_id"]).locked if session.get(CanonFact,change["target_id"]) else False) and getattr(session.get(CanonFact,change["target_id"]).fact_type,"value",session.get(CanonFact,change["target_id"]).fact_type) in {"CORE_CANON","SECRET_CANON"} for change in normalized)
+        return {"summary":summary,"impacts":impacts,"earliest_affected_scene":{"id":earliest.id,"sequence":earliest.sequence} if earliest else None,"rehearsal_invalidations":[item for item in impacts if item["recommended_action"]=="INVALIDATE_REHEARSAL"],"author_override_required":override}
