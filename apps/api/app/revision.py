@@ -63,7 +63,9 @@ def _record(record: Any) -> dict[str, Any]:
     return {column.name: serialize(getattr(record, column.name)) for column in record.__table__.columns}
 
 def target_fingerprint(value: dict[str, Any]) -> str:
-    stable = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    # ORM maintenance timestamps are not part of a revision target's semantic state.
+    semantic = {key: item for key, item in value.items() if key not in {"created_at", "updated_at"}}
+    stable = json.dumps(semantic, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
     return "revision-target-v1:" + hashlib.sha256(stable.encode()).hexdigest()
 
 class StructuredReferenceScanner:

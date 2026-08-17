@@ -20,7 +20,7 @@ from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionI
 from .versioning import WorldSnapshotBuilder, RevisionApplyService
 from .model_router import ModelRouter, ProjectModelConfigPayload
 from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fingerprint
-from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryEditPayload
+from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryContextStaleError, RecoveryEditPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -515,7 +515,12 @@ def repair_recovery_candidate(project_id: str, candidate_id: str, db: Session = 
     config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id)); max_attempts = config.max_repair_attempts if config else 1
     previous_repairs = db.scalar(select(func.count(ExecutionTrace.id)).where(ExecutionTrace.project_id == project_id, ExecutionTrace.stage == ExecutionStage.REPAIR, ExecutionTrace.source_id == candidate.id)) or 0
     if max_attempts <= 0 or previous_repairs >= max_attempts: raise HTTPException(status_code=409, detail={"code": "REPAIR_ATTEMPT_LIMIT"})
-    service = RecoveryCandidateService(); context, sanitized = service.rebuild(db, candidate)
+    service = RecoveryCandidateService()
+    try:
+        context, sanitized = service.safe_rebuild(db, candidate)
+    except RecoveryContextStaleError as exc:
+        candidate.status = RecoveryCandidateStatus.STALE.value; db.commit()
+        raise HTTPException(status_code=409, detail={"code": "RECOVERY_CONTEXT_STALE"}) from exc
     if context.get("fingerprint") != candidate.context_fingerprint:
         candidate.status = RecoveryCandidateStatus.STALE.value; db.commit(); raise HTTPException(status_code=409, detail={"code": "RECOVERY_CONTEXT_STALE"})
     current = service.current_version(db, candidate); parent = db.get(ExecutionTrace, candidate.source_trace_id)

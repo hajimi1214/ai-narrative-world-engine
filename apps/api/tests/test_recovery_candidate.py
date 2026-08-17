@@ -11,7 +11,7 @@ from app.recovery import RecoveryCandidateService, RecoveryActionResolver, Recov
 from app.execution_trace import RecoveryPolicy
 from app.character_mind import CharacterContextBuilder
 from test_llm_character_actor import valid_payload
-from test_scene_performance import approved_setup
+from test_scene_performance import approved_setup, client_for, performance_payload
 
 
 @pytest.fixture()
@@ -189,3 +189,33 @@ def test_recovery_policy_world_missing_forbids_repair():
 def test_recovery_policy_context_stale_allows_retry():
     retryable, repairable, actions = RecoveryPolicy.resolve("RECOVERY_CONTEXT_STALE")
     assert retryable is False and repairable is False and actions == ["ABORT"]
+
+def test_world_information_missing_endpoints_are_read_only(session, monkeypatch):
+    project, _, actor, _, proposal, _ = approved_setup(session, monkeypatch); client = client_for(session, monkeypatch)
+    trace = ExecutionTraceRecorder().start(session, project_id=project.id, stage=ExecutionStage.WORLD_RESOLVER, source_type="SCENE_PERFORMANCE_TURN", source_id="missing")
+    payload = {"outcome": "UNRESOLVED", "outcome_summary": "missing", "objective_facts": [], "actor_observation": None, "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": [], "resolution_basis_summary": None, "missing_information": ["fact"]}
+    candidate = RecoveryCandidateService().create(session, project_id=project.id, trace=trace, candidate_type="WORLD_RESOLUTION", payload=payload, context_fingerprint="x", locator={"project_id": project.id, "proposal_id": proposal.id, "performance_id": "missing", "performance_turn_id": "missing", "world_resolution_id": "missing"}, error_code="WORLD_INFORMATION_MISSING", validation_report={}, stage="WORLD_RESOLVER", source_type="SCENE_PERFORMANCE_TURN", source_id="missing"); session.commit()
+    for endpoint, body in [("edit", {"base_version": 1, "changes": [{"operation": "SET", "path": "/outcome", "value": "SUCCESS"}]}), ("ai-repair", None), ("adopt", None)]:
+        response = client.post(f"/projects/{project.id}/recovery-candidates/{candidate.id}/{endpoint}", json=body)
+        assert response.status_code == 409 and response.json()["detail"]["code"] == "WORLD_FACT_REQUIRED"
+
+def test_ai_repair_missing_performance_returns_stale_not_500(session, monkeypatch):
+    project, _, actor, _, proposal, _ = approved_setup(session, monkeypatch); client = client_for(session, monkeypatch)
+    trace = ExecutionTraceRecorder().start(session, project_id=project.id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="SCENE_PERFORMANCE", source_id="missing")
+    candidate = RecoveryCandidateService().create(session, project_id=project.id, trace=trace, candidate_type="CHARACTER_PERFORMANCE", payload=performance_payload(), context_fingerprint="x", locator={"project_id": project.id, "proposal_id": proposal.id, "performance_id": "missing", "actor_character_id": actor.id, "source_turn_id": "missing", "source_decision_id": "missing"}, error_code="TARGET_MISMATCH", validation_report={}, stage="CHARACTER_ACTOR", source_type="SCENE_PERFORMANCE", source_id="missing"); session.commit()
+    response = client.post(f"/projects/{project.id}/recovery-candidates/{candidate.id}/ai-repair")
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "RECOVERY_CONTEXT_STALE"
+
+def test_character_adopt_missing_character_returns_stale_not_500(session, monkeypatch):
+    project, _, actor, _, proposal, _ = approved_setup(session, monkeypatch); client = client_for(session, monkeypatch); context = CharacterContextBuilder().build(session, project.id, actor.id, proposal)
+    trace = ExecutionTraceRecorder().start(session, project_id=project.id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=actor.id)
+    candidate = RecoveryCandidateService().create(session, project_id=project.id, trace=trace, candidate_type="CHARACTER_DECISION", payload=json.loads(valid_payload()), context_fingerprint=context["fingerprint"], locator={"project_id": project.id, "proposal_id": proposal.id, "character_id": actor.id}, error_code="TARGET_MISMATCH", validation_report={}, stage="CHARACTER_ACTOR", source_type="CHARACTER", source_id=actor.id); candidate.status = RecoveryCandidateStatus.VALIDATED.value; session.delete(actor); session.commit()
+    response = client.post(f"/projects/{project.id}/recovery-candidates/{candidate.id}/adopt")
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "RECOVERY_CONTEXT_STALE"
+
+def test_candidate_list_uses_wrapped_api_contract(session, monkeypatch):
+    project, _, actor, _, proposal, _ = approved_setup(session, monkeypatch); client = client_for(session, monkeypatch); context = CharacterContextBuilder().build(session, project.id, actor.id, proposal)
+    trace = ExecutionTraceRecorder().start(session, project_id=project.id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=actor.id)
+    candidate = RecoveryCandidateService().create(session, project_id=project.id, trace=trace, candidate_type="CHARACTER_DECISION", payload=json.loads(valid_payload()), context_fingerprint=context["fingerprint"], locator={"project_id": project.id, "proposal_id": proposal.id, "character_id": actor.id}, error_code="TARGET_MISMATCH", validation_report={}, stage="CHARACTER_ACTOR", source_type="CHARACTER", source_id=actor.id); session.commit()
+    body = client.get(f"/projects/{project.id}/recovery-candidates").json()[0]
+    assert body["candidate"]["id"] == candidate.id and body["current_version"]["version_number"] == 1 and "available_actions" in body

@@ -21,6 +21,10 @@ from .execution_trace import TraceSanitizer
 
 CandidateType = Literal["CHARACTER_DECISION", "CHARACTER_PERFORMANCE", "WORLD_RESOLUTION"]
 
+
+class RecoveryContextStaleError(ValueError):
+    pass
+
 @dataclass
 class RecoveryValidationResult:
     schema_valid: bool
@@ -116,6 +120,13 @@ class RecoveryCandidateService:
         performance = db.get(ScenePerformance, loc["performance_id"]); turn = db.get(ScenePerformanceTurn, loc["performance_turn_id"]); proposal = db.get(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal, loc["proposal_id"])
         context = WorldResolutionContextBuilder().build(db, performance, turn, proposal, turn.world_resolution_request)
         return context, WorldContextSanitizer().sanitize(context)
+
+    def safe_rebuild(self, db, candidate):
+        """Translate only stale locator failures into a recoverable domain error."""
+        try:
+            return self.rebuild(db, candidate)
+        except (AttributeError, KeyError) as exc:
+            raise RecoveryContextStaleError("RECOVERY_CONTEXT_STALE") from exc
 
     def validate(self, db, candidate, payload):
         try:
