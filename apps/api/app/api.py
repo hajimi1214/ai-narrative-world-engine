@@ -394,13 +394,22 @@ def apply_revision(project_id:str,revision_id:str,payload:Payload,db:Session=Dep
         if str(exc) == "REVISION_STALE":
             revision = db.get(WorldRevision, revision_id)
             revision.status = RevisionStatus.STALE
+            ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_APPLY, source_type="WORLD_REVISION", source_id=revision_id, status=ExecutionStatus.BLOCKED, error_code="REVISION_STALE")
+            db.commit()
+        else:
+            revision = db.get(WorldRevision, revision_id)
+            ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_APPLY, source_type="WORLD_REVISION", source_id=revision_id, status=ExecutionStatus.BLOCKED, error_code=str(exc), input_fingerprint=getattr(revision, "base_state_fingerprint", None))
             db.commit()
         raise HTTPException(status_code=409, detail={"code": str(exc), "requires_repreview": str(exc) == "TARGET_STATE_STALE"}) from exc
     try:
         with db.begin_nested(): app=service.apply(db,project_id,revision,override,reason,prepared)
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_APPLY, source_type="WORLD_REVISION", source_id=revision.id, status=ExecutionStatus.SUCCEEDED, input_fingerprint=revision.base_state_fingerprint, output_fingerprint=db.get(WorldSnapshot, app.post_snapshot_id).state_fingerprint)
         db.commit(); db.refresh(app); return {"application":record_dict(app),"revision":record_dict(revision),"impact_report":revision.impact_report,"pending_retcon":bool(revision.impact_report.get("summary",{}).get("high") or revision.impact_report.get("summary",{}).get("critical") or revision.impact_report.get("summary",{}).get("manual_review"))}
     except ValueError as exc:
-        db.rollback(); raise HTTPException(status_code=409,detail={"code":str(exc)}) from exc
+        db.rollback()
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_APPLY, source_type="WORLD_REVISION", source_id=revision_id, status=ExecutionStatus.FAILED, error_code=str(exc))
+        db.commit()
+        raise HTTPException(status_code=409,detail={"code":str(exc)}) from exc
 @router.post("/projects/{project_id}/revision-applications/{application_id}/rollback")
 def rollback_revision(project_id:str,application_id:str,db:Session=Depends(get_db)):
     app=db.get(RevisionApplication,application_id)
@@ -408,8 +417,14 @@ def rollback_revision(project_id:str,application_id:str,db:Session=Depends(get_d
     if str(app.status.value if hasattr(app.status,"value") else app.status)!="APPLIED": raise HTTPException(status_code=409,detail={"code":"APPLICATION_NOT_APPLIED"})
     try:
         with db.begin_nested(): RevisionApplyService().rollback(db,project_id,app)
+        rollback_snapshot = db.scalar(select(WorldSnapshot).where(WorldSnapshot.project_id == project_id, WorldSnapshot.snapshot_type == SnapshotType.ROLLBACK_POINT).order_by(WorldSnapshot.created_at.desc(), WorldSnapshot.id.desc()))
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_ROLLBACK, source_type="REVISION_APPLICATION", source_id=app.id, status=ExecutionStatus.SUCCEEDED, output_fingerprint=rollback_snapshot.state_fingerprint if rollback_snapshot else None)
         db.commit(); db.refresh(app); return record_dict(app)
-    except ValueError as exc: db.rollback(); raise HTTPException(status_code=409,detail={"code":str(exc)}) from exc
+    except ValueError as exc:
+        db.rollback()
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_ROLLBACK, source_type="REVISION_APPLICATION", source_id=application_id, status=ExecutionStatus.BLOCKED, error_code=str(exc))
+        db.commit()
+        raise HTTPException(status_code=409,detail={"code":str(exc)}) from exc
 @router.get("/projects/{project_id}/model-config")
 def get_model_config(project_id:str,db:Session=Depends(get_db)):
     require_project(db,project_id); item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id)); return record_dict(item) if item else None
