@@ -71,8 +71,10 @@ def test_heuristic_inspect_is_take_local_and_observation_routed(session, monkeyp
 
 def test_resolve_endpoint_valid_restores_running_without_turn_increment(session, monkeypatch):
     project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
-    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
     location.profile = {"inspectable": "a shallow scratch"}; session.add(location); session.commit()
+    from app.director import DirectorContextBuilder
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]; session.add(proposal); session.commit()
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
     response = client.post(f"/projects/{project.id}/performances/{take.id}/world/resolve", json={"mode": "HEURISTIC"})
     assert response.status_code == 201, response.json()
     body = response.json()
@@ -90,3 +92,39 @@ def test_unresolved_world_keeps_awaiting_world(session, monkeypatch):
     assert response.status_code == 201
     assert response.json()["resolution"]["status"] == "UNRESOLVED"
     assert response.json()["performance"]["status"] == "AWAITING_WORLD"
+
+
+def test_target_character_context_is_objective_only(session, monkeypatch):
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    turn.world_resolution_request["target_character_id"] = other.id; session.add(turn); session.commit()
+    context = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
+    assert context["target_character"]["id"] == other.id
+    rendered = json.dumps(context["target_character"])
+    assert "knowledge" not in rendered and "memory" not in rendered and "goals" not in rendered
+
+
+def test_fact_scope_requires_exact_subject_type(session, monkeypatch):
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    context = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
+    payload = {"outcome":"SUCCESS", "outcome_summary":"ok", "objective_facts":[{"subject_type":"SCENE", "subject_id":"wrong", "predicate":"x", "value":True}], "actor_observation":None, "public_observation":None, "canon_fact_ids_used":[], "world_entity_ids_used":[], "resolution_basis_summary":None, "missing_information":[]}
+    report = WorldResolutionConstraintChecker().validate(session, context, __import__("app.world_resolution", fromlist=["WorldResolutionPayload"]).WorldResolutionPayload.model_validate(payload), project.id)
+    assert any(issue["code"] == "INVALID_FACT_SUBJECT" for issue in report["issues"])
+
+
+def test_resolution_retry_reuses_row_and_valid_cannot_retry(session, monkeypatch):
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    location.profile = {}; session.add(location); session.commit()
+    from app.director import DirectorContextBuilder
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]; session.add(proposal); session.commit()
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    first = client.post(f"/projects/{project.id}/performances/{take.id}/world/resolve", json={"mode":"HEURISTIC"})
+    assert first.status_code == 201 and first.json()["resolution"]["status"] == "UNRESOLVED"
+    resolution_id = first.json()["resolution"]["id"]
+    location.profile = {"inspectable":"mark"}; session.add(location); session.commit()
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]; take.proposal_context_fingerprint = proposal.context_fingerprint; session.add_all([proposal, take]); session.commit()
+    second = client.post(f"/projects/{project.id}/performances/{take.id}/world/resolve", json={"mode":"HEURISTIC"})
+    assert second.status_code == 201 and second.json()["resolution"]["id"] == resolution_id
+    assert second.json()["resolution"]["status"] == "VALID"
+    assert client.post(f"/projects/{project.id}/performances/{take.id}/world/resolve", json={"mode":"HEURISTIC"}).status_code == 409

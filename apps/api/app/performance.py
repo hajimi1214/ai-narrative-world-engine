@@ -99,8 +99,8 @@ class PerformanceCharacterContextBuilder:
                 own.append({"turn": turn.sequence, "decision_type": decision.decision_type.value if decision else None, "chosen_action": decision.chosen_action if decision else None, "target_character_id": decision.target_character_id if decision else None, "observable_action": turn.observable_action, "spoken_content": turn.spoken_content})
         context["scene"]["performance_observations"] = visible[-12:]
         world_observations = []
-        resolutions = session.scalars(select(WorldResolution).where(WorldResolution.performance_id == performance_id, WorldResolution.status == ResolutionStatus.VALID).order_by(WorldResolution.created_at, WorldResolution.id)).all()
-        for resolution in resolutions:
+        resolutions = session.execute(select(WorldResolution, __import__("app.models", fromlist=["ScenePerformanceTurn"]).ScenePerformanceTurn.sequence).join(__import__("app.models", fromlist=["ScenePerformanceTurn"]).ScenePerformanceTurn, WorldResolution.performance_turn_id == __import__("app.models", fromlist=["ScenePerformanceTurn"]).ScenePerformanceTurn.id).where(WorldResolution.performance_id == performance_id, WorldResolution.status == ResolutionStatus.VALID).order_by(__import__("app.models", fromlist=["ScenePerformanceTurn"]).ScenePerformanceTurn.sequence, WorldResolution.id)).all()
+        for resolution, _ in resolutions:
             if character_id not in (resolution.recipient_character_ids or []):
                 continue
             source_turn = session.get(__import__("app.models", fromlist=["ScenePerformanceTurn"]).ScenePerformanceTurn, resolution.performance_turn_id)

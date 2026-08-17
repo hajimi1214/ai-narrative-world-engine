@@ -404,12 +404,28 @@ def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Se
         raise HTTPException(status_code=404, detail="Scene Performance not found")
     if performance.status != PerformanceStatus.AWAITING_WORLD:
         raise HTTPException(status_code=409, detail={"code": "PERFORMANCE_NOT_AWAITING_WORLD"})
+    proposal = db.get(SceneProposal, performance.scene_proposal_id)
+    director_context = DirectorContextBuilder().build(db, project_id)
+    if not proposal or proposal.context_fingerprint != performance.proposal_context_fingerprint or proposal.context_fingerprint != director_context["fingerprint"]:
+        performance.status = PerformanceStatus.INVALIDATED; performance.stop_reason = "STALE_PERFORMANCE"; db.add(performance); db.commit()
+        raise HTTPException(status_code=409, detail={"code": "STALE_PERFORMANCE"})
     turns = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence.desc())).all()
-    turn = next((item for item in turns if item.requires_world_resolution and not db.scalar(select(WorldResolution.id).where(WorldResolution.performance_turn_id == item.id))), None)
+    turn = next((item for item in turns if item.requires_world_resolution and (not db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == item.id)) or db.scalar(select(WorldResolution.status).where(WorldResolution.performance_turn_id == item.id)).value in {"UNRESOLVED", "REJECTED"})), None)
     if not turn or not turn.world_resolution_request:
         raise HTTPException(status_code=409, detail={"code": "NO_PENDING_WORLD_REQUEST"})
-    proposal = db.get(SceneProposal, performance.scene_proposal_id)
+    request = turn.world_resolution_request
+    if request.get("target_character_id"):
+        target = db.get(Character, request["target_character_id"])
+        if not target or target.project_id != project_id:
+            raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE"})
+        if target.id not in (performance.active_participant_ids or []):
+            raise HTTPException(status_code=409, detail={"code": "INVALID_TARGET"})
+    if request.get("target_entity_id"):
+        target_entity = db.get(WorldEntity, request["target_entity_id"])
+        if not target_entity or target_entity.project_id != project_id:
+            raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE" if target_entity else "INVALID_ENTITY_REFERENCE"})
     context = WorldResolutionContextBuilder().build(db, performance, turn, proposal, turn.world_resolution_request)
+    context_fingerprint = context["fingerprint"]
     requested_mode = payload.model_dump().get("mode") or performance.mode.value
     try:
         mode = ResolverMode(requested_mode)
@@ -427,9 +443,20 @@ def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Se
         raise HTTPException(status_code=error_status, detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail={"code": MODEL_OUTPUT_INVALID, "message": "World resolver output was invalid."}) from exc
-    report = WorldResolutionConstraintChecker().validate(db, context, world_payload, project_id)
+    context_after = WorldResolutionContextBuilder().build(db, performance, turn, proposal, turn.world_resolution_request)
+    if context_after["fingerprint"] != context_fingerprint:
+        raise HTTPException(status_code=409, detail={"code": "WORLD_CONTEXT_STALE"})
+    report = WorldResolutionConstraintChecker().validate(db, context_after, world_payload, project_id)
     resolution_status = ResolutionStatus.VALID if report["valid"] and world_payload.outcome != ResolutionOutcome.UNRESOLVED else (ResolutionStatus.UNRESOLVED if report["valid"] else ResolutionStatus.REJECTED)
-    resolution = WorldResolution(project_id=project_id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode=mode, world_context_fingerprint=context["fingerprint"], status=resolution_status, **world_payload.model_dump(mode="json"))
+    resolution = db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == turn.id))
+    if resolution and resolution.status == ResolutionStatus.VALID:
+        raise HTTPException(status_code=409, detail={"code": "WORLD_ALREADY_RESOLVED"})
+    values = dict(project_id=project_id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode=mode, world_context_fingerprint=context_fingerprint, status=resolution_status, **world_payload.model_dump(mode="json"))
+    if resolution:
+        for key, value in values.items():
+            if key not in {"project_id", "performance_id", "performance_turn_id"}: setattr(resolution, key, value)
+    else:
+        resolution = WorldResolution(**values)
     resolution.recipient_character_ids = WorldObservationRouter().recipients(performance, turn, resolution)
     db.add(resolution)
     if resolution_status == ResolutionStatus.VALID:
