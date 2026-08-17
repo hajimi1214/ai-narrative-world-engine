@@ -33,7 +33,7 @@ class OpenAICompatibleProvider:
         if response.status_code >= 500:
             raise ModelProviderError(MODEL_UPSTREAM_ERROR)
         if response.status_code >= 400:
-            raise ModelProviderError(MODEL_UPSTREAM_ERROR)
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR, f"Upstream HTTP status {response.status_code}")
         try:
             body = response.json()
             content = body["choices"][0]["message"]["content"]

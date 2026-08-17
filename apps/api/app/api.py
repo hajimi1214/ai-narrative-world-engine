@@ -12,7 +12,8 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, Mod
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor
 from .settings import get_settings
-from .models import AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, StoryArc, StoryThread, WorldEntity, WritingBible
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible
+from .performance import HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, TurnScheduler
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -302,3 +303,84 @@ def get_character_decision(project_id: str, decision_id: str, db: Session = Depe
     decision = db.get(CharacterDecision, decision_id)
     if not decision or decision.project_id != project_id: raise HTTPException(status_code=404, detail="Character Decision not found")
     return record_dict(decision)
+
+def _performance_payload(performance: ScenePerformance, turns: list[ScenePerformanceTurn], db: Session):
+    value = record_dict(performance)
+    value["next_actor_id"] = TurnScheduler().next_actor(performance, turns)
+    value["turns"] = []
+    for turn in turns:
+        item = record_dict(turn)
+        decision = db.get(CharacterDecision, turn.character_decision_id)
+        item["decision"] = {"decision_type": getattr(decision.decision_type, "value", decision.decision_type), "intent": decision.intent, "chosen_action": decision.chosen_action, "motivation": decision.motivation, "status": getattr(decision.status, "value", decision.status)} if decision else None
+        value["turns"].append(item)
+    return value
+
+@router.post("/projects/{project_id}/director/proposals/{proposal_id}/performances", status_code=status.HTTP_201_CREATED)
+def create_performance(project_id: str, proposal_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    proposal = db.get(SceneProposal, proposal_id)
+    if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
+    if proposal.status != ProposalStatus.APPROVED: raise HTTPException(status_code=409, detail={"code": "PROPOSAL_NOT_APPROVED", "message": "Only APPROVED proposals can be rehearsed."})
+    current = DirectorContextBuilder().build(db, project_id)
+    if proposal.context_fingerprint != current["fingerprint"]: raise HTTPException(status_code=409, detail={"code": "STALE_PROPOSAL", "message": "Scene Proposal is stale."})
+    values = payload.model_dump(); mode = values.get("mode", PerformanceMode.HEURISTIC.value)
+    try: mode_enum = PerformanceMode(mode)
+    except ValueError: raise HTTPException(status_code=400, detail={"code": "INVALID_PERFORMANCE_MODE"})
+    max_turns = max(1, min(int(values.get("max_turns", 6)), 50))
+    take = (db.scalar(select(ScenePerformance.take_number).where(ScenePerformance.scene_proposal_id == proposal_id).order_by(ScenePerformance.take_number.desc())) or 0) + 1
+    performance = ScenePerformance(project_id=project_id, scene_proposal_id=proposal_id, take_number=take, proposal_context_fingerprint=current["fingerprint"], mode=mode_enum, participant_order=list(proposal.participants), active_participant_ids=list(proposal.participants), max_turns=max_turns, turn_count=0)
+    db.add(performance); db.commit(); db.refresh(performance)
+    return record_dict(performance)
+
+@router.get("/projects/{project_id}/director/proposals/{proposal_id}/performances")
+def list_performances(project_id: str, proposal_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [record_dict(item) for item in db.scalars(select(ScenePerformance).where(ScenePerformance.project_id == project_id, ScenePerformance.scene_proposal_id == proposal_id).order_by(ScenePerformance.take_number)).all()]
+
+@router.get("/projects/{project_id}/performances/{performance_id}")
+def get_performance(project_id: str, performance_id: str, db: Session = Depends(get_db)):
+    performance = db.get(ScenePerformance, performance_id)
+    if not performance or performance.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Performance not found")
+    turns = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence)).all()
+    return _performance_payload(performance, turns, db)
+
+@router.post("/projects/{project_id}/performances/{performance_id}/step", status_code=status.HTTP_201_CREATED)
+def performance_step(project_id: str, performance_id: str, db: Session = Depends(get_db)):
+    performance = db.get(ScenePerformance, performance_id)
+    if not performance or performance.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Performance not found")
+    if performance.status in {PerformanceStatus.AWAITING_WORLD, PerformanceStatus.PAUSED, PerformanceStatus.COMPLETED, PerformanceStatus.INVALIDATED, PerformanceStatus.FAILED}: raise HTTPException(status_code=409, detail={"code": "PERFORMANCE_NOT_RUNNABLE", "status": performance.status.value, "stop_reason": performance.stop_reason})
+    proposal = db.get(SceneProposal, performance.scene_proposal_id)
+    current = DirectorContextBuilder().build(db, project_id)
+    if proposal.context_fingerprint != current["fingerprint"] or performance.proposal_context_fingerprint != current["fingerprint"]:
+        performance.status = PerformanceStatus.INVALIDATED; performance.stop_reason = "STALE_PERFORMANCE"; db.add(performance); db.commit()
+        raise HTTPException(status_code=409, detail={"code": "STALE_PERFORMANCE"})
+    turns = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence)).all()
+    if performance.turn_count >= performance.max_turns:
+        performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "TURN_LIMIT"; db.add(performance); db.commit(); raise HTTPException(status_code=409, detail={"code": "TURN_LIMIT"})
+    previous_decision = db.get(CharacterDecision, turns[-1].character_decision_id) if turns else None
+    actor_id = TurnScheduler().next_actor(performance, turns, previous_decision.target_character_id if previous_decision else None)
+    if not actor_id: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "INSUFFICIENT_ACTIVE_PARTICIPANTS"; db.add(performance); db.commit(); raise HTTPException(status_code=409, detail={"code": performance.stop_reason})
+    context = PerformanceCharacterContextBuilder().build(db, project_id, actor_id, proposal, performance.id, turns)
+    actor_view = __import__("app.character_mind", fromlist=["ActorPerceptionSanitizer"]).ActorPerceptionSanitizer().sanitize(context)
+    try:
+        if performance.mode == PerformanceMode.HEURISTIC: raw_payload, result = HeuristicCharacterPerformer().perform(context)
+        else: raw_payload, result = LLMCharacterPerformer(get_model_provider(get_settings()), get_settings().ai_character_model).perform(actor_view)
+    except ModelProviderError as exc:
+        performance.status = PerformanceStatus.FAILED; performance.stop_reason = exc.code; db.add(performance); db.commit(); raise HTTPException(status_code=502, detail={"code": exc.code}) from exc
+    decision_data = raw_payload["decision"]
+    decision = CharacterDecision(project_id=project_id, scene_proposal_id=proposal.id, character_id=actor_id, context_fingerprint=context["fingerprint"], **decision_data)
+    decision_report = CharacterDecisionConstraintChecker().validate(db, context, decision)
+    action = __import__("app.performance", fromlist=["PerformanceActionPayload"]).PerformanceActionPayload.model_validate(raw_payload["action"])
+    action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, decision, action)
+    valid = decision_report.valid and action_report.valid
+    decision.status = CharacterDecisionStatus.VALID if valid else CharacterDecisionStatus.REJECTED
+    db.add(decision); db.flush()
+    recipients = PerformanceObservationRouter().recipients(action.visibility, performance.participant_order, actor_id, action.target_character_id)
+    turn = ScenePerformanceTurn(project_id=project_id, performance_id=performance.id, sequence=performance.turn_count + 1, actor_character_id=actor_id, actor_context_fingerprint=context["fingerprint"], character_decision_id=decision.id, action_visibility=action.visibility, observable_action=action.observable_action if valid else None, spoken_content=action.spoken_content if valid else None, recipient_character_ids=recipients if valid else [], requires_world_resolution=action.requires_world_resolution if valid else False, world_resolution_request=action.world_resolution_request.model_dump(mode="json") if valid and action.world_resolution_request else None, validation_result={"decision": decision_report.as_dict(), "action": action_report.as_dict()})
+    db.add(turn); performance.turn_count += 1; performance.status = PerformanceStatus.RUNNING
+    if not valid: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "CHARACTER_DECISION_REJECTED"
+    elif action.requires_world_resolution: performance.status = PerformanceStatus.AWAITING_WORLD
+    elif getattr(decision.decision_type, "value", decision.decision_type) == "WITHDRAW": performance.active_participant_ids = [item for item in performance.active_participant_ids if item != actor_id]
+    if performance.turn_count >= performance.max_turns and performance.status == PerformanceStatus.RUNNING: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "TURN_LIMIT"
+    db.add(performance); db.commit(); db.refresh(turn); db.refresh(performance)
+    return {"performance": _performance_payload(performance, turns + [turn], db), "turn": record_dict(turn), "decision": record_dict(decision), "validation_report": {"decision": decision_report.as_dict(), "action": action_report.as_dict()}, "model_metadata": {"provider": result.provider, "model": result.model, "latency_ms": result.latency_ms, "request_id": result.request_id} if result else None}

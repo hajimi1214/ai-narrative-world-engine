@@ -29,6 +29,8 @@ class CharacterDecisionPayload(BaseModel):
     intent: str
     chosen_action: str
     motivation: str
+    target_character_id: str | None
+    target_entity_id: str | None
     goal_refs: list[str]
     knowledge_used: list[KnowledgeReference]
     memory_refs: list[str]
@@ -53,7 +55,7 @@ def build_character_decision_contract() -> dict[str, Any]:
         "server_fields_forbidden": ["project_id", "scene_proposal_id", "character_id", "context_fingerprint", "status", "created_at"],
         "fields": {
             "decision_type": {"type": "enum string", "allowed_values": [item.value for item in CharacterDecisionType]},
-            "intent": {"type": "string"}, "chosen_action": {"type": "string"}, "motivation": {"type": "string"},
+            "intent": {"type": "string"}, "chosen_action": {"type": "string"}, "motivation": {"type": "string"}, "target_character_id": {"type": "string | null"}, "target_entity_id": {"type": "string | null"},
             "goal_refs": {"type": "string[]"},
             "knowledge_used": {"type": "object[]", "item": {"proposition": "string", "accepted_statuses": ["KNOWN | SUSPECTED | FALSE_BELIEF"]}},
             "memory_refs": {"type": "string[]"}, "ability_refs": {"type": "string[]"}, "inventory_refs": {"type": "string[]"},

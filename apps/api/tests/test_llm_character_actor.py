@@ -26,7 +26,7 @@ def session():
 def valid_payload(**changes):
     payload = {
         "decision_type": "INVESTIGATE", "intent": "verify register", "chosen_action": "Compare the available notes with the register.",
-        "motivation": "Verifying the register serves the current goal.", "goal_refs": ["verify register"],
+        "motivation": "Verifying the register serves the current goal.", "target_character_id": None, "target_entity_id": None, "goal_refs": ["verify register"],
         "knowledge_used": [], "memory_refs": [], "ability_refs": [], "inventory_refs": ["father-notes"],
         "relationship_factors": {}, "perceived_risk": "The keeper may delay access.", "accepted_cost": "Time.",
         "expected_personal_result": None, "uncertainties": ["The records may be incomplete."], "refused_options": [], "boundary_override_reason": None, "decision_summary": "Verify records before escalating.",
