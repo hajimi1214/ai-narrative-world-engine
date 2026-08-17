@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from .db import SessionLocal
 from .director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector
 from .character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor
-from .ai.errors import ModelProviderError
+from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, ModelProviderError
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor
 from .settings import get_settings
@@ -284,9 +284,8 @@ def character_ai_dry_run(project_id: str, proposal_id: str, character_id: str, d
     try:
         payload, model_result = LLMCharacterActor(get_model_provider(settings), settings.ai_character_model).decide(actor_view)
     except ModelProviderError as exc:
-        raise HTTPException(status_code=502, detail={"code": exc.code, "message": "Character model request could not be completed."}) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail={"code": "MODEL_AUTH_FAILED", "message": "Character model credentials are not configured."}) from exc
+        status_code = {MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502)
+        raise HTTPException(status_code=status_code, detail={"code": exc.code, "message": "Character model request could not be completed."}) from exc
     decision = CharacterDecision(project_id=project_id, scene_proposal_id=proposal.id, character_id=character.id, context_fingerprint=context["fingerprint"], **payload)
     report = CharacterDecisionConstraintChecker().validate(db, context, decision)
     decision.status = CharacterDecisionStatus.VALID if report.valid else CharacterDecisionStatus.REJECTED

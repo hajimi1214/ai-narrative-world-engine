@@ -12,12 +12,7 @@ class OpenAICompatibleProvider:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
 
-    def generate(self, system_prompt: str, user_payload: dict, model: str, repair_prompt: str | None = None) -> ModelResult:
-        messages = [{"role": "system", "content": system_prompt}]
-        if repair_prompt:
-            messages.append({"role": "user", "content": repair_prompt})
-        else:
-            messages.append({"role": "user", "content": __import__("json").dumps(user_payload, ensure_ascii=True, sort_keys=True)})
+    def generate(self, messages: list[dict[str, str]], model: str) -> ModelResult:
         started = time.perf_counter()
         try:
             response = httpx.post(

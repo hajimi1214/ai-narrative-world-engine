@@ -10,9 +10,11 @@ class FakeModelProvider:
         self.responses = [responses] if isinstance(responses, str) else list(responses or [])
         self.error = error
         self.calls = 0
+        self.messages: list[list[dict[str, str]]] = []
 
-    def generate(self, system_prompt: str, user_payload: dict, model: str, repair_prompt: str | None = None) -> ModelResult:
+    def generate(self, messages: list[dict[str, str]], model: str) -> ModelResult:
         self.calls += 1
+        self.messages.append(messages)
         if self.error:
             raise self.error
         content = self.responses[min(self.calls - 1, len(self.responses) - 1)] if self.responses else '{"decision_type":"WAIT","intent":"observe","chosen_action":"wait","motivation":"The character needs more information.","decision_summary":"Wait and observe."}'

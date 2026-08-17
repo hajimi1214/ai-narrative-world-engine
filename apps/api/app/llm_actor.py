@@ -1,7 +1,7 @@
 """LLM adapter for proposing a character decision, without database authority."""
 import json
 from typing import Any
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .ai.errors import ModelProviderError, MODEL_OUTPUT_INVALID
 from .ai.provider import ModelProvider, ModelResult
 from .models import CharacterDecisionType
@@ -18,6 +18,7 @@ Return only one JSON object matching the requested decision fields. No Markdown 
 
 
 class CharacterDecisionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     decision_type: CharacterDecisionType
     intent: str
     chosen_action: str
@@ -55,14 +56,21 @@ class LLMCharacterActor:
         self.model = model
 
     def decide(self, actor_view: dict[str, Any]) -> tuple[dict[str, Any], ModelResult]:
-        first = self.provider.generate(CHARACTER_SYSTEM_PROMPT, actor_view, self.model)
+        initial_messages = [
+            {"role": "system", "content": CHARACTER_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(actor_view, ensure_ascii=True, sort_keys=True)},
+        ]
+        first = self.provider.generate(initial_messages, self.model)
         try:
             payload = parse_decision_payload(first.content)
             return payload.model_dump(mode="json"), first
         except ModelProviderError as first_error:
             if first_error.code != MODEL_OUTPUT_INVALID:
                 raise
-        repair_prompt = "Repair the previous response into exactly one JSON object using the required decision fields. Keep the same decision meaning. Do not add novel facts or new knowledge evidence."
-        second = self.provider.generate(CHARACTER_SYSTEM_PROMPT, actor_view, self.model, repair_prompt=repair_prompt)
+        repair_messages = initial_messages + [
+            {"role": "assistant", "content": first.content},
+            {"role": "user", "content": "Return exactly one valid CharacterDecision JSON object. Preserve the original intended decision where possible. Do not add facts, knowledge, memories, items, abilities, characters, or entities that were not present in the actor input. Do not change epistemic status. Do not include Markdown."},
+        ]
+        second = self.provider.generate(repair_messages, self.model)
         payload = parse_decision_payload(second.content)
         return payload.model_dump(mode="json"), second

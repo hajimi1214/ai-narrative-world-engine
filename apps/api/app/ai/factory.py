@@ -1,4 +1,4 @@
-from .fake import FakeModelProvider
+from .errors import MODEL_PROVIDER_NOT_CONFIGURED, MODEL_PROVIDER_UNSUPPORTED, ModelProviderError
 from .openai_compatible import OpenAICompatibleProvider
 from ..settings import Settings
 
@@ -6,6 +6,8 @@ from ..settings import Settings
 def get_model_provider(settings: Settings):
     if settings.ai_provider == "openai_compatible":
         if not settings.ai_api_key:
-            raise ValueError("AI provider credentials are not configured")
+            raise ModelProviderError(MODEL_PROVIDER_NOT_CONFIGURED)
         return OpenAICompatibleProvider(settings.ai_base_url, settings.ai_api_key.get_secret_value(), settings.ai_timeout_seconds)
-    return FakeModelProvider()
+    if settings.ai_provider == "disabled":
+        raise ModelProviderError(MODEL_PROVIDER_NOT_CONFIGURED)
+    raise ModelProviderError(MODEL_PROVIDER_UNSUPPORTED)

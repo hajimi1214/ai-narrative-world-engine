@@ -3,10 +3,12 @@ import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from app.ai.errors import MODEL_AUTH_FAILED, MODEL_OUTPUT_INVALID, MODEL_TIMEOUT, MODEL_UPSTREAM_ERROR, ModelProviderError
+from app.ai.errors import MODEL_AUTH_FAILED, MODEL_OUTPUT_INVALID, MODEL_PROVIDER_NOT_CONFIGURED, MODEL_PROVIDER_UNSUPPORTED, MODEL_TIMEOUT, MODEL_UPSTREAM_ERROR, ModelProviderError
+from app.ai.factory import get_model_provider
 from app.ai.fake import FakeModelProvider
 from app.character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker
 from app.llm_actor import LLMCharacterActor
+from app.settings import Settings
 from app.models import CharacterDecision, CharacterKnowledge, CharacterMemory, KnowledgeStatus
 from app.db import Base
 import app.api as api
@@ -45,6 +47,16 @@ def test_perception_sanitizer_is_whitelist_and_isolates_actor_visible_context(se
         assert hidden not in rendered
 
 
+def test_perception_sanitizer_recursively_removes_director_only(session):
+    project, _, actor, other, _, proposal = seed(session)
+    actor.current_state = {"location_id": "archive", "nested": {"director_only": {"secret": True}}}
+    actor.relationships = {other.id: {"trust": "low", "metadata": {"director_only": "hidden"}}}
+    actor.inventory = [{"id": "father-notes", "nested": {"director_only": "hidden"}}]
+    session.add(actor); session.commit()
+    rendered = json.dumps(ActorPerceptionSanitizer().sanitize(context(session, project, actor, proposal)))
+    assert "director_only" not in rendered and "hidden" not in rendered
+
+
 def test_llm_actor_parses_json_fence_and_repairs_once():
     fenced = "```json\n" + valid_payload() + "\n```"
     payload, _ = LLMCharacterActor(FakeModelProvider(fenced), "test").decide({})
@@ -52,6 +64,33 @@ def test_llm_actor_parses_json_fence_and_repairs_once():
     provider = FakeModelProvider(["not json", valid_payload()])
     payload, _ = LLMCharacterActor(provider, "test").decide({})
     assert payload["chosen_action"] and provider.calls == 2
+
+
+def test_repair_messages_include_actor_view_invalid_output_and_instruction():
+    actor_view = {"character": {"name": "Ning Mo"}, "inventory": [{"id": "father-notes"}]}
+    provider = FakeModelProvider(["invalid model output", valid_payload()])
+    LLMCharacterActor(provider, "test").decide(actor_view)
+    repair = provider.messages[1]
+    assert json.dumps(actor_view, ensure_ascii=True, sort_keys=True) == repair[1]["content"]
+    assert repair[2] == {"role": "assistant", "content": "invalid model output"}
+    assert "Return exactly one valid CharacterDecision JSON object" in repair[3]["content"]
+
+
+def test_extra_model_fields_require_repair():
+    provider = FakeModelProvider([valid_payload(status="VALID"), valid_payload()])
+    payload, _ = LLMCharacterActor(provider, "test").decide({})
+    assert payload["decision_type"] == "INVESTIGATE" and provider.calls == 2
+
+
+@pytest.mark.parametrize("settings,code", [
+    (Settings(ai_provider="disabled"), MODEL_PROVIDER_NOT_CONFIGURED),
+    (Settings(ai_provider="unsupported"), MODEL_PROVIDER_UNSUPPORTED),
+    (Settings(ai_provider="openai_compatible", ai_api_key=None), MODEL_PROVIDER_NOT_CONFIGURED),
+])
+def test_provider_factory_never_silently_uses_fake(settings, code):
+    with pytest.raises(ModelProviderError) as error:
+        get_model_provider(settings)
+    assert error.value.code == code
 
 
 def test_llm_actor_rejects_two_invalid_json_outputs():
@@ -113,7 +152,8 @@ def test_ai_dry_run_returns_safe_provider_errors(session, monkeypatch, error, co
     proposal_id = client.post(f"/projects/{project.id}/director/dry-run").json()["proposal"]["id"]
     monkeypatch.setattr(api, "get_model_provider", lambda settings: FakeModelProvider(error=error))
     response = client.post(f"/projects/{project.id}/director/proposals/{proposal_id}/characters/{actor.id}/ai-dry-run")
-    assert response.status_code == 502
+    expected_status = {MODEL_TIMEOUT: 504, MODEL_AUTH_FAILED: 503}.get(code, 502)
+    assert response.status_code == expected_status
     assert response.json()["detail"]["code"] == code
     assert "secret should never be exposed" not in response.text and "sensitive upstream body" not in response.text
 

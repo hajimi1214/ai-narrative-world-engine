@@ -77,19 +77,26 @@ class ActorPerceptionSanitizer:
         character = context["character"]
         scene = context["scene"]
         return {
-            "character": {key: character.get(key) for key in ("name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state")},
+            "character": {key: self._visible(character.get(key)) for key in ("name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state")},
             "scene": {
-                "location": scene.get("location"),
-                "other_participants": scene.get("other_participants", []),
-                "visible_context": scene.get("visible_context", {}),
-                "actor_visible_context": scene.get("actor_visible_context", {}),
+                "location": self._visible(scene.get("location")),
+                "other_participants": self._visible(scene.get("other_participants", [])),
+                "visible_context": self._visible(scene.get("visible_context", {})),
+                "actor_visible_context": self._visible(scene.get("actor_visible_context", {})),
             },
-            "knowledge": context.get("knowledge", {}),
-            "memories": context.get("memories", []),
-            "relationships": context.get("relationships", {}),
-            "abilities": context.get("abilities", []),
-            "inventory": context.get("inventory", []),
+            "knowledge": self._visible(context.get("knowledge", {})),
+            "memories": self._visible(context.get("memories", [])),
+            "relationships": self._visible(context.get("relationships", {})),
+            "abilities": self._visible(context.get("abilities", [])),
+            "inventory": self._visible(context.get("inventory", [])),
         }
+
+    def _visible(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: self._visible(item) for key, item in value.items() if key != "director_only"}
+        if isinstance(value, list):
+            return [self._visible(item) for item in value]
+        return value
 
 @dataclass
 class CharacterDecisionIssue:
