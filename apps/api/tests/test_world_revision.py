@@ -49,3 +49,16 @@ def test_conflicting_paths_cross_project_and_cancelled_preview(session, monkeypa
     conflict=client.post(f"/projects/{project.id}/revisions",json={"title":"x","changes":[{"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/profile","value":{}},{"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/profile/x","value":1}]}); assert conflict.json()["detail"]["code"]=="CONFLICTING_CHANGE"
     revision=make_revision(client,project.id,{"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/name","value":"x"}).json(); client.post(f"/projects/{project.id}/revisions/{revision['id']}/cancel")
     assert client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").status_code==409
+
+def test_multi_change_virtual_target_and_reference_safety(session, monkeypatch):
+    project, location, actor, other, _, _=approved_setup(session,monkeypatch); client=client_for(session,monkeypatch)
+    changes=[{"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/profile/a","value":1},{"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/profile/b","value":{"entity_id":location.id}}]
+    revision=client.post(f"/projects/{project.id}/revisions",json={"title":"x","changes":changes}).json(); preview=client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").json()
+    normalized=preview["normalized_changes"]; assert normalized[0]["target_fingerprint_after"]==normalized[1]["target_fingerprint_after"]
+    bad=client.post(f"/projects/{project.id}/revisions",json={"title":"bad","changes":[{"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/profile/ref","value":{"entity_id":"missing"}}]})
+    assert bad.json()["detail"]["code"]=="UNKNOWN_REFERENCE"
+
+def test_pointer_and_target_schema_are_strict(session, monkeypatch):
+    project, _, actor, _, _, _=approved_setup(session,monkeypatch); client=client_for(session,monkeypatch)
+    for change, code in [({"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/name","value":None},"INVALID_TARGET_STATE"),({"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/abilities/99","value":{}},"INVALID_PATH"),({"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/profile/~2bad","value":1},"INVALID_PATH")]:
+        response=client.post(f"/projects/{project.id}/revisions",json={"title":"x","changes":[change]}); assert response.json()["detail"]["code"]==code
