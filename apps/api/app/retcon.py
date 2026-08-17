@@ -133,6 +133,10 @@ class CharacterCognitionImpactPlanner:
         character_ids = {item["character_id"] for item in items if item.get("character_id")}
         return [{"character_id": cid, "affected_knowledge_ids": [item["resource_id"] for item in items if item.get("character_id") == cid and item["resource_type"] == "CHARACTER_KNOWLEDGE"], "affected_memory_ids": [item["resource_id"] for item in items if item.get("character_id") == cid and item["resource_type"] == "CHARACTER_MEMORY"], "reason": "来自受影响世界事实的明确认知依赖"} for cid in sorted(character_ids)]
 
+class RetconPlanStalenessChecker:
+    def is_stale(self, session: Session, plan: RetconImpactPlan) -> bool:
+        return RevisionStateFingerprintBuilder().build(session, plan.project_id) != plan.basis_fingerprint
+
 class RetconImpactPlanner:
     def analyze(self, session: Session, request: RetconRequest, revision: Any) -> tuple[RetconImpactPlan, list[RetconImpactItem]]:
         normalized = revision.normalized_changes or []

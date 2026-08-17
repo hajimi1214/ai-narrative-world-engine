@@ -104,7 +104,7 @@ def test_plan_stale_after_formal_change(session, monkeypatch):
     plan = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze").json()["plan"]
     canon.proposition = "changed after analysis"; session.add(canon); session.commit()
     detail = client.get(f"/projects/{project.id}/retcon/plans/{plan['id']}").json()["plan"]
-    assert detail["is_stale"] is True
+    assert detail["is_stale"] is True and detail["status"] == "STALE"
 
 def test_basis_fingerprint_ignores_retcon_artifacts(session, monkeypatch):
     project, *_unused, revision, client = prepared(session, monkeypatch)

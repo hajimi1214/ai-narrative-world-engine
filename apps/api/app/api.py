@@ -22,7 +22,7 @@ from .model_router import ModelRouter, ProjectModelConfigPayload
 from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fingerprint
 from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryContextStaleError, RecoveryEditPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
-from .retcon import RetconImpactPlanner, CLASSIFICATION_LABELS, semantic_fingerprint
+from .retcon import RetconImpactPlanner, RetconPlanStalenessChecker, CLASSIFICATION_LABELS, semantic_fingerprint
 
 router = APIRouter()
 
@@ -43,9 +43,8 @@ def retcon_item_payload(item: RetconImpactItem) -> dict[str, Any]:
     return result
 
 def retcon_plan_payload(db: Session, plan: RetconImpactPlan) -> dict[str, Any]:
-    current_basis = RevisionStateFingerprintBuilder().build(db, plan.project_id)
-    stale = current_basis != plan.basis_fingerprint
-    return record_dict(plan) | {"is_stale": stale, "classification_labels": CLASSIFICATION_LABELS}
+    stale = RetconPlanStalenessChecker().is_stale(db, plan)
+    return record_dict(plan) | {"status": "STALE" if stale else plan.status, "is_stale": stale, "classification_labels": CLASSIFICATION_LABELS}
 
 # Retcon routes are declared before the main CRUD helpers; FastAPI evaluates
 # dependency defaults while importing the module.
