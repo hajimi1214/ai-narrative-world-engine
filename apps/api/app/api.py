@@ -13,7 +13,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -22,11 +22,98 @@ from .model_router import ModelRouter, ProjectModelConfigPayload
 from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fingerprint
 from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryContextStaleError, RecoveryEditPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
+from .retcon import RetconImpactPlanner, CLASSIFICATION_LABELS, semantic_fingerprint
 
 router = APIRouter()
 
 class Payload(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+class RetconRequestPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_revision_id: str
+    reason: str = Field(min_length=1, max_length=4000)
+
+def retcon_actions(status: str) -> list[str]:
+    return {"DRAFT": ["ANALYZE", "ABORT"], "PLANNED": ["REANALYZE", "ABORT"], "STALE": ["REANALYZE", "ABORT"], "ABORTED": []}.get(status, [])
+
+def retcon_item_payload(item: RetconImpactItem) -> dict[str, Any]:
+    result = record_dict(item)
+    result["classification_label"] = CLASSIFICATION_LABELS.get(item.classification, item.classification)
+    return result
+
+def retcon_plan_payload(db: Session, plan: RetconImpactPlan) -> dict[str, Any]:
+    current_basis = RevisionStateFingerprintBuilder().build(db, plan.project_id)
+    stale = current_basis != plan.basis_fingerprint
+    return record_dict(plan) | {"is_stale": stale, "classification_labels": CLASSIFICATION_LABELS}
+
+# Retcon routes are declared before the main CRUD helpers; FastAPI evaluates
+# dependency defaults while importing the module.
+def get_db():
+    db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
+@router.post("/projects/{project_id}/retcon/requests", status_code=status.HTTP_201_CREATED)
+def create_retcon_request(project_id: str, payload: RetconRequestPayload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    revision = db.get(WorldRevision, payload.source_revision_id)
+    if not revision or revision.project_id != project_id:
+        raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE" if revision else "TARGET_NOT_FOUND"})
+    if revision.status != RevisionStatus.PREVIEWED:
+        raise HTTPException(status_code=409, detail={"code": "SOURCE_REVISION_STALE"})
+    request = RetconRequest(project_id=project_id, source_revision_id=revision.id, reason=payload.reason, status="DRAFT", current_plan_version=0)
+    db.add(request); db.commit(); db.refresh(request)
+    return record_dict(request) | {"available_actions": retcon_actions(request.status)}
+
+@router.get("/projects/{project_id}/retcon/requests")
+def list_retcon_requests(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    requests = db.scalars(select(RetconRequest).where(RetconRequest.project_id == project_id).order_by(RetconRequest.created_at.desc(), RetconRequest.id)).all()
+    result = []
+    for request in requests:
+        latest = db.scalar(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id == request.id).order_by(RetconImpactPlan.version.desc()))
+        result.append(record_dict(request) | {"available_actions": retcon_actions(request.status), "latest_plan": retcon_plan_payload(db, latest) if latest else None})
+    return result
+
+@router.get("/projects/{project_id}/retcon/requests/{request_id}")
+def get_retcon_request(project_id: str, request_id: str, db: Session = Depends(get_db)):
+    request = db.get(RetconRequest, request_id)
+    if not request or request.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon request not found")
+    plans = db.scalars(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id == request.id).order_by(RetconImpactPlan.version.desc())).all()
+    return record_dict(request) | {"available_actions": retcon_actions(request.status), "plans": [retcon_plan_payload(db, plan) for plan in plans]}
+
+@router.post("/projects/{project_id}/retcon/requests/{request_id}/analyze")
+def analyze_retcon_request(project_id: str, request_id: str, db: Session = Depends(get_db)):
+    request = db.get(RetconRequest, request_id)
+    if not request or request.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon request not found")
+    if request.status == "ABORTED": raise HTTPException(status_code=409, detail={"code": "RETCON_REQUEST_ABORTED"})
+    revision = db.get(WorldRevision, request.source_revision_id)
+    if not revision or revision.project_id != project_id: raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE"})
+    current_basis = RevisionStateFingerprintBuilder().build(db, project_id)
+    if revision.status != RevisionStatus.PREVIEWED or revision.base_state_fingerprint != current_basis:
+        request.status = "STALE"; db.commit()
+        raise HTTPException(status_code=409, detail={"code": "SOURCE_REVISION_STALE"})
+    plan, items = RetconImpactPlanner().analyze(db, request, revision)
+    db.add(plan); db.flush()
+    for item in items: item.plan_id = plan.id; db.add(item)
+    request.current_plan_version = plan.version; request.status = "PLANNED"
+    db.commit(); db.refresh(plan)
+    return {"request": record_dict(request) | {"available_actions": retcon_actions(request.status)}, "plan": retcon_plan_payload(db, plan), "items": [retcon_item_payload(item) for item in items]}
+
+@router.get("/projects/{project_id}/retcon/plans/{plan_id}")
+def get_retcon_plan(project_id: str, plan_id: str, db: Session = Depends(get_db)):
+    plan = db.get(RetconImpactPlan, plan_id)
+    if not plan or plan.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon plan not found")
+    items = db.scalars(select(RetconImpactItem).where(RetconImpactItem.plan_id == plan.id).order_by(RetconImpactItem.resource_type, RetconImpactItem.resource_id)).all()
+    return {"plan": retcon_plan_payload(db, plan), "items": [retcon_item_payload(item) for item in items]}
+
+@router.post("/projects/{project_id}/retcon/requests/{request_id}/abort")
+def abort_retcon_request(project_id: str, request_id: str, db: Session = Depends(get_db)):
+    request = db.get(RetconRequest, request_id)
+    if not request or request.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon request not found")
+    request.status = "ABORTED"; db.commit(); db.refresh(request)
+    return record_dict(request) | {"available_actions": []}
 
 def routed_provider(settings, route):
     return get_model_provider(settings, route.provider, route.base_url)
