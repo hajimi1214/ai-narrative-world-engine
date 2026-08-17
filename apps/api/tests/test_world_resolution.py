@@ -6,8 +6,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from app.db import Base
-from app.models import CharacterDecision, CharacterDecisionStatus, CharacterDecisionType, PerformanceStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ResolutionStatus, ResolverMode, ActionVisibility, CanonFact, CanonType
-from app.world_resolution import PerformanceWorldStateBuilder, WorldObservationRouter, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, HeuristicWorldResolver
+from app.models import CharacterDecision, CharacterDecisionStatus, CharacterDecisionType, PerformanceStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ResolutionStatus, ResolverMode, ActionVisibility, CanonFact, CanonType, RevealConstraint, RevealStatus
+from app.world_resolution import PerformanceWorldStateBuilder, WorldObservationRouter, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, HeuristicWorldResolver, WorldContextSanitizer, WorldResolutionPayload
 from test_scene_performance import approved_setup
 
 
@@ -128,3 +128,48 @@ def test_resolution_retry_reuses_row_and_valid_cannot_retry(session, monkeypatch
     assert second.status_code == 201 and second.json()["resolution"]["id"] == resolution_id
     assert second.json()["resolution"]["status"] == "VALID"
     assert client.post(f"/projects/{project.id}/performances/{take.id}/world/resolve", json={"mode":"HEURISTIC"}).status_code == 409
+
+
+def test_locked_structured_canon_contradiction_blocks(session, monkeypatch):
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    canon = CanonFact(project_id=project.id, fact_type=CanonType.CORE_CANON, proposition="door is locked", data={"subject_type":"ENTITY", "subject_id":location.id, "predicate":"locked", "value":True}, locked=True)
+    session.add(canon); session.commit()
+    from app.director import DirectorContextBuilder
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]; session.add(proposal); session.commit()
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    context = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
+    payload = WorldResolutionPayload(outcome="FAILURE", outcome_summary="no", objective_facts=[{"subject_type":"ENTITY","subject_id":location.id,"predicate":"locked","value":False}], actor_observation=None, public_observation=None, canon_fact_ids_used=[], world_entity_ids_used=[location.id], resolution_basis_summary=None, missing_information=[])
+    report = WorldResolutionConstraintChecker().validate(session, context, payload, project.id)
+    assert any(item["code"] == "CANON_CONTRADICTION" for item in report["issues"])
+
+
+def test_locked_secret_proposition_leak_is_blocked_but_basis_is_private(session, monkeypatch):
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    secret_text = "A corpse is behind the stone door."
+    canon = CanonFact(project_id=project.id, fact_type=CanonType.SECRET_CANON, proposition=secret_text, data={"entity_id":location.id}, locked=True)
+    session.add(canon); session.flush(); session.add(RevealConstraint(project_id=project.id, canon_fact_id=canon.id, status=RevealStatus.LOCKED, allowed_character_ids=[])); session.commit()
+    from app.director import DirectorContextBuilder
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]; session.add(proposal); session.commit()
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    context = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
+    payload = WorldResolutionPayload(outcome="FAILURE", outcome_summary="blocked", objective_facts=[], actor_observation=secret_text, public_observation=None, canon_fact_ids_used=[], world_entity_ids_used=[], resolution_basis_summary=secret_text, missing_information=[])
+    report = WorldResolutionConstraintChecker().validate(session, context, payload, project.id)
+    assert any(item["code"] == "OBSERVATION_LEAK" for item in report["issues"])
+    safe = WorldResolutionPayload(**{**payload.model_dump(), "actor_observation":"The door is blocked.", "resolution_basis_summary":secret_text})
+    assert not any(item["code"] == "OBSERVATION_LEAK" for item in WorldResolutionConstraintChecker().validate(session, context, safe, project.id)["issues"])
+
+
+def test_world_context_sanitizer_recursively_removes_narrative_metadata():
+    value = WorldContextSanitizer().sanitize({"actor":{"current_state":{"author_only":"x","ok":True}}, "location":{"profile":{"nested":{"director_only":"x","locked":True}}}, "canon":[{"data":{"narrative_only":"x","secret":"kept"}}], "scope":{}})
+    rendered = json.dumps(value)
+    assert "director_only" not in rendered and "author_only" not in rendered and "narrative_only" not in rendered and "locked" in rendered and "secret" in rendered
+
+
+def test_research_settings_do_not_enter_world_context_or_fingerprint(session, monkeypatch):
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    first = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
+    project.research_settings = {"provider":"private","search_policy":"secret"}; session.add(project); session.commit()
+    second = WorldResolutionContextBuilder().build(session, take, turn, proposal, turn.world_resolution_request)
+    assert "provider" not in json.dumps(first) and "provider" not in json.dumps(second)
+    assert first["fingerprint"] == second["fingerprint"]
