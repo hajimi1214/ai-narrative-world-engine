@@ -8,12 +8,13 @@ from sqlalchemy.orm import Session
 from .db import SessionLocal
 from .director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector
 from .character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor
-from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, ModelProviderError
+from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MODEL_OUTPUT_INVALID, ModelProviderError
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode
 from .performance import HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, TurnScheduler, is_quiescent_cycle
+from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -313,6 +314,7 @@ def _performance_payload(performance: ScenePerformance, turns: list[ScenePerform
         decision = db.get(CharacterDecision, turn.character_decision_id)
         item["decision"] = {"decision_type": getattr(decision.decision_type, "value", decision.decision_type), "intent": decision.intent, "chosen_action": decision.chosen_action, "motivation": decision.motivation, "status": getattr(decision.status, "value", decision.status)} if decision else None
         value["turns"].append(item)
+    value["world_resolutions"] = [record_dict(item) for item in db.scalars(select(WorldResolution).where(WorldResolution.performance_id == performance.id).order_by(WorldResolution.created_at, WorldResolution.id)).all()]
     return value
 
 @router.post("/projects/{project_id}/director/proposals/{proposal_id}/performances", status_code=status.HTTP_201_CREATED)
@@ -358,7 +360,12 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
     if performance.turn_count >= performance.max_turns:
         performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "TURN_LIMIT"; db.add(performance); db.commit(); raise HTTPException(status_code=409, detail={"code": "TURN_LIMIT"})
     previous_decision = db.get(CharacterDecision, turns[-1].character_decision_id) if turns else None
-    actor_id = TurnScheduler().next_actor(performance, turns, previous_decision.target_character_id if previous_decision else None)
+    resume_actor = None
+    if turns and turns[-1].requires_world_resolution:
+        resolution = db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == turns[-1].id, WorldResolution.status == ResolutionStatus.VALID))
+        if resolution:
+            resume_actor = turns[-1].actor_character_id
+    actor_id = resume_actor or TurnScheduler().next_actor(performance, turns, previous_decision.target_character_id if previous_decision else None)
     if not actor_id: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "INSUFFICIENT_ACTIVE_PARTICIPANTS"; db.add(performance); db.commit(); raise HTTPException(status_code=409, detail={"code": performance.stop_reason})
     context = PerformanceCharacterContextBuilder().build(db, project_id, actor_id, proposal, performance.id, turns)
     actor_view = __import__("app.character_mind", fromlist=["ActorPerceptionSanitizer"]).ActorPerceptionSanitizer().sanitize(context)
@@ -388,3 +395,48 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
     if performance.turn_count >= performance.max_turns and performance.status == PerformanceStatus.RUNNING: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "TURN_LIMIT"
     db.add(performance); db.commit(); db.refresh(turn); db.refresh(performance)
     return {"performance": _performance_payload(performance, turns + [turn], db), "turn": record_dict(turn), "decision": record_dict(decision), "validation_report": {"decision": decision_report.as_dict(), "action": action_report.as_dict()}, "model_metadata": {"provider": result.provider, "model": result.model, "latency_ms": result.latency_ms, "request_id": result.request_id} if result else None}
+
+
+@router.post("/projects/{project_id}/performances/{performance_id}/world/resolve", status_code=status.HTTP_201_CREATED)
+def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Session = Depends(get_db)):
+    performance = db.get(ScenePerformance, performance_id)
+    if not performance or performance.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Scene Performance not found")
+    if performance.status != PerformanceStatus.AWAITING_WORLD:
+        raise HTTPException(status_code=409, detail={"code": "PERFORMANCE_NOT_AWAITING_WORLD"})
+    turns = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence.desc())).all()
+    turn = next((item for item in turns if item.requires_world_resolution and not db.scalar(select(WorldResolution.id).where(WorldResolution.performance_turn_id == item.id))), None)
+    if not turn or not turn.world_resolution_request:
+        raise HTTPException(status_code=409, detail={"code": "NO_PENDING_WORLD_REQUEST"})
+    proposal = db.get(SceneProposal, performance.scene_proposal_id)
+    context = WorldResolutionContextBuilder().build(db, performance, turn, proposal, turn.world_resolution_request)
+    requested_mode = payload.model_dump().get("mode") or performance.mode.value
+    try:
+        mode = ResolverMode(requested_mode)
+    except ValueError:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_RESOLVER_MODE"})
+    try:
+        if mode == ResolverMode.HEURISTIC:
+            raw, model_result = HeuristicWorldResolver().resolve(context)
+        else:
+            settings = get_settings()
+            raw, model_result = LLMWorldResolver(get_model_provider(settings), settings.ai_world_model).resolve(context)
+        world_payload = WorldResolutionPayload.model_validate(raw)
+    except ModelProviderError as exc:
+        error_status = {MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502)
+        raise HTTPException(status_code=error_status, detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"code": MODEL_OUTPUT_INVALID, "message": "World resolver output was invalid."}) from exc
+    report = WorldResolutionConstraintChecker().validate(db, context, world_payload, project_id)
+    resolution_status = ResolutionStatus.VALID if report["valid"] and world_payload.outcome != ResolutionOutcome.UNRESOLVED else (ResolutionStatus.UNRESOLVED if report["valid"] else ResolutionStatus.REJECTED)
+    resolution = WorldResolution(project_id=project_id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode=mode, world_context_fingerprint=context["fingerprint"], status=resolution_status, **world_payload.model_dump(mode="json"))
+    resolution.recipient_character_ids = WorldObservationRouter().recipients(performance, turn, resolution)
+    db.add(resolution)
+    if resolution_status == ResolutionStatus.VALID:
+        performance.status = PerformanceStatus.RUNNING; performance.stop_reason = None
+    elif resolution_status == ResolutionStatus.UNRESOLVED:
+        performance.status = PerformanceStatus.AWAITING_WORLD; performance.stop_reason = "WORLD_INFORMATION_MISSING"
+    else:
+        performance.status = PerformanceStatus.AWAITING_WORLD; performance.stop_reason = "WORLD_RESOLUTION_REJECTED"
+    db.add(performance); db.commit(); db.refresh(resolution); db.refresh(performance)
+    return {"performance": _performance_payload(performance, list(reversed(turns)), db), "resolution": record_dict(resolution), "validation_report": report, "model_metadata": {"provider": model_result.provider, "model": model_result.model, "latency_ms": model_result.latency_ms, "request_id": model_result.request_id} if model_result else None}

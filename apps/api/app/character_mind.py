@@ -86,6 +86,7 @@ class ActorPerceptionSanitizer:
                 "performance_observations": self._visible(scene.get("performance_observations", [])),
                 "self_turn_history": self._visible(scene.get("self_turn_history", [])),
                 "active_participant_ids": self._visible(scene.get("active_participant_ids", [])),
+                "world_observations": self._visible(scene.get("world_observations", [])),
             },
             "knowledge": self._visible(context.get("knowledge", {})),
             "memories": self._visible(context.get("memories", [])),

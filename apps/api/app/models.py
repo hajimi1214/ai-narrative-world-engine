@@ -27,6 +27,9 @@ class CharacterDecisionStatus(str, enum.Enum): DRAFT = "DRAFT"; VALID = "VALID";
 class PerformanceMode(str, enum.Enum): HEURISTIC = "HEURISTIC"; LLM = "LLM"
 class PerformanceStatus(str, enum.Enum): READY = "READY"; RUNNING = "RUNNING"; AWAITING_WORLD = "AWAITING_WORLD"; PAUSED = "PAUSED"; COMPLETED = "COMPLETED"; INVALIDATED = "INVALIDATED"; FAILED = "FAILED"
 class ActionVisibility(str, enum.Enum): PUBLIC = "PUBLIC"; TARGETED = "TARGETED"; COVERT = "COVERT"; PRIVATE = "PRIVATE"
+class ResolverMode(str, enum.Enum): HEURISTIC = "HEURISTIC"; LLM = "LLM"
+class ResolutionStatus(str, enum.Enum): VALID = "VALID"; REJECTED = "REJECTED"; UNRESOLVED = "UNRESOLVED"
+class ResolutionOutcome(str, enum.Enum): SUCCESS = "SUCCESS"; PARTIAL = "PARTIAL"; FAILURE = "FAILURE"; NO_EFFECT = "NO_EFFECT"; INTERRUPTED = "INTERRUPTED"; UNRESOLVED = "UNRESOLVED"
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
@@ -296,4 +299,26 @@ class ScenePerformanceTurn(Base):
     requires_world_resolution: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     world_resolution_request: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     validation_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class WorldResolution(Base):
+    __tablename__ = "world_resolutions"
+    __table_args__ = (UniqueConstraint("performance_turn_id"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    performance_id: Mapped[str] = mapped_column(ForeignKey("scene_performances.id"), nullable=False)
+    performance_turn_id: Mapped[str] = mapped_column(ForeignKey("scene_performance_turns.id"), nullable=False)
+    resolver_mode: Mapped[ResolverMode] = mapped_column(Enum(ResolverMode), nullable=False)
+    world_context_fingerprint: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[ResolutionStatus] = mapped_column(Enum(ResolutionStatus), nullable=False)
+    outcome: Mapped[ResolutionOutcome] = mapped_column(Enum(ResolutionOutcome), nullable=False)
+    outcome_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    objective_facts: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    actor_observation: Mapped[str | None] = mapped_column(Text)
+    public_observation: Mapped[str | None] = mapped_column(Text)
+    recipient_character_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    canon_fact_ids_used: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    world_entity_ids_used: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    resolution_basis_summary: Mapped[str | None] = mapped_column(Text)
+    missing_information: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

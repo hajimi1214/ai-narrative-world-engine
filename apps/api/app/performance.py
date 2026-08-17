@@ -9,7 +9,7 @@ from .ai.errors import ModelProviderError, MODEL_OUTPUT_INVALID
 from .ai.provider import ModelProvider, ModelResult
 from .character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, character_context_fingerprint
 from .llm_actor import CHARACTER_SYSTEM_PROMPT, CharacterDecisionPayload, DecisionPayloadParseError, build_character_decision_contract
-from .models import ActionVisibility, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, PerformanceStatus, RevealConstraint, RevealStatus, SceneProposal
+from .models import ActionVisibility, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, PerformanceStatus, RevealConstraint, RevealStatus, SceneProposal, ScenePerformance, WorldResolution, ResolutionStatus
 
 
 class WorldResolutionRequest(BaseModel):
@@ -98,6 +98,17 @@ class PerformanceCharacterContextBuilder:
                 decision = session.get(CharacterDecision, turn.character_decision_id)
                 own.append({"turn": turn.sequence, "decision_type": decision.decision_type.value if decision else None, "chosen_action": decision.chosen_action if decision else None, "target_character_id": decision.target_character_id if decision else None, "observable_action": turn.observable_action, "spoken_content": turn.spoken_content})
         context["scene"]["performance_observations"] = visible[-12:]
+        world_observations = []
+        resolutions = session.scalars(select(WorldResolution).where(WorldResolution.performance_id == performance_id, WorldResolution.status == ResolutionStatus.VALID).order_by(WorldResolution.created_at, WorldResolution.id)).all()
+        for resolution in resolutions:
+            if character_id not in (resolution.recipient_character_ids or []):
+                continue
+            source_turn = session.get(__import__("app.models", fromlist=["ScenePerformanceTurn"]).ScenePerformanceTurn, resolution.performance_turn_id)
+            if source_turn and source_turn.actor_character_id == character_id and resolution.actor_observation:
+                world_observations.append({"source": "WORLD", "resolution_id": resolution.id, "source_turn": source_turn.sequence, "observation": resolution.actor_observation})
+            if resolution.public_observation:
+                world_observations.append({"source": "WORLD", "resolution_id": resolution.id, "source_turn": source_turn.sequence if source_turn else None, "observation": resolution.public_observation})
+        context["scene"]["world_observations"] = world_observations[-12:]
         context["scene"]["self_turn_history"] = own[-12:]
         context["fingerprint"] = character_context_fingerprint({key: value for key, value in context.items() if key not in {"fingerprint", "version"}})
         context["version"] = context["fingerprint"]
