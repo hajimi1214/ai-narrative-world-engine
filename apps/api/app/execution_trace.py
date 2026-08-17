@@ -51,13 +51,13 @@ class ExecutionTraceRecorder:
     def start(self, db, *, project_id, stage, source_type, source_id,
                provider=None, model=None, input_fingerprint=None, output_fingerprint=None,
                latency_ms=None, request_id=None, error_code=None, upstream_status=None,
-               validation_report=None, attempt_number=1):
+               validation_report=None, attempt_number=1, parent_trace_id=None):
         trace = ExecutionTrace(project_id=project_id, stage=stage, source_type=source_type,
             source_id=source_id, status=ExecutionStatus.STARTED, provider=provider, model=model,
             input_fingerprint=input_fingerprint, output_fingerprint=output_fingerprint,
             latency_ms=latency_ms, request_id=request_id, error_code=error_code,
             upstream_status=upstream_status, validation_report=TraceSanitizer.clean(validation_report or {}),
-            retryable=False, repairable=False, attempt_number=attempt_number)
+            retryable=False, repairable=False, attempt_number=attempt_number, parent_trace_id=parent_trace_id)
         db.add(trace)
         return trace
 

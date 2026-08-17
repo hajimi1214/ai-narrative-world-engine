@@ -35,6 +35,9 @@ class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVIS
 class RevisionApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED="APPLIED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
 class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
+class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
+class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
+class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
@@ -355,3 +358,37 @@ class ProjectModelConfig(TimestampMixin, Base):
 class ExecutionTrace(Base):
     __tablename__="execution_traces"
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); stage: Mapped[ExecutionStage]=mapped_column(String(50),nullable=False); source_type: Mapped[str|None]=mapped_column(String(100)); source_id: Mapped[str|None]=mapped_column(String(36)); status: Mapped[ExecutionStatus]=mapped_column(String(30),nullable=False); provider: Mapped[str|None]=mapped_column(String(100)); model: Mapped[str|None]=mapped_column(String(200)); input_fingerprint: Mapped[str|None]=mapped_column(String(100)); output_fingerprint: Mapped[str|None]=mapped_column(String(100)); latency_ms: Mapped[int|None]=mapped_column(Integer); request_id: Mapped[str|None]=mapped_column(String(200)); error_type: Mapped[str|None]=mapped_column(String(100)); error_code: Mapped[str|None]=mapped_column(String(100)); upstream_status: Mapped[int|None]=mapped_column(Integer); validation_report: Mapped[dict[str,Any]]=mapped_column(JSON,default=dict,nullable=False); repairable: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); retryable: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); attempt_number: Mapped[int]=mapped_column(Integer,default=1,nullable=False); parent_trace_id: Mapped[str|None]=mapped_column(ForeignKey("execution_traces.id")); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False)
+
+class RecoveryCandidate(TimestampMixin, Base):
+    __tablename__ = "recovery_candidates"
+    __table_args__ = (UniqueConstraint("source_trace_id"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    source_trace_id: Mapped[str] = mapped_column(ForeignKey("execution_traces.id"), nullable=False)
+    stage: Mapped[str] = mapped_column(String(50), nullable=False)
+    candidate_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_type: Mapped[str | None] = mapped_column(String(100))
+    source_id: Mapped[str | None] = mapped_column(String(36))
+    context_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    context_locator: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    initial_error_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="OPEN", nullable=False)
+    current_version_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    adopted_resource_type: Mapped[str | None] = mapped_column(String(100))
+    adopted_resource_id: Mapped[str | None] = mapped_column(String(36))
+
+class RecoveryCandidateVersion(Base):
+    __tablename__ = "recovery_candidate_versions"
+    __table_args__ = (UniqueConstraint("candidate_id", "version_number"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    candidate_id: Mapped[str] = mapped_column(ForeignKey("recovery_candidates.id"), nullable=False)
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    origin: Mapped[str] = mapped_column(String(30), nullable=False)
+    parent_version_id: Mapped[str | None] = mapped_column(ForeignKey("recovery_candidate_versions.id"))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    payload_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    schema_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    constraint_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    validation_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    repair_trace_id: Mapped[str | None] = mapped_column(ForeignKey("execution_traces.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
