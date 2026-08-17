@@ -30,7 +30,11 @@ class ActionVisibility(str, enum.Enum): PUBLIC = "PUBLIC"; TARGETED = "TARGETED"
 class ResolverMode(str, enum.Enum): HEURISTIC = "HEURISTIC"; LLM = "LLM"
 class ResolutionStatus(str, enum.Enum): VALID = "VALID"; REJECTED = "REJECTED"; UNRESOLVED = "UNRESOLVED"
 class ResolutionOutcome(str, enum.Enum): SUCCESS = "SUCCESS"; PARTIAL = "PARTIAL"; FAILURE = "FAILURE"; NO_EFFECT = "NO_EFFECT"; INTERRUPTED = "INTERRUPTED"; UNRESOLVED = "UNRESOLVED"
-class RevisionStatus(str, enum.Enum): DRAFT = "DRAFT"; PREVIEWED = "PREVIEWED"; STALE = "STALE"; CANCELLED = "CANCELLED"
+class RevisionStatus(str, enum.Enum): DRAFT = "DRAFT"; PREVIEWED = "PREVIEWED"; STALE = "STALE"; CANCELLED = "CANCELLED"; APPLIED = "APPLIED"; ROLLED_BACK = "ROLLED_BACK"
+class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVISION"; POST_REVISION="POST_REVISION"; ROLLBACK_POINT="ROLLBACK_POINT"
+class RevisionApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED="APPLIED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
+class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; WRITER="WRITER"; CRITIC="CRITIC"
+class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
@@ -335,3 +339,19 @@ class WorldRevision(TimestampMixin, Base):
     change_set: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     normalized_changes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     impact_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+class WorldSnapshot(Base):
+    __tablename__="world_snapshots"
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False)
+    snapshot_type: Mapped[SnapshotType]=mapped_column(Enum(SnapshotType),nullable=False); schema_version: Mapped[int]=mapped_column(Integer,default=1,nullable=False)
+    state_fingerprint: Mapped[str]=mapped_column(String(100),nullable=False); payload: Mapped[dict[str,Any]]=mapped_column(JSON,nullable=False); source_revision_id: Mapped[str|None]=mapped_column(ForeignKey("world_revisions.id")); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False)
+class RevisionApplication(Base):
+    __tablename__="revision_applications"
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); revision_id: Mapped[str]=mapped_column(ForeignKey("world_revisions.id"),nullable=False)
+    status: Mapped[RevisionApplicationStatus]=mapped_column(Enum(RevisionApplicationStatus),default=RevisionApplicationStatus.PENDING,nullable=False); pre_snapshot_id: Mapped[str]=mapped_column(ForeignKey("world_snapshots.id"),nullable=False); post_snapshot_id: Mapped[str|None]=mapped_column(ForeignKey("world_snapshots.id")); expected_base_fingerprint: Mapped[str]=mapped_column(String(100),nullable=False); actual_base_fingerprint: Mapped[str]=mapped_column(String(100),nullable=False); author_override: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); author_override_reason: Mapped[str|None]=mapped_column(Text); applied_change_count: Mapped[int]=mapped_column(Integer,default=0,nullable=False); error_code: Mapped[str|None]=mapped_column(String(100)); error_summary: Mapped[str|None]=mapped_column(Text); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False); completed_at: Mapped[datetime|None]=mapped_column(DateTime)
+class ProjectModelConfig(TimestampMixin, Base):
+    __tablename__="project_model_configs"; __table_args__=(UniqueConstraint("project_id"),)
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); provider: Mapped[str|None]=mapped_column(String(100)); base_url: Mapped[str|None]=mapped_column(String(500)); character_model: Mapped[str|None]=mapped_column(String(200)); world_model: Mapped[str|None]=mapped_column(String(200)); director_model: Mapped[str|None]=mapped_column(String(200)); repair_model: Mapped[str|None]=mapped_column(String(200)); writer_model: Mapped[str|None]=mapped_column(String(200)); critic_model: Mapped[str|None]=mapped_column(String(200)); fallback_model: Mapped[str|None]=mapped_column(String(200)); auto_failover: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); max_repair_attempts: Mapped[int]=mapped_column(Integer,default=1,nullable=False)
+class ExecutionTrace(Base):
+    __tablename__="execution_traces"
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); stage: Mapped[ExecutionStage]=mapped_column(Enum(ExecutionStage),nullable=False); source_type: Mapped[str|None]=mapped_column(String(100)); source_id: Mapped[str|None]=mapped_column(String(36)); status: Mapped[ExecutionStatus]=mapped_column(Enum(ExecutionStatus),nullable=False); provider: Mapped[str|None]=mapped_column(String(100)); model: Mapped[str|None]=mapped_column(String(200)); input_fingerprint: Mapped[str|None]=mapped_column(String(100)); output_fingerprint: Mapped[str|None]=mapped_column(String(100)); latency_ms: Mapped[int|None]=mapped_column(Integer); request_id: Mapped[str|None]=mapped_column(String(200)); error_type: Mapped[str|None]=mapped_column(String(100)); error_code: Mapped[str|None]=mapped_column(String(100)); upstream_status: Mapped[int|None]=mapped_column(Integer); validation_report: Mapped[dict[str,Any]]=mapped_column(JSON,default=dict,nullable=False); repairable: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); retryable: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); attempt_number: Mapped[int]=mapped_column(Integer,default=1,nullable=False); parent_trace_id: Mapped[str|None]=mapped_column(ForeignKey("execution_traces.id")); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False)

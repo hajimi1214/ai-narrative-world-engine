@@ -12,10 +12,11 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace
 from .performance import HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder
+from .versioning import WorldSnapshotBuilder, RevisionApplyService
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -346,6 +347,62 @@ def cancel_revision(project_id: str, revision_id: str, db: Session = Depends(get
     if not revision or revision.project_id != project_id: raise HTTPException(status_code=404, detail="World Revision not found")
     revision.status = RevisionStatus.CANCELLED; db.add(revision); db.commit(); db.refresh(revision)
     return record_dict(revision)
+
+@router.post("/projects/{project_id}/snapshots", status_code=status.HTTP_201_CREATED)
+def create_snapshot(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db,project_id)
+    try: kind=SnapshotType(payload.model_dump().get("snapshot_type","BASELINE"))
+    except ValueError: raise HTTPException(status_code=400,detail={"code":"INVALID_SNAPSHOT_TYPE"})
+    snap=WorldSnapshotBuilder().create(db,project_id,kind); db.commit(); db.refresh(snap); return record_dict(snap)
+@router.get("/projects/{project_id}/snapshots")
+def list_snapshots(project_id:str,db:Session=Depends(get_db)):
+    require_project(db,project_id); return [record_dict(x) for x in db.scalars(select(WorldSnapshot).where(WorldSnapshot.project_id==project_id).order_by(WorldSnapshot.created_at.desc(),WorldSnapshot.id)).all()]
+@router.get("/projects/{project_id}/snapshots/{snapshot_id}")
+def get_snapshot(project_id:str,snapshot_id:str,db:Session=Depends(get_db)):
+    item=db.get(WorldSnapshot,snapshot_id)
+    if not item or item.project_id!=project_id: raise HTTPException(status_code=404,detail="World Snapshot not found")
+    return record_dict(item)
+@router.post("/projects/{project_id}/revisions/{revision_id}/apply")
+def apply_revision(project_id:str,revision_id:str,payload:Payload,db:Session=Depends(get_db)):
+    revision=db.get(WorldRevision,revision_id)
+    if not revision or revision.project_id!=project_id: raise HTTPException(status_code=404,detail="World Revision not found")
+    try:
+        with db.begin_nested(): app=RevisionApplyService().apply(db,project_id,revision,bool(payload.model_dump().get("author_override")),payload.model_dump().get("author_override_reason"))
+        db.commit(); db.refresh(app); return {"application":record_dict(app),"revision":record_dict(revision),"impact_report":revision.impact_report,"pending_retcon":bool(revision.impact_report.get("summary",{}).get("high") or revision.impact_report.get("summary",{}).get("critical") or revision.impact_report.get("summary",{}).get("manual_review"))}
+    except ValueError as exc:
+        db.rollback(); raise HTTPException(status_code=409,detail={"code":str(exc)}) from exc
+@router.post("/projects/{project_id}/revision-applications/{application_id}/rollback")
+def rollback_revision(project_id:str,application_id:str,db:Session=Depends(get_db)):
+    app=db.get(RevisionApplication,application_id)
+    if not app or app.project_id!=project_id: raise HTTPException(status_code=404,detail="Revision Application not found")
+    if str(app.status.value if hasattr(app.status,"value") else app.status)!="APPLIED": raise HTTPException(status_code=409,detail={"code":"APPLICATION_NOT_APPLIED"})
+    try:
+        with db.begin_nested(): RevisionApplyService().rollback(db,project_id,app)
+        db.commit(); db.refresh(app); return record_dict(app)
+    except ValueError as exc: db.rollback(); raise HTTPException(status_code=409,detail={"code":str(exc)}) from exc
+@router.get("/projects/{project_id}/model-config")
+def get_model_config(project_id:str,db:Session=Depends(get_db)):
+    require_project(db,project_id); item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id)); return record_dict(item) if item else None
+@router.put("/projects/{project_id}/model-config")
+def put_model_config(project_id:str,payload:Payload,db:Session=Depends(get_db)):
+    require_project(db,project_id); values=payload.model_dump(); forbidden={x for x in values if any(word in x.lower() for word in ("api_key","token","secret","authorization"))}
+    if forbidden: raise HTTPException(status_code=400,detail={"code":"SECRET_CONFIG_FORBIDDEN"})
+    item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id))
+    if item: return record_dict(update_record(db,item,values))
+    return record_dict(create_record(db,ProjectModelConfig,values,project_id))
+@router.get("/projects/{project_id}/execution-traces")
+def list_execution_traces(project_id:str,stage:str|None=None,status_filter:str|None=None,source_type:str|None=None,source_id:str|None=None,db:Session=Depends(get_db)):
+    query=select(ExecutionTrace).where(ExecutionTrace.project_id==project_id)
+    if stage: query=query.where(ExecutionTrace.stage==stage)
+    if status_filter: query=query.where(ExecutionTrace.status==status_filter)
+    if source_type: query=query.where(ExecutionTrace.source_type==source_type)
+    if source_id: query=query.where(ExecutionTrace.source_id==source_id)
+    return [record_dict(x) for x in db.scalars(query.order_by(ExecutionTrace.created_at.desc(),ExecutionTrace.id)).all()]
+@router.get("/projects/{project_id}/execution-traces/{trace_id}")
+def get_execution_trace(project_id:str,trace_id:str,db:Session=Depends(get_db)):
+    item=db.get(ExecutionTrace,trace_id)
+    if not item or item.project_id!=project_id: raise HTTPException(status_code=404,detail="Execution Trace not found")
+    return record_dict(item)
 
 def _performance_payload(performance: ScenePerformance, turns: list[ScenePerformanceTurn], db: Session):
     value = record_dict(performance)
