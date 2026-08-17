@@ -13,7 +13,7 @@ from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor
 from .settings import get_settings
 from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible
-from .performance import HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, TurnScheduler
+from .performance import HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, TurnScheduler, is_quiescent_cycle
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -286,7 +286,7 @@ def character_ai_dry_run(project_id: str, proposal_id: str, character_id: str, d
         payload, model_result = LLMCharacterActor(get_model_provider(settings), settings.ai_character_model).decide(actor_view)
     except ModelProviderError as exc:
         status_code = {MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502)
-        raise HTTPException(status_code=status_code, detail={"code": exc.code, "message": "Character model request could not be completed."}) from exc
+        raise HTTPException(status_code=status_code, detail={"code": exc.code, "upstream_status": exc.upstream_status, "message": "Character model request could not be completed."}) from exc
     decision = CharacterDecision(project_id=project_id, scene_proposal_id=proposal.id, character_id=character.id, context_fingerprint=context["fingerprint"], **payload)
     report = CharacterDecisionConstraintChecker().validate(db, context, decision)
     decision.status = CharacterDecisionStatus.VALID if report.valid else CharacterDecisionStatus.REJECTED
@@ -366,21 +366,25 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
         if performance.mode == PerformanceMode.HEURISTIC: raw_payload, result = HeuristicCharacterPerformer().perform(context)
         else: raw_payload, result = LLMCharacterPerformer(get_model_provider(get_settings()), get_settings().ai_character_model).perform(actor_view)
     except ModelProviderError as exc:
-        performance.status = PerformanceStatus.FAILED; performance.stop_reason = exc.code; db.add(performance); db.commit(); raise HTTPException(status_code=502, detail={"code": exc.code}) from exc
+        error_status = {"MODEL_AUTH_FAILED": 503, "MODEL_RATE_LIMITED": 429, "MODEL_TIMEOUT": 504}.get(exc.code, 502)
+        raise HTTPException(status_code=error_status, detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
     decision_data = raw_payload["decision"]
     decision = CharacterDecision(project_id=project_id, scene_proposal_id=proposal.id, character_id=actor_id, context_fingerprint=context["fingerprint"], **decision_data)
     decision_report = CharacterDecisionConstraintChecker().validate(db, context, decision)
     action = __import__("app.performance", fromlist=["PerformanceActionPayload"]).PerformanceActionPayload.model_validate(raw_payload["action"])
-    action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, decision, action)
+    action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, decision, action, performance.active_participant_ids)
     valid = decision_report.valid and action_report.valid
     decision.status = CharacterDecisionStatus.VALID if valid else CharacterDecisionStatus.REJECTED
     db.add(decision); db.flush()
-    recipients = PerformanceObservationRouter().recipients(action.visibility, performance.participant_order, actor_id, action.target_character_id)
+    recipients = PerformanceObservationRouter().recipients(action.visibility, [item for item in performance.participant_order if item in performance.active_participant_ids], actor_id, action.target_character_id)
     turn = ScenePerformanceTurn(project_id=project_id, performance_id=performance.id, sequence=performance.turn_count + 1, actor_character_id=actor_id, actor_context_fingerprint=context["fingerprint"], character_decision_id=decision.id, action_visibility=action.visibility, observable_action=action.observable_action if valid else None, spoken_content=action.spoken_content if valid else None, recipient_character_ids=recipients if valid else [], requires_world_resolution=action.requires_world_resolution if valid else False, world_resolution_request=action.world_resolution_request.model_dump(mode="json") if valid and action.world_resolution_request else None, validation_result={"decision": decision_report.as_dict(), "action": action_report.as_dict()})
     db.add(turn); performance.turn_count += 1; performance.status = PerformanceStatus.RUNNING
     if not valid: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "CHARACTER_DECISION_REJECTED"
     elif action.requires_world_resolution: performance.status = PerformanceStatus.AWAITING_WORLD
-    elif getattr(decision.decision_type, "value", decision.decision_type) == "WITHDRAW": performance.active_participant_ids = [item for item in performance.active_participant_ids if item != actor_id]
+    elif getattr(decision.decision_type, "value", decision.decision_type) == "WITHDRAW":
+        performance.active_participant_ids = [item for item in performance.active_participant_ids if item != actor_id]
+        if len(performance.active_participant_ids) < 2: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "INSUFFICIENT_ACTIVE_PARTICIPANTS"
+    if performance.status == PerformanceStatus.RUNNING and is_quiescent_cycle(performance, turns + [turn], db): performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "QUIESCENT"
     if performance.turn_count >= performance.max_turns and performance.status == PerformanceStatus.RUNNING: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "TURN_LIMIT"
     db.add(performance); db.commit(); db.refresh(turn); db.refresh(performance)
     return {"performance": _performance_payload(performance, turns + [turn], db), "turn": record_dict(turn), "decision": record_dict(decision), "validation_report": {"decision": decision_report.as_dict(), "action": action_report.as_dict()}, "model_metadata": {"provider": result.provider, "model": result.model, "latency_ms": result.latency_ms, "request_id": result.request_id} if result else None}

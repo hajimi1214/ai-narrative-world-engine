@@ -27,13 +27,13 @@ class OpenAICompatibleProvider:
             raise ModelProviderError(MODEL_UPSTREAM_ERROR) from exc
         latency_ms = int((time.perf_counter() - started) * 1000)
         if response.status_code in (401, 403):
-            raise ModelProviderError(MODEL_AUTH_FAILED)
+            raise ModelProviderError(MODEL_AUTH_FAILED, upstream_status=response.status_code)
         if response.status_code == 429:
-            raise ModelProviderError(MODEL_RATE_LIMITED)
+            raise ModelProviderError(MODEL_RATE_LIMITED, upstream_status=response.status_code)
         if response.status_code >= 500:
-            raise ModelProviderError(MODEL_UPSTREAM_ERROR)
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR, upstream_status=response.status_code)
         if response.status_code >= 400:
-            raise ModelProviderError(MODEL_UPSTREAM_ERROR, f"Upstream HTTP status {response.status_code}")
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR, f"Upstream HTTP status {response.status_code}", response.status_code)
         try:
             body = response.json()
             content = body["choices"][0]["message"]["content"]

@@ -83,7 +83,7 @@ def test_targeted_cannot_reach_non_target_and_world_request_requires_stop(sessio
     bad = PerformanceActionPayload(visibility=ActionVisibility.TARGETED, observable_action="ask", spoken_content="question", requires_world_resolution=False, world_resolution_request=None, disclosure_knowledge_ids=[], target_character_id="missing")
     report = PerformanceActionConstraintChecker().validate(session, context, proposal, decision, bad)
     assert any(issue.code == "INVALID_TARGET" for issue in report.issues)
-    request = PerformanceActionPayload(visibility=ActionVisibility.PUBLIC, observable_action="inspect", spoken_content=None, requires_world_resolution=True, world_resolution_request={"kind": "INSPECT", "description": "inspect box", "target_entity_id": proposal.location_id, "target_character_id": None}, disclosure_knowledge_ids=[], target_character_id=None)
+    request = PerformanceActionPayload(visibility=ActionVisibility.PUBLIC, observable_action="inspect", spoken_content=None, requires_world_resolution=True, world_resolution_request={"kind": "INSPECT", "description": "inspect box", "target_entity_id": proposal.location_id, "target_character_id": None}, disclosure_knowledge_ids=[], target_character_id=other.id)
     assert PerformanceActionConstraintChecker().validate(session, context, proposal, decision, request).valid
 
 
@@ -104,3 +104,66 @@ def test_withdraw_removes_active_participant_but_refuse_does_not(session):
     assert TurnScheduler().next_actor(performance, []) == "a"
     performance.active_participant_ids = ["b"]
     assert TurnScheduler().next_actor(performance, []) == "b"
+
+
+def performance_payload(decision_type="WAIT", target=None, action_target=None, spoken=None, observable=None, world=False):
+    return {"decision": {"decision_type": decision_type, "intent": "wait", "chosen_action": "wait", "motivation": "The character is cautious.", "target_character_id": target, "target_entity_id": None, "goal_refs": [], "knowledge_used": [], "memory_refs": [], "ability_refs": [], "inventory_refs": [], "relationship_factors": {}, "perceived_risk": None, "accepted_cost": None, "expected_personal_result": None, "uncertainties": [], "refused_options": [], "boundary_override_reason": None, "decision_summary": "Wait."}, "action": {"visibility": "PUBLIC", "observable_action": observable, "spoken_content": spoken, "requires_world_resolution": world, "world_resolution_request": None, "disclosure_knowledge_ids": [], "target_character_id": action_target}}
+
+
+def test_target_mismatch_and_self_target_scheduler_are_blocked(session, monkeypatch):
+    project, _, actor, other, proposal, _ = approved_setup(session, monkeypatch)
+    context = CharacterContextBuilder().build(session, project.id, actor.id, proposal)
+    from app.models import ActionVisibility, CharacterDecisionType
+    decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=actor.id, context_fingerprint=context["fingerprint"], decision_type=CharacterDecisionType.ASK, intent="ask", chosen_action="ask", target_character_id=other.id, target_entity_id=None, motivation="ask", goal_refs=[], knowledge_used=[], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, perceived_risk=None, accepted_cost=None, expected_personal_result=None, uncertainties=[], refused_options=[], decision_summary="ask")
+    action = PerformanceActionPayload(visibility=ActionVisibility.TARGETED, observable_action=None, spoken_content="question", requires_world_resolution=False, world_resolution_request=None, disclosure_knowledge_ids=[], target_character_id=actor.id)
+    assert any(issue.code == "TARGET_MISMATCH" for issue in PerformanceActionConstraintChecker().validate(session, context, proposal, decision, action, [actor.id, other.id]).issues)
+    performance = ScenePerformance(active_participant_ids=[actor.id, other.id], participant_order=[actor.id, other.id])
+    prior = type("Turn", (), {"actor_character_id": actor.id})()
+    from app.performance import TurnScheduler
+    assert TurnScheduler().next_actor(performance, [prior], actor.id) == other.id
+
+
+def test_withdraw_stops_when_one_participant_remains(session, monkeypatch):
+    project, _, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    performance = client.post(f"/projects/{project.id}/director/proposals/{proposal.id}/performances", json={"mode": "HEURISTIC"}).json()
+    class Withdraw:
+        def perform(self, context): return performance_payload("WITHDRAW"), None
+    monkeypatch.setattr(api, "HeuristicCharacterPerformer", Withdraw)
+    response = client.post(f"/projects/{project.id}/performances/{performance['id']}/step")
+    assert response.status_code == 201
+    assert response.json()["performance"]["status"] == "PAUSED"
+    assert response.json()["performance"]["stop_reason"] == "INSUFFICIENT_ACTIVE_PARTICIPANTS"
+    assert session.get(Character, actor.id).current_state["location_id"]
+
+
+def test_quiescent_requires_a_full_active_cycle(session, monkeypatch):
+    project, _, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    performance = client.post(f"/projects/{project.id}/director/proposals/{proposal.id}/performances", json={"mode": "HEURISTIC", "max_turns": 4}).json()
+    class Quiet:
+        calls = 0
+        def perform(self, context):
+            Quiet.calls += 1
+            return performance_payload("WAIT" if Quiet.calls == 1 else "OBSERVE"), None
+    monkeypatch.setattr(api, "HeuristicCharacterPerformer", Quiet)
+    assert client.post(f"/projects/{project.id}/performances/{performance['id']}/step").json()["performance"]["status"] == "RUNNING"
+    assert client.post(f"/projects/{project.id}/performances/{performance['id']}/step").json()["performance"]["stop_reason"] == "QUIESCENT"
+
+
+def test_withdrawn_participant_does_not_receive_public_observation():
+    from app.models import ActionVisibility
+    router = PerformanceObservationRouter()
+    assert router.recipients(ActionVisibility.PUBLIC, ["a", "b"], "a", None) == ["b"]
+    assert router.recipients(ActionVisibility.TARGETED, ["a", "b"], "a", "c") == []
+
+
+def test_provider_error_keeps_take_retryable_without_artifacts(session, monkeypatch):
+    project, _, actor, _, proposal, client = approved_setup(session, monkeypatch)
+    performance = client.post(f"/projects/{project.id}/director/proposals/{proposal.id}/performances", json={"mode": "LLM"}).json()
+    from app.ai.errors import MODEL_TIMEOUT, ModelProviderError
+    from app.ai.fake import FakeModelProvider
+    monkeypatch.setattr(api, "get_model_provider", lambda settings: FakeModelProvider(error=ModelProviderError(MODEL_TIMEOUT)))
+    response = client.post(f"/projects/{project.id}/performances/{performance['id']}/step")
+    assert response.status_code == 504 and response.json()["detail"]["upstream_status"] is None
+    after = session.get(ScenePerformance, performance["id"])
+    assert after.status == PerformanceStatus.READY and after.turn_count == 0
+    assert session.scalar(select(func.count(ScenePerformanceTurn.id))) == 0 and session.scalar(select(func.count(CharacterDecision.id))) == 0

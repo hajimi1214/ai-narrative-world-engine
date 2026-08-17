@@ -84,6 +84,10 @@ class LLMCharacterPerformer:
 class PerformanceCharacterContextBuilder:
     def build(self, session: Session, project_id: str, character_id: str, proposal: SceneProposal, performance_id: str, turns: list[Any]) -> dict[str, Any]:
         context = CharacterContextBuilder().build(session, project_id, character_id, proposal)
+        performance = session.get(__import__("app.models", fromlist=["ScenePerformance"]).ScenePerformance, performance_id)
+        active_ids = set((performance.active_participant_ids if performance else proposal.participants) or [])
+        context["scene"]["other_participants"] = [item for item in context["scene"]["other_participants"] if item["id"] in active_ids]
+        context["scene"]["active_participant_ids"] = sorted(active_ids)
         visible, own = [], []
         for turn in turns:
             recipients = turn.recipient_character_ids or []
@@ -120,11 +124,12 @@ class PerformanceActionReport:
 
 
 class PerformanceActionConstraintChecker:
-    def validate(self, session: Session, context: dict[str, Any], proposal: SceneProposal, decision: CharacterDecision, action: PerformanceActionPayload) -> PerformanceActionReport:
+    def validate(self, session: Session, context: dict[str, Any], proposal: SceneProposal, decision: CharacterDecision, action: PerformanceActionPayload, active_participant_ids: list[str] | None = None) -> PerformanceActionReport:
         issues: list[PerformanceIssue] = []
         def add(code, message, ids=None): issues.append(PerformanceIssue(code, "BLOCKING", message, ids or [], "Correct the performance action and try the turn again."))
-        participants = {item["id"] for item in context["scene"]["other_participants"]} | {context["character"]["id"]}
-        if action.visibility == ActionVisibility.TARGETED and (not action.target_character_id or action.target_character_id not in participants or action.target_character_id == decision.character_id): add("INVALID_TARGET", "TARGETED action must name another Scene participant.")
+        participants = set(active_participant_ids or ({item["id"] for item in context["scene"]["other_participants"]} | {context["character"]["id"]}))
+        if action.target_character_id != decision.target_character_id: add("TARGET_MISMATCH", "Action and CharacterDecision target_character_id must match.", [item for item in (action.target_character_id, decision.target_character_id) if item])
+        if action.visibility == ActionVisibility.TARGETED and (not action.target_character_id or action.target_character_id not in participants or action.target_character_id == decision.character_id): add("INVALID_TARGET", "TARGETED action must name another active Scene participant.")
         if action.visibility in {ActionVisibility.COVERT, ActionVisibility.PRIVATE} and action.target_character_id: add("INVALID_TARGET", "COVERT and PRIVATE actions cannot route to a recipient.", [action.target_character_id])
         own_knowledge = {item["id"] for status in context["knowledge"].values() for item in status}
         foreign = [item for item in action.disclosure_knowledge_ids if item not in own_knowledge]
@@ -133,7 +138,23 @@ class PerformanceActionConstraintChecker:
         if not action.requires_world_resolution and action.world_resolution_request is not None: add("INVALID_WORLD_REQUEST", "A non-resolving action cannot include a world request.")
         if action.world_resolution_request:
             request = action.world_resolution_request
-            if request.target_character_id and request.target_character_id not in participants: add("INVALID_TARGET", "World request targets an unavailable participant.", [request.target_character_id])
+            if request.target_character_id and (request.target_character_id not in participants or request.target_character_id == decision.character_id): add("INVALID_TARGET", "World request targets an unavailable active participant.", [request.target_character_id])
+            if request.target_entity_id:
+                target = session.get(__import__("app.models", fromlist=["WorldEntity"]).WorldEntity, request.target_entity_id)
+                visible_ids = set()
+                visible_ids.add(context["scene"].get("location", {}).get("id") if context["scene"].get("location") else None)
+                for item in context["inventory"]:
+                    if isinstance(item, dict) and isinstance(item.get("id"), str): visible_ids.add(item["id"])
+                def collect(value):
+                    if isinstance(value, dict):
+                        for key in ("entity_id", "location_id"):
+                            if isinstance(value.get(key), str): visible_ids.add(value[key])
+                        if isinstance(value.get("entity_ids"), list): visible_ids.update(item for item in value["entity_ids"] if isinstance(item, str))
+                        for child in value.values(): collect(child)
+                    elif isinstance(value, list):
+                        for child in value: collect(child)
+                collect(context["scene"].get("visible_context", {}))
+                if not target or target.project_id != decision.project_id or not target.active or request.target_entity_id not in visible_ids: add("INVALID_TARGET", "World request targets an unavailable or non-visible entity.", [request.target_entity_id])
         propositions = {item["proposition"] for status in context["knowledge"].values() for item in status if item["id"] in action.disclosure_knowledge_ids}
         forbidden = set(proposal.forbidden_reveals or [])
         canon = session.scalars(select(CanonFact).where(CanonFact.project_id == decision.project_id)).all()
@@ -148,8 +169,20 @@ class TurnScheduler:
     def next_actor(self, performance: Any, turns: list[Any], target_character_id: str | None = None) -> str | None:
         active = performance.active_participant_ids or []
         if not active: return None
-        if target_character_id in active: return target_character_id
+        if target_character_id in active and target_character_id != (turns[-1].actor_character_id if turns else None): return target_character_id
         if not turns: return active[0]
         last = turns[-1].actor_character_id
         index = active.index(last) if last in active else -1
         return active[(index + 1) % len(active)]
+
+
+def is_quiescent_cycle(performance: Any, turns: list[Any], session: Session) -> bool:
+    active = list(performance.active_participant_ids or [])
+    if not active or len(turns) < len(active): return False
+    recent = turns[-len(active):]
+    if {turn.actor_character_id for turn in recent} != set(active): return False
+    for turn in recent:
+        decision = session.get(CharacterDecision, turn.character_decision_id)
+        if not decision or getattr(decision.decision_type, "value", decision.decision_type) not in {"WAIT", "OBSERVE", "REFUSE"}: return False
+        if (turn.observable_action or "").strip() or (turn.spoken_content or "").strip() or turn.requires_world_resolution: return False
+    return True
