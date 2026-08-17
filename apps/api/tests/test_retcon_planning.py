@@ -50,13 +50,14 @@ def test_cross_project_request_blocked(session, monkeypatch):
 
 def test_analyze_creates_append_only_plan_and_preserves_formal_world(session, monkeypatch):
     project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
-    before = {"canon": canon.proposition, "knowledge": knowledge.proposition, "scene": scene.facts, "counts": session.scalar(select(func.count(CanonFact.id)))}
+    before = {"canon": canon.proposition, "knowledge": knowledge.proposition, "scene": scene.facts, "counts": session.scalar(select(func.count(CanonFact.id))), "formal_fingerprint": RevisionStateFingerprintBuilder().build(session, project.id)}
     request = client.post(f"/projects/{project.id}/retcon/requests", json={"source_revision_id":revision["id"],"reason":"影响预览"}).json()
     analyzed = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze")
     assert analyzed.status_code == 200, analyzed.text
     body = analyzed.json(); assert body["request"]["status"] == "PLANNED"; assert body["plan"]["version"] == 1
     assert canon.proposition == before["canon"] and knowledge.proposition == before["knowledge"] and scene.facts == before["scene"]
     assert session.scalar(select(func.count(CanonFact.id))) == before["counts"]
+    assert RevisionStateFingerprintBuilder().build(session, project.id) == before["formal_fingerprint"]
 
 def test_second_analyze_creates_plan_v2_with_parent(session, monkeypatch):
     project, *_unused, revision, client = prepared(session, monkeypatch)
