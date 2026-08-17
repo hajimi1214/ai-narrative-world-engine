@@ -7,23 +7,49 @@ import copy
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from .character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker
-from .llm_actor import CharacterDecisionPayload
+from .llm_actor import CharacterDecisionPayload, build_character_decision_contract, _extract_single_json_object
 from .models import CharacterDecision, CharacterDecisionStatus, RecoveryCandidate, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryCandidateVersion, RecoveryVersionOrigin, ScenePerformance, ScenePerformanceTurn, WorldResolution, ResolutionStatus
-from .performance import CharacterPerformancePayload, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder
+from .performance import CharacterPerformancePayload, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, performance_contract
 from .revision import RevisionPatchEngine, target_fingerprint
-from .world_resolution import WorldResolutionConstraintChecker, WorldResolutionPayload, WorldResolutionContextBuilder, WorldContextSanitizer
+from .world_resolution import WorldResolutionConstraintChecker, WorldResolutionPayload, WorldResolutionContextBuilder, WorldContextSanitizer, world_resolution_contract
 from .execution_trace import TraceSanitizer
 
 CandidateType = Literal["CHARACTER_DECISION", "CHARACTER_PERFORMANCE", "WORLD_RESOLUTION"]
 
+class RecoveryActionResolver:
+    @staticmethod
+    def resolve(error_code, candidate=None, repair_attempts=0, max_repair_attempts=1, context_stale=False):
+        if context_stale or (candidate and candidate.status == RecoveryCandidateStatus.STALE.value): return ["REBUILD_CONTEXT", "ABORT"]
+        if candidate and candidate.status in {RecoveryCandidateStatus.ADOPTED.value, RecoveryCandidateStatus.ABORTED.value}: return []
+        if error_code == "WORLD_INFORMATION_MISSING" or (candidate and candidate.initial_error_code == "WORLD_INFORMATION_MISSING"): return ["EDIT_WORLD", "ABORT"]
+        if candidate and candidate.status == RecoveryCandidateStatus.VALIDATED.value: return ["ADOPT", "MANUAL_EDIT", "ABORT"]
+        if candidate and candidate.status == RecoveryCandidateStatus.OPEN.value:
+            return ["AI_REPAIR", "MANUAL_EDIT", "ABORT"] if repair_attempts < max_repair_attempts else ["MANUAL_EDIT", "ABORT"]
+        if error_code == "MODEL_OUTPUT_INVALID": return ["RETRY", "ABORT"]
+        return ["RETRY", "ABORT"]
+
+class CandidateRepairAgent:
+    CONTRACTS = {"CHARACTER_DECISION": build_character_decision_contract, "CHARACTER_PERFORMANCE": performance_contract, "WORLD_RESOLUTION": world_resolution_contract}
+    def build_messages(self, candidate_type, context, payload, validation_report):
+        return [{"role": "system", "content": "You repair an untrusted structured candidate, not a character, director, or world author. Only fix validation errors. Do not invent facts, knowledge, entities, abilities, Canon, or world rules. Return exactly one JSON object."}, {"role": "user", "content": json.dumps({"sanitized_context": context, "candidate": payload, "validation_report": validation_report, "candidate_type": candidate_type, "output_contract": self.CONTRACTS[candidate_type]()}, ensure_ascii=True, sort_keys=True)}]
+    def repair(self, provider, model, candidate_type, context, payload, validation_report):
+        result = provider.generate(self.build_messages(candidate_type, context, payload, validation_report), model)
+        return self.CONTRACTS[candidate_type], _extract_single_json_object(result.content), result
+
+class RecoveryPatchChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operation: Literal["SET", "MERGE", "REMOVE"]
+    path: str
+    value: Any | None = None
+
 class RecoveryEditPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    base_version: int
-    changes: list[dict[str, Any]]
+    base_version: int = Field(ge=1)
+    changes: list[RecoveryPatchChange] = Field(min_length=1)
 
 class RecoveryCandidateService:
     MAX_BYTES = 64 * 1024
@@ -45,6 +71,11 @@ class RecoveryCandidateService:
         else: raise ValueError("UNSUPPORTED_CANDIDATE_TYPE")
         if len(json.dumps(value, ensure_ascii=True, separators=(",", ":"))) > self.MAX_BYTES: raise ValueError("CANDIDATE_TOO_LARGE")
         return value
+
+    def _guard_payload(self, payload):
+        if not isinstance(payload, dict): raise ValueError("CANDIDATE_PAYLOAD_OBJECT_REQUIRED")
+        if len(json.dumps(payload, ensure_ascii=True, separators=(",", ":"))) > self.MAX_BYTES: raise ValueError("CANDIDATE_TOO_LARGE")
+        return payload
 
     def create(self, db, *, project_id, trace, candidate_type: CandidateType, payload, context_fingerprint, locator, error_code, validation_report, stage, source_type, source_id):
         if not trace.id:
@@ -102,8 +133,15 @@ class RecoveryCandidateService:
             raise ValueError("RECOVERY_CONTEXT_STALE")
         current = copy.deepcopy(self.current_version(db, candidate).payload); engine = RevisionPatchEngine()
         for change in changes:
-            if change.get("operation") not in {"SET", "MERGE", "REMOVE"}: raise ValueError("INVALID_OPERATION")
-            engine.apply(current, change["operation"], change["path"], change.get("value"))
-        valid, report = self.validate(db, candidate, current); number = candidate.current_version_number + 1
-        version = RecoveryCandidateVersion(candidate_id=candidate.id, version_number=number, origin=RecoveryVersionOrigin.MANUAL_EDIT.value, parent_version_id=self.current_version(db, candidate).id, payload=self._payload(candidate.candidate_type, current), payload_fingerprint=target_fingerprint(current), schema_valid=True, constraint_valid=valid, validation_report=TraceSanitizer.clean(report))
+            item = change if isinstance(change, RecoveryPatchChange) else RecoveryPatchChange.model_validate(change)
+            engine.apply(current, item.operation, item.path, item.value)
+        self._guard_payload(current)
+        try:
+            normalized = self._payload(candidate.candidate_type, current); schema_valid = True
+            valid, report = self.validate(db, candidate, normalized)
+        except Exception:
+            normalized = current; schema_valid = False; valid = False
+            report = {"code": "MODEL_OUTPUT_INVALID", "issues": [{"path": "$", "message": "Manual candidate does not match its contract."}]}
+        number = candidate.current_version_number + 1
+        version = RecoveryCandidateVersion(candidate_id=candidate.id, version_number=number, origin=RecoveryVersionOrigin.MANUAL_EDIT.value, parent_version_id=self.current_version(db, candidate).id, payload=normalized, payload_fingerprint=target_fingerprint(normalized), schema_valid=schema_valid, constraint_valid=valid, validation_report=TraceSanitizer.clean(report))
         db.add(version); candidate.current_version_number = number; candidate.status = RecoveryCandidateStatus.VALIDATED.value if valid else RecoveryCandidateStatus.OPEN.value; db.flush(); return version

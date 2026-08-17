@@ -79,4 +79,4 @@ def test_trace_status_query_alias(session,monkeypatch):
     trace=ExecutionTraceRecorder().start(session,project_id=project.id,stage=ExecutionStage.CHARACTER_ACTOR,source_type="CHARACTER",source_id="source")
     ExecutionTraceRecorder().block(trace,"MODEL_OUTPUT_INVALID"); session.commit()
     rows=client.get(f"/projects/{project.id}/execution-traces",params={"status":"BLOCKED"}).json()
-    assert len(rows)==1 and rows[0]["error_code"]=="MODEL_OUTPUT_INVALID" and "AI_REPAIR" in rows[0]["available_actions"]
+    assert len(rows)==1 and rows[0]["error_code"]=="MODEL_OUTPUT_INVALID" and rows[0]["available_actions"]==["RETRY", "ABORT"]

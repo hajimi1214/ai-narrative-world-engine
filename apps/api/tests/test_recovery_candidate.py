@@ -8,6 +8,8 @@ from app.db import Base
 from app.execution_trace import ExecutionTraceRecorder
 from app.models import ExecutionStage, RecoveryCandidate, RecoveryCandidateStatus, CharacterDecision
 from app.recovery import RecoveryCandidateService
+from app.recovery import RecoveryActionResolver
+from app.character_mind import CharacterContextBuilder
 from test_llm_character_actor import valid_payload
 from test_scene_performance import approved_setup
 
@@ -37,6 +39,36 @@ def test_manual_edit_uses_new_version_and_rfc6901(session, monkeypatch):
     candidate = service.create(session, project_id=project.id, trace=trace, candidate_type="CHARACTER_DECISION", payload=json.loads(valid_payload()), context_fingerprint="character-context", locator={"project_id": project.id, "proposal_id": proposal.id, "character_id": actor.id}, error_code="TARGET_MISMATCH", validation_report={}, stage="CHARACTER_ACTOR", source_type="CHARACTER", source_id=actor.id)
     with pytest.raises(ValueError, match="RECOVERY_CONTEXT_STALE"):
         service.edit(session, candidate, 1, [{"operation": "SET", "path": "/decision_summary", "value": "repaired"}])
+
+def test_manual_schema_invalid_version_is_saved_open(session, monkeypatch):
+    project, _, actor, _, proposal, _ = approved_setup(session, monkeypatch)
+    context = CharacterContextBuilder().build(session, project.id, actor.id, proposal)
+    trace = ExecutionTraceRecorder().start(session, project_id=project.id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=actor.id)
+    service = RecoveryCandidateService(); candidate = service.create(session, project_id=project.id, trace=trace, candidate_type="CHARACTER_DECISION", payload=json.loads(valid_payload()), context_fingerprint=context["fingerprint"], locator={"project_id": project.id, "proposal_id": proposal.id, "character_id": actor.id}, error_code="TARGET_MISMATCH", validation_report={}, stage="CHARACTER_ACTOR", source_type="CHARACTER", source_id=actor.id)
+    version = service.edit(session, candidate, 1, [{"operation": "SET", "path": "/decision_type", "value": "NOT_A_DECISION"}])
+    assert version.schema_valid is False and candidate.status == "OPEN" and version.version_number == 2
+
+def test_manual_valid_edit_becomes_validated(session, monkeypatch):
+    project, _, actor, _, proposal, _ = approved_setup(session, monkeypatch)
+    context = CharacterContextBuilder().build(session, project.id, actor.id, proposal)
+    trace = ExecutionTraceRecorder().start(session, project_id=project.id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=actor.id)
+    service = RecoveryCandidateService(); candidate = service.create(session, project_id=project.id, trace=trace, candidate_type="CHARACTER_DECISION", payload=json.loads(valid_payload()), context_fingerprint=context["fingerprint"], locator={"project_id": project.id, "proposal_id": proposal.id, "character_id": actor.id}, error_code="TARGET_MISMATCH", validation_report={}, stage="CHARACTER_ACTOR", source_type="CHARACTER", source_id=actor.id)
+    version = service.edit(session, candidate, 1, [{"operation": "SET", "path": "/decision_summary", "value": "verified"}])
+    assert version.schema_valid is True and candidate.status == "VALIDATED"
+
+@pytest.mark.parametrize("code", ["KNOWLEDGE_LEAK", "TARGET_MISMATCH", "PREMATURE_REVEAL", "INVALID_CANON_REFERENCE", "CROSS_PROJECT_REFERENCE"])
+def test_constraint_errors_are_repairable(code):
+    assert RecoveryActionResolver.resolve(code, None) == ["RETRY", "ABORT"]
+
+def test_candidate_actions_world_information_missing_are_read_only():
+    class Candidate:
+        status = "OPEN"; initial_error_code = "WORLD_INFORMATION_MISSING"
+    assert RecoveryActionResolver.resolve("WORLD_INFORMATION_MISSING", Candidate()) == ["EDIT_WORLD", "ABORT"]
+
+def test_candidate_actions_validated_adopt_only():
+    class Candidate:
+        status = "VALIDATED"; initial_error_code = "TARGET_MISMATCH"
+    assert RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate()) == ["ADOPT", "MANUAL_EDIT", "ABORT"]
 
 
 def test_world_information_missing_candidate_cannot_be_edited(session, monkeypatch):

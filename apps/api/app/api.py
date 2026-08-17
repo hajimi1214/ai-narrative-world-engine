@@ -20,7 +20,7 @@ from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionI
 from .versioning import WorldSnapshotBuilder, RevisionApplyService
 from .model_router import ModelRouter, ProjectModelConfigPayload
 from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fingerprint
-from .recovery import RecoveryCandidateService, RecoveryEditPayload
+from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryEditPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
@@ -446,12 +446,12 @@ def put_model_config(project_id:str,payload:Payload,db:Session=Depends(get_db)):
     return record_dict(create_record(db,ProjectModelConfig,values,project_id))
 def _trace_payload(trace, db=None):
     value = record_dict(trace)
-    value["available_actions"] = RecoveryPolicy.resolve(value.get("error_code"))[2]
     candidate = db.scalar(select(RecoveryCandidate).where(RecoveryCandidate.source_trace_id == trace.id)) if db else None
     value["recovery_candidate_id"] = candidate.id if candidate else None
     value["candidate_status"] = candidate.status if candidate else None
-    if candidate and trace.error_code != "MODEL_OUTPUT_INVALID" and candidate.status == RecoveryCandidateStatus.OPEN.value:
-        value["available_actions"] = ["AI_REPAIR", "MANUAL_EDIT", "ABORT"]
+    config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == trace.project_id)) if db else None
+    attempts = db.scalar(select(func.count(ExecutionTrace.id)).where(ExecutionTrace.stage == ExecutionStage.REPAIR, ExecutionTrace.source_id == (candidate.id if candidate else ""))) if db else 0
+    value["available_actions"] = RecoveryActionResolver.resolve(trace.error_code, candidate, attempts or 0, config.max_repair_attempts if config else 1)
     return value
 
 @router.get("/projects/{project_id}/execution-traces")
@@ -477,8 +477,8 @@ def _candidate_or_404(db, project_id, candidate_id):
 def _candidate_payload(db, candidate):
     version = RecoveryCandidateService().current_version(db, candidate)
     source_trace = db.get(ExecutionTrace, candidate.source_trace_id)
-    value = {"candidate": record_dict(candidate), "current_version": record_dict(version), "validation_report": version.validation_report, "available_actions": RecoveryPolicy.resolve(candidate.initial_error_code)[2], "recovery_candidate_id": candidate.id}
-    if source_trace and source_trace.error_code == "MODEL_OUTPUT_INVALID": value["available_actions"] = ["RETRY", "ABORT"]
+    config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == candidate.project_id)); attempts = db.scalar(select(func.count(ExecutionTrace.id)).where(ExecutionTrace.stage == ExecutionStage.REPAIR, ExecutionTrace.source_id == candidate.id)) or 0
+    value = {"candidate": record_dict(candidate), "current_version": record_dict(version), "validation_report": version.validation_report, "available_actions": RecoveryActionResolver.resolve(source_trace.error_code if source_trace else candidate.initial_error_code, candidate, attempts, config.max_repair_attempts if config else 1), "recovery_candidate_id": candidate.id}
     return value
 
 @router.get("/projects/{project_id}/recovery-candidates")
@@ -501,6 +501,7 @@ def list_recovery_versions(project_id: str, candidate_id: str, db: Session = Dep
 @router.post("/projects/{project_id}/recovery-candidates/{candidate_id}/edit")
 def edit_recovery_candidate(project_id: str, candidate_id: str, payload: RecoveryEditPayload, db: Session = Depends(get_db)):
     candidate = _candidate_or_404(db, project_id, candidate_id)
+    if candidate.initial_error_code == "WORLD_INFORMATION_MISSING": raise HTTPException(status_code=409, detail={"code": "WORLD_FACT_REQUIRED"})
     if candidate.status in {RecoveryCandidateStatus.ADOPTED.value, RecoveryCandidateStatus.ABORTED.value, RecoveryCandidateStatus.STALE.value}: raise HTTPException(status_code=409, detail={"code": "RECOVERY_CANDIDATE_NOT_EDITABLE"})
     try: version = RecoveryCandidateService().edit(db, candidate, payload.base_version, payload.changes)
     except ValueError as exc: raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
@@ -509,6 +510,7 @@ def edit_recovery_candidate(project_id: str, candidate_id: str, payload: Recover
 @router.post("/projects/{project_id}/recovery-candidates/{candidate_id}/ai-repair")
 def repair_recovery_candidate(project_id: str, candidate_id: str, db: Session = Depends(get_db)):
     candidate = _candidate_or_404(db, project_id, candidate_id)
+    if candidate.initial_error_code == "WORLD_INFORMATION_MISSING": raise HTTPException(status_code=409, detail={"code": "WORLD_FACT_REQUIRED"})
     if candidate.status != RecoveryCandidateStatus.OPEN.value: raise HTTPException(status_code=409, detail={"code": "RECOVERY_CANDIDATE_NOT_OPEN"})
     config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id)); max_attempts = config.max_repair_attempts if config else 1
     previous_repairs = db.scalar(select(func.count(ExecutionTrace.id)).where(ExecutionTrace.project_id == project_id, ExecutionTrace.stage == ExecutionStage.REPAIR, ExecutionTrace.source_id == candidate.id)) or 0
@@ -520,11 +522,8 @@ def repair_recovery_candidate(project_id: str, candidate_id: str, db: Session = 
     last_repair = db.scalar(select(ExecutionTrace).where(ExecutionTrace.project_id == project_id, ExecutionTrace.stage == ExecutionStage.REPAIR, ExecutionTrace.source_id == candidate.id).order_by(ExecutionTrace.created_at.desc(), ExecutionTrace.id.desc()))
     settings = get_settings(); route = ModelRouter().resolve(db, project_id, settings, "REPAIR")
     trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.REPAIR, source_type="RECOVERY_CANDIDATE", source_id=candidate.id, provider=route.provider, model=route.model, input_fingerprint=candidate.context_fingerprint, attempt_number=previous_repairs + 1, parent_trace_id=(last_repair.id if last_repair else parent.id))
-    contract = {"CHARACTER_DECISION": "CharacterDecisionPayload", "CHARACTER_PERFORMANCE": "CharacterPerformancePayload", "WORLD_RESOLUTION": "WorldResolutionPayload"}[candidate.candidate_type]
-    messages = [{"role": "system", "content": "You repair an untrusted structured candidate. You are not a character, director, or world author. Only fix the listed validation issues; do not invent facts or change world rules. Return exactly one JSON object."}, {"role": "user", "content": json.dumps({"sanitized_context": sanitized, "candidate": current.payload, "validation_report": current.validation_report, "candidate_type": candidate.candidate_type, "output_contract": contract}, ensure_ascii=True, sort_keys=True)}]
     try:
-        result = routed_provider(settings, route).generate(messages, route.model)
-        repaired = _extract_single_json_object(result.content)
+        _, repaired, result = CandidateRepairAgent().repair(routed_provider(settings, route), route.model, candidate.candidate_type, sanitized, current.payload, current.validation_report)
         safe_payload = service._payload(candidate.candidate_type, repaired)
     except ModelProviderError as exc:
         ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status); db.commit(); raise HTTPException(status_code={MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502), detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
@@ -547,20 +546,35 @@ def abort_recovery_candidate(project_id: str, candidate_id: str, db: Session = D
 @router.post("/projects/{project_id}/recovery-candidates/{candidate_id}/adopt")
 def adopt_recovery_candidate(project_id: str, candidate_id: str, db: Session = Depends(get_db)):
     candidate = _candidate_or_404(db, project_id, candidate_id)
+    if candidate.initial_error_code == "WORLD_INFORMATION_MISSING": raise HTTPException(status_code=409, detail={"code": "WORLD_FACT_REQUIRED"})
     if candidate.status != RecoveryCandidateStatus.VALIDATED.value: raise HTTPException(status_code=409, detail={"code": "RECOVERY_CANDIDATE_NOT_VALIDATED"})
     service = RecoveryCandidateService(); version = service.current_version(db, candidate)
     valid, report = service.validate(db, candidate, version.payload)
-    if not valid: db.commit(); raise HTTPException(status_code=409, detail={"code": "RECOVERY_VALIDATION_FAILED", "validation_report": report})
+    if not valid:
+        db.commit()
+        raise HTTPException(status_code=409, detail={"code": report.get("code") if report.get("code") == "RECOVERY_CONTEXT_STALE" else "RECOVERY_VALIDATION_FAILED", "validation_report": report})
     if candidate.candidate_type == RecoveryCandidateType.CHARACTER_DECISION.value:
         loc = candidate.context_locator; decision = CharacterDecision(project_id=project_id, scene_proposal_id=loc["proposal_id"], character_id=loc["character_id"], context_fingerprint=candidate.context_fingerprint, status=CharacterDecisionStatus.VALID, **version.payload); db.add(decision); db.flush(); candidate.adopted_resource_type = "CHARACTER_DECISION"; candidate.adopted_resource_id = decision.id
     elif candidate.candidate_type == RecoveryCandidateType.WORLD_RESOLUTION.value:
         resolution = db.get(WorldResolution, candidate.context_locator["world_resolution_id"])
-        if candidate.initial_error_code == "WORLD_INFORMATION_MISSING": raise HTTPException(status_code=409, detail={"code": "WORLD_FACT_REQUIRED"})
+        loc = candidate.context_locator; performance = db.get(ScenePerformance, loc["performance_id"]); turn = db.get(ScenePerformanceTurn, loc["performance_turn_id"])
+        if not resolution or resolution.project_id != project_id or resolution.performance_id != performance.id or resolution.performance_turn_id != turn.id or resolution.status not in {ResolutionStatus.REJECTED, ResolutionStatus.UNRESOLVED} or performance.status != PerformanceStatus.AWAITING_WORLD or not turn.requires_world_resolution or not turn.world_resolution_request or db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == turn.id, WorldResolution.status == ResolutionStatus.VALID)):
+            candidate.status = RecoveryCandidateStatus.STALE.value; db.commit(); raise HTTPException(status_code=409, detail={"code": "RECOVERY_CONTEXT_STALE"})
         for key, value in version.payload.items(): setattr(resolution, key, value)
-        resolution.status = ResolutionStatus.VALID; candidate.adopted_resource_type = "WORLD_RESOLUTION"; candidate.adopted_resource_id = resolution.id
+        resolution.status = ResolutionStatus.VALID; resolution.recipient_character_ids = WorldObservationRouter().recipients(performance, turn, resolution); performance.status = PerformanceStatus.RUNNING; performance.stop_reason = None; candidate.adopted_resource_type = "WORLD_RESOLUTION"; candidate.adopted_resource_id = resolution.id
     else:
         loc = candidate.context_locator; turn = db.get(ScenePerformanceTurn, loc["source_turn_id"]); performance = db.get(ScenePerformance, loc["performance_id"]); parsed = CharacterPerformancePayload.model_validate(version.payload)
+        latest = db.scalar(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence.desc()))
+        resolution = db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == turn.id, WorldResolution.status == ResolutionStatus.VALID)) if turn else None
+        if not turn or turn.performance_id != performance.id or turn.sequence != (latest.sequence if latest else -1) or turn.character_decision_id != loc["source_decision_id"] or performance.status != PerformanceStatus.PAUSED or performance.stop_reason != "CHARACTER_DECISION_REJECTED" or resolution:
+            candidate.status = RecoveryCandidateStatus.STALE.value; db.commit(); raise HTTPException(status_code=409, detail={"code": "RECOVERY_CONTEXT_STALE"})
         decision = CharacterDecision(project_id=project_id, scene_proposal_id=loc["proposal_id"], character_id=loc["actor_character_id"], context_fingerprint=candidate.context_fingerprint, status=CharacterDecisionStatus.VALID, **parsed.decision.model_dump(mode="json")); db.add(decision); db.flush(); turn.character_decision_id = decision.id; turn.action_visibility = parsed.action.visibility; turn.observable_action = parsed.action.observable_action; turn.spoken_content = parsed.action.spoken_content; turn.requires_world_resolution = parsed.action.requires_world_resolution; turn.world_resolution_request = parsed.action.world_resolution_request.model_dump(mode="json") if parsed.action.world_resolution_request else None; performance.status = PerformanceStatus.AWAITING_WORLD if parsed.action.requires_world_resolution else PerformanceStatus.RUNNING; performance.stop_reason = None; candidate.adopted_resource_type = "SCENE_PERFORMANCE_TURN"; candidate.adopted_resource_id = turn.id
+        turn.recipient_character_ids = PerformanceObservationRouter().recipients(parsed.action.visibility, [item for item in performance.participant_order if item in performance.active_participant_ids], turn.actor_character_id, parsed.action.target_character_id)
+        turn.validation_result = {"decision": {"valid": True, "issues": []}, "action": {"valid": True, "issues": []}}
+        if getattr(decision.decision_type, "value", decision.decision_type) == "WITHDRAW":
+            performance.active_participant_ids = [item for item in performance.active_participant_ids if item != turn.actor_character_id]
+            if len(performance.active_participant_ids) < 2:
+                performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "INSUFFICIENT_ACTIVE_PARTICIPANTS"
     candidate.status = RecoveryCandidateStatus.ADOPTED.value; db.commit(); return _candidate_payload(db, candidate)
 
 def _performance_payload(performance: ScenePerformance, turns: list[ScenePerformanceTurn], db: Session):
