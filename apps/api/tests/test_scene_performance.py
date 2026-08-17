@@ -161,7 +161,7 @@ def test_provider_error_keeps_take_retryable_without_artifacts(session, monkeypa
     performance = client.post(f"/projects/{project.id}/director/proposals/{proposal.id}/performances", json={"mode": "LLM"}).json()
     from app.ai.errors import MODEL_TIMEOUT, ModelProviderError
     from app.ai.fake import FakeModelProvider
-    monkeypatch.setattr(api, "get_model_provider", lambda settings: FakeModelProvider(error=ModelProviderError(MODEL_TIMEOUT)))
+    monkeypatch.setattr(api, "get_model_provider", lambda settings, provider=None, base_url=None: FakeModelProvider(error=ModelProviderError(MODEL_TIMEOUT)))
     response = client.post(f"/projects/{project.id}/performances/{performance['id']}/step")
     assert response.status_code == 504 and response.json()["detail"]["upstream_status"] is None
     after = session.get(ScenePerformance, performance["id"])

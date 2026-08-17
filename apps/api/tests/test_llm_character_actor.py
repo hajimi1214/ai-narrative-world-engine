@@ -163,8 +163,8 @@ def test_ai_dry_run_uses_fake_provider_and_only_adds_decision(session, monkeypat
     project, _, actor, _, outsider, _ = seed(session)
     client = client_for(session, monkeypatch)
     proposal_id = client.post(f"/projects/{project.id}/director/dry-run").json()["proposal"]["id"]
-    provider = FakeModelProvider(valid_payload())
-    monkeypatch.setattr(api, "get_model_provider", lambda settings: provider)
+    fake_provider = FakeModelProvider(valid_payload())
+    monkeypatch.setattr(api, "get_model_provider", lambda settings, provider=None, base_url=None: fake_provider)
     before = {"decisions": session.scalar(select(func.count(CharacterDecision.id))), "knowledge": session.scalar(select(func.count(CharacterKnowledge.id))), "memories": session.scalar(select(func.count(CharacterMemory.id)))}
     response = client.post(f"/projects/{project.id}/director/proposals/{proposal_id}/characters/{actor.id}/ai-dry-run")
     assert response.status_code == 201, response.json()
@@ -185,7 +185,7 @@ def test_ai_dry_run_returns_safe_provider_errors(session, monkeypatch, error, co
     project, _, actor, _, _, _ = seed(session)
     client = client_for(session, monkeypatch)
     proposal_id = client.post(f"/projects/{project.id}/director/dry-run").json()["proposal"]["id"]
-    monkeypatch.setattr(api, "get_model_provider", lambda settings: FakeModelProvider(error=error))
+    monkeypatch.setattr(api, "get_model_provider", lambda settings, provider=None, base_url=None: FakeModelProvider(error=error))
     response = client.post(f"/projects/{project.id}/director/proposals/{proposal_id}/characters/{actor.id}/ai-dry-run")
     expected_status = {MODEL_TIMEOUT: 504, MODEL_AUTH_FAILED: 503}.get(code, 502)
     assert response.status_code == expected_status

@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 from typing import Any, Type
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -27,11 +27,12 @@ class Payload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 def routed_provider(settings, route):
-    """Keeps existing test injection seam while production uses the project route."""
-    try:
-        return get_model_provider(settings, route.provider, route.base_url)
-    except TypeError:
-        return get_model_provider(settings)
+    return get_model_provider(settings, route.provider, route.base_url)
+
+def primary_issue(report):
+    issues = report.get("issues", []) if isinstance(report, dict) else report.as_dict().get("issues", [])
+    codes = sorted(str(item.get("code")) for item in issues if item.get("blocking", True) and item.get("code"))
+    return codes[0] if codes else "VALIDATION_BLOCKED"
 
 def get_db():
     db = SessionLocal()
@@ -297,10 +298,10 @@ def character_ai_dry_run(project_id: str, proposal_id: str, character_id: str, d
     trace = None
     try:
         route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
-        trace = ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=character.id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
+        trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=character.id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
         payload, model_result = LLMCharacterActor(routed_provider(settings, route), route.model).decide(actor_view)
     except ModelProviderError as exc:
-        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=character.id, status=ExecutionStatus.BLOCKED if exc.code == MODEL_OUTPUT_INVALID else ExecutionStatus.FAILED, error_code=exc.code, upstream_status=exc.upstream_status)
+        if trace: (ExecutionTraceRecorder().block if exc.code == MODEL_OUTPUT_INVALID else ExecutionTraceRecorder().fail)(trace, exc.code, upstream_status=exc.upstream_status)
         db.commit()
         status_code = {MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502)
         raise HTTPException(status_code=status_code, detail={"code": exc.code, "upstream_status": exc.upstream_status, "message": "Character model request could not be completed."}) from exc
@@ -308,10 +309,8 @@ def character_ai_dry_run(project_id: str, proposal_id: str, character_id: str, d
     report = CharacterDecisionConstraintChecker().validate(db, context, decision)
     decision.status = CharacterDecisionStatus.VALID if report.valid else CharacterDecisionStatus.REJECTED
     if trace:
-        trace.status = ExecutionStatus.SUCCEEDED if report.valid else ExecutionStatus.BLOCKED
-        trace.latency_ms = model_result.latency_ms; trace.request_id = model_result.request_id
-        trace.output_fingerprint = stable_fingerprint(payload)
-        if not report.valid: trace.validation_report = {"issues": report.as_dict().get("issues", [])}
+        if report.valid: ExecutionTraceRecorder().succeed(trace, latency_ms=model_result.latency_ms, request_id=model_result.request_id, output_fingerprint=stable_fingerprint(payload))
+        else: ExecutionTraceRecorder().block(trace, primary_issue(report), validation_report={"issues": report.as_dict().get("issues", [])}, latency_ms=model_result.latency_ms, request_id=model_result.request_id)
     db.add(decision); db.commit(); db.refresh(decision)
     return {"character_context_summary": actor_view, "decision": record_dict(decision), "validation_report": report.as_dict(), "model_metadata": {"provider": model_result.provider, "model": model_result.model, "latency_ms": model_result.latency_ms, "request_id": model_result.request_id}}
 
@@ -353,6 +352,7 @@ def preview_revision(project_id: str, revision_id: str, db: Session = Depends(ge
     revision = db.get(WorldRevision, revision_id)
     if not revision or revision.project_id != project_id: raise HTTPException(status_code=404, detail="World Revision not found")
     if revision.status == RevisionStatus.CANCELLED: raise HTTPException(status_code=409, detail={"code":"REVISION_CANCELLED"})
+    if revision.status == RevisionStatus.APPLIED: raise HTTPException(status_code=409, detail={"code":"REVISION_ALREADY_APPLIED"})
     try:
         changes = RevisionChangeNormalizer().normalize(db, project_id, [__import__("app.revision", fromlist=["RevisionChangePayload"]).RevisionChangePayload.model_validate(item) for item in revision.change_set])
     except ValueError as exc: raise HTTPException(status_code=409, detail={"code":str(exc)}) from exc
@@ -364,6 +364,8 @@ def preview_revision(project_id: str, revision_id: str, db: Session = Depends(ge
 def cancel_revision(project_id: str, revision_id: str, db: Session = Depends(get_db)):
     revision = db.get(WorldRevision, revision_id)
     if not revision or revision.project_id != project_id: raise HTTPException(status_code=404, detail="World Revision not found")
+    if revision.status == RevisionStatus.APPLIED: raise HTTPException(status_code=409, detail={"code":"REVISION_ALREADY_APPLIED"})
+    if revision.status == RevisionStatus.CANCELLED: return record_dict(revision)
     revision.status = RevisionStatus.CANCELLED; db.add(revision); db.commit(); db.refresh(revision)
     return record_dict(revision)
 
@@ -372,6 +374,7 @@ def create_snapshot(project_id: str, payload: Payload, db: Session = Depends(get
     require_project(db,project_id)
     try: kind=SnapshotType(payload.model_dump().get("snapshot_type","BASELINE"))
     except ValueError: raise HTTPException(status_code=400,detail={"code":"INVALID_SNAPSHOT_TYPE"})
+    if kind != SnapshotType.BASELINE: raise HTTPException(status_code=409,detail={"code":"SYSTEM_SNAPSHOT_TYPE_FORBIDDEN"})
     snap=WorldSnapshotBuilder().create(db,project_id,kind); db.commit(); db.refresh(snap); return record_dict(snap)
 @router.get("/projects/{project_id}/snapshots")
 def list_snapshots(project_id:str,db:Session=Depends(get_db)):
@@ -442,10 +445,10 @@ def _trace_payload(trace):
     return value
 
 @router.get("/projects/{project_id}/execution-traces")
-def list_execution_traces(project_id:str,stage:str|None=None,status_filter:str|None=None,source_type:str|None=None,source_id:str|None=None,limit:int=50,db:Session=Depends(get_db)):
+def list_execution_traces(project_id:str,stage:str|None=None,status_filter:str|None=None,status_value:str|None=Query(None,alias="status"),source_type:str|None=None,source_id:str|None=None,limit:int=50,db:Session=Depends(get_db)):
     query=select(ExecutionTrace).where(ExecutionTrace.project_id==project_id)
     if stage: query=query.where(ExecutionTrace.stage==stage)
-    if status_filter: query=query.where(ExecutionTrace.status==status_filter)
+    if status_value or status_filter: query=query.where(ExecutionTrace.status==(status_value or status_filter))
     if source_type: query=query.where(ExecutionTrace.source_type==source_type)
     if source_id: query=query.where(ExecutionTrace.source_id==source_id)
     return [_trace_payload(x) for x in db.scalars(query.order_by(ExecutionTrace.created_at.desc(),ExecutionTrace.id).limit(min(max(limit, 1), 200))).all()]
@@ -524,10 +527,10 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
         if performance.mode == PerformanceMode.HEURISTIC: raw_payload, result = HeuristicCharacterPerformer().perform(context)
         else:
             settings = get_settings(); route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
-            trace = ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="SCENE_PERFORMANCE", source_id=performance.id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
+            trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="SCENE_PERFORMANCE", source_id=performance.id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
             raw_payload, result = LLMCharacterPerformer(routed_provider(settings, route), route.model).perform(actor_view)
     except ModelProviderError as exc:
-        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="SCENE_PERFORMANCE", source_id=performance.id, status=ExecutionStatus.BLOCKED if exc.code == MODEL_OUTPUT_INVALID else ExecutionStatus.FAILED, error_code=exc.code, upstream_status=exc.upstream_status)
+        if trace: (ExecutionTraceRecorder().block if exc.code == MODEL_OUTPUT_INVALID else ExecutionTraceRecorder().fail)(trace, exc.code, upstream_status=exc.upstream_status)
         db.commit()
         error_status = {"MODEL_AUTH_FAILED": 503, "MODEL_RATE_LIMITED": 429, "MODEL_TIMEOUT": 504}.get(exc.code, 502)
         raise HTTPException(status_code=error_status, detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
@@ -538,10 +541,8 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
     action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, decision, action, performance.active_participant_ids)
     valid = decision_report.valid and action_report.valid
     if trace:
-        trace.status = ExecutionStatus.SUCCEEDED if valid else ExecutionStatus.BLOCKED
-        trace.latency_ms = result.latency_ms; trace.request_id = result.request_id
-        trace.output_fingerprint = stable_fingerprint(raw_payload)
-        if not valid: trace.validation_report = {"decision": decision_report.as_dict(), "action": action_report.as_dict()}
+        if valid: ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms, request_id=result.request_id, output_fingerprint=stable_fingerprint(raw_payload))
+        else: ExecutionTraceRecorder().block(trace, primary_issue({"issues": decision_report.as_dict().get("issues", []) + action_report.as_dict().get("issues", [])}), validation_report={"decision": decision_report.as_dict(), "action": action_report.as_dict()}, latency_ms=result.latency_ms, request_id=result.request_id)
     decision.status = CharacterDecisionStatus.VALID if valid else CharacterDecisionStatus.REJECTED
     db.add(decision); db.flush()
     recipients = PerformanceObservationRouter().recipients(action.visibility, [item for item in performance.participant_order if item in performance.active_participant_ids], actor_id, action.target_character_id)
@@ -599,28 +600,32 @@ def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Se
         else:
             settings = get_settings()
             route = ModelRouter().resolve(db, project_id, settings, "WORLD")
-            trace = ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.WORLD_RESOLVER, source_type="SCENE_PERFORMANCE_TURN", source_id=turn.id, provider=route.provider, model=route.model, input_fingerprint=context_fingerprint)
+            trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.WORLD_RESOLVER, source_type="SCENE_PERFORMANCE_TURN", source_id=turn.id, provider=route.provider, model=route.model, input_fingerprint=context_fingerprint)
             raw, model_result = LLMWorldResolver(routed_provider(settings, route), route.model).resolve(context)
         world_payload = WorldResolutionPayload.model_validate(raw)
     except ModelProviderError as exc:
-        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.WORLD_RESOLVER, source_type="SCENE_PERFORMANCE_TURN", source_id=turn.id, status=ExecutionStatus.BLOCKED if exc.code == MODEL_OUTPUT_INVALID else ExecutionStatus.FAILED, error_code=exc.code, upstream_status=exc.upstream_status)
+        if trace: (ExecutionTraceRecorder().block if exc.code == MODEL_OUTPUT_INVALID else ExecutionTraceRecorder().fail)(trace, exc.code, upstream_status=exc.upstream_status)
         db.commit()
         error_status = {MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502)
         raise HTTPException(status_code=error_status, detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
     except Exception as exc:
+        if trace:
+            ExecutionTraceRecorder().block(trace, MODEL_OUTPUT_INVALID, validation_report={"schema": "World resolver output was invalid."})
+            db.commit()
         raise HTTPException(status_code=502, detail={"code": MODEL_OUTPUT_INVALID, "message": "World resolver output was invalid."}) from exc
     context_after = WorldResolutionContextBuilder().build(db, performance, turn, proposal, turn.world_resolution_request)
     if context_after["fingerprint"] != context_fingerprint:
+        if trace:
+            ExecutionTraceRecorder().block(trace, "WORLD_CONTEXT_STALE")
+            db.commit()
         raise HTTPException(status_code=409, detail={"code": "WORLD_CONTEXT_STALE"})
     report = WorldResolutionConstraintChecker().validate(db, context_after, world_payload, project_id)
     if trace:
-        trace.status = ExecutionStatus.SUCCEEDED if report["valid"] and world_payload.outcome != ResolutionOutcome.UNRESOLVED else ExecutionStatus.BLOCKED
-        trace.latency_ms = model_result.latency_ms; trace.request_id = model_result.request_id
-        trace.output_fingerprint = stable_fingerprint(world_payload.model_dump(mode="json"))
-        if trace.status == ExecutionStatus.BLOCKED:
-            trace.error_code = "WORLD_INFORMATION_MISSING" if world_payload.outcome == ResolutionOutcome.UNRESOLVED else None
-            trace.validation_report = {"issues": report.get("issues", [])}
-            trace.retryable, trace.repairable, _ = RecoveryPolicy.resolve(trace.error_code)
+        if report["valid"] and world_payload.outcome != ResolutionOutcome.UNRESOLVED:
+            ExecutionTraceRecorder().succeed(trace, latency_ms=model_result.latency_ms, request_id=model_result.request_id, output_fingerprint=stable_fingerprint(world_payload.model_dump(mode="json")))
+        else:
+            code = "WORLD_INFORMATION_MISSING" if world_payload.outcome == ResolutionOutcome.UNRESOLVED else primary_issue(report)
+            ExecutionTraceRecorder().block(trace, code, validation_report={"issues": report.get("issues", [])}, latency_ms=model_result.latency_ms, request_id=model_result.request_id)
     resolution_status = ResolutionStatus.VALID if report["valid"] and world_payload.outcome != ResolutionOutcome.UNRESOLVED else (ResolutionStatus.UNRESOLVED if report["valid"] else ResolutionStatus.REJECTED)
     resolution = db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == turn.id))
     if resolution and resolution.status == ResolutionStatus.VALID:

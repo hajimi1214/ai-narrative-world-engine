@@ -18,6 +18,7 @@ class RecoveryPolicy:
         "REVISION_STALE": (False, False, ["REPREVIEW", "ABORT"]),
         "TARGET_STATE_STALE": (False, False, ["REPREVIEW", "ABORT"]),
         "ROLLBACK_TARGET_STALE": (False, False, ["MANUAL_REVIEW", "ABORT"]),
+        "WORLD_CONTEXT_STALE": (True, False, ["RETRY", "ABORT"]),
     }
 
     @classmethod
@@ -26,12 +27,16 @@ class RecoveryPolicy:
 
 
 class TraceSanitizer:
-    BLOCKED = {"api_key", "authorization", "token", "secret", "headers", "prompt", "messages", "actor_context", "world_context", "secret_canon"}
+    BLOCKED = {"api_key", "authorization", "authorization_header", "token", "access_token", "secret", "headers", "prompt", "messages", "actor_context", "world_context", "secret_canon", "raw_output", "raw_response", "response_body"}
+
+    @classmethod
+    def _key(cls, key: Any) -> str:
+        return str(key).lower().replace("-", "_").replace(" ", "_")
 
     @classmethod
     def clean(cls, value: Any):
         if isinstance(value, dict):
-            return {str(key): cls.clean(item) for key, item in value.items() if str(key).lower() not in cls.BLOCKED}
+            return {str(key): cls.clean(item) for key, item in value.items() if cls._key(key) not in cls.BLOCKED}
         if isinstance(value, list):
             return [cls.clean(item) for item in value]
         return value
@@ -43,16 +48,42 @@ def stable_fingerprint(value: Any, prefix: str = "execution-output-v1") -> str:
 
 
 class ExecutionTraceRecorder:
-    def create(self, db, *, project_id, stage, source_type, source_id, status=ExecutionStatus.STARTED,
+    def start(self, db, *, project_id, stage, source_type, source_id,
                provider=None, model=None, input_fingerprint=None, output_fingerprint=None,
                latency_ms=None, request_id=None, error_code=None, upstream_status=None,
                validation_report=None, attempt_number=1):
-        retryable, repairable, _ = RecoveryPolicy.resolve(error_code)
         trace = ExecutionTrace(project_id=project_id, stage=stage, source_type=source_type,
-            source_id=source_id, status=status, provider=provider, model=model,
+            source_id=source_id, status=ExecutionStatus.STARTED, provider=provider, model=model,
             input_fingerprint=input_fingerprint, output_fingerprint=output_fingerprint,
             latency_ms=latency_ms, request_id=request_id, error_code=error_code,
             upstream_status=upstream_status, validation_report=TraceSanitizer.clean(validation_report or {}),
-            retryable=retryable, repairable=repairable, attempt_number=attempt_number)
+            retryable=False, repairable=False, attempt_number=attempt_number)
         db.add(trace)
+        return trace
+
+    def _finish(self, trace, status, *, error_code=None, upstream_status=None, validation_report=None, latency_ms=None, request_id=None, output_fingerprint=None):
+        trace.status = status
+        trace.error_code = error_code
+        trace.upstream_status = upstream_status
+        trace.validation_report = TraceSanitizer.clean(validation_report or {})
+        trace.latency_ms = latency_ms
+        trace.request_id = request_id
+        trace.output_fingerprint = output_fingerprint
+        trace.retryable, trace.repairable, _ = RecoveryPolicy.resolve(error_code)
+        return trace
+
+    def succeed(self, trace, *, latency_ms=None, request_id=None, output_fingerprint=None):
+        return self._finish(trace, ExecutionStatus.SUCCEEDED, latency_ms=latency_ms, request_id=request_id, output_fingerprint=output_fingerprint)
+
+    def fail(self, trace, error_code, *, upstream_status=None, validation_report=None, latency_ms=None, request_id=None):
+        return self._finish(trace, ExecutionStatus.FAILED, error_code=error_code, upstream_status=upstream_status, validation_report=validation_report, latency_ms=latency_ms, request_id=request_id)
+
+    def block(self, trace, error_code, *, validation_report=None, upstream_status=None, latency_ms=None, request_id=None):
+        return self._finish(trace, ExecutionStatus.BLOCKED, error_code=error_code, upstream_status=upstream_status, validation_report=validation_report, latency_ms=latency_ms, request_id=request_id)
+
+    # Kept for final Revision API traces, which have no long-lived model attempt.
+    def create(self, db, *, status=ExecutionStatus.STARTED, **kwargs):
+        trace = self.start(db, **kwargs)
+        if status != ExecutionStatus.STARTED:
+            self._finish(trace, status, error_code=kwargs.get("error_code"), upstream_status=kwargs.get("upstream_status"), validation_report=kwargs.get("validation_report"), latency_ms=kwargs.get("latency_ms"), request_id=kwargs.get("request_id"), output_fingerprint=kwargs.get("output_fingerprint"))
         return trace
