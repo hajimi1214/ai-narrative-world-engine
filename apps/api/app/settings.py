@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     ai_api_key: SecretStr | None = None
     ai_character_model: str = "deepseek-v4-pro"
     ai_world_model: str = "deepseek-v4-pro"
+    ai_director_model: str = "deepseek-v4-pro"
+    ai_repair_model: str = "deepseek-v4-pro"
+    ai_writer_model: str = "deepseek-v4-pro"
+    ai_critic_model: str = "deepseek-v4-pro"
     ai_timeout_seconds: float = 120.0
     character_actor_mode: str = "heuristic"
 

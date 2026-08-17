@@ -29,6 +29,35 @@ def _pointer(path: str) -> list[str]:
         parts.append(out)
     return parts
 
+class RevisionPatchEngine:
+    """Single RFC6901 patch implementation shared by preview and apply."""
+    def apply(self, document: dict[str, Any], operation: str, path: str, value: Any) -> tuple[Any, Any]:
+        parts=_pointer(path)
+        if not parts: raise ValueError("INVALID_PATH")
+        parent=document
+        for part in parts[:-1]:
+            if isinstance(parent,dict) and part in parent: parent=parent[part]
+            elif isinstance(parent,list) and part.isdigit() and 0<=int(part)<len(parent): parent=parent[int(part)]
+            else: raise ValueError("INVALID_PATH")
+        leaf=parts[-1]
+        if isinstance(parent,list) and (not leaf.isdigit() or not 0<=int(leaf)<len(parent)): raise ValueError("INVALID_PATH")
+        if isinstance(parent,dict) and leaf not in parent and operation=="REMOVE": raise ValueError("INVALID_PATH")
+        before=parent.get(leaf) if isinstance(parent,dict) else parent[int(leaf)] if isinstance(parent,list) else None
+        if operation=="SET":
+            if isinstance(parent,dict): parent[leaf]=value
+            elif isinstance(parent,list): parent[int(leaf)]=value
+            else: raise ValueError("INVALID_PATH")
+        elif operation=="MERGE":
+            if not isinstance(before,dict) or not isinstance(value,dict): raise ValueError("INVALID_MERGE_TARGET")
+            parent[leaf]={**before,**value}
+        elif operation=="REMOVE":
+            if isinstance(parent,dict): parent.pop(leaf)
+            elif isinstance(parent,list): parent.pop(int(leaf))
+            else: raise ValueError("INVALID_PATH")
+        else: raise ValueError("INVALID_OPERATION")
+        after=parent.get(leaf) if isinstance(parent,dict) else parent[int(leaf)] if isinstance(parent,list) and int(leaf)<len(parent) else None
+        return before,after
+
 def _record(record: Any) -> dict[str, Any]:
     from .api import serialize
     return {column.name: serialize(getattr(record, column.name)) for column in record.__table__.columns}
@@ -92,28 +121,12 @@ class RevisionChangeNormalizer:
             if not target: raise ValueError("REVISION_TARGET_NOT_FOUND")
             if target.project_id != project_id: raise ValueError("CROSS_PROJECT_REFERENCE")
             if key[:2] not in virtual: originals[key[:2]]=_record(target); virtual[key[:2]]=copy.deepcopy(originals[key[:2]])
-            after=virtual[key[:2]]; parent=after
-            for part in parts[:-1]:
-                if isinstance(parent, dict) and part in parent: parent=parent[part]
-                elif isinstance(parent, list) and part.isdigit() and int(part)<len(parent): parent=parent[int(part)]
-                else: raise ValueError("INVALID_PATH")
-            leaf=parts[-1]
-            if isinstance(parent,list) and (not leaf.isdigit() or int(leaf)<0 or int(leaf)>=len(parent)): raise ValueError("INVALID_PATH")
-            if isinstance(parent,dict) and leaf not in parent and change.operation == "REMOVE": raise ValueError("INVALID_PATH")
-            previous=parent.get(leaf) if isinstance(parent,dict) and leaf in parent else parent[int(leaf)] if isinstance(parent,list) else None
-            if change.operation == "MERGE":
-                if not isinstance(previous,dict) or not isinstance(change.value,dict): raise ValueError("INVALID_MERGE_TARGET")
-                parent[leaf]={**previous,**change.value}
-            elif change.operation == "REMOVE":
-                if len(parts)==1 and leaf in self.REQUIRED[change.target_type]: raise ValueError("REQUIRED_FIELD_REMOVAL")
-                if isinstance(parent,dict): parent.pop(leaf,None)
-                elif isinstance(parent,list) and leaf.isdigit(): parent.pop(int(leaf))
-                else: raise ValueError("INVALID_PATH")
-            else:
-                if isinstance(parent,dict): parent[leaf]=change.value
-                elif isinstance(parent,list) and leaf.isdigit(): parent[int(leaf)]=change.value
-                else: raise ValueError("INVALID_PATH")
-            normalized.append({"target_type":change.target_type,"target_id":change.target_id,"operation":change.operation,"path":change.path,"before_value":previous,"after_value":change.value if change.operation=="REMOVE" else (parent.get(leaf) if isinstance(parent,dict) else parent[int(leaf)] if isinstance(parent,list) and leaf.isdigit() and int(leaf)<len(parent) else None),"target_fingerprint_before":target_fingerprint(originals[key[:2]]),"warnings":[]})
+            if change.operation == "REMOVE" and len(parts) == 1 and parts[0] in self.REQUIRED[change.target_type]:
+                raise ValueError("REQUIRED_FIELD_REMOVAL")
+            previous, after_value = RevisionPatchEngine().apply(
+                virtual[key[:2]], change.operation, change.path, change.value
+            )
+            normalized.append({"target_type":change.target_type,"target_id":change.target_id,"operation":change.operation,"path":change.path,"before_value":previous,"after_value":after_value,"target_fingerprint_before":target_fingerprint(originals[key[:2]]),"warnings":[]})
         for key, preview in virtual.items():
             self._validate_target(preview, key[0], session, project_id)
             self._validate_references(preview, session, project_id)
@@ -224,61 +237,3 @@ class RevisionImpactAnalyzer:
         earliest=min((item for item in all_scenes if item.id in affected_scenes),key=lambda x:(x.sequence,x.id),default=None)
         summary={"total_impacts":len(impacts),"critical":sum(x["severity"]=="CRITICAL" for x in impacts),"high":sum(x["severity"]=="HIGH" for x in impacts),"medium":sum(x["severity"]=="MEDIUM" for x in impacts),"manual_review":sum(x["certainty"]=="MANUAL" for x in impacts)}
         return {"summary":summary,"impacts":impacts,"earliest_affected_scene":{"id":earliest.id,"sequence":earliest.sequence} if earliest else None,"rehearsal_invalidations":[x for x in impacts if x["recommended_action"]=="INVALIDATE_REHEARSAL"],"author_override_required":locked_override}
-        impacts=[]; scenes={}; scanner=StructuredReferenceScanner()
-        def add(category,severity,resource_type,resource_id,relation,evidence,action,certainty=None): impacts.append({"category":category,"severity":severity,"certainty":certainty or ("MANUAL" if category=="MANUAL_REVIEW" else "EXACT" if relation.startswith("DIRECT") else "STRUCTURED"),"resource_type":resource_type,"resource_id":resource_id,"relation":relation,"evidence":evidence,"recommended_action":action})
-        for change in normalized:
-            target_id=change["target_id"]
-            direct_target=session.get(CanonFact,target_id) if change["target_type"]=="CANON_FACT" else None
-            direct_severity="CRITICAL" if direct_target and direct_target.locked and getattr(direct_target.fact_type,"value",direct_target.fact_type) in {"CORE_CANON","SECRET_CANON"} else "HIGH" if direct_target and direct_target.locked else "MEDIUM" if direct_target else "HIGH"
-            add("DIRECT_TARGET", direct_severity, change["target_type"], target_id, "DIRECT_CHANGE", {"path":change["path"]}, "RETCON_REVIEW", "EXACT")
-            if change["target_type"] == "CANON_FACT":
-                old=change["before_value"] if change["path"]=="/proposition" else None
-                if old:
-                    for item in session.scalars(select(CharacterKnowledge).join(Character).where(Character.project_id==project_id, CharacterKnowledge.proposition==old)).all(): add("KNOWLEDGE_DEPENDENCY","HIGH","CHARACTER_KNOWLEDGE",item.id,"DIRECT_PROPOSITION",{"proposition":old},"REBUILD_KNOWLEDGE")
-                for item in session.scalars(select(RevealConstraint).where(RevealConstraint.project_id==project_id, RevealConstraint.canon_fact_id==target_id)).all(): add("REVEAL_OR_FORESHADOWING","HIGH","REVEAL_CONSTRAINT",item.id,"DIRECT_CANON_REFERENCE",{},"REVIEW_REVEAL")
-            for scene in session.scalars(select(Scene).where(Scene.project_id==project_id)).all():
-                refs=scanner.paths({"participants":scene.participants,"facts":scene.facts,"result":scene.result},target_id)
-                if target_id in (scene.participants or []) or refs or (change["target_type"]=="CANON_FACT" and change["before_value"] in (scene.facts or [])):
-                    add("SCENE_HISTORY","HIGH","SCENE",scene.id,"STRUCTURED_REFERENCE",{"reference_paths":refs},"REPLAY_FROM_SCENE"); scenes[scene.id]=scene
-            affected_proposals=set()
-            for proposal in session.scalars(select(SceneProposal).where(SceneProposal.project_id==project_id)).all():
-                proposal_refs=scanner.paths({"entry_state":proposal.entry_state,"character_motivations":proposal.character_motivations,"expected_progress":proposal.expected_progress,"possible_outcomes":proposal.possible_outcomes,"new_entity_requests":proposal.new_entity_requests,"risk_flags":proposal.risk_flags},target_id)
-                if target_id in (proposal.participants or []) or target_id==proposal.location_id or target_id in (proposal.required_canon or []) or target_id in (proposal.allowed_reveals or []) or target_id in (proposal.forbidden_reveals or []) or proposal_refs:
-                    affected_proposals.add(proposal.id); add("REHEARSAL_ARTIFACT","LOW","SCENE_PROPOSAL",proposal.id,"DIRECT_REFERENCE",{"reference_paths":proposal_refs},"INVALIDATE_REHEARSAL")
-            for decision in session.scalars(select(CharacterDecision).where(CharacterDecision.project_id==project_id)).all():
-                decision_refs=scanner.paths({"knowledge_used":decision.knowledge_used,"memory_refs":decision.memory_refs,"ability_refs":decision.ability_refs,"inventory_refs":decision.inventory_refs,"relationship_factors":decision.relationship_factors},target_id)
-                old_prop_hit=change["target_type"]=="CANON_FACT" and any(isinstance(item,dict) and item.get("proposition")==change["before_value"] for item in (decision.knowledge_used or []))
-                if target_id in {decision.character_id,decision.target_character_id,decision.target_entity_id} or decision_refs or old_prop_hit: add("CHARACTER_DECISION","LOW","CHARACTER_DECISION",decision.id,"DIRECT_REFERENCE" if target_id in {decision.character_id,decision.target_character_id,decision.target_entity_id} or old_prop_hit else "STRUCTURED_REFERENCE",{"reference_paths":decision_refs},"INVALIDATE_REHEARSAL","EXACT" if old_prop_hit else "STRUCTURED")
-            for resolution in session.scalars(select(WorldResolution).where(WorldResolution.project_id==project_id)).all():
-                if target_id in (resolution.canon_fact_ids_used or []) or target_id in (resolution.world_entity_ids_used or []) or scanner.paths(resolution.objective_facts,target_id): add("WORLD_RESOLUTION","LOW","WORLD_RESOLUTION",resolution.id,"STRUCTURED_REFERENCE",{},"INVALIDATE_REHEARSAL")
-            for memory in session.scalars(select(CharacterMemory).join(Character).where(Character.project_id==project_id)).all():
-                paths=scanner.paths(memory.distortion,target_id)
-                if memory.source_scene in scenes or paths or (change["target_type"]=="CANON_FACT" and memory.content == change["before_value"]): add("MEMORY_DEPENDENCY","MEDIUM","CHARACTER_MEMORY",memory.id,"STRUCTURED_REFERENCE",{"reference_paths":paths},"REVIEW_MEMORY","EXACT" if memory.source_scene in scenes or memory.content == change["before_value"] else "STRUCTURED")
-            for character in session.scalars(select(Character).where(Character.project_id==project_id)).all():
-                paths=scanner.paths(character.relationships,target_id)
-                if paths or (isinstance(character.relationships,dict) and target_id in character.relationships): add("RELATIONSHIP_DEPENDENCY","MEDIUM","CHARACTER",character.id,"STRUCTURED_REFERENCE",{"reference_paths":paths},"REVIEW_RELATIONSHIP")
-                other_paths=scanner.paths({"profile":character.profile,"current_state":character.current_state,"inventory":character.inventory},target_id)
-                if other_paths: add("STRUCTURED_REFERENCE","MEDIUM","CHARACTER",character.id,"STRUCTURED_REFERENCE",{"reference_paths":other_paths},"REVIEW")
-            for thread in session.scalars(select(StoryThread).where(StoryThread.project_id==project_id)).all():
-                paths=scanner.paths(thread.state,target_id)
-                if paths or (change["target_type"]=="CANON_FACT" and thread.goal == change["before_value"]): add("STORY_THREAD","MEDIUM","STORY_THREAD",thread.id,"STRUCTURED_REFERENCE",{"reference_paths":paths},"REVIEW_STORY_THREAD")
-            for chapter in session.scalars(select(Chapter).where(Chapter.project_id==project_id)).all():
-                affected=set(chapter.source_scene_ids or []) & set(scenes)
-                if affected: add("CHAPTER_SOURCE","MEDIUM","CHAPTER",chapter.id,"DIRECT_SCENE_SOURCE",{"scene_ids":sorted(affected)},"REVIEW_PROSE")
-            for performance in session.scalars(select(ScenePerformance).where(ScenePerformance.project_id==project_id)).all():
-                if performance.scene_proposal_id in affected_proposals: add("REHEARSAL_ARTIFACT","LOW","SCENE_PERFORMANCE",performance.id,"PROPOSAL_ARTIFACT",{},"INVALIDATE_REHEARSAL")
-            for turn in session.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.project_id==project_id)).all():
-                decision=session.get(CharacterDecision,turn.character_decision_id)
-                if decision and (decision.character_id==target_id or decision.target_character_id==target_id or decision.target_entity_id==target_id): add("REHEARSAL_ARTIFACT","LOW","SCENE_PERFORMANCE_TURN",turn.id,"DECISION_ARTIFACT",{},"INVALIDATE_REHEARSAL")
-            if any(segment in change["path"].split("/") for segment in {"world_time","happened_at","year","date","timeline"}): add("MANUAL_REVIEW","HIGH","REVISION",target_id,"TIMELINE_REVIEW_REQUIRED",{},"MANUAL_REVIEW")
-        unique={}
-        for item in impacts:
-            key=(item["category"],item["resource_type"],item["resource_id"],item["relation"])
-            if key not in unique: unique[key]=item
-            else:
-                old=unique[key]; paths=set(old.get("evidence",{}).get("reference_paths",[])); paths.update(item.get("evidence",{}).get("reference_paths",[])); old.setdefault("evidence",{})["reference_paths"]=sorted(paths)
-        impacts=list(unique.values())
-        earliest=min(scenes.values(), key=lambda item:(item.sequence,item.id)) if scenes else None
-        summary={"total_impacts":len(impacts),"critical":sum(item["severity"]=="CRITICAL" for item in impacts),"high":sum(item["severity"]=="HIGH" for item in impacts),"medium":sum(item["severity"]=="MEDIUM" for item in impacts),"manual_review":sum(item["certainty"]=="MANUAL" or item["category"]=="MANUAL_REVIEW" for item in impacts)}
-        override=any(change["target_type"]=="CANON_FACT" and (session.get(CanonFact,change["target_id"]).locked if session.get(CanonFact,change["target_id"]) else False) and getattr(session.get(CanonFact,change["target_id"]).fact_type,"value",session.get(CanonFact,change["target_id"]).fact_type) in {"CORE_CANON","SECRET_CANON"} for change in normalized)
-        return {"summary":summary,"impacts":impacts,"earliest_affected_scene":{"id":earliest.id,"sequence":earliest.sequence} if earliest else None,"rehearsal_invalidations":[item for item in impacts if item["recommended_action"]=="INVALIDATE_REHEARSAL"],"author_override_required":override}

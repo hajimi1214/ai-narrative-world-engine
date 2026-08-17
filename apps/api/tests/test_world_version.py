@@ -7,6 +7,8 @@ from app.db import Base
 from app.main import app
 import app.api as api
 from test_scene_performance import approved_setup
+from app.revision import RevisionPatchEngine
+from app.execution_trace import RecoveryPolicy, TraceSanitizer
 
 @pytest.fixture()
 def session():
@@ -20,3 +22,13 @@ def test_model_config_rejects_secrets(session,monkeypatch):
     project,_,_,_,_,_=approved_setup(session,monkeypatch); client=client_for(session,monkeypatch)
     assert client.put(f"/projects/{project.id}/model-config",json={"character_model":"x"}).status_code==200
     assert client.put(f"/projects/{project.id}/model-config",json={"api_key":"bad"}).status_code==400
+
+def test_patch_engine_honors_rfc6901_escaped_keys():
+    value={"profile":{"a/b":{"x~y":1}}}
+    before, after=RevisionPatchEngine().apply(value,"SET","/profile/a~1b/x~0y",2)
+    assert (before,after,value["profile"]["a/b"]["x~y"]) == (1,2,2)
+
+def test_trace_policy_and_sanitizer_do_not_retain_secrets():
+    assert RecoveryPolicy.resolve("MODEL_UPSTREAM_ERROR")[:2] == (True,False)
+    assert RecoveryPolicy.resolve("MODEL_OUTPUT_INVALID")[:2] == (False,True)
+    assert TraceSanitizer.clean({"prompt":"hidden","api_key":"hidden","safe":{"headers":"x","code":"OK"}}) == {"safe":{"code":"OK"}}

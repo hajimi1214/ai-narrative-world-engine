@@ -12,3 +12,11 @@ def downgrade():
     for table,index in (("execution_traces","ix_execution_traces_project_id"),("project_model_configs",None),("revision_applications","ix_revision_applications_project_id"),("world_snapshots","ix_world_snapshots_project_id")):
         if index: op.drop_index(index,table_name=table)
         op.drop_table(table)
+    # PostgreSQL ENUM values cannot be removed in place. Map the two 0007-only
+    # states to PREVIEWED, then recreate the exact 0006 enum definition.
+    op.execute("UPDATE world_revisions SET status = 'PREVIEWED' WHERE status IN ('APPLIED', 'ROLLED_BACK')")
+    op.execute("ALTER TABLE world_revisions ALTER COLUMN status TYPE VARCHAR USING status::text")
+    op.execute("ALTER TYPE revisionstatus RENAME TO revisionstatus_0007_old")
+    op.execute("CREATE TYPE revisionstatus AS ENUM ('DRAFT', 'PREVIEWED', 'STALE', 'CANCELLED')")
+    op.execute("ALTER TABLE world_revisions ALTER COLUMN status TYPE revisionstatus USING status::revisionstatus")
+    op.execute("DROP TYPE revisionstatus_0007_old")

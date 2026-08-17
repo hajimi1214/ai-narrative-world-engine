@@ -12,17 +12,26 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus
 from .performance import HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder
 from .versioning import WorldSnapshotBuilder, RevisionApplyService
+from .model_router import ModelRouter, ProjectModelConfigPayload
+from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fingerprint
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 
 router = APIRouter()
 
 class Payload(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+def routed_provider(settings, route):
+    """Keeps existing test injection seam while production uses the project route."""
+    try:
+        return get_model_provider(settings, route.provider, route.base_url)
+    except TypeError:
+        return get_model_provider(settings)
 
 def get_db():
     db = SessionLocal()
@@ -285,14 +294,24 @@ def character_ai_dry_run(project_id: str, proposal_id: str, character_id: str, d
     context = CharacterContextBuilder().build(db, project_id, character_id, proposal)
     actor_view = ActorPerceptionSanitizer().sanitize(context)
     settings = get_settings()
+    trace = None
     try:
-        payload, model_result = LLMCharacterActor(get_model_provider(settings), settings.ai_character_model).decide(actor_view)
+        route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
+        trace = ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=character.id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
+        payload, model_result = LLMCharacterActor(routed_provider(settings, route), route.model).decide(actor_view)
     except ModelProviderError as exc:
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=character.id, status=ExecutionStatus.BLOCKED if exc.code == MODEL_OUTPUT_INVALID else ExecutionStatus.FAILED, error_code=exc.code, upstream_status=exc.upstream_status)
+        db.commit()
         status_code = {MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502)
         raise HTTPException(status_code=status_code, detail={"code": exc.code, "upstream_status": exc.upstream_status, "message": "Character model request could not be completed."}) from exc
     decision = CharacterDecision(project_id=project_id, scene_proposal_id=proposal.id, character_id=character.id, context_fingerprint=context["fingerprint"], **payload)
     report = CharacterDecisionConstraintChecker().validate(db, context, decision)
     decision.status = CharacterDecisionStatus.VALID if report.valid else CharacterDecisionStatus.REJECTED
+    if trace:
+        trace.status = ExecutionStatus.SUCCEEDED if report.valid else ExecutionStatus.BLOCKED
+        trace.latency_ms = model_result.latency_ms; trace.request_id = model_result.request_id
+        trace.output_fingerprint = stable_fingerprint(payload)
+        if not report.valid: trace.validation_report = {"issues": report.as_dict().get("issues", [])}
     db.add(decision); db.commit(); db.refresh(decision)
     return {"character_context_summary": actor_view, "decision": record_dict(decision), "validation_report": report.as_dict(), "model_metadata": {"provider": model_result.provider, "model": model_result.model, "latency_ms": model_result.latency_ms, "request_id": model_result.request_id}}
 
@@ -366,8 +385,19 @@ def get_snapshot(project_id:str,snapshot_id:str,db:Session=Depends(get_db)):
 def apply_revision(project_id:str,revision_id:str,payload:Payload,db:Session=Depends(get_db)):
     revision=db.get(WorldRevision,revision_id)
     if not revision or revision.project_id!=project_id: raise HTTPException(status_code=404,detail="World Revision not found")
+    service = RevisionApplyService()
+    override = bool(payload.model_dump().get("author_override")); reason = payload.model_dump().get("author_override_reason")
     try:
-        with db.begin_nested(): app=RevisionApplyService().apply(db,project_id,revision,bool(payload.model_dump().get("author_override")),payload.model_dump().get("author_override_reason"))
+        prepared = service.preflight(db, project_id, revision, override, reason)
+    except ValueError as exc:
+        db.rollback()
+        if str(exc) == "REVISION_STALE":
+            revision = db.get(WorldRevision, revision_id)
+            revision.status = RevisionStatus.STALE
+            db.commit()
+        raise HTTPException(status_code=409, detail={"code": str(exc), "requires_repreview": str(exc) == "TARGET_STATE_STALE"}) from exc
+    try:
+        with db.begin_nested(): app=service.apply(db,project_id,revision,override,reason,prepared)
         db.commit(); db.refresh(app); return {"application":record_dict(app),"revision":record_dict(revision),"impact_report":revision.impact_report,"pending_retcon":bool(revision.impact_report.get("summary",{}).get("high") or revision.impact_report.get("summary",{}).get("critical") or revision.impact_report.get("summary",{}).get("manual_review"))}
     except ValueError as exc:
         db.rollback(); raise HTTPException(status_code=409,detail={"code":str(exc)}) from exc
@@ -385,24 +415,30 @@ def get_model_config(project_id:str,db:Session=Depends(get_db)):
     require_project(db,project_id); item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id)); return record_dict(item) if item else None
 @router.put("/projects/{project_id}/model-config")
 def put_model_config(project_id:str,payload:Payload,db:Session=Depends(get_db)):
-    require_project(db,project_id); values=payload.model_dump(); forbidden={x for x in values if any(word in x.lower() for word in ("api_key","token","secret","authorization"))}
-    if forbidden: raise HTTPException(status_code=400,detail={"code":"SECRET_CONFIG_FORBIDDEN"})
+    require_project(db,project_id)
+    try: values=ProjectModelConfigPayload.model_validate(payload.model_dump()).model_dump()
+    except Exception as exc: raise HTTPException(status_code=400,detail={"code":"INVALID_MODEL_CONFIG"}) from exc
     item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id))
     if item: return record_dict(update_record(db,item,values))
     return record_dict(create_record(db,ProjectModelConfig,values,project_id))
+def _trace_payload(trace):
+    value = record_dict(trace)
+    value["available_actions"] = RecoveryPolicy.resolve(value.get("error_code"))[2]
+    return value
+
 @router.get("/projects/{project_id}/execution-traces")
-def list_execution_traces(project_id:str,stage:str|None=None,status_filter:str|None=None,source_type:str|None=None,source_id:str|None=None,db:Session=Depends(get_db)):
+def list_execution_traces(project_id:str,stage:str|None=None,status_filter:str|None=None,source_type:str|None=None,source_id:str|None=None,limit:int=50,db:Session=Depends(get_db)):
     query=select(ExecutionTrace).where(ExecutionTrace.project_id==project_id)
     if stage: query=query.where(ExecutionTrace.stage==stage)
     if status_filter: query=query.where(ExecutionTrace.status==status_filter)
     if source_type: query=query.where(ExecutionTrace.source_type==source_type)
     if source_id: query=query.where(ExecutionTrace.source_id==source_id)
-    return [record_dict(x) for x in db.scalars(query.order_by(ExecutionTrace.created_at.desc(),ExecutionTrace.id)).all()]
+    return [_trace_payload(x) for x in db.scalars(query.order_by(ExecutionTrace.created_at.desc(),ExecutionTrace.id).limit(min(max(limit, 1), 200))).all()]
 @router.get("/projects/{project_id}/execution-traces/{trace_id}")
 def get_execution_trace(project_id:str,trace_id:str,db:Session=Depends(get_db)):
     item=db.get(ExecutionTrace,trace_id)
     if not item or item.project_id!=project_id: raise HTTPException(status_code=404,detail="Execution Trace not found")
-    return record_dict(item)
+    return _trace_payload(item)
 
 def _performance_payload(performance: ScenePerformance, turns: list[ScenePerformanceTurn], db: Session):
     value = record_dict(performance)
@@ -468,10 +504,16 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
     if not actor_id: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "INSUFFICIENT_ACTIVE_PARTICIPANTS"; db.add(performance); db.commit(); raise HTTPException(status_code=409, detail={"code": performance.stop_reason})
     context = PerformanceCharacterContextBuilder().build(db, project_id, actor_id, proposal, performance.id, turns)
     actor_view = __import__("app.character_mind", fromlist=["ActorPerceptionSanitizer"]).ActorPerceptionSanitizer().sanitize(context)
+    trace = None
     try:
         if performance.mode == PerformanceMode.HEURISTIC: raw_payload, result = HeuristicCharacterPerformer().perform(context)
-        else: raw_payload, result = LLMCharacterPerformer(get_model_provider(get_settings()), get_settings().ai_character_model).perform(actor_view)
+        else:
+            settings = get_settings(); route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
+            trace = ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="SCENE_PERFORMANCE", source_id=performance.id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
+            raw_payload, result = LLMCharacterPerformer(routed_provider(settings, route), route.model).perform(actor_view)
     except ModelProviderError as exc:
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="SCENE_PERFORMANCE", source_id=performance.id, status=ExecutionStatus.BLOCKED if exc.code == MODEL_OUTPUT_INVALID else ExecutionStatus.FAILED, error_code=exc.code, upstream_status=exc.upstream_status)
+        db.commit()
         error_status = {"MODEL_AUTH_FAILED": 503, "MODEL_RATE_LIMITED": 429, "MODEL_TIMEOUT": 504}.get(exc.code, 502)
         raise HTTPException(status_code=error_status, detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
     decision_data = raw_payload["decision"]
@@ -480,6 +522,11 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
     action = __import__("app.performance", fromlist=["PerformanceActionPayload"]).PerformanceActionPayload.model_validate(raw_payload["action"])
     action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, decision, action, performance.active_participant_ids)
     valid = decision_report.valid and action_report.valid
+    if trace:
+        trace.status = ExecutionStatus.SUCCEEDED if valid else ExecutionStatus.BLOCKED
+        trace.latency_ms = result.latency_ms; trace.request_id = result.request_id
+        trace.output_fingerprint = stable_fingerprint(raw_payload)
+        if not valid: trace.validation_report = {"decision": decision_report.as_dict(), "action": action_report.as_dict()}
     decision.status = CharacterDecisionStatus.VALID if valid else CharacterDecisionStatus.REJECTED
     db.add(decision); db.flush()
     recipients = PerformanceObservationRouter().recipients(action.visibility, [item for item in performance.participant_order if item in performance.active_participant_ids], actor_id, action.target_character_id)
@@ -525,6 +572,7 @@ def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Se
             raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE" if target_entity else "INVALID_ENTITY_REFERENCE"})
     context = WorldResolutionContextBuilder().build(db, performance, turn, proposal, turn.world_resolution_request)
     context_fingerprint = context["fingerprint"]
+    trace = None
     requested_mode = payload.model_dump().get("mode") or performance.mode.value
     try:
         mode = ResolverMode(requested_mode)
@@ -535,9 +583,13 @@ def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Se
             raw, model_result = HeuristicWorldResolver().resolve(context)
         else:
             settings = get_settings()
-            raw, model_result = LLMWorldResolver(get_model_provider(settings), settings.ai_world_model).resolve(context)
+            route = ModelRouter().resolve(db, project_id, settings, "WORLD")
+            trace = ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.WORLD_RESOLVER, source_type="SCENE_PERFORMANCE_TURN", source_id=turn.id, provider=route.provider, model=route.model, input_fingerprint=context_fingerprint)
+            raw, model_result = LLMWorldResolver(routed_provider(settings, route), route.model).resolve(context)
         world_payload = WorldResolutionPayload.model_validate(raw)
     except ModelProviderError as exc:
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.WORLD_RESOLVER, source_type="SCENE_PERFORMANCE_TURN", source_id=turn.id, status=ExecutionStatus.BLOCKED if exc.code == MODEL_OUTPUT_INVALID else ExecutionStatus.FAILED, error_code=exc.code, upstream_status=exc.upstream_status)
+        db.commit()
         error_status = {MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502)
         raise HTTPException(status_code=error_status, detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
     except Exception as exc:
@@ -546,6 +598,14 @@ def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Se
     if context_after["fingerprint"] != context_fingerprint:
         raise HTTPException(status_code=409, detail={"code": "WORLD_CONTEXT_STALE"})
     report = WorldResolutionConstraintChecker().validate(db, context_after, world_payload, project_id)
+    if trace:
+        trace.status = ExecutionStatus.SUCCEEDED if report["valid"] and world_payload.outcome != ResolutionOutcome.UNRESOLVED else ExecutionStatus.BLOCKED
+        trace.latency_ms = model_result.latency_ms; trace.request_id = model_result.request_id
+        trace.output_fingerprint = stable_fingerprint(world_payload.model_dump(mode="json"))
+        if trace.status == ExecutionStatus.BLOCKED:
+            trace.error_code = "WORLD_INFORMATION_MISSING" if world_payload.outcome == ResolutionOutcome.UNRESOLVED else None
+            trace.validation_report = {"issues": report.get("issues", [])}
+            trace.retryable, trace.repairable, _ = RecoveryPolicy.resolve(trace.error_code)
     resolution_status = ResolutionStatus.VALID if report["valid"] and world_payload.outcome != ResolutionOutcome.UNRESOLVED else (ResolutionStatus.UNRESOLVED if report["valid"] else ResolutionStatus.REJECTED)
     resolution = db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == turn.id))
     if resolution and resolution.status == ResolutionStatus.VALID:
