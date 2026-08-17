@@ -5,6 +5,7 @@ validated against a freshly rebuilt, permission-filtered context.
 """
 import copy
 import json
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,6 +20,15 @@ from .world_resolution import WorldResolutionConstraintChecker, WorldResolutionP
 from .execution_trace import TraceSanitizer
 
 CandidateType = Literal["CHARACTER_DECISION", "CHARACTER_PERFORMANCE", "WORLD_RESOLUTION"]
+
+@dataclass
+class RecoveryValidationResult:
+    schema_valid: bool
+    constraint_valid: bool
+    context_stale: bool
+    normalized_payload: dict[str, Any] | None
+    validation_report: dict[str, Any]
+    error_code: str | None = None
 
 class RecoveryActionResolver:
     @staticmethod
@@ -35,7 +45,7 @@ class RecoveryActionResolver:
 class CandidateRepairAgent:
     CONTRACTS = {"CHARACTER_DECISION": build_character_decision_contract, "CHARACTER_PERFORMANCE": performance_contract, "WORLD_RESOLUTION": world_resolution_contract}
     def build_messages(self, candidate_type, context, payload, validation_report):
-        return [{"role": "system", "content": "You repair an untrusted structured candidate, not a character, director, or world author. Only fix validation errors. Do not invent facts, knowledge, entities, abilities, Canon, or world rules. Return exactly one JSON object."}, {"role": "user", "content": json.dumps({"sanitized_context": context, "candidate": payload, "validation_report": validation_report, "candidate_type": candidate_type, "output_contract": self.CONTRACTS[candidate_type]()}, ensure_ascii=True, sort_keys=True)}]
+        return [{"role": "system", "content": "You repair an untrusted structured candidate. The candidate may contain wrong knowledge, wrong IDs, leaked secrets, or Canon conflicts. It is not authoritative. Only sanitized_context is the source of world facts. Do not invent facts, knowledge, entities, abilities, Canon, or world rules. Return exactly one JSON object."}, {"role": "user", "content": json.dumps({"sanitized_context": context, "candidate": payload, "validation_report": validation_report, "candidate_type": candidate_type, "output_contract": self.CONTRACTS[candidate_type]()}, ensure_ascii=True, sort_keys=True)}]
     def repair(self, provider, model, candidate_type, context, payload, validation_report):
         result = provider.generate(self.build_messages(candidate_type, context, payload, validation_report), model)
         return self.CONTRACTS[candidate_type], _extract_single_json_object(result.content), result
@@ -108,26 +118,36 @@ class RecoveryCandidateService:
         return context, WorldContextSanitizer().sanitize(context)
 
     def validate(self, db, candidate, payload):
-        context, _ = self.rebuild(db, candidate)
-        if context.get("fingerprint") != candidate.context_fingerprint: candidate.status = RecoveryCandidateStatus.STALE.value; return False, {"code": "RECOVERY_CONTEXT_STALE", "issues": []}
+        try:
+            context, _ = self.rebuild(db, candidate)
+        except Exception:
+            candidate.status = RecoveryCandidateStatus.STALE.value
+            return RecoveryValidationResult(False, False, True, None, {"code": "RECOVERY_CONTEXT_STALE", "issues": []}, "RECOVERY_CONTEXT_STALE")
+        if context.get("fingerprint") != candidate.context_fingerprint:
+            candidate.status = RecoveryCandidateStatus.STALE.value
+            return RecoveryValidationResult(False, False, True, None, {"code": "RECOVERY_CONTEXT_STALE", "issues": []}, "RECOVERY_CONTEXT_STALE")
         try:
             if candidate.candidate_type == RecoveryCandidateType.CHARACTER_DECISION.value:
                 parsed = CharacterDecisionPayload.model_validate(payload)
                 loc = candidate.context_locator; proposal = db.get(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal, loc["proposal_id"])
                 decision = CharacterDecision(project_id=loc["project_id"], scene_proposal_id=proposal.id, character_id=loc["character_id"], context_fingerprint=candidate.context_fingerprint, **parsed.model_dump(mode="json"))
-                report = CharacterDecisionConstraintChecker().validate(db, context, decision); return report.valid, report.as_dict()
+                report = CharacterDecisionConstraintChecker().validate(db, context, decision); normalized = parsed.model_dump(mode="json"); return RecoveryValidationResult(True, report.valid, False, normalized, report.as_dict(), None if report.valid else "CONSTRAINT_FAILED")
             if candidate.candidate_type == RecoveryCandidateType.CHARACTER_PERFORMANCE.value:
                 parsed = CharacterPerformancePayload.model_validate(payload); loc = candidate.context_locator; proposal = db.get(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal, loc["proposal_id"]); performance = db.get(ScenePerformance, loc["performance_id"])
                 decision = CharacterDecision(project_id=loc["project_id"], scene_proposal_id=proposal.id, character_id=loc["actor_character_id"], context_fingerprint=candidate.context_fingerprint, **parsed.decision.model_dump(mode="json"))
-                d = CharacterDecisionConstraintChecker().validate(db, context, decision); a = PerformanceActionConstraintChecker().validate(db, context, proposal, decision, parsed.action, performance.active_participant_ids); return d.valid and a.valid, {"decision": d.as_dict(), "action": a.as_dict()}
-            parsed = WorldResolutionPayload.model_validate(payload); return (report := WorldResolutionConstraintChecker().validate(db, context, parsed, candidate.project_id))["valid"], report
+                d = CharacterDecisionConstraintChecker().validate(db, context, decision); a = PerformanceActionConstraintChecker().validate(db, context, proposal, decision, parsed.action, performance.active_participant_ids); valid = d.valid and a.valid; return RecoveryValidationResult(True, valid, False, parsed.model_dump(mode="json"), {"decision": d.as_dict(), "action": a.as_dict()}, None if valid else "CONSTRAINT_FAILED")
+            parsed = WorldResolutionPayload.model_validate(payload); report = WorldResolutionConstraintChecker().validate(db, context, parsed, candidate.project_id); valid = report["valid"]; return RecoveryValidationResult(True, valid, False, parsed.model_dump(mode="json"), report, None if valid else "CONSTRAINT_FAILED")
         except Exception as exc:
-            return False, {"code": "MODEL_OUTPUT_INVALID", "issues": [{"path": "$", "message": "Candidate does not match its contract."}]}
+            return RecoveryValidationResult(False, False, False, None, {"code": "MODEL_OUTPUT_INVALID", "issues": [{"path": "$", "message": "Candidate does not match its contract."}]}, "MODEL_OUTPUT_INVALID")
 
     def edit(self, db, candidate, base_version, changes):
         if candidate.current_version_number != base_version: raise ValueError("RECOVERY_VERSION_STALE")
         if candidate.initial_error_code == "WORLD_INFORMATION_MISSING": raise ValueError("WORLD_FACT_REQUIRED")
-        context, _ = self.rebuild(db, candidate)
+        try:
+            context, _ = self.rebuild(db, candidate)
+        except Exception as exc:
+            candidate.status = RecoveryCandidateStatus.STALE.value
+            raise ValueError("RECOVERY_CONTEXT_STALE") from exc
         if context.get("fingerprint") != candidate.context_fingerprint:
             candidate.status = RecoveryCandidateStatus.STALE.value
             raise ValueError("RECOVERY_CONTEXT_STALE")
@@ -138,8 +158,13 @@ class RecoveryCandidateService:
         self._guard_payload(current)
         try:
             normalized = self._payload(candidate.candidate_type, current); schema_valid = True
-            valid, report = self.validate(db, candidate, normalized)
-        except Exception:
+            result = self.validate(db, candidate, normalized)
+            if result.context_stale:
+                raise ValueError("RECOVERY_CONTEXT_STALE")
+            valid, report = result.constraint_valid, result.validation_report
+        except ValueError as exc:
+            if str(exc) == "RECOVERY_CONTEXT_STALE":
+                raise
             normalized = current; schema_valid = False; valid = False
             report = {"code": "MODEL_OUTPUT_INVALID", "issues": [{"path": "$", "message": "Manual candidate does not match its contract."}]}
         number = candidate.current_version_number + 1

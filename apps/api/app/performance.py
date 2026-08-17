@@ -197,3 +197,26 @@ def is_quiescent_cycle(performance: Any, turns: list[Any], session: Session) -> 
         if not decision or getattr(decision.decision_type, "value", decision.decision_type) not in {"WAIT", "OBSERVE", "REFUSE"}: return False
         if (turn.observable_action or "").strip() or (turn.spoken_content or "").strip() or turn.requires_world_resolution: return False
     return True
+
+
+class PerformancePostTurnStateResolver:
+    """Apply the shared post-turn state machine for normal and recovery turns."""
+    def apply(self, performance: Any, turns: list[Any], turn: Any, decision: Any, action: Any, session: Session) -> None:
+        performance.status = PerformanceStatus.RUNNING
+        performance.stop_reason = None
+        if action.requires_world_resolution:
+            performance.status = PerformanceStatus.AWAITING_WORLD
+            return
+        if getattr(decision.decision_type, "value", decision.decision_type) == "WITHDRAW":
+            performance.active_participant_ids = [item for item in (performance.active_participant_ids or []) if item != turn.actor_character_id]
+            if len(performance.active_participant_ids) < 2:
+                performance.status = PerformanceStatus.PAUSED
+                performance.stop_reason = "INSUFFICIENT_ACTIVE_PARTICIPANTS"
+                return
+        if performance.status == PerformanceStatus.RUNNING and is_quiescent_cycle(performance, turns, session):
+            performance.status = PerformanceStatus.PAUSED
+            performance.stop_reason = "QUIESCENT"
+            return
+        if performance.status == PerformanceStatus.RUNNING and performance.turn_count >= performance.max_turns:
+            performance.status = PerformanceStatus.PAUSED
+            performance.stop_reason = "TURN_LIMIT"

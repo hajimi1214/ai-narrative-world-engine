@@ -7,8 +7,8 @@ from sqlalchemy.pool import StaticPool
 from app.db import Base
 from app.execution_trace import ExecutionTraceRecorder
 from app.models import ExecutionStage, RecoveryCandidate, RecoveryCandidateStatus, CharacterDecision
-from app.recovery import RecoveryCandidateService
-from app.recovery import RecoveryActionResolver
+from app.recovery import RecoveryCandidateService, RecoveryActionResolver, RecoveryValidationResult, CandidateRepairAgent
+from app.execution_trace import RecoveryPolicy
 from app.character_mind import CharacterContextBuilder
 from test_llm_character_actor import valid_payload
 from test_scene_performance import approved_setup
@@ -56,9 +56,30 @@ def test_manual_valid_edit_becomes_validated(session, monkeypatch):
     version = service.edit(session, candidate, 1, [{"operation": "SET", "path": "/decision_summary", "value": "verified"}])
     assert version.schema_valid is True and candidate.status == "VALIDATED"
 
-@pytest.mark.parametrize("code", ["KNOWLEDGE_LEAK", "TARGET_MISMATCH", "PREMATURE_REVEAL", "INVALID_CANON_REFERENCE", "CROSS_PROJECT_REFERENCE"])
+@pytest.mark.parametrize("code", ["KNOWLEDGE_LEAK", "TARGET_MISMATCH", "INVALID_TARGET", "INVALID_WORLD_REQUEST", "PREMATURE_REVEAL", "INVALID_CANON_REFERENCE", "INVALID_ENTITY_REFERENCE", "INVALID_FACT_SUBJECT", "INVALID_RESOLUTION_STATE", "CROSS_PROJECT_REFERENCE", "CANON_CONTRADICTION", "OBSERVATION_LEAK"])
 def test_constraint_errors_are_repairable(code):
-    assert RecoveryActionResolver.resolve(code, None) == ["RETRY", "ABORT"]
+    retryable, repairable = RecoveryPolicy.resolve(code)[:2]
+    assert retryable is False and repairable is True
+    class Candidate:
+        status = "OPEN"; initial_error_code = code
+    assert RecoveryActionResolver.resolve(code, Candidate(), repair_attempts=0, max_repair_attempts=1) == ["AI_REPAIR", "MANUAL_EDIT", "ABORT"]
+
+@pytest.mark.parametrize("candidate_type, expected", [("CHARACTER_DECISION", "required_fields"), ("CHARACTER_PERFORMANCE", "action"), ("WORLD_RESOLUTION", "WorldFact")])
+def test_repair_agent_uses_real_output_contract(candidate_type, expected):
+    messages = CandidateRepairAgent().build_messages(candidate_type, {}, {}, {})
+    body = json.loads(messages[1]["content"])
+    assert isinstance(body["output_contract"], dict)
+    assert expected in body["output_contract"]
+    assert "untrusted" in messages[0]["content"] and "sanitized_context" in messages[1]["content"]
+
+def test_recovery_validation_result_is_explicit():
+    result = RecoveryValidationResult(True, False, False, {"x": 1}, {"issues": []}, "CONSTRAINT_FAILED")
+    assert result.schema_valid and not result.constraint_valid and not result.context_stale
+
+def test_repair_trace_parent_chain_is_explicit(session):
+    recorder = ExecutionTraceRecorder(); first = recorder.start(session, project_id="p", stage=ExecutionStage.REPAIR, source_type="RECOVERY_CANDIDATE", source_id="c", attempt_number=1); session.flush()
+    second = recorder.start(session, project_id="p", stage=ExecutionStage.REPAIR, source_type="RECOVERY_CANDIDATE", source_id="c", attempt_number=2, parent_trace_id=first.id)
+    assert second.parent_trace_id == first.id
 
 def test_candidate_actions_world_information_missing_are_read_only():
     class Candidate:
@@ -87,3 +108,84 @@ def test_candidate_payload_rejects_raw_and_oversized_data(session, monkeypatch):
     value = json.loads(valid_payload()); value["decision_summary"] = "x" * 70000
     with pytest.raises(ValueError, match="CANDIDATE_TOO_LARGE"):
         RecoveryCandidateService().create(session, project_id=project.id, trace=trace, candidate_type="CHARACTER_DECISION", payload=value, context_fingerprint="x", locator={"project_id": project.id, "proposal_id": proposal.id, "character_id": actor.id}, error_code="KNOWLEDGE_LEAK", validation_report={"raw_output": "must not persist"}, stage="CHARACTER_ACTOR", source_type="CHARACTER", source_id=actor.id)
+
+def test_world_information_missing_actions_have_no_repair():
+    class Candidate:
+        status = "OPEN"; initial_error_code = "WORLD_INFORMATION_MISSING"
+    assert RecoveryActionResolver.resolve("WORLD_INFORMATION_MISSING", Candidate()) == ["EDIT_WORLD", "ABORT"]
+
+def test_adopted_candidate_has_no_actions():
+    class Candidate:
+        status = "ADOPTED"; initial_error_code = "TARGET_MISMATCH"
+    assert RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate()) == []
+
+def test_aborted_candidate_has_no_actions():
+    class Candidate:
+        status = "ABORTED"; initial_error_code = "TARGET_MISMATCH"
+    assert RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate()) == []
+
+def test_repair_attempt_limit_removes_ai_repair():
+    class Candidate:
+        status = "OPEN"; initial_error_code = "TARGET_MISMATCH"
+    assert RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate(), repair_attempts=1, max_repair_attempts=1) == ["MANUAL_EDIT", "ABORT"]
+
+def test_stale_candidate_requires_rebuild_context():
+    class Candidate:
+        status = "STALE"; initial_error_code = "TARGET_MISMATCH"
+    assert RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate()) == ["REBUILD_CONTEXT", "ABORT"]
+
+def test_trace_sanitizer_removes_candidate_secrets():
+    from app.execution_trace import TraceSanitizer
+    clean = TraceSanitizer.clean({"api-key": "x", "raw_output": "x", "safe": 1})
+    assert clean == {"safe": 1}
+
+def test_model_output_invalid_without_candidate_is_retryable_action():
+    assert RecoveryActionResolver.resolve("MODEL_OUTPUT_INVALID", None) == ["RETRY", "ABORT"]
+
+def test_validated_candidate_can_adopt():
+    class Candidate:
+        status = "VALIDATED"; initial_error_code = "TARGET_MISMATCH"
+    assert "ADOPT" in RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate())
+
+def test_open_candidate_can_manual_edit():
+    class Candidate:
+        status = "OPEN"; initial_error_code = "TARGET_MISMATCH"
+    assert "MANUAL_EDIT" in RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate())
+
+def test_open_candidate_can_abort():
+    class Candidate:
+        status = "OPEN"; initial_error_code = "TARGET_MISMATCH"
+    assert "ABORT" in RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate())
+
+def test_context_stale_flag_overrides_candidate_actions():
+    class Candidate:
+        status = "VALIDATED"; initial_error_code = "TARGET_MISMATCH"
+    assert RecoveryActionResolver.resolve("TARGET_MISMATCH", Candidate(), context_stale=True) == ["REBUILD_CONTEXT", "ABORT"]
+
+def test_recovery_validation_schema_invalid_shape():
+    result = RecoveryValidationResult(False, False, False, None, {"code": "MODEL_OUTPUT_INVALID"}, "MODEL_OUTPUT_INVALID")
+    assert result.normalized_payload is None and result.error_code == "MODEL_OUTPUT_INVALID"
+
+def test_recovery_validation_constraint_invalid_shape():
+    result = RecoveryValidationResult(True, False, False, {"ok": True}, {"issues": [{"code": "TARGET_MISMATCH"}]}, "CONSTRAINT_FAILED")
+    assert result.normalized_payload == {"ok": True} and not result.constraint_valid
+
+def test_recovery_validation_context_stale_shape():
+    result = RecoveryValidationResult(False, False, True, None, {"code": "RECOVERY_CONTEXT_STALE"}, "RECOVERY_CONTEXT_STALE")
+    assert result.context_stale and result.error_code == "RECOVERY_CONTEXT_STALE"
+
+def test_repair_agent_contract_is_not_named_placeholder():
+    body = json.loads(CandidateRepairAgent().build_messages("CHARACTER_DECISION", {}, {}, {})[1]["content"])
+    assert body["output_contract"] != "CharacterDecisionPayload"
+
+def test_repair_agent_candidate_is_not_authority():
+    system = CandidateRepairAgent().build_messages("WORLD_RESOLUTION", {}, {}, {})[0]["content"]
+    assert "not authoritative" in system and "sanitized_context" in system
+
+def test_recovery_policy_world_missing_forbids_repair():
+    retryable, repairable, actions = RecoveryPolicy.resolve("WORLD_INFORMATION_MISSING")
+    assert not retryable and not repairable and actions == ["EDIT_WORLD", "ABORT"]
+
+def test_recovery_policy_context_stale_allows_retry():
+    retryable, repairable, actions = RecoveryPolicy.resolve("RECOVERY_CONTEXT_STALE")
+    assert retryable is False and repairable is False and actions == ["ABORT"]
