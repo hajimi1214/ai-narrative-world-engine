@@ -74,3 +74,11 @@ def test_revision_state_fingerprint_ignores_revision_and_prose_derivatives(sessi
     first=RevisionStateFingerprintBuilder().build(session,project.id)
     revision=WorldRevision(project_id=project.id,title="x",change_set=[],normalized_changes=[],impact_report={}); session.add(revision); session.commit()
     assert RevisionStateFingerprintBuilder().build(session,project.id)==first
+
+def test_memory_source_scene_propagates_from_final_affected_scenes(session, monkeypatch):
+    project, _, actor, _, _, _=approved_setup(session,monkeypatch); client=client_for(session,monkeypatch)
+    from app.models import CharacterMemory
+    scene=Scene(project_id=project.id,sequence=2,participants=[actor.id],facts=[],result={}); session.add(scene); session.flush(); memory=CharacterMemory(character_id=actor.id,content="memory",source_scene=scene.id); session.add(memory); session.commit()
+    revision=make_revision(client,project.id,{"target_type":"CHARACTER","target_id":actor.id,"operation":"SET","path":"/name","value":"changed"}).json()
+    report=client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").json()["impact_report"]
+    assert any(item["category"]=="MEMORY_DEPENDENCY" and item["resource_id"]==memory.id for item in report["impacts"])
