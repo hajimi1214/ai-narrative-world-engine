@@ -7,7 +7,7 @@ from app.ai.errors import MODEL_AUTH_FAILED, MODEL_OUTPUT_INVALID, MODEL_PROVIDE
 from app.ai.factory import get_model_provider
 from app.ai.fake import FakeModelProvider
 from app.character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker
-from app.llm_actor import LLMCharacterActor
+from app.llm_actor import LLMCharacterActor, build_character_decision_contract
 from app.settings import Settings
 from app.models import CharacterDecision, CharacterKnowledge, CharacterMemory, KnowledgeStatus
 from app.db import Base
@@ -29,7 +29,7 @@ def valid_payload(**changes):
         "motivation": "Verifying the register serves the current goal.", "goal_refs": ["verify register"],
         "knowledge_used": [], "memory_refs": [], "ability_refs": [], "inventory_refs": ["father-notes"],
         "relationship_factors": {}, "perceived_risk": "The keeper may delay access.", "accepted_cost": "Time.",
-        "uncertainties": ["The records may be incomplete."], "refused_options": [], "decision_summary": "Verify records before escalating.",
+        "expected_personal_result": None, "uncertainties": ["The records may be incomplete."], "refused_options": [], "boundary_override_reason": None, "decision_summary": "Verify records before escalating.",
     }
     payload.update(changes)
     return json.dumps(payload)
@@ -66,20 +66,55 @@ def test_llm_actor_parses_json_fence_and_repairs_once():
     assert payload["chosen_action"] and provider.calls == 2
 
 
+def test_llm_actor_extracts_a_single_object_from_plain_text_prefix():
+    payload, _ = LLMCharacterActor(FakeModelProvider("Here is the JSON:\n" + valid_payload()), "test").decide({})
+    assert payload["decision_type"] == "INVESTIGATE"
+
+
 def test_repair_messages_include_actor_view_invalid_output_and_instruction():
     actor_view = {"character": {"name": "Ning Mo"}, "inventory": [{"id": "father-notes"}]}
     provider = FakeModelProvider(["invalid model output", valid_payload()])
     LLMCharacterActor(provider, "test").decide(actor_view)
     repair = provider.messages[1]
-    assert json.dumps(actor_view, ensure_ascii=True, sort_keys=True) == repair[1]["content"]
+    assert json.loads(repair[1]["content"])["actor_view"] == actor_view
     assert repair[2] == {"role": "assistant", "content": "invalid model output"}
-    assert "Return exactly one valid CharacterDecision JSON object" in repair[3]["content"]
+    repair_payload = json.loads(repair[3]["content"])
+    assert repair_payload["validation_errors"][0]["type"] == "invalid_json"
+    assert "Return exactly one valid CharacterDecision JSON object" in repair_payload["instruction"]
+
+
+def test_initial_request_contains_explicit_output_contract():
+    provider = FakeModelProvider(valid_payload())
+    LLMCharacterActor(provider, "test").decide({"character": {"name": "Ning Mo"}})
+    request = json.loads(provider.messages[0][1]["content"])
+    assert request["actor_view"]["character"]["name"] == "Ning Mo"
+    assert request["output_contract"]["fields"]["knowledge_used"]["item"]["proposition"] == "string"
+    assert request["output_contract"]["fields"]["decision_type"]["allowed_values"] == ["ACT", "WAIT", "ASK", "INVESTIGATE", "CONFRONT", "WITHDRAW", "REFUSE", "HELP", "HIDE", "NEGOTIATE", "OBSERVE", "CUSTOM"]
+
+
+@pytest.mark.parametrize("invalid,expected_path,expected_type", [
+    (lambda value: {key: item for key, item in value.items() if key != "decision_summary"}, "decision_summary", "missing"),
+    (lambda value: value | {"decision_type": "REVEAL"}, "decision_type", "enum"),
+    (lambda value: value | {"knowledge_used": ["not-an-object"]}, "knowledge_used.0", "model_type"),
+])
+def test_repair_receives_safe_schema_diagnostics(invalid, expected_path, expected_type):
+    malformed = invalid(json.loads(valid_payload()))
+    provider = FakeModelProvider([json.dumps(malformed), valid_payload()])
+    LLMCharacterActor(provider, "test").decide({})
+    diagnostic = json.loads(provider.messages[1][3]["content"])["validation_errors"][0]
+    assert diagnostic["path"] == expected_path and expected_type in diagnostic["type"]
 
 
 def test_extra_model_fields_require_repair():
     provider = FakeModelProvider([valid_payload(status="VALID"), valid_payload()])
     payload, _ = LLMCharacterActor(provider, "test").decide({})
     assert payload["decision_type"] == "INVESTIGATE" and provider.calls == 2
+
+
+def test_contract_comes_from_payload_schema_and_exposes_all_fields():
+    contract = build_character_decision_contract()
+    assert contract["all_fields_required"] and "knowledge_used" in contract["required_fields"]
+    assert contract["fields"]["decision_type"]["allowed_values"] == ["ACT", "WAIT", "ASK", "INVESTIGATE", "CONFRONT", "WITHDRAW", "REFUSE", "HELP", "HIDE", "NEGOTIATE", "OBSERVE", "CUSTOM"]
 
 
 @pytest.mark.parametrize("settings,code", [
@@ -100,7 +135,7 @@ def test_llm_actor_rejects_two_invalid_json_outputs():
 
 
 @pytest.mark.parametrize("payload,code", [
-    (valid_payload(knowledge_used=["invented fact"]), "KNOWLEDGE_LEAK"),
+    (valid_payload(knowledge_used=[{"proposition": "invented fact", "accepted_statuses": ["KNOWN"]}]), "KNOWLEDGE_LEAK"),
     (valid_payload(memory_refs=["foreign-memory"]), "FOREIGN_MEMORY"),
     (valid_payload(inventory_refs=["missing-item"]), "INVENTORY_MISSING"),
     (valid_payload(ability_refs=["unknown"]), "ABILITY_UNKNOWN"),
