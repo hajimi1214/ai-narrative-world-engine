@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from .execution_trace import stable_fingerprint
@@ -45,6 +45,70 @@ def explicit_memory_id(reference: Any) -> str | None:
     if isinstance(reference, str) and reference.strip(): return reference.strip()
     value = reference.get("memory_id") if isinstance(reference, dict) else None
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def resolve_explicit_knowledge_reference(
+    db: Session,
+    project_id: str,
+    decision: CharacterDecision,
+    reference: Any,
+) -> CharacterKnowledge | None:
+    """Resolve only an explicit, ownership-bound Knowledge reference."""
+    knowledge_id = explicit_knowledge_id(reference)
+    if not knowledge_id or decision.project_id != project_id:
+        return None
+    knowledge = db.get(CharacterKnowledge, knowledge_id)
+    character = db.get(Character, knowledge.character_id) if knowledge else None
+    if not knowledge or not character or knowledge.character_id != decision.character_id:
+        return None
+    if character.project_id != project_id:
+        return None
+    if "proposition" in reference and reference["proposition"] != knowledge.proposition:
+        return None
+    if "accepted_statuses" in reference:
+        accepted = reference["accepted_statuses"]
+        if not isinstance(accepted, list) or _value(knowledge.status) not in {_value(value) for value in accepted}:
+            return None
+    return knowledge
+
+
+def resolve_explicit_memory_reference(
+    db: Session,
+    project_id: str,
+    decision: CharacterDecision,
+    reference: Any,
+) -> CharacterMemory | None:
+    """Resolve only a direct Memory ID, with optional exact content binding."""
+    memory_id = explicit_memory_id(reference)
+    if not memory_id or decision.project_id != project_id:
+        return None
+    memory = db.get(CharacterMemory, memory_id)
+    character = db.get(Character, memory.character_id) if memory else None
+    if not memory or not character or memory.character_id != decision.character_id:
+        return None
+    if character.project_id != project_id:
+        return None
+    if isinstance(reference, dict) and "content" in reference and reference["content"] != memory.content:
+        return None
+    return memory
+
+
+def assert_active_timeline_endpoints(db: Session, project_id: str) -> None:
+    """Ensure the active causal graph cannot enter historical timeline rows."""
+    for link in db.scalars(select(CausalLink).where(
+        CausalLink.project_id == project_id,
+        CausalLink.active.is_(True),
+    ).order_by(CausalLink.source_key)).all():
+        endpoints = (
+            (link.cause_type, link.cause_id),
+            (link.effect_type, link.effect_id),
+        )
+        for resource_type, resource_id in endpoints:
+            if _value(resource_type) != CausalResourceType.TIMELINE_EVENT.value:
+                continue
+            event = db.get(TimelineEvent, resource_id)
+            if not event or event.project_id != project_id or not event.active:
+                raise ValueError("CAUSAL_LEDGER_INACTIVE_TIMELINE_ENDPOINT")
 
 
 def read_overlay_path(document: Any, path: str) -> tuple[bool, Any]:
@@ -211,8 +275,12 @@ class CausalLedgerService:
             # execution lineage.  They must not be traversable from current state.
             db.execute(update(CausalLink).where(
                 CausalLink.project_id == project_id,
-                CausalLink.cause_type == CausalResourceType.TIMELINE_EVENT,
-                CausalLink.cause_id.in_(old_state_event_ids),
+                or_(
+                    (CausalLink.cause_type == CausalResourceType.TIMELINE_EVENT) &
+                    CausalLink.cause_id.in_(old_state_event_ids),
+                    (CausalLink.effect_type == CausalResourceType.TIMELINE_EVENT) &
+                    CausalLink.effect_id.in_(old_state_event_ids),
+                ),
             ).values(active=False))
         state_events = self._index_state_changes(db, scene, checkpoint, transitions, pre.payload, post.payload)
         for event in state_events:
@@ -311,12 +379,12 @@ class CausalLedgerService:
             decision = db.get(CharacterDecision, turn.character_decision_id)
             if decision and decision.project_id == scene.project_id:
                 for reference in decision.knowledge_used or []:
-                    knowledge_id = explicit_knowledge_id(reference); knowledge = db.get(CharacterKnowledge, knowledge_id) if knowledge_id else None
-                    if knowledge and knowledge.character_id == decision.character_id:
+                    knowledge = resolve_explicit_knowledge_reference(db, scene.project_id, decision, reference)
+                    if knowledge:
                         self._link(db, scene.project_id, CausalResourceType.CHARACTER_KNOWLEDGE, knowledge.id, CausalResourceType.CHARACTER_DECISION, decision.id, CausalEdgeKind.CAUSAL, CausalRelationType.KNOWLEDGE_INFORMED_DECISION, scene, {"explicit_reference": True})
                 for reference in decision.memory_refs or []:
-                    memory_id = explicit_memory_id(reference); memory = db.get(CharacterMemory, memory_id) if memory_id else None
-                    if memory and memory.character_id == decision.character_id:
+                    memory = resolve_explicit_memory_reference(db, scene.project_id, decision, reference)
+                    if memory:
                         self._link(db, scene.project_id, CausalResourceType.CHARACTER_MEMORY, memory.id, CausalResourceType.CHARACTER_DECISION, decision.id, CausalEdgeKind.CAUSAL, CausalRelationType.MEMORY_INFORMED_DECISION, scene, {"explicit_reference": True})
                 self._link(db, scene.project_id, CausalResourceType.CHARACTER_DECISION, decision.id, CausalResourceType.SCENE_PERFORMANCE_TURN, turn.id, CausalEdgeKind.CAUSAL, CausalRelationType.DECISION_PRODUCED_TURN, scene, {"performance_id": binding.performance_id})
             resolution = db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == turn.id))
@@ -436,6 +504,7 @@ class CausalLedgerBackfillService:
 
 class CurrentCausalLedgerAudit:
     def audit(self, db: Session, project_id: str) -> None:
+        assert_active_timeline_endpoints(db, project_id)
         scenes = db.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == "OCCURRED", Scene.history_status == "ACTIVE").order_by(Scene.sequence, Scene.id)).all()
         for scene in scenes:
             events = db.scalars(select(TimelineEvent).where(TimelineEvent.project_id == project_id, TimelineEvent.scene_id == scene.id, TimelineEvent.event_type == TimelineEventType.SCENE_OCCURRED, TimelineEvent.active.is_(True))).all()
@@ -513,6 +582,10 @@ class CausalProvenanceQuery:
         return self._walk(db, project_id, resource_type, resource_id, max_depth, incoming=False)
 
     def _walk(self, db: Session, project_id: str, resource_type: CausalResourceType, resource_id: str, max_depth: int, incoming: bool) -> list[dict[str, Any]]:
+        if _value(resource_type) == CausalResourceType.TIMELINE_EVENT.value:
+            event = db.get(TimelineEvent, resource_id)
+            if not event or event.project_id != project_id or not event.active:
+                return []
         result, queue, visited = [], [(resource_type, resource_id, 0)], {(resource_type.value, resource_id)}
         while queue:
             kind, identifier, depth = queue.pop(0)
@@ -521,6 +594,10 @@ class CausalProvenanceQuery:
             query = query.where(CausalLink.effect_type == kind, CausalLink.effect_id == identifier) if incoming else query.where(CausalLink.cause_type == kind, CausalLink.cause_id == identifier)
             for link in db.scalars(query.order_by(CausalLink.sequence, CausalLink.source_key)).all():
                 next_kind, next_id = (link.cause_type, link.cause_id) if incoming else (link.effect_type, link.effect_id)
+                if _value(next_kind) == CausalResourceType.TIMELINE_EVENT.value:
+                    event = db.get(TimelineEvent, next_id)
+                    if not event or event.project_id != project_id or not event.active:
+                        continue
                 result.append({"id": link.id, "cause_type": _value(link.cause_type), "cause_id": link.cause_id, "effect_type": _value(link.effect_type), "effect_id": link.effect_id, "edge_kind": _value(link.edge_kind), "relation_type": _value(link.relation_type), "scene_id": link.scene_id, "sequence": link.sequence, "evidence": link.evidence})
                 marker = (_value(next_kind), next_id)
                 if marker not in visited:

@@ -3,14 +3,16 @@ import copy
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Enum, create_engine, select
+from sqlalchemy import Enum, create_engine, or_, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import app.api as api
 from app.causal_ledger import (
-    CausalLedgerBackfillService, CausalLedgerService, CurrentCausalLedgerAudit,
-    SceneStateTransitionExtractor, explicit_knowledge_id, explicit_memory_id, read_overlay_path,
+    CausalLedgerBackfillService, CausalLedgerService, CausalProvenanceQuery,
+    CurrentCausalLedgerAudit, SceneStateTransitionExtractor, assert_active_timeline_endpoints,
+    explicit_knowledge_id, explicit_memory_id, read_overlay_path,
+    resolve_explicit_knowledge_reference, resolve_explicit_memory_reference,
 )
 from app.db import Base
 from app.main import app
@@ -18,7 +20,7 @@ from app.models import (
     CausalEdgeKind, CausalLink, CausalRelationType, CausalResourceType, CharacterDecision,
     CharacterKnowledge, CharacterMemory,
     RetconApplication, RetconReplaySession, Scene, SceneCommit, SceneExecutionBinding,
-    SceneStateCheckpoint, StateDeltaBatch, TimelineEvent, TimelineEventType, WorldEntity,
+    SceneStateCheckpoint, StateDeltaBatch, StateDeltaItem, TimelineEvent, TimelineEventType, WorldEntity,
     WorldSnapshot,
 )
 from test_scene_commit import add_resolution_turn, effect, prepared_commit
@@ -199,6 +201,64 @@ def test_explicit_knowledge_informs_decision_only(session, monkeypatch):
     assert link and link.relation_type == CausalRelationType.KNOWLEDGE_INFORMED_DECISION
 
 
+def test_knowledge_reference_proposition_mismatch_is_rejected(session, monkeypatch):
+    project, _location, actor, _other, _proposal, performance, turn, _resolution, _batch, client = _commit(session, monkeypatch)
+    committed = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
+    assert committed.status_code == 200
+    knowledge = CharacterKnowledge(character_id=actor.id, proposition="door open", status="KNOWN", source=None)
+    other_knowledge = CharacterKnowledge(character_id=actor.id, proposition="door locked", status="KNOWN", source=None)
+    session.add_all([knowledge, other_knowledge]); session.flush()
+    decision = session.get(CharacterDecision, turn.character_decision_id)
+    decision.knowledge_used = [{"knowledge_id": other_knowledge.id, "proposition": knowledge.proposition, "accepted_statuses": ["KNOWN"]}]
+    session.commit()
+    CausalLedgerService().index_scene(session, project.id, committed.json()["scene"]["id"])
+    assert not session.scalars(select(CausalLink).where(CausalLink.effect_id == decision.id, CausalLink.relation_type == CausalRelationType.KNOWLEDGE_INFORMED_DECISION)).all()
+
+
+def test_knowledge_reference_status_and_ownership_are_strict(session, monkeypatch):
+    project, _location, actor, other, _proposal, performance, turn, _resolution, _batch, client = _commit(session, monkeypatch)
+    committed = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
+    assert committed.status_code == 200
+    suspected = CharacterKnowledge(character_id=actor.id, proposition="door open", status="SUSPECTED", source=None)
+    foreign = CharacterKnowledge(character_id=other.id, proposition="door open", status="KNOWN", source=None)
+    session.add_all([suspected, foreign]); session.flush()
+    decision = session.get(CharacterDecision, turn.character_decision_id)
+    decision.knowledge_used = [
+        {"knowledge_id": suspected.id, "proposition": suspected.proposition, "accepted_statuses": ["KNOWN"]},
+        {"knowledge_id": foreign.id, "proposition": foreign.proposition, "accepted_statuses": ["KNOWN"]},
+    ]
+    session.commit()
+    CausalLedgerService().index_scene(session, project.id, committed.json()["scene"]["id"])
+    assert not session.scalars(select(CausalLink).where(CausalLink.effect_id == decision.id, CausalLink.relation_type == CausalRelationType.KNOWLEDGE_INFORMED_DECISION)).all()
+
+
+def test_memory_reference_content_mismatch_is_rejected(session, monkeypatch):
+    project, _location, actor, _other, _proposal, performance, turn, _resolution, _batch, client = _commit(session, monkeypatch)
+    committed = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
+    assert committed.status_code == 200
+    memory = CharacterMemory(character_id=actor.id, content="door opened", source_scene=None)
+    other_memory = CharacterMemory(character_id=actor.id, content="door locked", source_scene=None)
+    session.add_all([memory, other_memory]); session.flush()
+    decision = session.get(CharacterDecision, turn.character_decision_id)
+    decision.memory_refs = [{"memory_id": other_memory.id, "content": memory.content}]
+    session.commit()
+    CausalLedgerService().index_scene(session, project.id, committed.json()["scene"]["id"])
+    assert not session.scalars(select(CausalLink).where(CausalLink.effect_id == decision.id, CausalLink.relation_type == CausalRelationType.MEMORY_INFORMED_DECISION)).all()
+
+
+def test_explicit_reference_resolvers_are_project_and_contract_bound(session, monkeypatch):
+    project, _location, actor, _other, _proposal, performance, turn, _resolution, _batch, client = _commit(session, monkeypatch)
+    committed = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
+    assert committed.status_code == 200
+    knowledge = CharacterKnowledge(character_id=actor.id, proposition="door open", status="KNOWN", source=None)
+    memory = CharacterMemory(character_id=actor.id, content="door opened", source_scene=None)
+    session.add_all([knowledge, memory]); session.flush()
+    decision = session.get(CharacterDecision, turn.character_decision_id)
+    assert resolve_explicit_knowledge_reference(session, project.id, decision, {"knowledge_id": knowledge.id, "proposition": knowledge.proposition, "accepted_statuses": ["KNOWN"]}) is knowledge
+    assert resolve_explicit_memory_reference(session, project.id, decision, {"memory_id": memory.id, "content": memory.content}) is memory
+    assert resolve_explicit_knowledge_reference(session, project.id, decision, {"proposition": knowledge.proposition}) is None
+
+
 def test_proposition_only_knowledge_reference_does_not_create_edge(session, monkeypatch):
     project, _location, actor, _other, _proposal, performance, turn, _resolution, _batch, client = _commit(session, monkeypatch)
     committed = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
@@ -233,7 +293,7 @@ def test_explicit_memory_reference_only_links_named_memory(session, monkeypatch)
     unreferenced = CharacterMemory(character_id=actor.id, content="Another action", source_scene=None)
     session.add_all([memory, unreferenced]); session.flush()
     decision = session.get(CharacterDecision, turn.character_decision_id)
-    decision.memory_refs = [{"memory_id": memory.id}]
+    decision.memory_refs = [memory.id]
     session.commit()
     CausalLedgerService().index_scene(session, project.id, committed.json()["scene"]["id"])
     linked = session.scalars(select(CausalLink).where(CausalLink.effect_id == decision.id, CausalLink.relation_type == CausalRelationType.MEMORY_INFORMED_DECISION)).all()
@@ -294,6 +354,37 @@ def test_current_ledger_audit_passes_after_normal_commit(session, monkeypatch):
     project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = _commit(session, monkeypatch)
     assert client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").status_code == 200
     CurrentCausalLedgerAudit().audit(session, project.id)
+
+
+def test_current_ledger_audit_rejects_active_link_to_inactive_timeline_event(session, monkeypatch):
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = _commit(session, monkeypatch)
+    assert client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").status_code == 200
+    event = session.scalar(select(TimelineEvent).where(
+        TimelineEvent.project_id == project.id,
+        TimelineEvent.event_type == TimelineEventType.STATE_CHANGE,
+    ))
+    event.active = False
+    session.flush()
+    with pytest.raises(ValueError, match="CAUSAL_LEDGER_INACTIVE_TIMELINE_ENDPOINT"):
+        CurrentCausalLedgerAudit().audit(session, project.id)
+    with pytest.raises(ValueError, match="CAUSAL_LEDGER_INACTIVE_TIMELINE_ENDPOINT"):
+        assert_active_timeline_endpoints(session, project.id)
+
+
+def test_walker_skips_corrupt_inactive_timeline_endpoint(session, monkeypatch):
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = _commit(session, monkeypatch)
+    assert client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").status_code == 200
+    event = session.scalar(select(TimelineEvent).where(
+        TimelineEvent.project_id == project.id,
+        TimelineEvent.event_type == TimelineEventType.STATE_CHANGE,
+    ))
+    item_id = event.structured_payload["state_delta_item_id"]
+    event.active = False
+    session.flush()
+    links = CausalProvenanceQuery().resource_links(
+        session, project.id, CausalResourceType.STATE_DELTA_ITEM.value, item_id,
+    )
+    assert all(entry["effect_id"] != event.id for entry in links["outgoing"])
 
 
 def test_ledger_failure_rolls_back_normal_materialization(session, monkeypatch):
@@ -398,6 +489,14 @@ def test_preserved_scene_refreshes_checkpoint_derived_ledger_rows(session, monke
     )).all()
     assert old_scene_event and old_state_events
     old_scene_fingerprint = old_scene_event.event_fingerprint
+    old_event = old_state_events[0]
+    old_incoming = CausalLedgerService()._link(
+        session, fixture.project.id, CausalResourceType.WORLD_RESOLUTION,
+        fixture.preserved_ids[2], CausalResourceType.TIMELINE_EVENT, old_event.id,
+        CausalEdgeKind.PROVENANCE, CausalRelationType.RESOLUTION_PRODUCED_STATE_CHANGE,
+        scene3, {"fixture": "incoming-old-event"},
+    )
+    assert old_incoming.active
 
     created = fixture.client.post(
         f"/projects/{fixture.project.id}/retcon/applications/{fixture.application_id}/replay-sessions"
@@ -423,6 +522,20 @@ def test_preserved_scene_refreshes_checkpoint_derived_ledger_rows(session, monke
     assert current_scene_event.structured_payload["checkpoint_id"] == current_checkpoint.id
     assert current_scene_event.event_fingerprint != old_scene_fingerprint
     assert all(session.get(TimelineEvent, event.id).active is False for event in old_state_events)
+    touching_old = session.scalars(select(CausalLink).where(
+        CausalLink.project_id == fixture.project.id,
+        or_(CausalLink.cause_id.in_([event.id for event in old_state_events]), CausalLink.effect_id.in_([event.id for event in old_state_events])),
+    )).all()
+    assert touching_old and all(link.active is False for link in touching_old)
+    durable = session.scalar(select(CausalLink).where(
+        CausalLink.project_id == fixture.project.id,
+        CausalLink.cause_id == fixture.preserved_ids[0],
+        CausalLink.relation_type == CausalRelationType.DECISION_PRODUCED_TURN,
+    ))
+    assert durable and durable.active is True
+    trace = CausalProvenanceQuery().trace_decision(session, fixture.project.id, fixture.preserved_ids[0])
+    trace_ids = {item["id"] for item in trace["downstream"]}
+    assert old_event.id not in trace_ids
     current_states = session.scalars(select(TimelineEvent).where(
         TimelineEvent.scene_id == scene3.id,
         TimelineEvent.event_type == TimelineEventType.STATE_CHANGE,
