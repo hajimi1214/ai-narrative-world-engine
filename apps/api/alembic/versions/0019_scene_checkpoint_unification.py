@@ -33,6 +33,7 @@ def downgrade():
     # 0018 can only express one checkpoint per (project, scene).  Preserve
     # the active/latest boundary and intentionally discard older index rows;
     # snapshots remain append-only audit records and are never cascaded here.
+    op.execute("UPDATE scene_state_checkpoints SET supersedes_checkpoint_id = NULL")
     op.execute("""
         DELETE FROM scene_state_checkpoints
         WHERE id IN (

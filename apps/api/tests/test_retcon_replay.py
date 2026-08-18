@@ -176,14 +176,21 @@ def test_dynamic_expansion_promotes_execution_and_quarantines_scene_cognition(se
     assert escalated.status_code == 200 and escalated.json()["runs"][-1]["validation_report"]["result"] == "REPLAY_ESCALATED"
     replay_session = session.get(RetconReplaySession, session_id); promoted = replay_session.queue[replay_session.cursor]
     assert promoted["mode"] == "REPLAY" and promoted["reason"] == "DYNAMIC_EXPANSION"
+    assert replay_session.cursor == 1
+    escalated_boundary = replay_session.staged_world_state["scene_checkpoints"][scene3.id]
+    assert "pre_payload" in escalated_boundary and "post_payload" not in escalated_boundary
+    escalated_pre_fingerprint = escalated_boundary["pre_fingerprint"]
     assert promoted["decision_ids"] == [old_decision.id] and promoted["turn_ids"] == [old_turn.id] and promoted["resolution_ids"] == [old_resolution.id]
     assert replay_session.failure_report is None and replay_session.staged_world_state["dynamic_cognition_invalidations"]
     assert session.query(RetconCognitionInvalidation).filter(RetconCognitionInvalidation.reason == "DYNAMIC_REPLAY_EXPANSION").count() == 0
     replayed = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step")
     assert replayed.status_code == 200 and replayed.json()["status"] == "RUNNING", replayed.text
     session.expire_all()
-    staged = session.get(RetconReplaySession, session_id).staged_world_state["scene_results"][scene3.id]
+    replay_session = session.get(RetconReplaySession, session_id)
+    staged = replay_session.staged_world_state["scene_results"][scene3.id]
     assert len(staged["decisions"]) == len(staged["turns"]) == len(staged["resolutions"]) == 1
+    replayed_boundary = replay_session.staged_world_state["scene_checkpoints"][scene3.id]
+    assert replayed_boundary["pre_fingerprint"] == escalated_pre_fingerprint and "post_payload" in replayed_boundary
     committed = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/commit", json={"explicit_confirmation": True})
     assert committed.status_code == 200, committed.text
     session.expire_all(); old_scene3 = session.get(Scene, scene3.id); new_scene3 = session.get(Scene, old_scene3.superseded_by_scene_id)

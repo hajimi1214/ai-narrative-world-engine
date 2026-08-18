@@ -47,7 +47,18 @@ class SceneCheckpointIntegrityValidator:
         # A replay replacement is a new Scene identity and must not appear in
         # its PRE.  A preserved Scene deliberately keeps its identity while
         # receiving a new boundary version, so its historical row may appear.
-        if (before and not checkpoint.supersedes_checkpoint_id) or not after or after.get("status") != "OCCURRED" or after.get("history_status") != "ACTIVE": raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
+        if before:
+            if origin == "NORMAL_COMMIT":
+                raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
+            from .models import ReplaySceneRun
+            preserved = db.scalar(select(ReplaySceneRun).where(
+                ReplaySceneRun.replay_session_id == checkpoint.source_replay_session_id,
+                ReplaySceneRun.original_scene_id == scene.id,
+                ReplaySceneRun.mode == "VALIDATE_PRESERVED",
+            ))
+            if not preserved:
+                raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
+        if not after or after.get("status") != "OCCURRED" or after.get("history_status") != "ACTIVE": raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
 
 class SceneCheckpointService:
     resolver = CurrentSceneCheckpointResolver(); validator = SceneCheckpointIntegrityValidator()
@@ -61,7 +72,11 @@ class SceneCheckpointService:
         active = db.scalars(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == project_id, SceneStateCheckpoint.scene_id == scene.id, SceneStateCheckpoint.active.is_(True))).all()
         if len(active) > 1: raise ValueError("SCENE_CHECKPOINT_CURRENT_AMBIGUOUS")
         prior = active[0] if active else None; version = (db.scalar(select(func.max(SceneStateCheckpoint.version)).where(SceneStateCheckpoint.project_id == project_id, SceneStateCheckpoint.scene_id == scene.id)) or 0) + 1
-        if prior: prior.active = False
+        # PostgreSQL enforces the partial unique index immediately; flush the
+        # inactive lifecycle change before inserting the next active version.
+        if prior:
+            prior.active = False
+            db.flush()
         checkpoint = SceneStateCheckpoint(project_id=project_id, scene_id=scene.id, sequence=scene.sequence, pre_snapshot_id=pre.id, post_snapshot_id=post.id, current_scene_id=scene.id, capture_protocol_version=3, version=version, active=True, origin=getattr(origin, "value", origin), source_scene_commit_id=source_scene_commit_id, source_replay_session_id=source_replay_session_id, supersedes_checkpoint_id=prior.id if prior else None, pre_state_fingerprint=pre.state_fingerprint, post_state_fingerprint=post.state_fingerprint)
         db.add(checkpoint); db.flush(); checkpoint.checkpoint_fingerprint = checkpoint_fingerprint(checkpoint, scene, pre, post); db.flush(); return checkpoint
     def current(self, db, project_id, scene_id): return self.resolver.current(db, project_id, scene_id)
