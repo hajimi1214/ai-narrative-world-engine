@@ -440,6 +440,8 @@ def test_preserved_scene_refreshes_checkpoint_derived_ledger_rows(session, monke
             TimelineEvent.active.is_(True),
         )).all()
         assert same_scope == [state]
+        if state.supersedes_event_id:
+            assert state.supersedes_event_id in {event.id for event in old_state_events}
     history = fixture.client.get(
         f"/projects/{fixture.project.id}/causal-ledger/state-history",
         params={"target_type": current_states[0].target_type, "target_id": current_states[0].target_id, "path": current_states[0].path},
@@ -451,6 +453,11 @@ def test_preserved_scene_refreshes_checkpoint_derived_ledger_rows(session, monke
         params={"target_type": current_states[0].target_type, "target_id": current_states[0].target_id, "path": current_states[0].path},
     )
     assert why.status_code == 200 and why.json()["event"]["checkpoint_id"] == current_checkpoint.id
+    counts = (session.query(TimelineEvent).count(), session.query(CausalLink).count())
+    CausalLedgerBackfillService().backfill(session, fixture.project.id); session.flush()
+    assert counts == (session.query(TimelineEvent).count(), session.query(CausalLink).count())
+    CausalLedgerBackfillService().backfill(session, fixture.project.id); session.flush()
+    assert counts == (session.query(TimelineEvent).count(), session.query(CausalLink).count())
 
 
 def test_project_time_transition_is_extracted():
