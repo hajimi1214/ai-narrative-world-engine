@@ -64,7 +64,11 @@ class HeuristicCharacterPerformer:
         from .character_mind import HeuristicCharacterActor
         decision = HeuristicCharacterActor().decide(context)
         decision.update({"target_character_id": None, "target_entity_id": None})
-        action = {"visibility": ActionVisibility.PUBLIC.value, "observable_action": decision["chosen_action"], "spoken_content": None, "requires_world_resolution": False, "world_resolution_request": None, "disclosure_knowledge_ids": [], "target_character_id": None}
+        affordance = next(iter(context.get("scene", {}).get("world_affordances", []) or []), None)
+        if affordance:
+            action = {"visibility": ActionVisibility.PUBLIC.value, "observable_action": affordance.get("description"), "spoken_content": None, "requires_world_resolution": True, "world_resolution_request": affordance, "disclosure_knowledge_ids": [], "target_character_id": None}
+        else:
+            action = {"visibility": ActionVisibility.PUBLIC.value, "observable_action": decision["chosen_action"], "spoken_content": None, "requires_world_resolution": False, "world_resolution_request": None, "disclosure_knowledge_ids": [], "target_character_id": None}
         return {"decision": decision, "action": action}, None
 
 
