@@ -32,9 +32,9 @@ class HistoricalDependencyGraphBuilder:
                 clauses.extend(cast(column,Text).contains(str(n)) for n in needles)
         return session.scalars(select(model).where(model.project_id==project_id,or_(*clauses))).all() if clauses else []
     def build(self,session:Session,project_id:str,target_ids:set[str],old_values:set[str],target_types:dict[str,str]|None=None):
-        target_types=target_types or {}; queue=deque(); node_paths={}; node_certainty={}; edges=[]
+        target_types=target_types or {}; queue=deque(); nodes=set(); edges=[]; root_nodes=set()
         def enqueue(node,path=None):
-            if node not in node_paths: node_paths[node]=path or [{"type":node[0],"id":node[1],"certainty":"CONFIRMED"}]; node_certainty[node]="CONFIRMED"; queue.append(node)
+            if node not in nodes: nodes.add(node); queue.append(node)
         for ident in sorted(target_ids):
             typ=target_types.get(ident)
             if typ is None:
@@ -42,17 +42,15 @@ class HistoricalDependencyGraphBuilder:
                     if session.get(model,ident): typ=label; break
             if typ: enqueue((typ,ident))
         def add(source,target,edge_type,reason,evidence_path=None):
-            if target not in node_paths and len(node_paths)>=self.max_nodes: self.limit_reached=True; return
+            if target not in nodes and len(nodes)>=self.max_nodes: self.limit_reached=True; return
             key=(*source,*target,edge_type)
             if key in self.visited_edges: return
             if len(self.visited_edges)>=self.max_edges: self.limit_reached=True; return
-            certainty = "UNCERTAIN" if edge_type in {"EXACT_VALUE_WITHOUT_LINEAGE", "DEPENDENCY_LINEAGE_MISSING"} or node_certainty.get(source) == "UNCERTAIN" else "CONFIRMED"
-            self.visited_edges.add(key); path=list(node_paths[source]); path.append({"type":target[0],"id":target[1],"certainty":certainty,**({"path":evidence_path} if evidence_path else {})})
-            edges.append(DependencyEdge(source[0],source[1],target[0],target[1],edge_type,reason,path,certainty))
-            if target not in node_paths:
-                node_paths[target]=path; node_certainty[target]=certainty; queue.append(target)
-            elif (certainty == "CONFIRMED" and node_certainty.get(target) == "UNCERTAIN") or (certainty == node_certainty.get(target) and len(path)<len(node_paths[target])):
-                node_paths[target]=path; node_certainty[target]=certainty
+            intrinsic = "UNCERTAIN" if edge_type in {"EXACT_VALUE_WITHOUT_LINEAGE", "DEPENDENCY_LINEAGE_MISSING"} else "CONFIRMED"
+            self.visited_edges.add(key)
+            path=[{"type":source[0],"id":source[1]}, {"type":target[0],"id":target[1],"certainty":intrinsic,**({"path":evidence_path} if evidence_path else {})}]
+            edges.append(DependencyEdge(source[0],source[1],target[0],target[1],edge_type,reason,path,intrinsic))
+            if target not in nodes: nodes.add(target); queue.append(target)
         def exact(value,needles):
             for needle in sorted(needles):
                 paths=self.scanner.paths(value,needle)
@@ -113,11 +111,32 @@ class HistoricalDependencyGraphBuilder:
                 for row in session.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.project_id==project_id,ScenePerformanceTurn.character_decision_id==ident)).all():add(source,("SCENE_PERFORMANCE_TURN",row.id),"DECISION_TO_TURN","演出回合使用受影响角色决策")
             elif typ=="SCENE_PERFORMANCE_TURN":
                 for row in session.scalars(select(WorldResolution).where(WorldResolution.project_id==project_id,WorldResolution.performance_turn_id==ident)).all():add(source,("WORLD_RESOLUTION",row.id),"TURN_TO_RESOLUTION","世界响应属于受影响演出回合")
-        return edges
+        root_nodes={(target_types.get(ident) or next((label for model,label in ((CanonFact,"CANON_FACT"),(WorldEntity,"WORLD_ENTITY"),(Character,"CHARACTER")) if session.get(model,ident)),""),ident) for ident in target_ids}
+        resolved=CausalPathResolver().resolve(root_nodes,edges)
+        return [DependencyEdge(edge.source_type,edge.source_id,edge.target_type,edge.target_id,edge.edge_type,edge.reason,resolved.get((edge.target_type,edge.target_id),edge.path)[0],resolved.get((edge.target_type,edge.target_id),edge.path)[1]) for edge in edges]
+
+class CausalPathResolver:
+    """Resolve best paths after raw graph discovery, independent of discovery order."""
+    def resolve(self, roots, edges):
+        adjacency={}
+        for edge in edges: adjacency.setdefault((edge.source_type,edge.source_id),[]).append(edge)
+        for values in adjacency.values(): values.sort(key=lambda e:(e.target_type,e.target_id,e.edge_type,json.dumps(e.path,sort_keys=True,ensure_ascii=True)))
+        best={root:([{"type":root[0],"id":root[1],"certainty":"CONFIRMED"}],"CONFIRMED") for root in roots}; queue=deque(sorted(roots))
+        while queue:
+            source=queue.popleft(); source_path,source_certainty=best[source]
+            for edge in adjacency.get(source,[]):
+                target=(edge.target_type,edge.target_id); certainty="UNCERTAIN" if source_certainty=="UNCERTAIN" or edge.certainty=="UNCERTAIN" else "CONFIRMED"
+                node=dict(edge.path[-1]); node["certainty"]=certainty; candidate=source_path+[node]
+                current=best.get(target)
+                quality=(0 if certainty=="CONFIRMED" else 1,len(candidate),json.dumps(candidate,sort_keys=True,ensure_ascii=True))
+                current_quality=(0 if current and current[1]=="CONFIRMED" else 1,len(current[0]),json.dumps(current[0],sort_keys=True,ensure_ascii=True)) if current else None
+                if current is None or quality<current_quality:
+                    best[target]=(candidate,certainty); queue.append(target)
+        return best
 
 class ImpactClassificationResolver:
     def classify(self,edge):
-        if edge.certainty == "UNCERTAIN" or edge.edge_type in {"EXACT_VALUE_WITHOUT_LINEAGE", "DEPENDENCY_LINEAGE_MISSING"}:return "REVALIDATE",edge.edge_type
+        if edge.certainty == "UNCERTAIN":return "REVALIDATE",edge.edge_type
         if edge.target_type=="CHARACTER_KNOWLEDGE":return "REBUILD_COGNITION","该人物认知直接依赖被修改的世界事实。"
         if edge.target_type=="CHARACTER_MEMORY":return "REBUILD_COGNITION","该人物记忆包含被修改事实的结构化依赖。"
         if edge.target_type in {"CHARACTER_DECISION","SCENE_PERFORMANCE_TURN"}:return "REPLAY_REQUIRED","演出使用了需要重新建立的认知或决策。"

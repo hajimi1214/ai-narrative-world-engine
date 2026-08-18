@@ -10,7 +10,7 @@ from app.main import app
 import app.api as api
 from app.models import CanonFact, CharacterKnowledge, CharacterMemory, Scene, WorldEntity, WorldRevision, RetconRequest, RetconImpactPlan, RetconImpactItem, CharacterDecision, CharacterDecisionType, CharacterDecisionStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ActionVisibility, PerformanceMode, PerformanceStatus, ResolverMode, ResolutionStatus, ResolutionOutcome
 from app.revision import RevisionStateFingerprintBuilder
-from app.retcon import HistoricalDependencyGraphBuilder, ReplayBoundaryFinder, RetconBasisFingerprintBuilder
+from app.retcon import HistoricalDependencyGraphBuilder, ReplayBoundaryFinder, RetconBasisFingerprintBuilder, CausalPathResolver, DependencyEdge
 from app.revision import StructuredReferenceScanner
 import app.retcon as retcon_module
 from test_character_mind import seed
@@ -348,6 +348,15 @@ def test_analyze_never_calls_ai_provider(session, monkeypatch):
     monkeypatch.setattr(api,"get_model_provider",lambda *args,**kwargs:(_ for _ in ()).throw(AssertionError("AI must not be used")))
     req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"deterministic"}).json()
     assert client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").status_code==200
+
+def test_late_confirmed_path_upgrades_all_descendants_order_independently():
+    def edge(source,target,kind,certainty):
+        return DependencyEdge(source[0],source[1],target[0],target[1],kind,"test",[{"type":source[0],"id":source[1]},{"type":target[0],"id":target[1]}],certainty)
+    a=("CANON_FACT","A"); k=("CHARACTER_KNOWLEDGE","K"); d=("CHARACTER_DECISION","D"); t=("SCENE_PERFORMANCE_TURN","T"); r=("WORLD_RESOLUTION","R"); b=("CANON_FACT","B"); s=("SCENE","S")
+    edges=[edge(a,k,"EXACT_VALUE_WITHOUT_LINEAGE","UNCERTAIN"),edge(k,d,"KNOWLEDGE_TO_DECISION","CONFIRMED"),edge(d,t,"DECISION_TO_TURN","CONFIRMED"),edge(t,r,"TURN_TO_RESOLUTION","CONFIRMED"),edge(a,b,"CANON_STRUCTURED_REFERENCE","CONFIRMED"),edge(b,s,"EXPLICIT_SCENE_REFERENCE","CONFIRMED"),edge(s,k,"SCENE_TO_KNOWLEDGE","CONFIRMED")]
+    first=CausalPathResolver().resolve({a},edges); second=CausalPathResolver().resolve({a},list(reversed(edges)))
+    assert first==second
+    assert first[k][1]=="CONFIRMED" and first[d][1]=="CONFIRMED" and [node["type"] for node in first[r][0]]==["CANON_FACT","CANON_FACT","SCENE","CHARACTER_KNOWLEDGE","CHARACTER_DECISION","SCENE_PERFORMANCE_TURN","WORLD_RESOLUTION"]
 
 def test_mixed_confirmed_and_uncertain_knowledge_aggregates_to_one_confirmed_item(session, monkeypatch):
     project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); knowledge.source=scene.id; session.commit()
