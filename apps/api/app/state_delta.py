@@ -47,6 +47,22 @@ def state_delta_item_fingerprint(project_id: str, resolution_id: str, turn_id: s
     }, "state-delta-item-v1")
 
 
+def compute_state_delta_after(before: Any, found: bool, effect: StateEffectPayload) -> Any:
+    """Pure, shared candidate after-value calculation."""
+    if effect.operation.name in {"SET", "UPSERT"}:
+        return copy.deepcopy(effect.value)
+    if not found or not isinstance(before, list):
+        raise ValueError("STATE_DELTA_PATH_UNRESOLVED")
+    after = copy.deepcopy(before)
+    if effect.operation.name == "ADD":
+        if effect.value not in after:
+            after.append(copy.deepcopy(effect.value))
+        return after
+    if effect.operation.name == "REMOVE":
+        return [item for item in after if item != effect.value]
+    raise ValueError("UNSUPPORTED_STATE_EFFECT")
+
+
 class FormalWorldStateReader:
     """Reads formal state without any authority to mutate it."""
 
@@ -143,7 +159,7 @@ class StateDeltaCandidateBuilder:
             self._validate_resolution_scope(resolution, turn, effect)
             if not found and effect.operation != StateDeltaOperation.UPSERT:
                 raise ValueError("STATE_DELTA_PATH_UNRESOLVED")
-            after = self._after_value(before, found, effect)
+            after = compute_state_delta_after(before, found, effect)
             if found and before == after:
                 report.append({"target_id": effect.target_id, "path": effect.path, "code": "NO_STATE_CHANGE"})
                 continue
@@ -224,18 +240,8 @@ class StateDeltaCandidateBuilder:
                 raise ValueError("UNSUPPORTED_STATE_EFFECT")
 
     def _after_value(self, before: Any, found: bool, effect: StateEffectPayload) -> Any:
-        if effect.operation in {StateDeltaOperation.SET, StateDeltaOperation.UPSERT}:
-            return copy.deepcopy(effect.value)
-        if not found or not isinstance(before, list):
-            raise ValueError("STATE_DELTA_PATH_UNRESOLVED")
-        after = copy.deepcopy(before)
-        if effect.operation == StateDeltaOperation.ADD:
-            if effect.value not in after:
-                after.append(copy.deepcopy(effect.value))
-            return after
-        if effect.operation == StateDeltaOperation.REMOVE:
-            return [item for item in after if item != effect.value]
-        raise ValueError("UNSUPPORTED_STATE_EFFECT")
+        """Compatibility wrapper for callers of the 7A builder."""
+        return compute_state_delta_after(before, found, effect)
 
 
 def _escape(value: str) -> str:

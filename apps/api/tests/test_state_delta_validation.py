@@ -16,7 +16,7 @@ from app.models import (
     StateDeltaBatch, StateDeltaBatchStatus, StateDeltaDomain, StateDeltaItem, StateDeltaOperation,
     StateDeltaTargetType, StoryThread, ThreadStatus, WorldEntity, WorldResolution,
 )
-from app.state_delta import StateDeltaCandidateBuilder
+from app.state_delta import StateDeltaCandidateBuilder, StateEffectPayload, state_delta_item_fingerprint
 from test_scene_performance import approved_setup
 
 
@@ -110,6 +110,29 @@ def test_before_value_stale_and_item_tamper_are_detected(session, monkeypatch):
     assert "STATE_DELTA_ITEM_FINGERPRINT_MISMATCH" in issue_codes(response2.json())
 
 
+def test_tamper_and_rehash_still_fails_after_proof(session, monkeypatch):
+    project, _location, _actor, _other, _proposal, _performance, turn, resolution, batch, client = source_fixture(session, monkeypatch)
+    item = session.scalar(select(StateDeltaItem).where(StateDeltaItem.batch_id == batch.id))
+    effect = StateEffectPayload.model_validate(item.evidence["state_effect"])
+    item.after_value = False
+    item.semantic_fingerprint = state_delta_item_fingerprint(project.id, resolution.id, turn.id, effect, item.before_value, item.after_value, item.evidence)
+    session.commit()
+    response = validate(client, project, batch)
+    assert "STATE_DELTA_ITEM_AFTER_MISMATCH" in issue_codes(response.json())
+
+
+def test_fabricated_effect_rehashed_still_fails_source_membership(session, monkeypatch):
+    project, location, _actor, _other, _proposal, _performance, turn, resolution, batch, client = source_fixture(session, monkeypatch)
+    item = session.scalar(select(StateDeltaItem).where(StateDeltaItem.batch_id == batch.id))
+    fabricated = StateEffectPayload.model_validate(make_effect(location.id, path="/profile/locked", value=False))
+    item.path = fabricated.path; item.after_value = False; item.causal_reason = fabricated.reason
+    item.evidence = {**item.evidence, "state_effect": fabricated.model_dump(mode="json")}
+    item.semantic_fingerprint = state_delta_item_fingerprint(project.id, resolution.id, turn.id, fabricated, item.before_value, item.after_value, item.evidence)
+    session.commit()
+    response = validate(client, project, batch)
+    assert "STATE_DELTA_ITEM_SOURCE_EFFECT_MISMATCH" in issue_codes(response.json())
+
+
 def test_zero_item_batch_validates_as_no_state_change(session, monkeypatch):
     project, _location, _actor, _other, _proposal, _performance, _turn, _resolution, batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
     response = validate(client, project, batch)
@@ -200,6 +223,25 @@ def test_invalid_world_time_format_rejects(session, monkeypatch):
     assert "STATE_DELTA_WORLD_TIME_INVALID" in issue_codes(response.json())
 
 
+@pytest.mark.parametrize("before, after, expected", [
+    ("2040-01-01T00:00:00", "2040-01-01T08:00:00+08:00", None),
+    ("2040-01-01T00:00:00", "2040-01-02T00:00:00Z", None),
+    ("2040-01-02T00:00:00", "2040-01-01T08:00:00+08:00", "STATE_DELTA_WORLD_TIME_REGRESSION"),
+])
+def test_world_time_timezone_normalization(before, after, expected, session, monkeypatch):
+    project, _location, _actor, _other, _proposal, _performance, _turn, resolution, _batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
+    project.current_world_time = datetime.fromisoformat(before); session.add(project)
+    resolution.state_effects = [make_effect(project.id, path="/current_world_time", value=after, domain="WORLD_TIME", target_type="PROJECT")]
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]; session.commit()
+    response = validate(client, project, batch)
+    codes = issue_codes(response.json())
+    if expected:
+        assert expected in codes
+    else:
+        assert response.json()["status"] == "VALIDATED"
+
+
 def test_locked_structured_canon_conflict_is_safe_for_secret(session, monkeypatch):
     project, location, _actor, _other, _proposal, _performance, _turn, _resolution, batch, client = source_fixture(session, monkeypatch)
     canon = CanonFact(project_id=project.id, fact_type=CanonType.SECRET_CANON, proposition="SECRET TEXT MUST NOT APPEAR", data={"target_type": "WORLD_ENTITY", "target_id": location.id, "path": "/profile/opened", "value": False}, locked=True)
@@ -280,3 +322,73 @@ def test_source_lineage_tamper_rejects_validation(session, monkeypatch):
     performance.scene_proposal_id = "missing-proposal"; session.commit()
     response = validate(client, project, batch)
     assert "STATE_DELTA_SOURCE_LINEAGE_INVALID" in issue_codes(response.json())
+
+
+def test_move_and_deactivate_passes_using_final_overlay(session, monkeypatch):
+    project, location_a, actor, other, _proposal, _performance, _turn, resolution, _batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
+    for character in session.scalars(select(Character).where(Character.project_id == project.id)).all():
+        if character.id != actor.id:
+            character.current_state = {}
+    session.commit()
+    location_b = WorldEntity(project_id=project.id, entity_type="LOCATION", name="B", profile={})
+    session.add(location_b); session.flush()
+    resolution.state_effects = [
+        make_effect(actor.id, path="/current_state/location_id", value=location_b.id, domain="CHARACTER_LOCATION", target_type="CHARACTER"),
+        make_effect(location_a.id, path="/active", value=False, domain="WORLD_ENTITY_ACTIVE", target_type="WORLD_ENTITY"),
+    ]
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]; session.commit()
+    response = validate(client, project, batch)
+    assert response.json()["status"] == "VALIDATED"
+
+
+def test_structured_item_duplicate_ownership_rejects(session, monkeypatch):
+    project, _location, actor, other, _proposal, _performance, _turn, resolution, _batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
+    item = WorldEntity(project_id=project.id, entity_type="ITEM", name="X", profile={})
+    session.add(item); session.flush()
+    other.inventory = [item.id]; session.add(other)
+    resolution.state_effects = [make_effect(actor.id, path="/inventory", value=item.id, domain="CHARACTER_INVENTORY", target_type="CHARACTER", operation="ADD")]
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]; session.commit()
+    response = validate(client, project, batch)
+    assert "STATE_DELTA_ITEM_MULTIPLE_OWNERS" in issue_codes(response.json())
+
+
+@pytest.mark.parametrize("before, after, expected", [
+    (ThreadStatus.RESOLVED, ThreadStatus.OPEN, "STATE_DELTA_THREAD_TERMINAL_REOPEN"),
+    (ThreadStatus.ABANDONED, ThreadStatus.OPEN, "STATE_DELTA_THREAD_TERMINAL_REOPEN"),
+    (ThreadStatus.OPEN, ThreadStatus.RESOLVED, None),
+])
+def test_thread_terminal_transitions(before, after, expected, session, monkeypatch):
+    project, _location, _actor, _other, _proposal, _performance, _turn, resolution, _batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
+    thread = StoryThread(project_id=project.id, title="thread", type="MAIN", progress=0.2, state={}, status=before)
+    session.add(thread); session.flush()
+    resolution.state_effects = [make_effect(thread.id, path="/status", value=after.value, domain="STORY_THREAD_STATUS", target_type="STORY_THREAD")]
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]; session.commit()
+    response = validate(client, project, batch)
+    codes = issue_codes(response.json())
+    if expected:
+        assert expected in codes
+    else:
+        assert response.json()["status"] == "VALIDATED"
+
+
+@pytest.mark.parametrize("canon_data, value, conflict", [
+    ({"target_type": "WORLD_ENTITY", "target_id": "TARGET", "path": "/profile/opened", "value": False}, True, True),
+    ({"target_type": "WORLD_ENTITY", "target_id": "TARGET", "path": "/profile/opened", "value": True}, True, False),
+    ({}, True, False),
+])
+def test_core_canon_and_unstructured_canon_rules(canon_data, value, conflict, session, monkeypatch):
+    project, location, _actor, _other, _proposal, _performance, _turn, resolution, _batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
+    canon_data = {**canon_data, "target_id": location.id} if canon_data else {}
+    canon = CanonFact(project_id=project.id, fact_type=CanonType.CORE_CANON, proposition="DO NOT USE THIS TEXT", data=canon_data, locked=True)
+    session.add(canon)
+    resolution.state_effects = [make_effect(location.id, value=value)]
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]; session.commit()
+    response = validate(client, project, batch)
+    if conflict:
+        assert "STATE_DELTA_CANON_CONFLICT" in issue_codes(response.json())
+    else:
+        assert "STATE_DELTA_CANON_CONFLICT" not in issue_codes(response.json())

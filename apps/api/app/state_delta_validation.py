@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import ValidationError
@@ -20,7 +20,8 @@ from .models import (
 from .revision import _pointer, _record
 from .state_delta import (
     DERIVATION_VERSION, FormalWorldStateReader, StateDeltaCandidateBuilder,
-    StateDeltaInputFingerprintBuilder, state_delta_item_fingerprint,
+    StateDeltaInputFingerprintBuilder, WorldResolutionStateDeltaTranslator,
+    compute_state_delta_after, state_delta_item_fingerprint,
 )
 from .state_effect_contract import StateEffectPayload
 from .versioning import WorldSnapshotBuilder
@@ -81,6 +82,7 @@ class StateDeltaValidationWorldView:
 class StateDeltaValidator:
     reader = FormalWorldStateReader()
     candidate_builder = StateDeltaCandidateBuilder()
+    translator = WorldResolutionStateDeltaTranslator()
 
     def validate(self, db: Session, project_id: str, batch_id: str) -> ValidationResult:
         batch = db.get(StateDeltaBatch, batch_id)
@@ -97,6 +99,12 @@ class StateDeltaValidator:
         issues: list[dict[str, Any]] = []
         item_results: list[dict[str, Any]] = []
         resolution, performance, turn, proposal = self._source(db, batch, issues)
+        canonical_effects: list[StateEffectPayload] = []
+        if resolution:
+            canonical_effects, translation_issues = self.translator.translate(resolution)
+            if translation_issues:
+                for translation_issue in translation_issues:
+                    self._issue(issues, translation_issue.get("code", "STATE_DELTA_ITEM_SOURCE_EFFECT_MISMATCH"))
         if resolution and performance and turn and proposal:
             expected_input = StateDeltaInputFingerprintBuilder().build(resolution, turn, performance, batch.base_world_fingerprint)
             if expected_input != batch.input_fingerprint:
@@ -109,7 +117,7 @@ class StateDeltaValidator:
         valid_items: list[tuple[StateDeltaItem, StateEffectPayload]] = []
         for item in items:
             item_issues: list[str] = []
-            effect = self._validate_item(db, batch, item, item_issues)
+            effect = self._validate_item(db, batch, item, item_issues, canonical_effects)
             for code in item_issues:
                 self._issue(issues, code, item)
             if effect and not item_issues:
@@ -172,7 +180,7 @@ class StateDeltaValidator:
         if [item.ordinal for item in items] != list(range(1, len(items) + 1)):
             self._issue(issues, "STATE_DELTA_ORDINAL_INVALID")
 
-    def _validate_item(self, db: Session, batch: StateDeltaBatch, item: StateDeltaItem, codes: list[str]) -> StateEffectPayload | None:
+    def _validate_item(self, db: Session, batch: StateDeltaBatch, item: StateDeltaItem, codes: list[str], canonical_effects: list[StateEffectPayload]) -> StateEffectPayload | None:
         if item.project_id != batch.project_id or item.batch_id != batch.id or item.source_turn_id != batch.source_turn_id or item.source_resolution_id != batch.source_resolution_id:
             codes.append("STATE_DELTA_ITEM_LINEAGE_INVALID")
         evidence = item.evidence if isinstance(item.evidence, dict) else {}
@@ -189,9 +197,18 @@ class StateDeltaValidator:
             codes.append("STATE_DELTA_ITEM_EVIDENCE_INVALID")
         if (effect.target_type != item.target_type or effect.target_id != item.target_id or effect.domain != item.domain or effect.operation != item.operation or effect.path != item.path or effect.reason != item.causal_reason):
             codes.append("STATE_DELTA_ITEM_EVIDENCE_MISMATCH")
+        matches = [candidate for candidate in canonical_effects if candidate.model_dump(mode="json") == effect.model_dump(mode="json")]
+        if len(matches) != 1:
+            codes.append("STATE_DELTA_ITEM_SOURCE_EFFECT_MISMATCH")
         expected = state_delta_item_fingerprint(batch.project_id, batch.source_resolution_id, batch.source_turn_id, effect, item.before_value, item.after_value, evidence)
         if expected != item.semantic_fingerprint:
             codes.append("STATE_DELTA_ITEM_FINGERPRINT_MISMATCH")
+        try:
+            expected_after = compute_state_delta_after(item.before_value, True, effect)
+            if expected_after != item.after_value:
+                codes.append("STATE_DELTA_ITEM_AFTER_MISMATCH")
+        except ValueError:
+            codes.append("STATE_DELTA_ITEM_AFTER_MISMATCH")
         try:
             self.candidate_builder._validate_effect(effect)
             before, found = self.reader.before_value(db, batch.project_id, effect)
@@ -294,8 +311,8 @@ class StateDeltaValidator:
             self._issue(issues, "STATE_DELTA_THREAD_TERMINAL_REOPEN", item)
 
     def _validate_world_time(self, item: StateDeltaItem, issues: list[dict[str, Any]]) -> None:
-        after = _time(item.after_value)
-        before = _time(item.before_value) if item.before_value else None
+        after = normalize_world_time(item.after_value)
+        before = normalize_world_time(item.before_value) if item.before_value else None
         if after is None:
             self._issue(issues, "STATE_DELTA_WORLD_TIME_INVALID", item)
         elif before is not None and after < before:
@@ -364,3 +381,13 @@ def _time(value: Any) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def normalize_world_time(value: Any) -> datetime | None:
+    """Canonical UTC-naive world time used for all validation comparisons."""
+    parsed = _time(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
