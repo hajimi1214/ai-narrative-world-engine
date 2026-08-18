@@ -65,7 +65,7 @@ def retcon_item_payload(item: RetconImpactItem, db: Session | None = None) -> di
 
 def retcon_plan_payload(db: Session, plan: RetconImpactPlan) -> dict[str, Any]:
     application = db.scalar(select(RetconApplication).where(RetconApplication.retcon_plan_id == plan.id).order_by(RetconApplication.created_at.desc(), RetconApplication.id.desc()))
-    consumed = application is not None and application.status in {RetconApplicationStatus.APPLIED_PENDING_REPLAY, RetconApplicationStatus.ROLLED_BACK}
+    consumed = application is not None and application.status in {RetconApplicationStatus.APPLIED_PENDING_REPLAY, RetconApplicationStatus.REPLAY_COMPLETED, RetconApplicationStatus.ROLLED_BACK}
     stale = False if consumed else RetconPlanStalenessChecker().is_stale(db, plan)
     revision = db.get(WorldRevision, db.get(RetconRequest, plan.retcon_request_id).source_revision_id) if db.get(RetconRequest, plan.retcon_request_id) else None
     requirements = RetconAuthorOverrideResolver().resolve(db, plan.project_id, revision) if revision else {"explicit_confirmation_required": True, "author_override_required": False, "author_override_targets": []}

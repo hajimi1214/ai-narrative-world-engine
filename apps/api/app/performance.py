@@ -139,7 +139,7 @@ class PerformanceActionReport:
 
 
 class PerformanceActionConstraintChecker:
-    def validate(self, session: Session, context: dict[str, Any], proposal: SceneProposal, decision: CharacterDecision, action: PerformanceActionPayload, active_participant_ids: list[str] | None = None) -> PerformanceActionReport:
+    def validate(self, session: Session, context: dict[str, Any], proposal: SceneProposal, decision: CharacterDecision, action: PerformanceActionPayload, active_participant_ids: list[str] | None = None, world_view=None) -> PerformanceActionReport:
         issues: list[PerformanceIssue] = []
         def add(code, message, ids=None): issues.append(PerformanceIssue(code, "BLOCKING", message, ids or [], "Correct the performance action and try the turn again."))
         participants = set(active_participant_ids or ({item["id"] for item in context["scene"]["other_participants"]} | {context["character"]["id"]}))
@@ -155,7 +155,7 @@ class PerformanceActionConstraintChecker:
             request = action.world_resolution_request
             if request.target_character_id and (request.target_character_id not in participants or request.target_character_id == decision.character_id): add("INVALID_TARGET", "World request targets an unavailable active participant.", [request.target_character_id])
             if request.target_entity_id:
-                target = session.get(__import__("app.models", fromlist=["WorldEntity"]).WorldEntity, request.target_entity_id)
+                target = world_view.entity(request.target_entity_id) if world_view else session.get(__import__("app.models", fromlist=["WorldEntity"]).WorldEntity, request.target_entity_id)
                 visible_ids = set()
                 visible_ids.add(context["scene"].get("location", {}).get("id") if context["scene"].get("location") else None)
                 for item in context["inventory"]:
@@ -169,7 +169,8 @@ class PerformanceActionConstraintChecker:
                     elif isinstance(value, list):
                         for child in value: collect(child)
                 collect(context["scene"].get("visible_context", {}))
-                if not target or target.project_id != decision.project_id or not target.active or request.target_entity_id not in visible_ids: add("INVALID_TARGET", "World request targets an unavailable or non-visible entity.", [request.target_entity_id])
+                target_active = target.get("active", True) if isinstance(target, dict) else getattr(target, "active", True)
+                if not target or (not world_view and target.project_id != decision.project_id) or target_active is False or request.target_entity_id not in visible_ids: add("INVALID_TARGET", "World request targets an unavailable or non-visible entity.", [request.target_entity_id])
         propositions = {item["proposition"] for status in context["knowledge"].values() for item in status if item["id"] in action.disclosure_knowledge_ids}
         forbidden = set(proposal.forbidden_reveals or [])
         canon = session.scalars(select(CanonFact).where(CanonFact.project_id == decision.project_id)).all()

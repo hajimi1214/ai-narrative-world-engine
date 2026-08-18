@@ -12,7 +12,8 @@ from app.historical import SceneStateCheckpointService
 from app.historical import TemporalCharacterCognitionReader
 from app.replay import ReplayService
 from app.character_mind import ActiveCharacterCognitionReader
-from app.models import RetconCognitionInvalidation, RetconCognitionInvalidationStatus
+from app.models import RetconCognitionInvalidation, RetconCognitionInvalidationStatus, CharacterKnowledge, CharacterMemory, ActionVisibility
+from app.replay import ReplayWorldView, ReplayCognitionReplacementMatcher, PreservedSceneValidator, ReplayResourceMapper
 from test_retcon_apply import analyzed_setup, apply_success, client_for
 
 @pytest.fixture()
@@ -142,8 +143,10 @@ def test_replay_queue_ignores_superseded_scene(session, monkeypatch):
     values = replay_ready(session, monkeypatch); project, _, _, scene, _, _, _, client, _, application_id = values
     scene.history_status = "SUPERSEDED"; session.commit()
     result = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
-    assert result.status_code == 201, result.text
-    assert scene.id not in {item["scene_id"] for item in result.json()["queue"]}
+    # A superseded scene is excluded from the active queue; affected cognition
+    # without another exact active replay coverage must fail closed.
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "COGNITION_REPLAY_COVERAGE_UNRESOLVED"
 
 def test_commit_failure_hook_rolls_back_real_api(session, monkeypatch):
     values = replay_ready(session, monkeypatch); project, _, _, scene, _, _, _, client, _, application_id = values
@@ -152,7 +155,162 @@ def test_commit_failure_hook_rolls_back_real_api(session, monkeypatch):
         body = client.get(f"/projects/{project.id}/retcon/replay-sessions/{session_id}").json()
         if body["cursor"] >= len(body["queue"]): break
         assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step").status_code == 200
-    monkeypatch.setattr(ReplayService, "failure_injector", lambda _: (_ for _ in ()).throw(RuntimeError("TEST_REPLAY_COMMIT_FAILURE")))
+    stages = []
+    def inject(stage):
+        stages.append(stage)
+        if stage == "AFTER_FORMAL_MATERIALIZATION":
+            raise RuntimeError("TEST_REPLAY_COMMIT_FAILURE")
+    monkeypatch.setattr(ReplayService, "failure_injector", inject)
     failed = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/commit", json={"explicit_confirmation": True})
     assert failed.status_code == 409 and failed.json()["detail"]["code"] == "REPLAY_COMMIT_FAILED"
+    assert stages == ["AFTER_FORMAL_MATERIALIZATION"]
     session.expire_all(); assert session.get(Scene, scene.id).history_status == "ACTIVE"
+
+def test_replay_world_view_reads_historical_character_state(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    replay = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()
+    replay_session = session.get(RetconReplaySession, replay["id"])
+    character = replay_session.staged_world_state["current_world"]["characters"][0]
+    character["current_state"] = {"location_id": "historical"}; replay_session.staged_world_state = replay_session.staged_world_state
+    assert ReplayWorldView(replay_session).character(character["id"])["current_state"]["location_id"] == "historical"
+
+def test_replay_world_view_reads_baseline_entity_fact(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    replay = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()
+    replay_session = session.get(RetconReplaySession, replay["id"]); entity = replay_session.staged_world_state["current_world"]["world_entities"][0]
+    assert ReplayWorldView(replay_session).fact("ENTITY", entity["id"], "locked") == (entity.get("profile") or {}).get("locked")
+
+def test_replay_world_view_latest_staged_fact_wins(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    replay = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json(); replay_session = session.get(RetconReplaySession, replay["id"])
+    entity = replay_session.staged_world_state["current_world"]["world_entities"][0]; state = dict(replay_session.staged_world_state); state["staged_facts"] = [{"subject_type":"ENTITY","subject_id":entity["id"],"predicate":"locked","value":False},{"subject_type":"ENTITY","subject_id":entity["id"],"predicate":"locked","value":True}]; state["current_world"] = dict(state["current_world"], staged_facts=state["staged_facts"]); replay_session.staged_world_state = state
+    assert ReplayWorldView(replay_session).fact("ENTITY", entity["id"], "locked") is True
+    assert ReplayWorldView(replay_session).entity(entity["id"])["profile"]["locked"] is True
+
+def test_temporal_reader_adds_only_prior_staged_cognition(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, knowledge, scene, _, _, _, client, _, application_id = values
+    replay = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json(); replay_session = session.get(RetconReplaySession, replay["id"])
+    state = dict(replay_session.staged_world_state); state["staged_cognition"] = {"knowledge":[{"temp_id":"prior","character_id":knowledge.character_id,"status":"SUSPECTED","proposition":"prior","confidence":0.3,"source_sequence":scene.sequence-1}],"memories":[]}; replay_session.staged_world_state = state
+    rows = TemporalCharacterCognitionReader().read(session, project.id, knowledge.character_id, replay_session, scene.sequence)
+    assert any(row.id == "prior" and row.status == "SUSPECTED" for row in rows["knowledge"])
+
+def test_temporal_reader_excludes_future_staged_cognition(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, knowledge, scene, _, _, _, client, _, application_id = values
+    replay = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json(); replay_session = session.get(RetconReplaySession, replay["id"])
+    state = dict(replay_session.staged_world_state); state["staged_cognition"] = {"knowledge":[{"temp_id":"future","character_id":knowledge.character_id,"status":"KNOWN","proposition":"future","confidence":1.0,"source_sequence":scene.sequence+1}],"memories":[]}; replay_session.staged_world_state = state
+    rows = TemporalCharacterCognitionReader().read(session, project.id, knowledge.character_id, replay_session, scene.sequence)
+    assert all(row.id != "future" for row in rows["knowledge"])
+
+def test_replay_context_preserves_epistemic_statuses(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, knowledge, scene, _, _, _, client, _, application_id = values
+    replay = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json(); replay_session = session.get(RetconReplaySession, replay["id"])
+    state = dict(replay_session.staged_world_state); state["staged_cognition"] = {"knowledge":[{"temp_id":"suspected","character_id":knowledge.character_id,"status":"SUSPECTED","proposition":"suspected","confidence":0.4},{"temp_id":"false","character_id":knowledge.character_id,"status":"FALSE_BELIEF","proposition":"false","confidence":0.1}],"memories":[]}; replay_session.staged_world_state = state
+    rows = TemporalCharacterCognitionReader().read(session, project.id, knowledge.character_id, replay_session, scene.sequence+1)
+    assert {row.status for row in rows["knowledge"] if row.id in {"suspected","false"}} == {"SUSPECTED","FALSE_BELIEF"}
+
+def test_replacement_matcher_requires_structured_fact_identity(session):
+    old = CharacterKnowledge(id="old", character_id="char", proposition='ENTITY door: locked = true', status="KNOWN", source="scene")
+    candidate = {"character_id":"char", "fact_identity":{"subject_type":"ENTITY","subject_id":"door","predicate":"locked","value":True}}
+    assert ReplayCognitionReplacementMatcher().knowledge(old, candidate, "scene") is True
+
+def test_replacement_matcher_rejects_different_fact(session):
+    old = CharacterKnowledge(id="old", character_id="char", proposition='ENTITY door: locked = true', status="KNOWN", source="scene")
+    candidate = {"character_id":"char", "fact_identity":{"subject_type":"ENTITY","subject_id":"door","predicate":"locked","value":False}}
+    assert ReplayCognitionReplacementMatcher().knowledge(old, candidate, "scene") is False
+
+def test_memory_matcher_never_uses_text_similarity(session):
+    old = CharacterMemory(id="old", character_id="char", content="the door is locked", source_scene="scene")
+    candidate = {"character_id":"char", "content":"the door is locked"}
+    assert ReplayCognitionReplacementMatcher().memory(old, candidate, "scene") is False
+
+def test_missing_cognition_lineage_fails_session_creation(session, monkeypatch):
+    values = apply_success(session, monkeypatch); project, _, _, scene, _, _, _, client, applied = values
+    pre = SceneStateCheckpointService().capture_pre(session, project.id, scene.id); SceneStateCheckpointService().finalize(session, project.id, scene.id, pre.id); session.commit()
+    result = client.post(f"/projects/{project.id}/retcon/applications/{applied['application']['id']}/replay-sessions")
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "COGNITION_REPLAY_COVERAGE_UNRESOLVED"
+
+def test_checkpoint_has_no_row_until_finalize(session, monkeypatch):
+    values = apply_success(session, monkeypatch); project, _, _, scene, _, _, _, _, _ = values
+    pre = SceneStateCheckpointService().capture_pre(session, project.id, scene.id); session.flush()
+    assert session.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.scene_id == scene.id)) is None
+    checkpoint = SceneStateCheckpointService().finalize(session, project.id, scene.id, pre.id)
+    assert checkpoint.capture_protocol_version == 2 and checkpoint.pre_snapshot_id != checkpoint.post_snapshot_id
+
+def test_commit_failure_leaves_no_snapshots_or_replacement_scene(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, scene, _, _, _, client, _, application_id = values
+    session_id = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]
+    body = client.get(f"/projects/{project.id}/retcon/replay-sessions/{session_id}").json()
+    while body["cursor"] < len(body["queue"]):
+        assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step").status_code == 200; body = client.get(f"/projects/{project.id}/retcon/replay-sessions/{session_id}").json()
+    monkeypatch.setattr(ReplayService, "failure_injector", lambda stage: (_ for _ in ()).throw(RuntimeError("TEST_REPLAY_COMMIT_FAILURE")) if stage == "AFTER_FORMAL_MATERIALIZATION" else None)
+    assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/commit", json={"explicit_confirmation":True}).status_code == 409
+    session.expire_all(); assert session.query(Scene).filter(Scene.project_id == project.id, Scene.history_status == "STAGED").count() == 0
+    assert session.query(WorldSnapshot).filter(WorldSnapshot.snapshot_type == "PRE_REPLAY_COMMIT").count() == 0
+
+def test_plan_remains_consumed_after_replay_completed(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, scene, _, _, analyzed, client, _, application_id = values
+    sid = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]; queue = client.get(f"/projects/{project.id}/retcon/replay-sessions/{sid}").json()["queue"]
+    while client.get(f"/projects/{project.id}/retcon/replay-sessions/{sid}").json()["cursor"] < len(queue): client.post(f"/projects/{project.id}/retcon/replay-sessions/{sid}/step")
+    assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{sid}/commit", json={"explicit_confirmation":True}).status_code == 200
+    plan = client.get(f"/projects/{project.id}/retcon/plans/{analyzed['plan']['id']}").json()["plan"]
+    assert plan["consumed"] is True and plan["consumption_status"] == "REPLAY_COMPLETED" and plan["is_stale"] is False
+
+def test_resource_mapper_uses_structured_source_scene(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, knowledge, scene, _, _, _, _, _, application_id = values
+    mapped = ReplayResourceMapper().map(session, session.get(RetconApplication, application_id), [scene.id])
+    assert knowledge.id in mapped[scene.id]["knowledge_ids"]
+
+@pytest.mark.parametrize("visibility,target,expected", [(ActionVisibility.PUBLIC, None, ["other"]),(ActionVisibility.PRIVATE, None, []),(ActionVisibility.COVERT, None, []),(ActionVisibility.TARGETED, "other", ["other"])])
+def test_replay_observation_router_respects_visibility(visibility, target, expected):
+    from app.performance import PerformanceObservationRouter
+    assert PerformanceObservationRouter().recipients(visibility, ["actor", "other"], "actor", target) == expected
+
+def test_replay_abort_does_not_change_formal_scene(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, scene, _, _, _, client, _, application_id = values
+    sid = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]
+    assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{sid}/abort").status_code == 200
+    session.expire_all(); assert session.get(Scene, scene.id).history_status == "ACTIVE"
+
+def test_replay_abort_keeps_application_pending(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    sid = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]
+    client.post(f"/projects/{project.id}/retcon/replay-sessions/{sid}/abort")
+    assert session.get(RetconApplication, application_id).status == RetconApplicationStatus.APPLIED_PENDING_REPLAY
+
+def test_replay_failure_does_not_resolve_cognition(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, knowledge, _, _, _, _, client, _, application_id = values
+    sid = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]
+    while client.get(f"/projects/{project.id}/retcon/replay-sessions/{sid}").json()["cursor"] < 1: client.post(f"/projects/{project.id}/retcon/replay-sessions/{sid}/step")
+    monkeypatch.setattr(ReplayService, "failure_injector", lambda stage: (_ for _ in ()).throw(RuntimeError("TEST_REPLAY_COMMIT_FAILURE")) if stage == "AFTER_FORMAL_MATERIALIZATION" else None)
+    client.post(f"/projects/{project.id}/retcon/replay-sessions/{sid}/commit", json={"explicit_confirmation":True})
+    invalidation = session.scalar(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.resource_id == knowledge.id))
+    assert invalidation.status == RetconCognitionInvalidationStatus.ACTIVE
+
+def test_replay_session_current_fingerprint_changes_after_step(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    body = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json(); before = body["current_fingerprint"]
+    body = client.post(f"/projects/{project.id}/retcon/replay-sessions/{body['id']}/step").json()
+    assert body["current_fingerprint"] != before
+
+def test_replay_queue_freezes_separate_cognition_lists(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, knowledge, _, _, _, _, client, _, application_id = values
+    body = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json(); item = body["queue"][0]
+    assert item["knowledge_ids"] == [knowledge.id] and "cognition_resource_ids" not in item
+
+@pytest.mark.parametrize("predicate,value", [("locked", True),("locked", False),("opened", True),("opened", False),("temperature", 3),("state", "sealed")])
+def test_replay_world_view_fact_overlay_variants(session, monkeypatch, predicate, value):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    body = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json(); replay_session = session.get(RetconReplaySession, body["id"]); entity = replay_session.staged_world_state["current_world"]["world_entities"][0]
+    state = dict(replay_session.staged_world_state); state["staged_facts"] = [{"subject_type":"ENTITY","subject_id":entity["id"],"predicate":predicate,"value":value}]; state["current_world"] = dict(state["current_world"], staged_facts=state["staged_facts"]); replay_session.staged_world_state = state
+    assert ReplayWorldView(replay_session).fact("ENTITY", entity["id"], predicate) == value
+
+def test_replay_baseline_fingerprint_is_stable_for_same_session(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    first = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()
+    assert first["baseline_fingerprint"] == session.get(RetconReplaySession, first["id"]).baseline_fingerprint
+
+def test_replay_application_is_not_completed_before_commit(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    sid = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]
+    assert session.get(RetconApplication, application_id).status == RetconApplicationStatus.APPLIED_PENDING_REPLAY
+    assert session.get(RetconReplaySession, sid).status == "READY"

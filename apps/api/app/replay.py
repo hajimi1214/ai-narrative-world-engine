@@ -1,6 +1,7 @@
 """Deterministic selective replay orchestration.  It never invokes an AI provider."""
 from __future__ import annotations
 import hashlib, json
+import re
 from datetime import datetime
 from sqlalchemy import select, func
 from copy import deepcopy
@@ -80,19 +81,32 @@ class ReplayResourceMapper:
                 resolutions = db.scalars(select(WorldResolution).where(WorldResolution.performance_turn_id == turn.id).order_by(WorldResolution.id)).all()
                 for resolution in resolutions: ownership["WORLD_RESOLUTION"].setdefault(resolution.id, []).append(scene_id)
                 pairs[scene_id].append({"decision_id": turn.character_decision_id, "turn_id": turn.id, "resolution_ids": [row.id for row in resolutions]})
+        def path_scenes(item):
+            return sorted({node.get("id") for node in (item.dependency_path or []) if node.get("type") == "SCENE" and node.get("id") in scene_ids})
+
+        def cognition_candidates(item, row, source_field):
+            # Source lineage is authoritative.  Only fall back when it is absent,
+            # never by combining unrelated hints into an ambiguous guess.
+            structured = getattr(row, source_field, None) if row else None
+            if structured:
+                return [structured] if structured in scene_ids else []
+            if item.scene_id:
+                return [item.scene_id] if item.scene_id in scene_ids else []
+            return path_scenes(item)
+
         for item in items:
             if item.resource_type == "CHARACTER_KNOWLEDGE":
-                row = db.get(CharacterKnowledge, item.resource_id); structured = getattr(row, "source", None); candidates = [sid for sid in scene_ids if sid == structured]
+                row = db.get(CharacterKnowledge, item.resource_id)
+                candidates = cognition_candidates(item, row, "source")
             elif item.resource_type == "CHARACTER_MEMORY":
-                row = db.get(CharacterMemory, item.resource_id); structured = getattr(row, "source_scene", None); candidates = [sid for sid in scene_ids if sid == structured]
+                row = db.get(CharacterMemory, item.resource_id)
+                candidates = cognition_candidates(item, row, "source_scene")
             elif item.resource_type in ownership:
                 candidates = ownership[item.resource_type].get(item.resource_id, [])
             else:
                 candidates = [sid for sid in scene_ids if item.scene_id == sid or any(node.get("type") == "SCENE" and node.get("id") == sid for node in (item.dependency_path or []))]
-            if not candidates and item.resource_type in {"CHARACTER_KNOWLEDGE", "CHARACTER_MEMORY"}:
-                if not item.scene_id or item.scene_id not in scene_ids: continue
-                candidates = [sid for sid in scene_ids if item.scene_id == sid or any(node.get("type") == "SCENE" and node.get("id") == sid for node in (item.dependency_path or []))]
-                if len(candidates) != 1: raise ValueError("COGNITION_REPLAY_COVERAGE_UNRESOLVED")
+            if item.resource_type in {"CHARACTER_KNOWLEDGE", "CHARACTER_MEMORY"} and len(candidates) != 1:
+                raise ValueError("COGNITION_REPLAY_COVERAGE_UNRESOLVED" if not candidates else "COGNITION_REPLAY_COVERAGE_AMBIGUOUS")
             if len(candidates) != 1 and item.resource_type in {"CHARACTER_DECISION", "SCENE_PERFORMANCE_TURN", "WORLD_RESOLUTION"}:
                 raise ValueError("REPLAY_RESOURCE_SCENE_UNRESOLVED" if not candidates else "REPLAY_RESOURCE_MAPPING_AMBIGUOUS")
             if candidates:
@@ -103,6 +117,28 @@ class ReplayResourceMapper:
             for key in result[sid]:
                 if key != "execution_pairs": result[sid][key] = sorted(set(result[sid][key]))
         return result
+
+class ReplayCognitionReplacementMatcher:
+    """Match only explicit structured provenance; never compare prose semantically."""
+    _fact = re.compile(r"^(ENTITY|CHARACTER|LOCATION|SCENE) ([^:]+): ([^ ]+) = (.+)$")
+
+    def knowledge(self, old: CharacterKnowledge, candidate: dict, scene_id: str) -> bool:
+        identity = candidate.get("fact_identity") or {}
+        if old.character_id != candidate.get("character_id") or old.source != scene_id:
+            return False
+        match = self._fact.match(old.proposition or "")
+        if not match:
+            return False
+        try:
+            old_value = json.loads(match.group(4))
+        except (TypeError, json.JSONDecodeError):
+            old_value = match.group(4)
+        return {"subject_type": match.group(1), "subject_id": match.group(2), "predicate": match.group(3), "value": old_value} == identity
+
+    def memory(self, old: CharacterMemory, candidate: dict, scene_id: str) -> bool:
+        # Legacy memories have no structured turn/resolution provenance.  Do not
+        # infer replacement from text or source_scene alone.
+        return False
 
 def _fingerprint(value):
     return "replay-input-v1:" + hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
@@ -115,7 +151,7 @@ class CurrentSceneHistoryResolver:
         return rows[0] if rows else None
 
 class PreservedSceneValidator:
-    def validate(self, db: Session, scene: Scene, world=None):
+    def validate(self, db: Session, scene: Scene, world=None, replay_session=None):
         participants = scene.participants or []
         available = {row.get("id") for row in world.rows("characters")} if world else {row.id for row in db.query(__import__("app.models", fromlist=["Character"]).Character).filter_by(project_id=scene.project_id).all()}
         missing = sorted(set(participants) - available)
@@ -127,17 +163,37 @@ class PreservedSceneValidator:
             performance = db.get(ScenePerformance, binding.performance_id)
             proposal = db.get(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal, performance.scene_proposal_id) if performance else None
         prerequisites = ((proposal.entry_state if proposal else {}) or {}).get("replay_prerequisites", {})
-        view = world or ReplayWorldView(type("ReplayState", (), {"staged_world_state": {"current_world": {}}})())
+        view = world
         for required in prerequisites.get("required_entity_facts", []):
             if view.fact("ENTITY", required.get("entity_id"), required.get("predicate")) != required.get("expected"):
                 return "REPLAY_ESCALATED", {"code": "STRUCTURED_PREREQUISITE_FAILED", "entity_id": required.get("entity_id"), "predicate": required.get("predicate")}
         for entity_id in prerequisites.get("required_active_entities", []):
             entity = view.entity(entity_id)
             if not entity or not entity.get("active", False): return "REPLAY_ESCALATED", {"code": "ENTITY_UNAVAILABLE", "entity_id": entity_id}
-        if prerequisites.get("location_id") and not view.entity(prerequisites["location_id"]): return "REPLAY_ESCALATED", {"code": "LOCATION_UNAVAILABLE", "location_id": prerequisites["location_id"]}
+        location_id = prerequisites.get("location_id")
+        if location_id:
+            location = view.entity(location_id)
+            if not location or not location.get("active", False):
+                return "REPLAY_ESCALATED", {"code": "LOCATION_UNAVAILABLE", "location_id": location_id}
         for character_id in prerequisites.get("required_active_characters", []):
             character = view.character(character_id)
             if not character or not character.get("active", False): return "REPLAY_ESCALATED", {"code": "CHARACTER_UNAVAILABLE", "character_id": character_id}
+        canon_ids = {row.get("id") for row in view.canon()}
+        for canon_id in prerequisites.get("required_canon_fact_ids", []):
+            if canon_id not in canon_ids:
+                return "REPLAY_ESCALATED", {"code": "CANON_PREREQUISITE_FAILED", "canon_fact_id": canon_id}
+        for required in prerequisites.get("required_inventory", []):
+            character = view.character(required.get("character_id")) or {}
+            if required.get("item") not in (character.get("inventory") or []):
+                return "REPLAY_ESCALATED", {"code": "INVENTORY_PREREQUISITE_FAILED", "character_id": required.get("character_id")}
+        if prerequisites.get("required_knowledge"):
+            if replay_session is None:
+                return "REPLAY_ESCALATED", {"code": "KNOWLEDGE_PREREQUISITE_UNAVAILABLE"}
+            from .historical import TemporalCharacterCognitionReader
+            for required in prerequisites["required_knowledge"]:
+                rows = TemporalCharacterCognitionReader().read(db, scene.project_id, required.get("character_id"), replay_session, scene.sequence)["knowledge"]
+                if required.get("knowledge_id") not in {row.id for row in rows}:
+                    return "REPLAY_ESCALATED", {"code": "KNOWLEDGE_PREREQUISITE_FAILED", "character_id": required.get("character_id"), "knowledge_id": required.get("knowledge_id")}
         return "PRESERVED", {"code": "PRESERVED_PREREQUISITES_VALID"}
 
 class SelectiveReplayQueue:
@@ -213,7 +269,7 @@ class ReplayService:
         run = ReplaySceneRun(project_id=session.project_id, replay_session_id=session.id, original_scene_id=scene.id, original_sequence=scene.sequence, mode=item["mode"], status=ReplaySceneRunStatus.RUNNING, input_fingerprint=_fingerprint({"scene": scene.id, "sequence": scene.sequence, "baseline": session.baseline_fingerprint}), started_at=datetime.utcnow())
         db.add(run); db.flush()
         if item["mode"] == "VALIDATE_PRESERVED":
-            result, report = PreservedSceneValidator().validate(db, scene, ReplayWorldView(session))
+            result, report = PreservedSceneValidator().validate(db, scene, ReplayWorldView(session), session)
             if result == "REPLAY_ESCALATED":
                 queue = deepcopy(session.queue); queue[session.cursor] = {**queue[session.cursor], "mode": "REPLAY", "reason": "DYNAMIC_EXPANSION", "dynamic_expansion_reason": report}; session.queue = queue
                 run.status = ReplaySceneRunStatus.VALIDATED; run.validation_report = {"result": "REPLAY_ESCALATED", **report}; session.status = ReplaySessionStatus.RUNNING; session.failure_report = {"code": "DYNAMIC_REPLAY_EXPANSION", "reason": report}; db.flush(); return run
@@ -232,11 +288,12 @@ class ReplayService:
                 context = ReplayCharacterContextBuilder().build(db, session, scene, proposal, old.character_id)
                 output, _ = HeuristicCharacterPerformer().perform(context)
                 candidate = CharacterDecision(project_id=session.project_id, scene_proposal_id=proposal.id, character_id=old.character_id, context_fingerprint=context["fingerprint"], **output["decision"])
-                decision_report = CharacterDecisionConstraintChecker().validate(db, context, candidate)
+                replay_view = ReplayWorldView(session)
+                decision_report = CharacterDecisionConstraintChecker().validate(db, context, candidate, replay_view)
                 if not decision_report.valid:
                     run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_DECISION_CONSTRAINT_FAILED", "report": decision_report.as_dict()}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
                 parsed = CharacterPerformancePayload.model_validate(output)
-                action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, candidate, parsed.action, list(scene.participants or []))
+                action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, candidate, parsed.action, list(scene.participants or []), replay_view)
                 if not action_report.valid:
                     run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_ACTION_CONSTRAINT_FAILED", "report": action_report.as_dict()}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
                 decision_temp = f"replay-decision:{session.id}:{scene.id}:{len(staged_decisions)+1}"
@@ -257,12 +314,12 @@ class ReplayService:
                     if len(pair.get("resolution_ids", [])) > 1:
                         run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_EXECUTION_LINEAGE_AMBIGUOUS"}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
                     resolved["temp_id"] = f"replay-resolution:{session.id}:{scene.id}:{turn_temp}"; resolved["replay_of_id"] = next(iter(pair.get("resolution_ids", [])), None); resolved["turn_temp_id"] = turn_temp; resolved["resolver_mode"] = "HEURISTIC"; resolved["status"] = "VALID"; resolved["recipient_character_ids"] = sorted(({old.character_id} if resolved.get("actor_observation") else set()) | (set(scene.participants or []) if resolved.get("public_observation") else set()))
-                    resolution_report = WorldResolutionConstraintChecker().validate(db, world_context, WorldResolutionPayload.model_validate(resolved), session.project_id)
+                    resolution_report = WorldResolutionConstraintChecker().validate(db, world_context, WorldResolutionPayload.model_validate(resolved), session.project_id, replay_view)
                     if not resolution_report["valid"]:
                         run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_RESOLUTION_CONSTRAINT_FAILED", "report": resolution_report}; session.status = ReplaySessionStatus.BLOCKED; return run
                     staged_resolutions.append(resolved)
                     if resolved.get("actor_observation"):
-                        for fact in resolved.get("objective_facts", []): knowledge.append({"temp_id": f"replay-knowledge:{session.id}:{scene.id}:{len(knowledge)+1}", "character_id": old.character_id, "status": "KNOWN", "proposition": f"{fact['subject_type']} {fact['subject_id']}: {fact['predicate']} = {json.dumps(fact['value'], sort_keys=True)}", "confidence": 1.0, "source_sequence": scene.sequence, "source_turn_temp_id": turn_temp, "source_resolution_temp_id": resolved["temp_id"], "old_resource_id": None, "reason": "STRUCTURED_ACTOR_OBSERVATION"})
+                        for fact in resolved.get("objective_facts", []): knowledge.append({"temp_id": f"replay-knowledge:{session.id}:{scene.id}:{len(knowledge)+1}", "character_id": old.character_id, "status": "KNOWN", "proposition": f"{fact['subject_type']} {fact['subject_id']}: {fact['predicate']} = {json.dumps(fact['value'], sort_keys=True)}", "confidence": 1.0, "source_sequence": scene.sequence, "source_turn_temp_id": turn_temp, "source_resolution_temp_id": resolved["temp_id"], "fact_identity": fact, "old_resource_id": None, "reason": "STRUCTURED_ACTOR_OBSERVATION"})
                     for recipient in resolved["recipient_character_ids"]:
                         observation = resolved.get("actor_observation") if recipient == old.character_id else resolved.get("public_observation")
                         if observation: memories.append({"temp_id": f"replay-memory:{session.id}:{scene.id}:{len(memories)+1}", "character_id": recipient, "content": observation, "importance": .5, "emotional_weight": 0.0, "confidence": 1.0, "source_sequence": scene.sequence, "source_turn_temp_id": turn_temp, "source_resolution_temp_id": resolved["temp_id"], "old_resource_id": None, "reason": "REPLAY_OBSERVATION"})
@@ -276,53 +333,76 @@ class ReplayService:
         if session.status != ReplaySessionStatus.RUNNING or session.cursor < len(session.queue): self._fail("REPLAY_NOT_VALIDATED")
         app = db.get(RetconApplication, session.retcon_application_id)
         session.pre_commit_snapshot_id = WorldSnapshotBuilder().create(db, session.project_id, __import__("app.models", fromlist=["SnapshotType"]).SnapshotType.PRE_REPLAY_COMMIT).id
-        if type(self).failure_injector:
-            type(self).failure_injector("AFTER_REPLAY_MATERIALIZATION")
         runs = db.scalars(select(ReplaySceneRun).where(ReplaySceneRun.replay_session_id == session.id).order_by(ReplaySceneRun.original_sequence, ReplaySceneRun.completed_at, ReplaySceneRun.id)).all()
         final_runs = {}
         for run in runs:
             if run.mode == "REPLAY" and run.status == ReplaySceneRunStatus.VALIDATED:
                 final_runs[run.original_scene_id] = run
+        materialized = []
+        state = session.staged_world_state or {}
         for run in final_runs.values():
-            if not run.replacement_scene_id:
-                old = db.get(Scene, run.original_scene_id)
-                staged = (session.staged_world_state or {}).get(str(run.original_sequence), {})
-                if old:
-                    resolutions = staged.get("resolutions", []); facts = [fact for resolution in resolutions for fact in resolution.get("objective_facts", [])]
-                    new = Scene(project_id=old.project_id, sequence=old.sequence, world_time=old.world_time, location=old.location, participants=list(old.participants or []), intent=old.intent, facts=facts, result={"resolutions": [{"outcome": value.get("outcome"), "outcome_summary": value.get("outcome_summary"), "objective_facts": value.get("objective_facts", [])} for value in resolutions]}, summary="Deterministic replay scene", story_threads=list(old.story_threads or []), status=old.status, history_status="STAGED")
-                    db.add(new); db.flush(); run.replacement_scene_id = new.id
-            old = db.get(Scene, run.original_scene_id); new = db.get(Scene, run.replacement_scene_id) if run.replacement_scene_id else None
-            if old and new:
-                old.history_status = "SUPERSEDED"; old.superseded_by_scene_id = new.id; db.flush(); new.history_status = "ACTIVE"; run.status = ReplaySceneRunStatus.COMMITTED
-                staged = (session.staged_world_state or {}).get(str(run.original_sequence), {})
-                decisions = staged.get("decisions", [])
-                if decisions:
-                    proposal_id = db.get(CharacterDecision, decisions[0]["replay_of_id"]).scene_proposal_id if db.get(CharacterDecision, decisions[0]["replay_of_id"]) else None
-                    if proposal_id:
-                        take = (db.scalar(select(func.max(ScenePerformance.take_number)).where(ScenePerformance.scene_proposal_id == proposal_id)) or 0) + 1
-                        performance = ScenePerformance(project_id=session.project_id, scene_proposal_id=proposal_id, take_number=take, proposal_context_fingerprint=_fingerprint({"session": session.id, "scene": new.id}), mode=PerformanceMode.HEURISTIC, status=PerformanceStatus.COMPLETED, participant_order=list(new.participants or []), active_participant_ids=list(new.participants or []), max_turns=len(decisions), turn_count=len(decisions))
-                        db.add(performance); db.flush()
-                        binding = SceneExecutionBinding(project_id=session.project_id, scene_id=new.id, performance_id=performance.id, replay_session_id=session.id, active=False); db.add(binding)
-                        for idx, item in enumerate(decisions, 1):
-                            payload = item["decision"]; action = item["action"]
-                            decision = CharacterDecision(project_id=session.project_id, scene_proposal_id=proposal_id, character_id=item["character_id"], context_fingerprint=item["context_fingerprint"], replay_session_id=session.id, replay_of_id=item["replay_of_id"], **payload)
-                            db.add(decision); db.flush()
-                            staged_turn = next((turn for turn in staged.get("turns", []) if turn.get("decision_temp_id") == item.get("temp_id")), None) or {}
-                            turn = ScenePerformanceTurn(project_id=session.project_id, performance_id=performance.id, sequence=staged_turn.get("sequence", idx), actor_character_id=item["character_id"], actor_context_fingerprint=item["context_fingerprint"], character_decision_id=decision.id, action_visibility=staged_turn.get("visibility", action["visibility"]), observable_action=staged_turn.get("observable_action", action.get("observable_action")), spoken_content=staged_turn.get("spoken_content", action.get("spoken_content")), recipient_character_ids=staged_turn.get("recipient_character_ids", list(new.participants or [])), requires_world_resolution=staged_turn.get("requires_world_resolution", action.get("requires_world_resolution", False)), world_resolution_request=staged_turn.get("world_resolution_request", action.get("world_resolution_request")), validation_result=staged_turn.get("validation", {"valid": True}), replay_session_id=session.id, replay_of_id=staged_turn.get("replay_of_id"))
-                            db.add(turn); db.flush(); run.new_decision_ids = list(run.new_decision_ids or []) + [decision.id]; run.new_turn_ids = list(run.new_turn_ids or []) + [turn.id]
-                            staged_resolution = next((value for value in staged.get("resolutions", []) if value.get("turn_temp_id") == staged_turn.get("temp_id")), None)
-                            if staged_resolution:
-                                resolution = WorldResolution(project_id=session.project_id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode=ResolverMode.HEURISTIC, world_context_fingerprint=_fingerprint(staged_resolution), status=ResolutionStatus.VALID, outcome=staged_resolution["outcome"], outcome_summary=staged_resolution["outcome_summary"], objective_facts=staged_resolution.get("objective_facts", []), actor_observation=staged_resolution.get("actor_observation"), public_observation=staged_resolution.get("public_observation"), recipient_character_ids=staged_resolution.get("recipient_character_ids", []), canon_fact_ids_used=staged_resolution.get("canon_fact_ids_used", []), world_entity_ids_used=staged_resolution.get("world_entity_ids_used", []), resolution_basis_summary=staged_resolution.get("resolution_basis_summary"), missing_information=staged_resolution.get("missing_information", []), replay_session_id=session.id, replay_of_id=staged_resolution.get("replay_of_id"))
-                                db.add(resolution); db.flush(); run.new_resolution_ids = list(run.new_resolution_ids or []) + [resolution.id]
-                        for item in staged.get("knowledge", []):
-                            row = CharacterKnowledge(character_id=item["character_id"], proposition=item["proposition"], status=item["status"], source=new.id, confidence=item["confidence"], replay_session_id=session.id, replay_of_id=item.get("old_resource_id")); db.add(row); db.flush(); run.new_knowledge_ids = list(run.new_knowledge_ids or []) + [row.id]
-                        for item in staged.get("memories", []):
-                            row = CharacterMemory(character_id=item["character_id"], content=item["content"], importance=item["importance"], emotional_weight=item["emotional_weight"], confidence=item["confidence"], distortion={}, source_scene=new.id, replay_session_id=session.id, replay_of_id=item.get("old_resource_id")); db.add(row); db.flush(); run.new_memory_ids = list(run.new_memory_ids or []) + [row.id]
-                        old_binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == old.id, SceneExecutionBinding.active.is_(True)))
-                        if old_binding: old_binding.active = False
-                        db.flush(); binding.active = True
-                        if type(self).failure_injector:
-                            type(self).failure_injector("AFTER_REPLAY_MATERIALIZATION")
+            old = db.get(Scene, run.original_scene_id)
+            staged = state.get("scene_results", {}).get(run.original_scene_id) or state.get(str(run.original_sequence), {})
+            if not old:
+                self._fail("REPLAY_SCENE_NOT_FOUND")
+            resolutions = staged.get("resolutions", [])
+            facts = [fact for resolution in resolutions for fact in resolution.get("objective_facts", [])]
+            new = Scene(project_id=old.project_id, sequence=old.sequence, world_time=old.world_time, location=old.location, participants=list(old.participants or []), intent=old.intent, facts=facts, result={"resolutions": [{"outcome": value.get("outcome"), "outcome_summary": value.get("outcome_summary"), "objective_facts": value.get("objective_facts", [])} for value in resolutions]}, summary="Deterministic replay scene", story_threads=list(old.story_threads or []), status=old.status, history_status="STAGED")
+            db.add(new); db.flush(); run.replacement_scene_id = new.id
+            binding = None
+            decisions = staged.get("decisions", [])
+            if decisions:
+                old_decision = db.get(CharacterDecision, decisions[0]["replay_of_id"])
+                proposal_id = old_decision.scene_proposal_id if old_decision else None
+                if not proposal_id:
+                    self._fail("REPLAY_EXECUTION_LINEAGE_INCOMPLETE")
+                take = (db.scalar(select(func.max(ScenePerformance.take_number)).where(ScenePerformance.scene_proposal_id == proposal_id)) or 0) + 1
+                performance_data = staged.get("performance", {})
+                performance = ScenePerformance(project_id=session.project_id, scene_proposal_id=proposal_id, take_number=take, proposal_context_fingerprint=_fingerprint({"session": session.id, "scene": new.id}), mode=PerformanceMode.HEURISTIC, status=PerformanceStatus.COMPLETED, participant_order=list(performance_data.get("participant_order", new.participants or [])), active_participant_ids=list(performance_data.get("active_participant_ids", new.participants or [])), max_turns=len(decisions), turn_count=len(decisions))
+                db.add(performance); db.flush()
+                binding = SceneExecutionBinding(project_id=session.project_id, scene_id=new.id, performance_id=performance.id, replay_session_id=session.id, active=False)
+                db.add(binding)
+                for idx, item in enumerate(decisions, 1):
+                    payload = item["decision"]; action = item["action"]
+                    decision = CharacterDecision(project_id=session.project_id, scene_proposal_id=proposal_id, character_id=item["character_id"], context_fingerprint=item["context_fingerprint"], replay_session_id=session.id, replay_of_id=item["replay_of_id"], **payload)
+                    db.add(decision); db.flush()
+                    staged_turn = next((turn for turn in staged.get("turns", []) if turn.get("decision_temp_id") == item.get("temp_id")), None)
+                    if not staged_turn:
+                        self._fail("REPLAY_EXECUTION_LINEAGE_INCOMPLETE")
+                    turn = ScenePerformanceTurn(project_id=session.project_id, performance_id=performance.id, sequence=staged_turn["sequence"], actor_character_id=item["character_id"], actor_context_fingerprint=item["context_fingerprint"], character_decision_id=decision.id, action_visibility=staged_turn.get("visibility", action["visibility"]), observable_action=staged_turn.get("observable_action", action.get("observable_action")), spoken_content=staged_turn.get("spoken_content", action.get("spoken_content")), recipient_character_ids=staged_turn.get("recipient_character_ids", []), requires_world_resolution=staged_turn.get("requires_world_resolution", action.get("requires_world_resolution", False)), world_resolution_request=staged_turn.get("world_resolution_request", action.get("world_resolution_request")), validation_result=staged_turn.get("validation", {"valid": True}), replay_session_id=session.id, replay_of_id=staged_turn.get("replay_of_id"))
+                    db.add(turn); db.flush(); run.new_decision_ids = list(run.new_decision_ids or []) + [decision.id]; run.new_turn_ids = list(run.new_turn_ids or []) + [turn.id]
+                    staged_resolution = next((value for value in resolutions if value.get("turn_temp_id") == staged_turn["temp_id"]), None)
+                    if staged_resolution:
+                        resolution = WorldResolution(project_id=session.project_id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode=ResolverMode.HEURISTIC, world_context_fingerprint=_fingerprint(staged_resolution), status=ResolutionStatus.VALID, outcome=staged_resolution["outcome"], outcome_summary=staged_resolution["outcome_summary"], objective_facts=staged_resolution.get("objective_facts", []), actor_observation=staged_resolution.get("actor_observation"), public_observation=staged_resolution.get("public_observation"), recipient_character_ids=staged_resolution.get("recipient_character_ids", []), canon_fact_ids_used=staged_resolution.get("canon_fact_ids_used", []), world_entity_ids_used=staged_resolution.get("world_entity_ids_used", []), resolution_basis_summary=staged_resolution.get("resolution_basis_summary"), missing_information=staged_resolution.get("missing_information", []), replay_session_id=session.id, replay_of_id=staged_resolution.get("replay_of_id"))
+                        db.add(resolution); db.flush(); run.new_resolution_ids = list(run.new_resolution_ids or []) + [resolution.id]
+            for item in staged.get("knowledge", []):
+                old_resource_id = item.get("old_resource_id")
+                if not old_resource_id:
+                    for resource_id in next((q.get("knowledge_ids", []) for q in session.queue if q.get("scene_id") == run.original_scene_id), []):
+                        old_knowledge = db.get(CharacterKnowledge, resource_id)
+                        if old_knowledge and ReplayCognitionReplacementMatcher().knowledge(old_knowledge, item, run.original_scene_id):
+                            old_resource_id = old_knowledge.id; break
+                row = CharacterKnowledge(character_id=item["character_id"], proposition=item["proposition"], status=item["status"], source=new.id, confidence=item["confidence"], replay_session_id=session.id, replay_of_id=old_resource_id); db.add(row); db.flush(); run.new_knowledge_ids = list(run.new_knowledge_ids or []) + [row.id]
+            for item in staged.get("memories", []):
+                row = CharacterMemory(character_id=item["character_id"], content=item["content"], importance=item["importance"], emotional_weight=item["emotional_weight"], confidence=item["confidence"], distortion={}, source_scene=new.id, replay_session_id=session.id, replay_of_id=item.get("old_resource_id")); db.add(row); db.flush(); run.new_memory_ids = list(run.new_memory_ids or []) + [row.id]
+            materialized.append((run, old, new, binding))
+
+        # The hook is deliberately after every formal row has been flushed and
+        # before either historical timeline is made current.
+        db.flush()
+        if type(self).failure_injector:
+            type(self).failure_injector("AFTER_FORMAL_MATERIALIZATION")
+
+        for _run, old, new, _binding in materialized:
+            old.history_status = "SUPERSEDED"; old.superseded_by_scene_id = new.id
+            old_binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == old.id, SceneExecutionBinding.active.is_(True)))
+            if old_binding: old_binding.active = False
+        db.flush()
+        for run, _old, new, binding in materialized:
+            new.history_status = "ACTIVE"
+            if binding: binding.active = True
+            run.status = ReplaySceneRunStatus.COMMITTED
+        db.flush()
         replacement_by_old = {run.original_scene_id: run.replacement_scene_id for run in final_runs.values() if run.replacement_scene_id}
         # A rebuild is complete only when the affected resource was covered by a replayed scene.
         for inv in db.scalars(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.retcon_application_id == app.id, RetconCognitionInvalidation.status == RetconCognitionInvalidationStatus.ACTIVE)).all():

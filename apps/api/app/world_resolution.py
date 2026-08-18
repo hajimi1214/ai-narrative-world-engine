@@ -143,14 +143,16 @@ class WorldObservationRouter:
 
 
 class WorldResolutionConstraintChecker:
-    def validate(self, session: Session, context: dict[str, Any], payload: WorldResolutionPayload, project_id: str) -> dict[str, Any]:
+    def validate(self, session: Session, context: dict[str, Any], payload: WorldResolutionPayload, project_id: str, world_view=None) -> dict[str, Any]:
         issues = []
         def add(code, message, ids=None): issues.append({"code":code, "severity":"BLOCKING", "message":message, "related_entity_ids":ids or []})
         allowed_entities = set(context.get("allowed_world_entity_ids", [])); scope = context["scope"]
         for entity_id in payload.world_entity_ids_used:
-            entity = session.get(WorldEntity, entity_id)
-            if entity and entity.project_id != project_id: add("CROSS_PROJECT_REFERENCE", "World entity belongs to another project.", [entity_id])
-            elif not entity or entity_id not in allowed_entities: add("INVALID_ENTITY_REFERENCE", "World entity is unavailable to this resolver.", [entity_id])
+            entity = world_view.entity(entity_id) if world_view else session.get(WorldEntity, entity_id)
+            if entity and not world_view and entity.project_id != project_id: add("CROSS_PROJECT_REFERENCE", "World entity belongs to another project.", [entity_id])
+            else:
+                entity_active = entity.get("active", True) if isinstance(entity, dict) else getattr(entity, "active", True)
+                if not entity or entity_id not in allowed_entities or entity_active is False: add("INVALID_ENTITY_REFERENCE", "World entity is unavailable to this resolver.", [entity_id])
         allowed_canon = {item["id"] for item in context.get("canon", [])}
         for canon_id in payload.canon_fact_ids_used:
             fact = session.get(CanonFact, canon_id)

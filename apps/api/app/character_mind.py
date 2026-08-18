@@ -139,7 +139,7 @@ class CharacterDecisionValidationReport:
     def as_dict(self): return {"valid": self.valid, "issues": [item.__dict__ for item in self.issues]}
 
 class CharacterDecisionConstraintChecker:
-    def validate(self, session: Session, context: dict[str, Any], decision: CharacterDecision) -> CharacterDecisionValidationReport:
+    def validate(self, session: Session, context: dict[str, Any], decision: CharacterDecision, world_view=None) -> CharacterDecisionValidationReport:
         issues: list[CharacterDecisionIssue] = []
         add = lambda code, severity, message, ids, fix: issues.append(CharacterDecisionIssue(code, severity, message, ids, fix))
         character = context["character"]
@@ -161,7 +161,7 @@ class CharacterDecisionConstraintChecker:
         if any(term in motivation for term in ("director need", "plot need", "chapter goal", "outline requirement", "剧情需要", "大纲要求", "导演需要")): add("DIRECTOR_PUPPETING", "BLOCKING", "Decision motivation is authorial rather than character-driven.", [decision.character_id], "Ground motivation in the character's goals, knowledge, or relationships.")
         if scene["location"] and character["current_state"].get("location_id") and character["current_state"]["location_id"] != scene["location"]["id"] and decision.decision_type != CharacterDecisionType.WAIT:
             add("IMPOSSIBLE_LOCATION", "BLOCKING", "Character is not at the proposal location.", [decision.character_id], "Use WAIT or a future Transition before acting at that location.")
-        self._targets(session, context, decision, add)
+        self._targets(session, context, decision, add, world_view)
         return CharacterDecisionValidationReport(issues)
 
     def _knowledge(self, context, decision, add):
@@ -179,15 +179,16 @@ class CharacterDecisionConstraintChecker:
             ability = available.get(reference)
             if not ability: add("ABILITY_UNKNOWN", "BLOCKING", "Character cannot intentionally use an unknown ability.", [reference], "Use a visible ability from Actor Context.")
             elif isinstance(ability, dict) and ability.get("status", "AVAILABLE") != "AVAILABLE": add("ABILITY_UNAVAILABLE", "BLOCKING", "Ability is currently unavailable to the character.", [reference], "Choose an available ability or wait for recovery.")
-    def _targets(self, session, context, decision, add):
+    def _targets(self, session, context, decision, add, world_view=None):
         if decision.target_character_id:
             participant_ids = {item["id"] for item in context["scene"]["other_participants"]} | {context["character"]["id"]}
             target = session.get(Character, decision.target_character_id)
             if not target or target.project_id != decision.project_id or decision.target_character_id not in participant_ids: add("INVALID_TARGET", "BLOCKING", "Target character is unavailable in this Scene.", [decision.target_character_id], "Target an existing Scene participant.")
         if decision.target_entity_id:
-            target = session.get(WorldEntity, decision.target_entity_id)
+            target = world_view.entity(decision.target_entity_id) if world_view else session.get(WorldEntity, decision.target_entity_id)
             scene_location = context["scene"]["location"] or {}
-            if not target or target.project_id != decision.project_id or decision.target_entity_id != scene_location.get("id"): add("INVALID_TARGET", "BLOCKING", "Target entity is unavailable in this Scene.", [decision.target_entity_id], "Target the current Scene location or a future exposed entity.")
+            target_active = target.get("active", True) if isinstance(target, dict) else getattr(target, "active", True)
+            if not target or (not world_view and target.project_id != decision.project_id) or target_active is False or decision.target_entity_id != scene_location.get("id"): add("INVALID_TARGET", "BLOCKING", "Target entity is unavailable in this Scene.", [decision.target_entity_id], "Target the current Scene location or a future exposed entity.")
 
 class HeuristicCharacterActor:
     def decide(self, context: dict[str, Any]) -> dict[str, Any]:
