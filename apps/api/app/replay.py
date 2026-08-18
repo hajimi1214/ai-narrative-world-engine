@@ -143,6 +143,13 @@ class ReplayCognitionReplacementMatcher:
 def _fingerprint(value):
     return "replay-input-v1:" + hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
+def _cognition_fingerprint(row):
+    if isinstance(row, CharacterKnowledge):
+        value = {"type": "KNOWLEDGE", "id": row.id, "character_id": row.character_id, "proposition": row.proposition, "status": getattr(row.status, "value", row.status), "source": row.source, "confidence": row.confidence}
+    else:
+        value = {"type": "MEMORY", "id": row.id, "character_id": row.character_id, "content": row.content, "source_scene": row.source_scene, "importance": row.importance, "emotional_weight": row.emotional_weight, "confidence": row.confidence}
+    return _fingerprint(value)
+
 class CurrentSceneHistoryResolver:
     def resolve(self, db: Session, project_id: str, sequence: int):
         rows = db.scalars(select(Scene).where(Scene.project_id == project_id, Scene.sequence == sequence, Scene.history_status == "ACTIVE")).all()
@@ -271,8 +278,30 @@ class ReplayService:
         if item["mode"] == "VALIDATE_PRESERVED":
             result, report = PreservedSceneValidator().validate(db, scene, ReplayWorldView(session), session)
             if result == "REPLAY_ESCALATED":
-                queue = deepcopy(session.queue); queue[session.cursor] = {**queue[session.cursor], "mode": "REPLAY", "reason": "DYNAMIC_EXPANSION", "dynamic_expansion_reason": report}; session.queue = queue
-                run.status = ReplaySceneRunStatus.VALIDATED; run.validation_report = {"result": "REPLAY_ESCALATED", **report}; session.status = ReplaySessionStatus.RUNNING; session.failure_report = {"code": "DYNAMIC_REPLAY_EXPANSION", "reason": report}; db.flush(); return run
+                queue = deepcopy(session.queue)
+                promoted = dict(queue[session.cursor])
+                pairs = list(promoted.get("execution_pairs", []))
+                binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
+                if binding and (not pairs or any(not pair.get("decision_id") or not pair.get("turn_id") for pair in pairs)):
+                    run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "DYNAMIC_REPLAY_EXECUTION_INCOMPLETE"}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
+                if binding:
+                    promoted["decision_ids"] = sorted({pair["decision_id"] for pair in pairs})
+                    promoted["turn_ids"] = sorted({pair["turn_id"] for pair in pairs})
+                    promoted["resolution_ids"] = sorted({resolution_id for pair in pairs for resolution_id in pair.get("resolution_ids", [])})
+                dynamic = []
+                for row in db.scalars(select(CharacterKnowledge).join(__import__("app.models", fromlist=["Character"]).Character, CharacterKnowledge.character_id == __import__("app.models", fromlist=["Character"]).Character.id).where(CharacterKnowledge.source == scene.id, __import__("app.models", fromlist=["Character"]).Character.project_id == session.project_id)).all():
+                    dynamic.append({"resource_type": "KNOWLEDGE", "resource_id": row.id, "character_id": row.character_id, "scene_id": scene.id, "sequence": scene.sequence, "fingerprint": _cognition_fingerprint(row)})
+                for row in db.scalars(select(CharacterMemory).join(__import__("app.models", fromlist=["Character"]).Character, CharacterMemory.character_id == __import__("app.models", fromlist=["Character"]).Character.id).where(CharacterMemory.source_scene == scene.id, __import__("app.models", fromlist=["Character"]).Character.project_id == session.project_id)).all():
+                    dynamic.append({"resource_type": "MEMORY", "resource_id": row.id, "character_id": row.character_id, "scene_id": scene.id, "sequence": scene.sequence, "fingerprint": _cognition_fingerprint(row)})
+                promoted["knowledge_ids"] = sorted(set(promoted.get("knowledge_ids", [])) | {item["resource_id"] for item in dynamic if item["resource_type"] == "KNOWLEDGE"})
+                promoted["memory_ids"] = sorted(set(promoted.get("memory_ids", [])) | {item["resource_id"] for item in dynamic if item["resource_type"] == "MEMORY"})
+                promoted.update({"mode": "REPLAY", "reason": "DYNAMIC_EXPANSION", "dynamic_expansion_reason": report})
+                queue[session.cursor] = promoted; session.queue = queue
+                state = deepcopy(session.staged_world_state); staged_invalidations = state.setdefault("dynamic_cognition_invalidations", [])
+                known = {(item["resource_type"], item["resource_id"]) for item in staged_invalidations}
+                staged_invalidations.extend(item for item in dynamic if (item["resource_type"], item["resource_id"]) not in known)
+                session.staged_world_state = state
+                run.status = ReplaySceneRunStatus.VALIDATED; run.validation_report = {"result": "REPLAY_ESCALATED", **report}; session.status = ReplaySessionStatus.RUNNING; session.failure_report = None; db.flush(); return run
             run.status = ReplaySceneRunStatus.VALIDATED; run.validation_report = report
         else:
             queue_item = session.queue[session.cursor]
@@ -280,6 +309,8 @@ class ReplayService:
             staged_decisions = []
             staged_turns = []
             staged_resolutions, knowledge, memories = [], [], []
+            if queue_item.get("reason") == "DYNAMIC_EXPANSION" and db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True))) and not queue_item.get("decision_ids"):
+                run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "DYNAMIC_REPLAY_EXECUTION_INCOMPLETE"}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
             for old_id in queue_item.get("decision_ids", []):
                 old = db.get(CharacterDecision, old_id)
                 if not old: continue
@@ -313,8 +344,10 @@ class ReplayService:
                         run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "WORLD_INFORMATION_MISSING", "missing_information": resolved.get("missing_information", [])}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
                     if len(pair.get("resolution_ids", [])) > 1:
                         run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_EXECUTION_LINEAGE_AMBIGUOUS"}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
-                    resolved["temp_id"] = f"replay-resolution:{session.id}:{scene.id}:{turn_temp}"; resolved["replay_of_id"] = next(iter(pair.get("resolution_ids", [])), None); resolved["turn_temp_id"] = turn_temp; resolved["resolver_mode"] = "HEURISTIC"; resolved["status"] = "VALID"; resolved["recipient_character_ids"] = sorted(({old.character_id} if resolved.get("actor_observation") else set()) | (set(scene.participants or []) if resolved.get("public_observation") else set()))
-                    resolution_report = WorldResolutionConstraintChecker().validate(db, world_context, WorldResolutionPayload.model_validate(resolved), session.project_id, replay_view)
+                    resolution_payload = WorldResolutionPayload.model_validate(resolved)
+                    resolved["recipient_character_ids"] = sorted(({old.character_id} if resolved.get("actor_observation") else set()) | (set(scene.participants or []) if resolved.get("public_observation") else set()))
+                    resolved["temp_id"] = f"replay-resolution:{session.id}:{scene.id}:{turn_temp}"; resolved["replay_of_id"] = next(iter(pair.get("resolution_ids", [])), None); resolved["turn_temp_id"] = turn_temp; resolved["resolver_mode"] = "HEURISTIC"; resolved["status"] = "VALID"
+                    resolution_report = WorldResolutionConstraintChecker().validate(db, world_context, resolution_payload, session.project_id, replay_view)
                     if not resolution_report["valid"]:
                         run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_RESOLUTION_CONSTRAINT_FAILED", "report": resolution_report}; session.status = ReplaySessionStatus.BLOCKED; return run
                     staged_resolutions.append(resolved)
@@ -351,6 +384,9 @@ class ReplayService:
             db.add(new); db.flush(); run.replacement_scene_id = new.id
             binding = None
             decisions = staged.get("decisions", [])
+            old_binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == old.id, SceneExecutionBinding.active.is_(True)))
+            if old_binding and not decisions:
+                self._fail("DYNAMIC_REPLAY_EXECUTION_INCOMPLETE" if next((item for item in session.queue if item.get("scene_id") == old.id), {}).get("reason") == "DYNAMIC_EXPANSION" else "REPLAY_EXECUTION_LINEAGE_INCOMPLETE")
             if decisions:
                 old_decision = db.get(CharacterDecision, decisions[0]["replay_of_id"])
                 proposal_id = old_decision.scene_proposal_id if old_decision else None
@@ -385,7 +421,19 @@ class ReplayService:
                 row = CharacterKnowledge(character_id=item["character_id"], proposition=item["proposition"], status=item["status"], source=new.id, confidence=item["confidence"], replay_session_id=session.id, replay_of_id=old_resource_id); db.add(row); db.flush(); run.new_knowledge_ids = list(run.new_knowledge_ids or []) + [row.id]
             for item in staged.get("memories", []):
                 row = CharacterMemory(character_id=item["character_id"], content=item["content"], importance=item["importance"], emotional_weight=item["emotional_weight"], confidence=item["confidence"], distortion={}, source_scene=new.id, replay_session_id=session.id, replay_of_id=item.get("old_resource_id")); db.add(row); db.flush(); run.new_memory_ids = list(run.new_memory_ids or []) + [row.id]
+            if old_binding and binding is None:
+                self._fail("REPLAY_EXECUTION_LINEAGE_INCOMPLETE")
             materialized.append((run, old, new, binding))
+
+        # Dynamic expansion has only been staged so far.  Materialize its
+        # quarantine records inside this same transaction, never during step.
+        existing_invalidations = {(row.resource_type, row.resource_id) for row in db.scalars(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.retcon_application_id == app.id)).all()}
+        for item in state.get("dynamic_cognition_invalidations", []):
+            key = (item["resource_type"], item["resource_id"])
+            if key in existing_invalidations:
+                continue
+            db.add(RetconCognitionInvalidation(project_id=session.project_id, retcon_application_id=app.id, character_id=item["character_id"], resource_type=item["resource_type"], resource_id=item["resource_id"], source_impact_item_id=None, reason="DYNAMIC_REPLAY_EXPANSION", original_semantic_fingerprint=item["fingerprint"], status=RetconCognitionInvalidationStatus.ACTIVE))
+            existing_invalidations.add(key)
 
         # The hook is deliberately after every formal row has been flushed and
         # before either historical timeline is made current.
