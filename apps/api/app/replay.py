@@ -215,6 +215,20 @@ class ReplayService:
             old = db.get(Scene, run.original_scene_id); new = db.get(Scene, run.replacement_scene_id) if run.replacement_scene_id else None
             if old and new:
                 old.history_status = "SUPERSEDED"; old.superseded_by_scene_id = new.id; db.flush(); new.history_status = "ACTIVE"; run.status = ReplaySceneRunStatus.COMMITTED
+                staged = (session.staged_world_state or {}).get(str(run.original_sequence), {})
+                decisions = staged.get("decisions", [])
+                if decisions:
+                    proposal_id = db.get(CharacterDecision, decisions[0]["replay_of_id"]).scene_proposal_id if db.get(CharacterDecision, decisions[0]["replay_of_id"]) else None
+                    if proposal_id:
+                        performance = ScenePerformance(project_id=session.project_id, scene_proposal_id=proposal_id, take_number=run.original_sequence + 100000, proposal_context_fingerprint=_fingerprint({"session": session.id, "scene": new.id}), mode=PerformanceMode.HEURISTIC, status=PerformanceStatus.COMPLETED, participant_order=list(new.participants or []), active_participant_ids=list(new.participants or []), max_turns=len(decisions), turn_count=len(decisions))
+                        db.add(performance); db.flush()
+                        binding = SceneExecutionBinding(project_id=session.project_id, scene_id=new.id, performance_id=performance.id, replay_session_id=session.id, active=True); db.add(binding)
+                        for idx, item in enumerate(decisions, 1):
+                            payload = item["decision"]; action = item["action"]
+                            decision = CharacterDecision(project_id=session.project_id, scene_proposal_id=proposal_id, character_id=item["character_id"], context_fingerprint=item["context_fingerprint"], replay_session_id=session.id, replay_of_id=item["replay_of_id"], **payload)
+                            db.add(decision); db.flush()
+                            turn = ScenePerformanceTurn(project_id=session.project_id, performance_id=performance.id, sequence=idx, actor_character_id=item["character_id"], actor_context_fingerprint=item["context_fingerprint"], character_decision_id=decision.id, action_visibility=action["visibility"], observable_action=action.get("observable_action"), spoken_content=action.get("spoken_content"), recipient_character_ids=list(new.participants or []), requires_world_resolution=action.get("requires_world_resolution", False), world_resolution_request=action.get("world_resolution_request"), validation_result={"valid": True}, replay_session_id=session.id, replay_of_id=item["replay_of_id"])
+                            db.add(turn); db.flush(); run.new_decision_ids = list(run.new_decision_ids or []) + [decision.id]; run.new_turn_ids = list(run.new_turn_ids or []) + [turn.id]
         replacement_by_old = {run.original_scene_id: run.replacement_scene_id for run in final_runs.values() if run.replacement_scene_id}
         # A rebuild is complete only when the affected resource was covered by a replayed scene.
         for inv in db.scalars(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.retcon_application_id == app.id, RetconCognitionInvalidation.status == RetconCognitionInvalidationStatus.ACTIVE)).all():
