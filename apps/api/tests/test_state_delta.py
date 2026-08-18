@@ -263,13 +263,13 @@ def test_state_effect_change_changes_input_and_item_fingerprints(session, monkey
     session.commit()
     first, first_items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
     session.commit()
-    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/latched", True)]
+    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/opened", "ajar")]
     session.commit()
     second, second_items, existing = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
     assert not existing and second.id != first.id
     assert second.input_fingerprint != first.input_fingerprint
     assert first_items[0].semantic_fingerprint != second_items[0].semantic_fingerprint
-    assert second_items[0].after_value is True
+    assert second_items[0].after_value == "ajar"
 
 
 def test_state_effect_removal_creates_distinct_noop_batch(session, monkeypatch):
