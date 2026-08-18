@@ -18,6 +18,7 @@ from .performance import HeuristicCharacterPerformer, CharacterPerformancePayloa
 from .character_mind import CharacterContextBuilder, CharacterDecisionConstraintChecker
 from .world_resolution import HeuristicWorldResolver, WorldResolutionPayload, WorldResolutionConstraintChecker
 from .historical import SceneCheckpointService, SceneCheckpointOrigin, CurrentSceneCheckpointResolver, snapshot_fingerprint
+from .causal_ledger import CausalLedgerService
 from .revision import _record
 
 
@@ -644,4 +645,7 @@ class ReplayService:
         for checkpoint in db.scalars(select(checkpoint_model).where(checkpoint_model.source_replay_session_id == session.id)).all():
             checkpoint_service.validate_integrity(db, checkpoint)
         session.post_commit_snapshot_id = WorldSnapshotBuilder().create(db, session.project_id, __import__("app.models", fromlist=["SnapshotType"]).SnapshotType.POST_REPLAY_COMMIT).id
+        # Ledger records are derived from the now-final current history and
+        # remain inside the replay transaction for atomic rollback semantics.
+        CausalLedgerService().sync_after_replay_commit(db, session)
         db.flush(); return session

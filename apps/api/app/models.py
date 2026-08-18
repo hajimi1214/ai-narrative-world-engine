@@ -43,6 +43,11 @@ class RetconApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED_PENDIN
 class RetconCognitionInvalidationStatus(str, enum.Enum): ACTIVE="ACTIVE"; RESOLVED="RESOLVED"; ROLLED_BACK="ROLLED_BACK"
 class ReplaySessionStatus(str, enum.Enum): READY="READY"; RUNNING="RUNNING"; BLOCKED="BLOCKED"; COMPLETED="COMPLETED"; ABORTED="ABORTED"
 class ReplaySceneRunStatus(str, enum.Enum): PENDING="PENDING"; RUNNING="RUNNING"; VALIDATED="VALIDATED"; BLOCKED="BLOCKED"; COMMITTED="COMMITTED"
+class TimelineEventType(str, enum.Enum): SCENE_OCCURRED="SCENE_OCCURRED"; STATE_CHANGE="STATE_CHANGE"; RETCON_APPLIED="RETCON_APPLIED"; REPLAY_COMMITTED="REPLAY_COMMITTED"
+class TimelineOrigin(str, enum.Enum): NORMAL_COMMIT="NORMAL_COMMIT"; REPLAY_COMMIT="REPLAY_COMMIT"; RETCON="RETCON"; LEGACY_BACKFILL="LEGACY_BACKFILL"
+class CausalResourceType(str, enum.Enum): CANON_FACT="CANON_FACT"; WORLD_ENTITY="WORLD_ENTITY"; CHARACTER_KNOWLEDGE="CHARACTER_KNOWLEDGE"; CHARACTER_MEMORY="CHARACTER_MEMORY"; CHARACTER_DECISION="CHARACTER_DECISION"; SCENE_PERFORMANCE_TURN="SCENE_PERFORMANCE_TURN"; WORLD_RESOLUTION="WORLD_RESOLUTION"; STATE_DELTA_ITEM="STATE_DELTA_ITEM"; TIMELINE_EVENT="TIMELINE_EVENT"; SCENE="SCENE"; RETCON_APPLICATION="RETCON_APPLICATION"; REPLAY_SESSION="REPLAY_SESSION"
+class CausalEdgeKind(str, enum.Enum): CAUSAL="CAUSAL"; TEMPORAL="TEMPORAL"; PROVENANCE="PROVENANCE"; STRUCTURAL="STRUCTURAL"
+class CausalRelationType(str, enum.Enum): KNOWLEDGE_INFORMED_DECISION="KNOWLEDGE_INFORMED_DECISION"; MEMORY_INFORMED_DECISION="MEMORY_INFORMED_DECISION"; DECISION_PRODUCED_TURN="DECISION_PRODUCED_TURN"; TURN_RESOLVED_BY="TURN_RESOLVED_BY"; RESOLUTION_PRODUCED_STATE_CHANGE="RESOLUTION_PRODUCED_STATE_CHANGE"; STATE_CHANGE_COMMITTED_IN_SCENE="STATE_CHANGE_COMMITTED_IN_SCENE"; SCENE_PRODUCED_KNOWLEDGE="SCENE_PRODUCED_KNOWLEDGE"; SCENE_PRODUCED_MEMORY="SCENE_PRODUCED_MEMORY"; CANON_CONSTRAINED_RESOLUTION="CANON_CONSTRAINED_RESOLUTION"; WORLD_ENTITY_CONTEXT_FOR_RESOLUTION="WORLD_ENTITY_CONTEXT_FOR_RESOLUTION"; SCENE_PRECEDES_SCENE="SCENE_PRECEDES_SCENE"; RETCON_TRIGGERED_REPLAY="RETCON_TRIGGERED_REPLAY"; REPLAY_REPLACED_SCENE="REPLAY_REPLACED_SCENE"
 class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; SCENE_COMMIT="SCENE_COMMIT"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
@@ -559,6 +564,57 @@ class SceneStateCheckpoint(Base):
     pre_state_fingerprint: Mapped[str | None] = mapped_column(String(120))
     post_state_fingerprint: Mapped[str | None] = mapped_column(String(120))
     checkpoint_fingerprint: Mapped[str | None] = mapped_column(String(120), index=True)
+
+class TimelineEvent(Base):
+    __tablename__ = "timeline_events"
+    __table_args__ = (
+        UniqueConstraint("project_id", "source_key", name="uq_timeline_event_project_source_key"),
+        Index("ix_timeline_event_project_sequence_active", "project_id", "sequence", "active"),
+        Index("ix_timeline_event_project_type_active", "project_id", "event_type", "active"),
+        Index("ix_timeline_event_target_path", "target_type", "target_id", "path"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    event_type: Mapped[TimelineEventType] = mapped_column(Enum(TimelineEventType), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    source_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id"))
+    sequence: Mapped[int | None] = mapped_column(Integer)
+    ordinal: Mapped[int | None] = mapped_column(Integer)
+    world_time: Mapped[datetime | None] = mapped_column(DateTime)
+    origin: Mapped[TimelineOrigin] = mapped_column(Enum(TimelineOrigin), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    supersedes_event_id: Mapped[str | None] = mapped_column(ForeignKey("timeline_events.id"))
+    checkpoint_id: Mapped[str | None] = mapped_column(ForeignKey("scene_state_checkpoints.id"))
+    target_type: Mapped[str | None] = mapped_column(String(40))
+    target_id: Mapped[str | None] = mapped_column(String(36))
+    path: Mapped[str | None] = mapped_column(String(500))
+    before_value: Mapped[Any] = mapped_column(JSON)
+    after_value: Mapped[Any] = mapped_column(JSON)
+    structured_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    event_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class CausalLink(Base):
+    __tablename__ = "causal_links"
+    __table_args__ = (UniqueConstraint("project_id", "source_key", name="uq_causal_link_project_source_key"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    cause_type: Mapped[CausalResourceType] = mapped_column(Enum(CausalResourceType), nullable=False)
+    cause_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    effect_type: Mapped[CausalResourceType] = mapped_column(Enum(CausalResourceType), nullable=False)
+    effect_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    edge_kind: Mapped[CausalEdgeKind] = mapped_column(Enum(CausalEdgeKind), nullable=False)
+    relation_type: Mapped[CausalRelationType] = mapped_column(Enum(CausalRelationType), nullable=False)
+    scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id"))
+    sequence: Mapped[int | None] = mapped_column(Integer)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    source_key: Mapped[str] = mapped_column(String(700), nullable=False)
+    link_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    replay_session_id: Mapped[str | None] = mapped_column(ForeignKey("retcon_replay_sessions.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class SceneExecutionBinding(Base):
     __tablename__ = "scene_execution_bindings"

@@ -32,6 +32,7 @@ from .state_delta_validation import StateDeltaValidationWorldView, StateDeltaVal
 from .state_effect_contract import StateEffectPayload
 from .versioning import WorldSnapshotBuilder
 from .historical import SceneCheckpointService, SceneCheckpointOrigin
+from .causal_ledger import CausalLedgerService
 
 
 @dataclass
@@ -411,6 +412,10 @@ class SceneCommitService:
         record.commit_fingerprint = stable_fingerprint({"source_fingerprint": record.source_fingerprint, "sequence": scene.sequence, "item_fingerprints": [item.semantic_fingerprint for item in prepared.items], "pre": record.pre_world_fingerprint, "post": post_fingerprint}, "scene-commit-v1")
         trace = ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.SCENE_COMMIT, source_type="SCENE_PERFORMANCE", source_id=prepared.performance.id, status=ExecutionStatus.SUCCEEDED, input_fingerprint=record.source_fingerprint, output_fingerprint=record.commit_fingerprint)
         db.add(trace)
+        db.flush()
+        # Phase 8 is a derived audit write in this same transaction.  A ledger
+        # failure therefore rolls back formal scene materialization as well.
+        CausalLedgerService().sync_after_scene_commit(db, record)
         db.flush()
         if self.failure_injector:
             self.failure_injector("AFTER_SCENE_COMMIT_MATERIALIZATION")

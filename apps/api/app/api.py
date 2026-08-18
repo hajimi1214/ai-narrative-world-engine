@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -30,6 +30,7 @@ from .historical import SceneStateCheckpointService, CurrentSceneCheckpointResol
 from .state_delta import StateDeltaCandidateBuilder
 from .state_delta_validation import StateDeltaValidator
 from .scene_commit import SceneCommitService
+from .causal_ledger import CausalLedgerBackfillService, CausalProvenanceQuery
 
 router = APIRouter()
 
@@ -210,6 +211,70 @@ def list_scene_checkpoints(project_id: str, scene_id: str, db: Session = Depends
     if not scene or scene.project_id != project_id:
         raise HTTPException(status_code=404, detail="Scene not found")
     return [scene_checkpoint_payload(row) for row in CurrentSceneCheckpointResolver().history(db, project_id, scene_id)]
+
+@router.get("/projects/{project_id}/timeline")
+def list_timeline(project_id: str, sequence_from: int | None = None, sequence_to: int | None = None,
+                  active_only: bool = True, event_type: str | None = None, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    query = select(TimelineEvent).where(TimelineEvent.project_id == project_id)
+    if active_only:
+        query = query.where(TimelineEvent.active.is_(True))
+    if sequence_from is not None:
+        query = query.where(TimelineEvent.sequence >= sequence_from)
+    if sequence_to is not None:
+        query = query.where(TimelineEvent.sequence <= sequence_to)
+    if event_type:
+        query = query.where(TimelineEvent.event_type == event_type)
+    reader = CausalProvenanceQuery()
+    return [reader.event_payload(row) for row in db.scalars(query.order_by(TimelineEvent.sequence, TimelineEvent.ordinal, TimelineEvent.event_type, TimelineEvent.id)).all()]
+
+@router.get("/projects/{project_id}/causal-ledger/state-history")
+def causal_state_history(project_id: str, target_type: str, target_id: str, path: str | None = None,
+                         include_superseded: bool = False, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return CausalProvenanceQuery().state_history(db, project_id, target_type, target_id, path, include_superseded)
+
+@router.get("/projects/{project_id}/causal-ledger/why-state")
+def causal_why_state(project_id: str, target_type: str, target_id: str, path: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        return CausalProvenanceQuery().why_state(db, project_id, target_type, target_id, path)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+
+@router.get("/projects/{project_id}/causal-ledger/decisions/{decision_id}")
+def causal_trace_decision(project_id: str, decision_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        return CausalProvenanceQuery().trace_decision(db, project_id, decision_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+
+@router.get("/projects/{project_id}/causal-ledger/knowledge/{knowledge_id}")
+def causal_trace_knowledge(project_id: str, knowledge_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        return CausalProvenanceQuery().trace_knowledge(db, project_id, knowledge_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+
+@router.get("/projects/{project_id}/causal-ledger/resources/{resource_type}/{resource_id}")
+def causal_resource_links(project_id: str, resource_type: str, resource_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        return CausalProvenanceQuery().resource_links(db, project_id, resource_type, resource_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+
+@router.post("/projects/{project_id}/causal-ledger/backfill")
+def backfill_causal_ledger(project_id: str, db: Session = Depends(get_db)):
+    try:
+        CausalLedgerBackfillService().backfill(db, project_id)
+        db.commit()
+        return {"project_id": project_id, "status": "INDEXED"}
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 
 @router.post("/projects/{project_id}/retcon/requests", status_code=status.HTTP_201_CREATED)
 def create_retcon_request(project_id: str, payload: RetconRequestPayload, db: Session = Depends(get_db)):
