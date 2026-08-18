@@ -46,6 +46,17 @@ def _value_id(value: Any) -> str | None:
     return None
 
 
+def context_knowledge_id(item: Any) -> str | None:
+    """Return the canonical recalled knowledge id, with frozen-history fallback."""
+    if not isinstance(item, dict):
+        return None
+    value = item.get("knowledge_id")
+    if isinstance(value, str) and value:
+        return value
+    value = item.get("id")
+    return value if isinstance(value, str) and value else None
+
+
 class StructuredActorCueExtractor:
     """Extract explicit IDs only; prose and arbitrary JSON strings are never cues."""
     def extract(self, proposal: SceneProposal, character_id: str | None = None) -> dict[str, tuple[str, ...]]:
@@ -173,9 +184,10 @@ def _scene_metadata(session: Session, project_id: str, scene_id: str | None) -> 
 class CharacterKnowledgeRetriever:
     STATUS_WEIGHT = {"KNOWN": 3, "SUSPECTED": 2, "FALSE_BELIEF": 1}
 
-    def retrieve(self, session: Session, project_id: str, records: list[CharacterKnowledge], cues: dict[str, tuple[str, ...]], beliefs: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-        usage = _CognitionUsage(session, project_id, CausalResourceType.CHARACTER_KNOWLEDGE, CausalRelationType.KNOWLEDGE_INFORMED_DECISION)
-        current_sequence = session.scalar(select(Scene.sequence).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc()).limit(1)) or 0
+    def retrieve(self, session: Session, project_id: str, records: list[CharacterKnowledge], cues: dict[str, tuple[str, ...]], beliefs: dict[str, dict[str, Any]], *, usage=None, usage_provider=None, current_sequence: int | None = None) -> list[dict[str, Any]]:
+        usage = usage or usage_provider or _CognitionUsage(session, project_id, CausalResourceType.CHARACTER_KNOWLEDGE, CausalRelationType.KNOWLEDGE_INFORMED_DECISION)
+        if current_sequence is None:
+            current_sequence = session.scalar(select(Scene.sequence).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc()).limit(1)) or 0
         ranked = []
         for row in records:
             item = beliefs[row.id]; count, latest = usage.get(row.id); cue = _cue_hits(item["fact_identity"], cues)
@@ -190,18 +202,21 @@ class CharacterMemoryRetriever:
     """Deterministic salience retrieval. Text content is never a ranking authority."""
     MAX_PER_SOURCE_SCENE = 3
 
-    def retrieve(self, session: Session, project_id: str, records: list[CharacterMemory], cues: dict[str, tuple[str, ...]]) -> list[dict[str, Any]]:
-        usage = _CognitionUsage(session, project_id, CausalResourceType.CHARACTER_MEMORY, CausalRelationType.MEMORY_INFORMED_DECISION)
+    def retrieve(self, session: Session, project_id: str, records: list[CharacterMemory], cues: dict[str, tuple[str, ...]], *, usage=None, usage_provider=None, current_sequence: int | None = None, scene_provider=None, scene_metadata_provider=None) -> list[dict[str, Any]]:
+        usage = usage or usage_provider or _CognitionUsage(session, project_id, CausalResourceType.CHARACTER_MEMORY, CausalRelationType.MEMORY_INFORMED_DECISION)
+        scene_provider = scene_provider or scene_metadata_provider
         project = session.get(Project, project_id)
-        max_sequence = session.scalar(select(Scene.sequence).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc()).limit(1)) or 0
+        max_sequence = current_sequence if current_sequence is not None else (session.scalar(select(Scene.sequence).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc()).limit(1)) or 0)
         ranked = []
         for memory in records:
-            scene = _scene_metadata(session, project_id, memory.source_scene)
+            source_scene = getattr(memory, "source_scene", None) or getattr(memory, "source_scene_id", None)
+            scene = scene_provider(source_scene) if scene_provider else _scene_metadata(session, project_id, source_scene)
             cue, strong = self._cue_score(memory, scene, cues); count, latest = usage.get(memory.id)
-            source_sequence = scene.sequence if scene else -1
+            source_sequence = (scene.get("sequence", -1) if isinstance(scene, dict) else scene.sequence) if scene else -1
             recency = self._recency(memory, scene, project, max_sequence)
             score = cue + 2 * max(0.0, float(memory.importance)) + abs(float(memory.emotional_weight)) + max(0.0, float(memory.confidence)) + min(count, 4) + recency
-            item = {"memory_id": memory.id, "content": memory.content, "importance": memory.importance, "emotional_weight": memory.emotional_weight, "confidence": memory.confidence, "distortion": memory.distortion or {}, "happened_at": memory.happened_at.isoformat() if memory.happened_at else None, "source_scene_id": memory.source_scene}
+            happened_at = getattr(memory, "happened_at", None)
+            item = {"memory_id": memory.id, "content": memory.content, "importance": getattr(memory, "importance", 0.5), "emotional_weight": getattr(memory, "emotional_weight", 0.0), "confidence": getattr(memory, "confidence", 1.0), "distortion": getattr(memory, "distortion", {}) or {}, "happened_at": happened_at.isoformat() if hasattr(happened_at, "isoformat") else happened_at, "source_scene_id": getattr(memory, "source_scene", None)}
             ranked.append((score, cue, count, source_sequence, item["happened_at"] or "", strong, item))
         ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4], item[6]["memory_id"]))
         selected, by_scene = [], {}
@@ -222,7 +237,8 @@ class CharacterMemoryRetriever:
         return selected
 
     def _cue_score(self, memory: CharacterMemory, scene: Scene | None, cues: dict[str, tuple[str, ...]]) -> tuple[float, bool]:
-        distortion = memory.distortion if isinstance(memory.distortion, dict) else {}
+        distortion_value = getattr(memory, "distortion", {})
+        distortion = distortion_value if isinstance(distortion_value, dict) else {}
         ids = {
             "entity_ids": set(distortion.get("entity_ids", [])) if isinstance(distortion.get("entity_ids"), list) else set(),
             "participant_ids": set(distortion.get("participant_ids", [])) if isinstance(distortion.get("participant_ids"), list) else set(),
@@ -231,19 +247,24 @@ class CharacterMemoryRetriever:
             "item_ids": set(distortion.get("item_ids", [])) if isinstance(distortion.get("item_ids"), list) else set(),
         }
         if scene:
-            if scene.location:
-                ids["location_ids"].add(str(scene.location)); ids["entity_ids"].add(str(scene.location))
-            ids["participant_ids"].update(str(value) for value in (scene.participants or []) if isinstance(value, str))
-            ids["thread_ids"].update(str(value) for value in (scene.story_threads or []) if isinstance(value, str))
+            location = scene.get("location") if isinstance(scene, dict) else scene.location
+            participants = scene.get("participants", []) if isinstance(scene, dict) else (scene.participants or [])
+            threads = scene.get("story_threads", []) if isinstance(scene, dict) else (scene.story_threads or [])
+            if location:
+                ids["location_ids"].add(str(location)); ids["entity_ids"].add(str(location))
+            ids["participant_ids"].update(str(value) for value in participants if isinstance(value, str))
+            ids["thread_ids"].update(str(value) for value in threads if isinstance(value, str))
         location = bool(ids["location_ids"].intersection(cues["location_ids"])); participants = len(ids["participant_ids"].intersection(cues["participant_ids"])); threads = bool(ids["thread_ids"].intersection(cues["thread_ids"])); other = len(ids["entity_ids"].intersection(cues["entity_ids"])) + len(ids["item_ids"].intersection(cues["item_ids"]))
         score = 4 * int(location) + 3 * participants + 3 * int(threads) + 2 * other
         return float(score), score >= 6
 
     def _recency(self, memory: CharacterMemory, scene: Scene | None, project: Project | None, max_sequence: int) -> float:
         if scene:
-            return 2.0 / (1 + max(0, max_sequence - scene.sequence))
-        if memory.happened_at and project and project.current_world_time:
-            return 1.0 / (1 + abs((project.current_world_time - memory.happened_at).total_seconds()) / 86400)
+            sequence = scene.get("sequence", -1) if isinstance(scene, dict) else scene.sequence
+            return 2.0 / (1 + max(0, max_sequence - sequence))
+        happened_at = getattr(memory, "happened_at", None)
+        if happened_at and project and project.current_world_time:
+            return 1.0 / (1 + abs((project.current_world_time - happened_at).total_seconds()) / 86400)
         return 0.0
 
 
@@ -265,6 +286,60 @@ class CharacterMindViewBuilder:
         identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
         result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
         result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
+        return result
+
+
+class ReplayCognitionUsageProvider:
+    """Current-history usage view for a replay sequence, including staged refs."""
+    def __init__(self, db, replay_session, sequence: int):
+        self.data: dict[str, tuple[int, int]] = {}
+        excluded = {item.get("scene_id") for item in (replay_session.queue or []) if item.get("mode") == "REPLAY" and item.get("sequence", 0) <= sequence}
+        links = db.scalars(select(CausalLink).where(CausalLink.project_id == replay_session.project_id, CausalLink.active.is_(True))).all()
+        for link in links:
+            if getattr(link, "scene_id", None) in excluded:
+                continue
+            if getattr(link, "relation_type", None) not in {CausalRelationType.KNOWLEDGE_INFORMED_DECISION, CausalRelationType.MEMORY_INFORMED_DECISION}:
+                continue
+            if getattr(link, "cause_type", None) not in {CausalResourceType.CHARACTER_KNOWLEDGE, CausalResourceType.CHARACTER_MEMORY}:
+                continue
+            count, latest = self.data.get(link.cause_id, (0, -1)); self.data[link.cause_id] = (count + 1, max(latest, getattr(link, "sequence", -1) or -1))
+        state = replay_session.staged_world_state or {}
+        for scene_result in (state.get("scene_results", {}) or {}).values():
+            scene_sequence = scene_result.get("sequence", -1)
+            if scene_sequence < 0 or scene_sequence >= sequence:
+                continue
+            for decision in scene_result.get("decisions", []) or []:
+                for reference in decision.get("decision", {}).get("knowledge_used", []) or []:
+                    ident = context_knowledge_id(reference)
+                    if ident:
+                        count, latest = self.data.get(ident, (0, -1)); self.data[ident] = (count + 1, max(latest, scene_sequence))
+                for reference in decision.get("decision", {}).get("memory_refs", []) or []:
+                    ident = reference if isinstance(reference, str) else reference.get("memory_id") if isinstance(reference, dict) else None
+                    if ident:
+                        count, latest = self.data.get(ident, (0, -1)); self.data[ident] = (count + 1, max(latest, scene_sequence))
+
+    def get(self, resource_id: str) -> tuple[int, int]:
+        return self.data.get(resource_id, (0, -1))
+
+
+class ReplayCharacterMindViewBuilder:
+    """Phase 9 retrieval over Temporal cognition and replay sandbox state."""
+    def build(self, db, replay_session, scene, proposal, character_id: str) -> dict[str, Any]:
+        from .historical import TemporalCharacterCognitionReader
+        from .replay import ReplayWorldView
+        world = ReplayWorldView(replay_session); character = world.character(character_id)
+        if not character:
+            raise ValueError("REPLAY_CHARACTER_STATE_UNAVAILABLE")
+        cognition = TemporalCharacterCognitionReader().read(db, replay_session.project_id, character_id, replay_session, scene.sequence)
+        cues = StructuredActorCueExtractor().extract(proposal, character_id)
+        beliefs, conflicts = CharacterBeliefViewBuilder().build(cognition["knowledge"])
+        usage = ReplayCognitionUsageProvider(db, replay_session, scene.sequence)
+        knowledge = CharacterKnowledgeRetriever().retrieve(db, replay_session.project_id, cognition["knowledge"], cues, beliefs, usage=usage, current_sequence=scene.sequence)
+        scene_rows = {row.get("id"): row for row in (replay_session.staged_world_state or {}).get("current_world", {}).get("scenes", []) if row.get("id")}
+        scene_provider = lambda ident: scene_rows.get(ident)
+        memories = CharacterMemoryRetriever().retrieve(db, replay_session.project_id, cognition["memories"], cues, usage=usage, current_sequence=scene.sequence, scene_provider=scene_provider)
+        result = {"character_id": character_id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": {key: character.get(key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}, "proposal_id": proposal.id, "cues": cues, "knowledge": knowledge, "memories": memories, "belief_conflicts": conflicts}
+        result["mind_fingerprint"] = _stable_fingerprint("replay-character-mind-v1", result)
         return result
 
 

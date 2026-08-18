@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .ai.errors import ModelProviderError, MODEL_OUTPUT_INVALID
 from .ai.provider import ModelProvider, ModelResult
-from .character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, character_context_fingerprint
+from .character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, character_context_fingerprint, context_knowledge_id
 from .llm_actor import CHARACTER_SYSTEM_PROMPT, CharacterDecisionPayload, DecisionPayloadParseError, build_character_decision_contract
 from .models import ActionVisibility, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, PerformanceStatus, RevealConstraint, RevealStatus, SceneProposal, ScenePerformance, WorldResolution, ResolutionStatus
 
@@ -146,7 +146,7 @@ class PerformanceActionConstraintChecker:
         if action.target_character_id != decision.target_character_id: add("TARGET_MISMATCH", "Action and CharacterDecision target_character_id must match.", [item for item in (action.target_character_id, decision.target_character_id) if item])
         if action.visibility == ActionVisibility.TARGETED and (not action.target_character_id or action.target_character_id not in participants or action.target_character_id == decision.character_id): add("INVALID_TARGET", "TARGETED action must name another active Scene participant.")
         if action.visibility in {ActionVisibility.COVERT, ActionVisibility.PRIVATE} and action.target_character_id: add("INVALID_TARGET", "COVERT and PRIVATE actions cannot route to a recipient.", [action.target_character_id])
-        own_knowledge = {item["id"] for status in context["knowledge"].values() for item in status}
+        own_knowledge = {context_knowledge_id(item) for status in context["knowledge"].values() for item in status if context_knowledge_id(item)}
         foreign = [item for item in action.disclosure_knowledge_ids if item not in own_knowledge]
         if foreign: add("KNOWLEDGE_LEAK", "Disclosure references knowledge unavailable to this character.", foreign)
         if action.requires_world_resolution and action.world_resolution_request is None: add("INVALID_WORLD_REQUEST", "World resolution requires a structured request.")
@@ -171,7 +171,7 @@ class PerformanceActionConstraintChecker:
                 collect(context["scene"].get("visible_context", {}))
                 target_active = target.get("active", True) if isinstance(target, dict) else getattr(target, "active", True)
                 if not target or (not world_view and target.project_id != decision.project_id) or target_active is False or request.target_entity_id not in visible_ids: add("INVALID_TARGET", "World request targets an unavailable or non-visible entity.", [request.target_entity_id])
-        propositions = {item["proposition"] for status in context["knowledge"].values() for item in status if item["id"] in action.disclosure_knowledge_ids}
+        propositions = {item["proposition"] for status in context["knowledge"].values() for item in status if context_knowledge_id(item) in action.disclosure_knowledge_ids}
         forbidden = set(proposal.forbidden_reveals or [])
         canon = session.scalars(select(CanonFact).where(CanonFact.project_id == decision.project_id)).all()
         locked = session.scalars(select(RevealConstraint).where(RevealConstraint.project_id == decision.project_id, RevealConstraint.status == RevealStatus.LOCKED)).all()
