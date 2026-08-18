@@ -264,6 +264,8 @@ def commit_replay_session(project_id: str, session_id: str, payload: ReplayCommi
     if not session or session.project_id != project_id: raise HTTPException(status_code=404, detail="Replay session not found")
     try:
         ReplayService().commit(db, session, payload.explicit_confirmation); db.commit(); db.refresh(session); return replay_session_payload(db, session)
+    except IntegrityError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": "REPLAY_COMMIT_INTEGRITY_ERROR"}) from exc
     except ValueError as exc:
         db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 

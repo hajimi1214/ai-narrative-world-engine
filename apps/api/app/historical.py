@@ -54,6 +54,11 @@ class TemporalCharacterCognitionReader:
         invalidated = set(db.scalars(select(RetconCognitionInvalidation.resource_id).where(RetconCognitionInvalidation.project_id == project_id, RetconCognitionInvalidation.character_id == character_id, RetconCognitionInvalidation.status != "ROLLED_BACK")).all())
         knowledge = [self._row(CharacterKnowledge, row) for row in source.get("character_knowledge", []) if row.get("character_id") == character_id and row.get("id") not in invalidated]
         memories = [self._row(CharacterMemory, row) for row in source.get("character_memories", []) if row.get("character_id") == character_id and row.get("id") not in invalidated]
+        staged = (replay_session.staged_world_state or {}).get("staged_cognition", {})
+        for item in staged.get("knowledge", []):
+            if item.get("character_id") == character_id and item.get("source_sequence", 0) < sequence: knowledge.append(self._row(CharacterKnowledge, {"id": item["temp_id"], **item}))
+        for item in staged.get("memories", []):
+            if item.get("character_id") == character_id and item.get("source_sequence", 0) < sequence: memories.append(self._row(CharacterMemory, {"id": item["temp_id"], **item}))
         return {"knowledge": knowledge, "memories": memories}
 
     def _row(self, model, data):

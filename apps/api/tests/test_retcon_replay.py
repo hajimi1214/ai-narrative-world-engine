@@ -24,6 +24,7 @@ def session():
 def replay_ready(session, monkeypatch):
     values = apply_success(session, monkeypatch)
     project, canon, knowledge, scene, revision, request, plan, client, applied = values
+    knowledge.source = scene.id
     pre = SceneStateCheckpointService().capture_pre(session, project.id, scene.id)
     session.flush()
     SceneStateCheckpointService().finalize(session, project.id, scene.id, pre.id)
@@ -140,4 +141,5 @@ def test_replay_queue_ignores_superseded_scene(session, monkeypatch):
     values = replay_ready(session, monkeypatch); project, _, _, scene, _, _, _, client, _, application_id = values
     scene.history_status = "SUPERSEDED"; session.commit()
     result = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
-    assert result.status_code == 201 and scene.id not in {item["scene_id"] for item in result.json()["queue"]}
+    assert result.status_code == 201, result.text
+    assert scene.id not in {item["scene_id"] for item in result.json()["queue"]}
