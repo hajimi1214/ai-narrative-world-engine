@@ -21,6 +21,7 @@ from .models import (
     TimelineEventType, TimelineOrigin, WorldEntity, WorldResolution, WorldSnapshot,
 )
 from .state_delta_validation import normalize_world_time
+from .state_delta import WorldResolutionStateDeltaTranslator, compute_state_delta_after
 
 
 def _value(value: Any) -> Any:
@@ -34,6 +35,16 @@ def _escape(part: str) -> str:
 def paths_overlap(left: str | None, right: str | None) -> bool:
     """RFC6901 ancestry overlap used by state provenance lookup."""
     return bool(left and right and (left == right or left.startswith(right.rstrip("/") + "/") or right.startswith(left.rstrip("/") + "/")))
+
+def explicit_knowledge_id(reference: Any) -> str | None:
+    """Only the structured Decision contract can name a Knowledge row."""
+    value = reference.get("knowledge_id") if isinstance(reference, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+def explicit_memory_id(reference: Any) -> str | None:
+    if isinstance(reference, str) and reference.strip(): return reference.strip()
+    value = reference.get("memory_id") if isinstance(reference, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def read_overlay_path(document: Any, path: str) -> tuple[bool, Any]:
@@ -185,6 +196,24 @@ class CausalLedgerService:
         if not pre or not post:
             raise ValueError("CAUSAL_LEDGER_CHECKPOINT_INVALID")
         transitions = self.extractor.extract(pre.payload, post.payload)
+        old_state_event_ids = list(db.scalars(
+            select(TimelineEvent.id).where(
+                TimelineEvent.project_id == project_id,
+                TimelineEvent.scene_id == scene.id,
+                TimelineEvent.event_type == TimelineEventType.STATE_CHANGE,
+                TimelineEvent.active.is_(True),
+                TimelineEvent.checkpoint_id != checkpoint.id,
+            )
+        ))
+        if old_state_event_ids:
+            db.execute(update(TimelineEvent).where(TimelineEvent.id.in_(old_state_event_ids)).values(active=False))
+            # These links are derived from superseded checkpoint state, not durable
+            # execution lineage.  They must not be traversable from current state.
+            db.execute(update(CausalLink).where(
+                CausalLink.project_id == project_id,
+                CausalLink.cause_type == CausalResourceType.TIMELINE_EVENT,
+                CausalLink.cause_id.in_(old_state_event_ids),
+            ).values(active=False))
         state_events = self._index_state_changes(db, scene, checkpoint, transitions, pre.payload, post.payload)
         for event in state_events:
             self._link(db, project_id, CausalResourceType.TIMELINE_EVENT, event.id, CausalResourceType.SCENE, scene.id, CausalEdgeKind.PROVENANCE, CausalRelationType.STATE_CHANGE_COMMITTED_IN_SCENE, scene, {"checkpoint_id": checkpoint.id})
@@ -196,7 +225,13 @@ class CausalLedgerService:
         if origin == TimelineOrigin.NORMAL_COMMIT:
             return self._normal_state_events(db, scene, checkpoint, transitions, pre, post)
         if origin == TimelineOrigin.LEGACY_BACKFILL:
-            return [self._state_event(db, scene, checkpoint, transition, {"checkpoint_id": checkpoint.id, "legacy_backfill": True}) for transition in transitions]
+            return [
+                self._state_event(
+                    db, scene, checkpoint, transition,
+                    {"checkpoint_id": checkpoint.id, "legacy_backfill": True}, index,
+                )
+                for index, transition in enumerate(transitions, 1)
+            ]
         return self._replay_state_events(db, scene, checkpoint, transitions)
 
     def _normal_state_events(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition], pre: dict[str, Any], post: dict[str, Any]) -> list[TimelineEvent]:
@@ -213,7 +248,26 @@ class CausalLedgerService:
             covered = [item for item in items if item.target_type.value == transition.target_type and item.target_id == transition.target_id and (item.path == transition.path or transition.path.startswith(item.path + "/"))]
             if len(covered) != 1:
                 raise ValueError("CAUSAL_LEDGER_STATE_DELTA_MISMATCH")
-        for item in items:
+        turn_sequences = {
+            turn.id: turn.sequence
+            for turn in db.scalars(
+                select(ScenePerformanceTurn).where(
+                    ScenePerformanceTurn.id.in_([item.source_turn_id for item in items if item.source_turn_id])
+                )
+            )
+        }
+        ordered = sorted(
+            items,
+            key=lambda item: (
+                turn_sequences.get(item.source_turn_id, -1),
+                item.ordinal,
+                item.target_type.value,
+                item.target_id,
+                item.path,
+                item.semantic_fingerprint,
+            ),
+        )
+        for index, item in enumerate(ordered, 1):
             found_before, actual_before = self._snapshot_value(pre, item.target_type.value, item.target_id, item.path)
             found_after, actual_after = self._snapshot_value(post, item.target_type.value, item.target_id, item.path)
             # UPSERT may intentionally create the final leaf.  It is still
@@ -221,7 +275,7 @@ class CausalLedgerService:
             if (found_before and not _path_same(item.path, actual_before, item.before_value)) or (not found_before and item.before_value is not None) or (found_after and not _path_same(item.path, actual_after, item.after_value)) or (not found_after and item.after_value is not None):
                 raise ValueError("CAUSAL_LEDGER_STATE_DELTA_MISMATCH")
             transition = SceneStateTransition(item.target_type.value, item.target_id, item.path, item.before_value, item.after_value)
-            events.append(self._state_event(db, scene, checkpoint, transition, {"state_delta_batch_id": item.batch_id, "state_delta_item_id": item.id, "source_resolution_id": item.source_resolution_id, "source_turn_id": item.source_turn_id, "domain": _value(item.domain), "operation": _value(item.operation), "item_semantic_fingerprint": item.semantic_fingerprint}))
+            events.append(self._state_event(db, scene, checkpoint, transition, {"state_delta_batch_id": item.batch_id, "state_delta_item_id": item.id, "source_resolution_id": item.source_resolution_id, "source_turn_id": item.source_turn_id, "domain": _value(item.domain), "operation": _value(item.operation), "item_semantic_fingerprint": item.semantic_fingerprint}, index))
         return events
 
     def _replay_state_events(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition]) -> list[TimelineEvent]:
@@ -231,12 +285,15 @@ class CausalLedgerService:
         run = db.scalar(select(ReplaySceneRun).where(ReplaySceneRun.replay_session_id == session.id, ReplaySceneRun.replacement_scene_id == scene.id))
         original_scene_id = run.original_scene_id if run else scene.id
         result = []
-        for transition in transitions:
-            result.append(self._state_event(db, scene, checkpoint, transition, {"checkpoint_id": checkpoint.id, "replay_session_id": session.id, "replacement_scene_id": scene.id, "original_scene_id": original_scene_id, "replay_scene_run_id": run.id if run else None}))
+        for index, transition in enumerate(transitions, 1):
+            result.append(self._state_event(db, scene, checkpoint, transition, {"checkpoint_id": checkpoint.id, "replay_session_id": session.id, "replacement_scene_id": scene.id, "original_scene_id": original_scene_id, "replay_scene_run_id": run.id if run else None}, index))
         return result
 
-    def _state_event(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transition: SceneStateTransition, payload: dict[str, Any]) -> TimelineEvent:
-        return self._event(db, project_id=scene.project_id, event_type=TimelineEventType.STATE_CHANGE, source_type="SCENE_CHECKPOINT", source_id=checkpoint.id, source_key=f"CHECKPOINT:{checkpoint.id}:{transition.target_type}:{transition.target_id}:{transition.path}", scene=scene, ordinal=None, checkpoint=checkpoint, origin=self._origin(checkpoint), target_type=transition.target_type, target_id=transition.target_id, path=transition.path, before=transition.before_value, after=transition.after_value, structured_payload=payload)
+    def _state_event(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transition: SceneStateTransition, payload: dict[str, Any], ordinal: int = 1) -> TimelineEvent:
+        prior = db.scalar(select(TimelineEvent).where(TimelineEvent.project_id == scene.project_id, TimelineEvent.scene_id == scene.id, TimelineEvent.event_type == TimelineEventType.STATE_CHANGE, TimelineEvent.target_type == transition.target_type, TimelineEvent.target_id == transition.target_id, TimelineEvent.path == transition.path, TimelineEvent.checkpoint_id != checkpoint.id).order_by(TimelineEvent.sequence.desc(), TimelineEvent.ordinal.desc(), TimelineEvent.id.desc()))
+        row = self._event(db, project_id=scene.project_id, event_type=TimelineEventType.STATE_CHANGE, source_type="SCENE_CHECKPOINT", source_id=checkpoint.id, source_key=f"CHECKPOINT:{checkpoint.id}:{transition.target_type}:{transition.target_id}:{transition.path}", scene=scene, ordinal=ordinal, checkpoint=checkpoint, origin=self._origin(checkpoint), target_type=transition.target_type, target_id=transition.target_id, path=transition.path, before=transition.before_value, after=transition.after_value, structured_payload=payload)
+        if prior and row.supersedes_event_id is None: row.supersedes_event_id = prior.id
+        return row
 
     def _snapshot_value(self, payload: dict[str, Any], target_type: str, target_id: str, path: str) -> tuple[bool, Any]:
         if target_type == "PROJECT":
@@ -253,12 +310,12 @@ class CausalLedgerService:
         for turn in turns:
             decision = db.get(CharacterDecision, turn.character_decision_id)
             if decision and decision.project_id == scene.project_id:
-                for knowledge_id in decision.knowledge_used or []:
-                    knowledge = db.get(CharacterKnowledge, str(knowledge_id))
+                for reference in decision.knowledge_used or []:
+                    knowledge_id = explicit_knowledge_id(reference); knowledge = db.get(CharacterKnowledge, knowledge_id) if knowledge_id else None
                     if knowledge and knowledge.character_id == decision.character_id:
                         self._link(db, scene.project_id, CausalResourceType.CHARACTER_KNOWLEDGE, knowledge.id, CausalResourceType.CHARACTER_DECISION, decision.id, CausalEdgeKind.CAUSAL, CausalRelationType.KNOWLEDGE_INFORMED_DECISION, scene, {"explicit_reference": True})
-                for memory_id in decision.memory_refs or []:
-                    memory = db.get(CharacterMemory, str(memory_id))
+                for reference in decision.memory_refs or []:
+                    memory_id = explicit_memory_id(reference); memory = db.get(CharacterMemory, memory_id) if memory_id else None
                     if memory and memory.character_id == decision.character_id:
                         self._link(db, scene.project_id, CausalResourceType.CHARACTER_MEMORY, memory.id, CausalResourceType.CHARACTER_DECISION, decision.id, CausalEdgeKind.CAUSAL, CausalRelationType.MEMORY_INFORMED_DECISION, scene, {"explicit_reference": True})
                 self._link(db, scene.project_id, CausalResourceType.CHARACTER_DECISION, decision.id, CausalResourceType.SCENE_PERFORMANCE_TURN, turn.id, CausalEdgeKind.CAUSAL, CausalRelationType.DECISION_PRODUCED_TURN, scene, {"performance_id": binding.performance_id})
@@ -290,10 +347,19 @@ class CausalLedgerService:
 
     def _link_replay_resolution_if_unique(self, db: Session, scene: Scene, binding: SceneExecutionBinding, event: TimelineEvent) -> None:
         candidates = []
+        translator = WorldResolutionStateDeltaTranslator()
         for resolution in db.scalars(select(WorldResolution).join(ScenePerformanceTurn, WorldResolution.performance_turn_id == ScenePerformanceTurn.id).where(ScenePerformanceTurn.performance_id == binding.performance_id)).all():
-            for effect in resolution.state_effects or []:
-                if isinstance(effect, dict) and effect.get("target_id") == event.target_id and effect.get("path") == event.path:
-                    candidates.append(resolution)
+            canonical_effects, _ = translator.translate(resolution)
+            for effect in canonical_effects:
+                try:
+                    expected = compute_state_delta_after(
+                        event.before_value,
+                        event.before_value is not None,
+                        effect,
+                    )
+                except ValueError:
+                    continue
+                if effect.target_type.value == event.target_type and effect.target_id == event.target_id and effect.path == event.path and _path_same(event.path, expected, event.after_value): candidates.append(resolution)
         if len({value.id for value in candidates}) == 1:
             resolution = candidates[0]
             self._link(db, scene.project_id, CausalResourceType.WORLD_RESOLUTION, resolution.id, CausalResourceType.TIMELINE_EVENT, event.id, CausalEdgeKind.CAUSAL, CausalRelationType.RESOLUTION_PRODUCED_STATE_CHANGE, scene, {"structured_effect_path": event.path})
@@ -321,11 +387,21 @@ class CausalLedgerService:
             self._link(db, project_id, CausalResourceType.SCENE, before.id, CausalResourceType.SCENE, after.id, CausalEdgeKind.TEMPORAL, CausalRelationType.SCENE_PRECEDES_SCENE, after, {"ordered_by": ["sequence", "id"]})
 
     def _event(self, db: Session, *, project_id: str, event_type: TimelineEventType, source_type: str, source_id: str, source_key: str, origin: TimelineOrigin, structured_payload: dict[str, Any], scene: Scene | None = None, ordinal: int | None = None, checkpoint: SceneStateCheckpoint | None = None, target_type: str | None = None, target_id: str | None = None, path: str | None = None, before: Any = None, after: Any = None) -> TimelineEvent:
-        values = {"event_type": _value(event_type), "source_key": source_key, "scene_id": scene.id if scene else None, "sequence": scene.sequence if scene else None, "ordinal": ordinal, "origin": _value(origin), "checkpoint_fingerprint": checkpoint.checkpoint_fingerprint if checkpoint else None, "target_type": target_type, "target_id": target_id, "path": path, "before": before, "after": after, "payload": structured_payload}
+        values = {
+            "event_type": _value(event_type), "source_type": source_type,
+            "source_id": source_id, "source_key": source_key,
+            "scene_id": scene.id if scene else None,
+            "sequence": scene.sequence if scene else None,
+            "ordinal": ordinal, "world_time": scene.world_time if scene else None,
+            "origin": _value(origin), "checkpoint_id": checkpoint.id if checkpoint else None,
+            "checkpoint_fingerprint": checkpoint.checkpoint_fingerprint if checkpoint else None,
+            "target_type": target_type, "target_id": target_id, "path": path,
+            "before": before, "after": after, "payload": structured_payload,
+        }
         fingerprint = stable_fingerprint(values, "timeline-event-v1")
         row = db.scalar(select(TimelineEvent).where(TimelineEvent.project_id == project_id, TimelineEvent.source_key == source_key))
         if row:
-            row.active = True; row.event_fingerprint = fingerprint; row.structured_payload = copy.deepcopy(structured_payload)
+            row.event_type=event_type; row.source_type=source_type; row.source_id=source_id; row.scene_id=scene.id if scene else None; row.sequence=scene.sequence if scene else None; row.ordinal=ordinal; row.world_time=scene.world_time if scene else None; row.origin=origin; row.active=True; row.checkpoint_id=checkpoint.id if checkpoint else None; row.target_type=target_type; row.target_id=target_id; row.path=path; row.before_value=copy.deepcopy(before); row.after_value=copy.deepcopy(after); row.event_fingerprint=fingerprint; row.structured_payload=copy.deepcopy(structured_payload)
             return row
         row = TimelineEvent(project_id=project_id, event_type=event_type, source_type=source_type, source_id=source_id, source_key=source_key, scene_id=scene.id if scene else None, sequence=scene.sequence if scene else None, ordinal=ordinal, world_time=scene.world_time if scene else None, origin=origin, active=True, checkpoint_id=checkpoint.id if checkpoint else None, target_type=target_type, target_id=target_id, path=path, before_value=copy.deepcopy(before), after_value=copy.deepcopy(after), structured_payload=copy.deepcopy(structured_payload), event_fingerprint=fingerprint)
         db.add(row); db.flush(); return row
