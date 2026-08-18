@@ -35,6 +35,8 @@ class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVIS
 class RevisionApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED="APPLIED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
 class RetconApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED_PENDING_REPLAY="APPLIED_PENDING_REPLAY"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
 class RetconCognitionInvalidationStatus(str, enum.Enum): ACTIVE="ACTIVE"; RESOLVED="RESOLVED"; ROLLED_BACK="ROLLED_BACK"
+class ReplaySessionStatus(str, enum.Enum): READY="READY"; RUNNING="RUNNING"; BLOCKED="BLOCKED"; COMPLETED="COMPLETED"; ABORTED="ABORTED"
+class ReplaySceneRunStatus(str, enum.Enum): PENDING="PENDING"; RUNNING="RUNNING"; VALIDATED="VALIDATED"; BLOCKED="BLOCKED"; COMMITTED="COMMITTED"
 class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
@@ -137,6 +139,8 @@ class CharacterKnowledge(Base):
     proposition: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[KnowledgeStatus] = mapped_column(Enum(KnowledgeStatus), nullable=False)
     source: Mapped[str | None] = mapped_column(String(200))
+    replay_session_id: Mapped[str | None] = mapped_column(String(36))
+    replay_of_id: Mapped[str | None] = mapped_column(String(36))
     confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     acquired_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
@@ -149,6 +153,8 @@ class CharacterMemory(Base):
     emotional_weight: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     distortion: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    replay_session_id: Mapped[str | None] = mapped_column(String(36))
+    replay_of_id: Mapped[str | None] = mapped_column(String(36))
     source_scene: Mapped[str | None] = mapped_column(String(36))
     happened_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -189,6 +195,8 @@ class Scene(Base):
     summary: Mapped[str | None] = mapped_column(Text)
     story_threads: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     status: Mapped[SceneStatus] = mapped_column(Enum(SceneStatus), default=SceneStatus.PLANNED, nullable=False)
+    history_status: Mapped[str] = mapped_column(String(30), default="ACTIVE", nullable=False)
+    superseded_by_scene_id: Mapped[str | None] = mapped_column(String(36))
 
 class Chapter(Base):
     __tablename__ = "chapters"
@@ -275,6 +283,8 @@ class CharacterDecision(Base):
     decision_summary: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[CharacterDecisionStatus] = mapped_column(Enum(CharacterDecisionStatus), default=CharacterDecisionStatus.DRAFT, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    replay_session_id: Mapped[str | None] = mapped_column(String(36))
+    replay_of_id: Mapped[str | None] = mapped_column(String(36))
 
 class ScenePerformance(TimestampMixin, Base):
     __tablename__ = "scene_performances"
@@ -310,6 +320,8 @@ class ScenePerformanceTurn(Base):
     world_resolution_request: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     validation_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    replay_session_id: Mapped[str | None] = mapped_column(String(36))
+    replay_of_id: Mapped[str | None] = mapped_column(String(36))
 
 class WorldResolution(Base):
     __tablename__ = "world_resolutions"
@@ -331,6 +343,8 @@ class WorldResolution(Base):
     world_entity_ids_used: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     resolution_basis_summary: Mapped[str | None] = mapped_column(Text)
     missing_information: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    replay_session_id: Mapped[str | None] = mapped_column(String(36))
+    replay_of_id: Mapped[str | None] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class WorldRevision(TimestampMixin, Base):
@@ -417,6 +431,43 @@ class RetconCognitionInvalidation(Base):
     original_semantic_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
     status: Mapped[RetconCognitionInvalidationStatus] = mapped_column(String(20), default=RetconCognitionInvalidationStatus.ACTIVE, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class RetconReplaySession(TimestampMixin, Base):
+    __tablename__ = "retcon_replay_sessions"
+    __table_args__ = (UniqueConstraint("retcon_application_id", name="uq_replay_session_application"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    retcon_application_id: Mapped[str] = mapped_column(ForeignKey("retcon_applications.id"), nullable=False)
+    status: Mapped[ReplaySessionStatus] = mapped_column(String(30), default=ReplaySessionStatus.READY, nullable=False)
+    current_sequence: Mapped[int | None] = mapped_column(Integer)
+    baseline_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("world_snapshots.id"))
+    baseline_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    current_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    queue: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    cursor: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failure_report: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+class ReplaySceneRun(Base):
+    __tablename__ = "replay_scene_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    replay_session_id: Mapped[str] = mapped_column(ForeignKey("retcon_replay_sessions.id"), nullable=False, index=True)
+    original_scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id"), nullable=False)
+    original_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    mode: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[ReplaySceneRunStatus] = mapped_column(String(30), default=ReplaySceneRunStatus.PENDING, nullable=False)
+    input_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    new_decision_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    new_turn_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    new_resolution_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    new_knowledge_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    new_memory_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    replacement_scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id"))
+    validation_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 class WorldSnapshot(Base):
     __tablename__="world_snapshots"

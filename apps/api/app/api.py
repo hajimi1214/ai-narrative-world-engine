@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -25,6 +25,7 @@ from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCand
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 from .retcon import RetconImpactPlanner, RetconPlanStalenessChecker, CLASSIFICATION_LABELS, semantic_fingerprint
 from .retcon_apply import RetconApplyService, RetconPendingReplayGuard, RetconAuthorOverrideResolver, has_pending_replay
+from .replay import ReplayService
 
 router = APIRouter()
 
@@ -220,6 +221,47 @@ def rollback_retcon(project_id: str, application_id: str, db: Session = Depends(
         ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_ROLLBACK, source_type="RETCON_APPLICATION", source_id=application_id, status=ExecutionStatus.BLOCKED, error_code=code)
         db.commit()
         raise HTTPException(status_code=409, detail={"code": code}) from exc
+
+class ReplayCommitPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    explicit_confirmation: bool = False
+
+def replay_session_payload(db: Session, session: RetconReplaySession) -> dict[str, Any]:
+    runs = db.scalars(select(ReplaySceneRun).where(ReplaySceneRun.replay_session_id == session.id).order_by(ReplaySceneRun.original_sequence, ReplaySceneRun.id)).all()
+    return record_dict(session) | {"queue": session.queue, "runs": [record_dict(run) for run in runs]}
+
+@router.post("/projects/{project_id}/retcon/applications/{application_id}/replay-sessions", status_code=status.HTTP_201_CREATED)
+def create_replay_session(project_id: str, application_id: str, db: Session = Depends(get_db)):
+    try:
+        session = ReplayService().create_session(db, project_id, application_id)
+        db.commit(); db.refresh(session)
+        return replay_session_payload(db, session)
+    except ValueError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+@router.get("/projects/{project_id}/retcon/replay-sessions/{session_id}")
+def get_replay_session(project_id: str, session_id: str, db: Session = Depends(get_db)):
+    session = db.get(RetconReplaySession, session_id)
+    if not session or session.project_id != project_id: raise HTTPException(status_code=404, detail="Replay session not found")
+    return replay_session_payload(db, session)
+
+@router.post("/projects/{project_id}/retcon/replay-sessions/{session_id}/step")
+def step_replay_session(project_id: str, session_id: str, db: Session = Depends(get_db)):
+    session = db.get(RetconReplaySession, session_id)
+    if not session or session.project_id != project_id: raise HTTPException(status_code=404, detail="Replay session not found")
+    try:
+        ReplayService().step(db, session); db.commit(); db.refresh(session); return replay_session_payload(db, session)
+    except ValueError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+@router.post("/projects/{project_id}/retcon/replay-sessions/{session_id}/commit")
+def commit_replay_session(project_id: str, session_id: str, payload: ReplayCommitPayload, db: Session = Depends(get_db)):
+    session = db.get(RetconReplaySession, session_id)
+    if not session or session.project_id != project_id: raise HTTPException(status_code=404, detail="Replay session not found")
+    try:
+        ReplayService().commit(db, session, payload.explicit_confirmation); db.commit(); db.refresh(session); return replay_session_payload(db, session)
+    except ValueError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 
 def routed_provider(settings, route):
     return get_model_provider(settings, route.provider, route.base_url)
