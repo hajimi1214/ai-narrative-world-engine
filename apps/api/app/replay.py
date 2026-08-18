@@ -144,6 +144,7 @@ class SelectiveReplayQueue:
         return sorted(queue, key=lambda item: (item["sequence"], item["scene_id"]))
 
 class ReplayService:
+    failure_injector = None
     def _fail(self, code):
         raise ValueError(code)
 
@@ -301,6 +302,8 @@ class ReplayService:
                         old_binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == old.id, SceneExecutionBinding.active.is_(True)))
                         if old_binding: old_binding.active = False
                         db.flush(); binding.active = True
+                        if self.failure_injector:
+                            self.failure_injector("AFTER_REPLAY_MATERIALIZATION")
         replacement_by_old = {run.original_scene_id: run.replacement_scene_id for run in final_runs.values() if run.replacement_scene_id}
         # A rebuild is complete only when the affected resource was covered by a replayed scene.
         for inv in db.scalars(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.retcon_application_id == app.id, RetconCognitionInvalidation.status == RetconCognitionInvalidationStatus.ACTIVE)).all():
