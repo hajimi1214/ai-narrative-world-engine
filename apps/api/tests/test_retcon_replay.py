@@ -7,12 +7,12 @@ from fastapi.testclient import TestClient
 from app.db import Base
 from app.main import app
 import app.api as api
-from app.models import RetconReplaySession, ReplaySceneRun, RetconApplication, RetconApplicationStatus, Scene, WorldSnapshot, SceneStateCheckpoint
+from app.models import RetconReplaySession, ReplaySceneRun, RetconApplication, RetconApplicationStatus, Scene, WorldSnapshot, SceneStateCheckpoint, Character, CharacterDecision, CharacterDecisionType, CharacterDecisionStatus, ScenePerformance, ScenePerformanceTurn, SceneExecutionBinding, PerformanceMode, PerformanceStatus, ActionVisibility
 from app.historical import SceneStateCheckpointService
 from app.historical import TemporalCharacterCognitionReader
 from app.replay import ReplayService
 from app.character_mind import ActiveCharacterCognitionReader
-from app.models import RetconCognitionInvalidation, RetconCognitionInvalidationStatus, CharacterKnowledge, CharacterMemory, ActionVisibility
+from app.models import RetconCognitionInvalidation, RetconCognitionInvalidationStatus, CharacterKnowledge, CharacterMemory
 from app.replay import ReplayWorldView, ReplayCognitionReplacementMatcher, PreservedSceneValidator, ReplayResourceMapper
 from test_retcon_apply import analyzed_setup, apply_success, client_for
 
@@ -33,10 +33,50 @@ def replay_ready(session, monkeypatch):
     session.commit()
     return values + (applied["application"]["id"],)
 
+def historical_replay_world(session, monkeypatch):
+    """A real historical timeline: PRE -> old execution -> POST -> future -> retcon."""
+    from test_retcon_planning import prepared
+    project, canon, knowledge, scene, _independent, revision, client = prepared(session, monkeypatch)
+    actor = session.get(Character, knowledge.character_id)
+    location_id = session.query(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first().location_id
+    actor.current_state = {"location_id": location_id}; actor.inventory = []; actor.relationships = {"trust": 0.2}; actor.physical_state = {"condition": "healthy"}; actor.emotional_state = {"mood": "calm"}; knowledge.source = scene.id
+    pre = SceneStateCheckpointService().capture_pre(session, project.id, scene.id)
+    proposal = session.query(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first()
+    decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=actor.id, context_fingerprint="historical", decision_type=CharacterDecisionType.OBSERVE, intent="observe", chosen_action="observe", target_character_id=None, target_entity_id=None, motivation="historical", goal_refs=[], knowledge_used=[], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, perceived_risk=None, accepted_cost=None, expected_personal_result=None, uncertainties=[], refused_options=[], boundary_override_reason=None, decision_summary="historical", status=CharacterDecisionStatus.VALID)
+    performance = ScenePerformance(project_id=project.id, scene_proposal_id=proposal.id, take_number=77, proposal_context_fingerprint="historical", mode=PerformanceMode.HEURISTIC, status=PerformanceStatus.COMPLETED, participant_order=[actor.id], active_participant_ids=[actor.id], max_turns=1, turn_count=1)
+    session.add_all([decision, performance]); session.flush()
+    turn = ScenePerformanceTurn(project_id=project.id, performance_id=performance.id, sequence=1, actor_character_id=actor.id, actor_context_fingerprint="historical", character_decision_id=decision.id, action_visibility=ActionVisibility.PRIVATE, observable_action="observe", spoken_content=None, recipient_character_ids=[], requires_world_resolution=False, world_resolution_request=None, validation_result={"valid": True})
+    session.add(turn); session.flush(); session.add(SceneExecutionBinding(project_id=project.id, scene_id=scene.id, performance_id=performance.id, active=True)); session.flush()
+    SceneStateCheckpointService().finalize(session, project.id, scene.id, pre.id)
+    actor.current_state = {"location_id": "future-location"}; actor.inventory = ["future-key"]; actor.relationships = {"trust": 0.9}; actor.physical_state = {"condition": "wounded"}; actor.emotional_state = {"mood": "fearful"}
+    session.add(CharacterKnowledge(character_id=actor.id, proposition="future secret", status="KNOWN", source="future-scene")); session.add(CharacterMemory(character_id=actor.id, content="future memory", source_scene="future-scene")); session.commit()
+    # The revision is authored after the future timeline exists, exactly as a
+    # real retcon request is; the replay baseline still comes from Scene PRE.
+    revision = client.post(f"/projects/{project.id}/revisions", json={"title": "historical retcon", "changes": [{"target_type": "CANON_FACT", "target_id": canon.id, "operation": "SET", "path": "/proposition", "value": "new location truth"}]}).json()
+    assert client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").status_code == 200
+    request = client.post(f"/projects/{project.id}/retcon/requests", json={"source_revision_id": revision["id"], "reason": "historical fixture"}).json()
+    analyzed = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze")
+    assert analyzed.status_code == 200, analyzed.text
+    applied = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed.json()["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "historical fixture"})
+    assert applied.status_code == 200, applied.text
+    return project, scene, actor, proposal, client, applied.json()["application"]["id"]
+
 def test_create_replay_session_requires_pending_application(session, monkeypatch):
     project, *_unused, revision, client = __import__("test_retcon_planning", fromlist=["prepared"]).prepared(session, monkeypatch)
     result = client.post(f"/projects/{project.id}/retcon/applications/not-an-application/replay-sessions")
     assert result.status_code == 409
+
+def test_historical_fixture_replay_context_excludes_future_character_state(session, monkeypatch):
+    from app.replay import ReplayCharacterContextBuilder
+    project, scene, actor, proposal, client, application_id = historical_replay_world(session, monkeypatch)
+    created = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
+    assert created.status_code == 201, created.text
+    context = ReplayCharacterContextBuilder().build(session, session.get(RetconReplaySession, created.json()["id"]), scene, proposal, actor.id)
+    assert context["character"]["current_state"]["location_id"] != "future-location"
+    assert context["inventory"] == []
+    assert context["character"]["relationships"] == {}
+    assert context["character"]["physical_state"] == {"condition": "healthy"}
+    assert context["character"]["emotional_state"] == {"mood": "calm"}
 
 def test_replay_session_initial_queue_is_frozen_and_deterministic(session, monkeypatch):
     values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
