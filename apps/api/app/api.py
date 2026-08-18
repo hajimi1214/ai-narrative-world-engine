@@ -5,10 +5,11 @@ from typing import Any, Type
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .db import SessionLocal
 from .director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector
-from .character_mind import ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor
+from .character_mind import ActiveCharacterCognitionReader, ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor
 from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MODEL_OUTPUT_INVALID, ModelProviderError
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
@@ -23,7 +24,7 @@ from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fing
 from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryContextStaleError, RecoveryEditPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 from .retcon import RetconImpactPlanner, RetconPlanStalenessChecker, CLASSIFICATION_LABELS, semantic_fingerprint
-from .retcon_apply import RetconApplyService, has_pending_replay
+from .retcon_apply import RetconApplyService, RetconPendingReplayGuard, RetconAuthorOverrideResolver, has_pending_replay
 
 router = APIRouter()
 
@@ -43,7 +44,7 @@ class RetconApplyPayload(BaseModel):
     author_override_reason: str | None = None
 
 def retcon_actions(status: str) -> list[str]:
-    return {"DRAFT": ["ANALYZE", "ABORT"], "PLANNED": ["REANALYZE", "ABORT"], "STALE": ["REANALYZE", "ABORT"], "ABORTED": []}.get(status, [])
+    return {"DRAFT": ["ANALYZE", "ABORT"], "PLANNED": ["REANALYZE", "ABORT", "APPLY"], "STALE": ["REANALYZE", "ABORT"], "APPLIED_PENDING_REPLAY": [], "ROLLED_BACK": [], "ABORTED": []}.get(status, [])
 
 def retcon_item_payload(item: RetconImpactItem, db: Session | None = None) -> dict[str, Any]:
     result = record_dict(item)
@@ -61,13 +62,19 @@ def retcon_item_payload(item: RetconImpactItem, db: Session | None = None) -> di
     return result
 
 def retcon_plan_payload(db: Session, plan: RetconImpactPlan) -> dict[str, Any]:
-    stale = RetconPlanStalenessChecker().is_stale(db, plan)
-    return record_dict(plan) | {"status": "STALE" if stale else plan.status, "is_stale": stale, "classification_labels": CLASSIFICATION_LABELS}
+    application = db.scalar(select(RetconApplication).where(RetconApplication.retcon_plan_id == plan.id).order_by(RetconApplication.created_at.desc(), RetconApplication.id.desc()))
+    consumed = application is not None and application.status in {RetconApplicationStatus.APPLIED_PENDING_REPLAY, RetconApplicationStatus.ROLLED_BACK}
+    stale = False if consumed else RetconPlanStalenessChecker().is_stale(db, plan)
+    revision = db.get(WorldRevision, db.get(RetconRequest, plan.retcon_request_id).source_revision_id) if db.get(RetconRequest, plan.retcon_request_id) else None
+    requirements = RetconAuthorOverrideResolver().resolve(db, plan.project_id, revision) if revision else {"explicit_confirmation_required": True, "author_override_required": False, "author_override_targets": []}
+    return record_dict(plan) | {"status": "STALE" if stale else plan.status, "is_stale": stale, "consumed": consumed, "consumed_by_application_id": application.id if consumed else None, "consumption_status": getattr(application.status, "value", application.status) if consumed else None, "apply_requirements": requirements, "classification_labels": CLASSIFICATION_LABELS}
 
 def retcon_request_payload(db: Session, request: RetconRequest, latest: RetconImpactPlan | None = None) -> dict[str, Any]:
     if latest is None:
         latest = db.scalar(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id == request.id).order_by(RetconImpactPlan.version.desc()))
-    effective_status = "STALE" if latest and RetconPlanStalenessChecker().is_stale(db, latest) else request.status
+    application = db.scalar(select(RetconApplication).where(RetconApplication.retcon_request_id == request.id).order_by(RetconApplication.created_at.desc(), RetconApplication.id.desc()))
+    lifecycle = getattr(application.status, "value", application.status) if application else None
+    effective_status = lifecycle or ("STALE" if latest and RetconPlanStalenessChecker().is_stale(db, latest) else request.status)
     return record_dict(request) | {"effective_status": effective_status, "available_actions": retcon_actions(effective_status)}
 
 def retcon_application_payload(db: Session, application: RetconApplication) -> dict[str, Any]:
@@ -115,6 +122,8 @@ def analyze_retcon_request(project_id: str, request_id: str, db: Session = Depen
     request = db.get(RetconRequest, request_id)
     if not request or request.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon request not found")
     if request.status == "ABORTED": raise HTTPException(status_code=409, detail={"code": "RETCON_REQUEST_ABORTED"})
+    if request.status == "APPLIED_PENDING_REPLAY": raise HTTPException(status_code=409, detail={"code": "RETCON_ALREADY_APPLIED"})
+    if request.status == "ROLLED_BACK": raise HTTPException(status_code=409, detail={"code": "RETCON_REQUEST_ROLLED_BACK"})
     revision = db.get(WorldRevision, request.source_revision_id)
     if not revision or revision.project_id != project_id: raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE"})
     current_basis = RevisionStateFingerprintBuilder().build(db, project_id)
@@ -144,20 +153,19 @@ def get_retcon_plan(project_id: str, plan_id: str, db: Session = Depends(get_db)
 def abort_retcon_request(project_id: str, request_id: str, db: Session = Depends(get_db)):
     request = db.get(RetconRequest, request_id)
     if not request or request.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon request not found")
+    if request.status == "APPLIED_PENDING_REPLAY": raise HTTPException(status_code=409, detail={"code": "RETCON_ALREADY_APPLIED"})
+    if request.status == "ROLLED_BACK": raise HTTPException(status_code=409, detail={"code": "RETCON_REQUEST_ROLLED_BACK"})
+    if request.status not in {"DRAFT", "PLANNED", "STALE"}: raise HTTPException(status_code=409, detail={"code": "RETCON_REQUEST_NOT_ABORTABLE"})
     request.status = "ABORTED"; db.commit(); db.refresh(request)
     return retcon_request_payload(db, request)
 
 @router.post("/projects/{project_id}/retcon/requests/{request_id}/apply")
-def apply_retcon(project_id: str, request_id: str, payload: RetconApplyPayload | None = None, db: Session = Depends(get_db)):
-    # Preserve the historical route-probe behavior for callers that send no body;
-    # an explicit Phase 6B payload is required to mutate the formal world.
-    if payload is None:
-        raise HTTPException(status_code=404, detail="Retcon apply requires explicit confirmation payload")
-    request = db.get(RetconRequest, request_id)
+def apply_retcon(project_id: str, request_id: str, payload: RetconApplyPayload, db: Session = Depends(get_db)):
+    request = db.scalar(select(RetconRequest).where(RetconRequest.id == request_id, RetconRequest.project_id == project_id).with_for_update())
     if not request or request.project_id != project_id:
         raise HTTPException(status_code=404, detail="Retcon request not found")
-    plan = db.get(RetconImpactPlan, payload.plan_id)
-    revision = db.get(WorldRevision, request.source_revision_id)
+    plan = db.scalar(select(RetconImpactPlan).where(RetconImpactPlan.id == payload.plan_id).with_for_update())
+    revision = db.scalar(select(WorldRevision).where(WorldRevision.id == request.source_revision_id).with_for_update())
     if not plan or plan.retcon_request_id != request_id or plan.project_id != project_id:
         raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE" if plan else "RETCON_PLAN_NOT_FOUND"})
     if not revision or revision.project_id != project_id:
@@ -170,6 +178,9 @@ def apply_retcon(project_id: str, request_id: str, payload: RetconApplyPayload |
         ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_APPLY, source_type="WORLD_REVISION", source_id=revision.id, status=ExecutionStatus.SUCCEEDED, input_fingerprint=plan.basis_fingerprint, output_fingerprint=application.post_apply_world_fingerprint)
         db.commit(); db.refresh(application)
         return {"application": retcon_application_payload(db, application), "revision_application": record_dict(revision_application), "revision": record_dict(revision), "cognition_invalidations": [record_dict(item) for item in invalidations], "replay_summary": application.replay_summary}
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "RETCON_ALREADY_APPLIED"}) from exc
     except ValueError as exc:
         db.rollback()
         code = str(exc)
@@ -212,8 +223,10 @@ def routed_provider(settings, route):
     return get_model_provider(settings, route.provider, route.base_url)
 
 def ensure_replay_not_pending(db: Session, project_id: str) -> None:
-    if has_pending_replay(db, project_id):
-        raise HTTPException(status_code=409, detail={"code": "RETCON_REPLAY_REQUIRED"})
+    try:
+        RetconPendingReplayGuard().assert_progression_allowed(db, project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 
 def primary_issue(report):
     issues = report.get("issues", []) if isinstance(report, dict) else report.as_dict().get("issues", [])
@@ -252,6 +265,12 @@ def update_record(db: Session, record: Any, values: dict[str, Any]):
     db.add(record); db.commit(); db.refresh(record)
     return record
 
+FORMAL_MUTATION_MODELS = {Character, WorldEntity, CanonFact, StoryThread, StoryArc, Scene, Chapter}
+
+def guard_formal_mutation(db: Session, project_id: str, model: Type) -> None:
+    if model in FORMAL_MUTATION_MODELS:
+        ensure_replay_not_pending(db, project_id)
+
 @router.get("/projects")
 def list_projects(db: Session = Depends(get_db)):
     return [record_dict(item) for item in db.scalars(select(Project).order_by(Project.created_at.desc())).all()]
@@ -266,14 +285,19 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
 
 @router.patch("/projects/{project_id}")
 def patch_project(project_id: str, payload: Payload, db: Session = Depends(get_db)):
-    return record_dict(update_record(db, require_project(db, project_id), payload.model_dump()))
+    values = payload.model_dump()
+    if "current_world_time" in values:
+        ensure_replay_not_pending(db, project_id)
+    return record_dict(update_record(db, require_project(db, project_id), values))
 
 @router.get("/projects/{project_id}/snapshot")
 def project_snapshot(project_id: str, db: Session = Depends(get_db)):
     project = require_project(db, project_id)
     characters = db.scalars(select(Character).where(Character.project_id == project_id, Character.active.is_(True))).all()
     character_ids = [item.id for item in characters]
-    knowledge = db.scalars(select(CharacterKnowledge).where(CharacterKnowledge.character_id.in_(character_ids))).all() if character_ids else []
+    reader = ActiveCharacterCognitionReader()
+    knowledge = [item for character in characters for item in reader.knowledge(db, project_id, character.id)] if character_ids else []
+    memories = [item for character in characters for item in reader.memories(db, project_id, character.id)] if character_ids else []
     return {
         "project": record_dict(project),
         "active_writing_bible": next((record_dict(item) for item in db.scalars(select(WritingBible).where(WritingBible.project_id == project_id, WritingBible.active.is_(True))).all()), None),
@@ -281,7 +305,8 @@ def project_snapshot(project_id: str, db: Session = Depends(get_db)):
         "canon": [record_dict(item) for item in db.scalars(select(CanonFact).where(CanonFact.project_id == project_id)).all()],
         "active_characters": [record_dict(item) for item in characters],
         "character_states": [{"character_id": item.id, "current_state": serialize(item.current_state), "physical_state": serialize(item.physical_state), "emotional_state": serialize(item.emotional_state), "goals": serialize(item.goals)} for item in characters],
-        "character_knowledge_summary": [{"character_id": item.character_id, "proposition": item.proposition, "status": item.status.value, "confidence": item.confidence} for item in knowledge],
+        "character_knowledge_summary": [{"id": item.id, "character_id": item.character_id, "proposition": item.proposition, "status": item.status.value, "confidence": item.confidence} for item in knowledge],
+        "character_memory_summary": [{"character_id": item.character_id, "content": item.content, "importance": item.importance, "confidence": item.confidence} for item in memories],
         "world_entities": [record_dict(item) for item in db.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True))).all()],
         "active_story_threads": [record_dict(item) for item in db.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status.in_(["OPEN", "PAUSED"]))).all()],
         "current_story_arc": next((record_dict(item) for item in db.scalars(select(StoryArc).where(StoryArc.project_id == project_id, StoryArc.status == "ACTIVE").order_by(StoryArc.id.desc())).all()), None),
@@ -296,6 +321,7 @@ def project_routes(prefix: str, model: Type, allow_update: bool = True):
     @router.post(f"/projects/{{project_id}}/{prefix}", status_code=status.HTTP_201_CREATED)
     def add_item(project_id: str, payload: Payload, db: Session = Depends(get_db)):
         require_project(db, project_id)
+        guard_formal_mutation(db, project_id, model)
         return record_dict(create_record(db, model, payload.model_dump(), project_id))
     @router.get(f"/{prefix}/{{item_id}}")
     def get_item(item_id: str, db: Session = Depends(get_db)):
@@ -307,11 +333,13 @@ def project_routes(prefix: str, model: Type, allow_update: bool = True):
         def patch_item(item_id: str, payload: Payload, db: Session = Depends(get_db)):
             item = db.get(model, item_id)
             if not item: raise HTTPException(status_code=404, detail="Resource not found")
+            guard_formal_mutation(db, item.project_id, model)
             return record_dict(update_record(db, item, payload.model_dump()))
     @router.delete(f"/{prefix}/{{item_id}}", status_code=status.HTTP_204_NO_CONTENT)
     def delete_item(item_id: str, db: Session = Depends(get_db)):
         item = db.get(model, item_id)
         if not item: raise HTTPException(status_code=404, detail="Resource not found")
+        guard_formal_mutation(db, item.project_id, model)
         db.delete(item); db.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -322,6 +350,7 @@ for path, model, allow_update in [("characters", Character, True), ("world-entit
 def patch_canon(fact_id: str, payload: Payload, db: Session = Depends(get_db)):
     fact = db.get(CanonFact, fact_id)
     if not fact: raise HTTPException(status_code=404, detail="Canon fact not found")
+    guard_formal_mutation(db, fact.project_id, CanonFact)
     try: return record_dict(update_canon(db, fact, **payload.model_dump()))
     except DomainRuleError as error: raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -374,7 +403,9 @@ def character_knowledge(character_id: str, db: Session = Depends(get_db)):
 
 @router.post("/characters/{character_id}/knowledge", status_code=status.HTTP_201_CREATED)
 def create_character_knowledge(character_id: str, payload: Payload, db: Session = Depends(get_db)):
-    if not db.get(Character, character_id): raise HTTPException(status_code=404, detail="Character not found")
+    character = db.get(Character, character_id)
+    if not character: raise HTTPException(status_code=404, detail="Character not found")
+    ensure_replay_not_pending(db, character.project_id)
     return record_dict(create_record(db, CharacterKnowledge, payload.model_dump() | {"character_id": character_id}))
 
 @router.get("/characters/{character_id}/memories")
@@ -384,7 +415,9 @@ def character_memories(character_id: str, db: Session = Depends(get_db)):
 
 @router.post("/characters/{character_id}/memories", status_code=status.HTTP_201_CREATED)
 def create_character_memory(character_id: str, payload: Payload, db: Session = Depends(get_db)):
-    if not db.get(Character, character_id): raise HTTPException(status_code=404, detail="Character not found")
+    character = db.get(Character, character_id)
+    if not character: raise HTTPException(status_code=404, detail="Character not found")
+    ensure_replay_not_pending(db, character.project_id)
     return record_dict(create_record(db, CharacterMemory, payload.model_dump() | {"character_id": character_id}))
 
 def context_summary(context: dict[str, Any]) -> dict[str, Any]:
@@ -741,6 +774,7 @@ def abort_recovery_candidate(project_id: str, candidate_id: str, db: Session = D
 
 @router.post("/projects/{project_id}/recovery-candidates/{candidate_id}/adopt")
 def adopt_recovery_candidate(project_id: str, candidate_id: str, db: Session = Depends(get_db)):
+    ensure_replay_not_pending(db, project_id)
     candidate = _candidate_or_404(db, project_id, candidate_id)
     if candidate.initial_error_code == "WORLD_INFORMATION_MISSING": raise HTTPException(status_code=409, detail={"code": "WORLD_FACT_REQUIRED"})
     if candidate.status != RecoveryCandidateStatus.VALIDATED.value: raise HTTPException(status_code=409, detail={"code": "RECOVERY_CANDIDATE_NOT_VALIDATED"})

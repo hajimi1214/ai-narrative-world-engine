@@ -100,7 +100,7 @@ def test_aborted_request_cannot_analyze_and_actions_never_apply(session, monkeyp
 def test_no_apply_or_replay_endpoints(session, monkeypatch):
     project, *_unused, revision, client = prepared(session, monkeypatch)
     request = client.post(f"/projects/{project.id}/retcon/requests", json={"source_revision_id":revision["id"],"reason":"routes"}).json()
-    assert client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply").status_code == 404
+    assert client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply").status_code == 422
     assert client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/replay").status_code == 404
 
 def test_plan_stale_after_formal_change(session, monkeypatch):
@@ -225,7 +225,7 @@ def test_plan_append_only_parent_and_unique_versions(session, monkeypatch):
 def test_no_provider_or_replay_routes(session, monkeypatch):
     project, *_unused, revision, client = prepared(session, monkeypatch)
     req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"routes"}).json()
-    assert client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/apply").status_code==404
+    assert client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/apply").status_code==422
     assert client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/replay").status_code==404
 
 def test_related_knowledge_change_stales_plan(session, monkeypatch):
