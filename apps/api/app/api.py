@@ -28,6 +28,7 @@ from .retcon_apply import RetconApplyService, RetconPendingReplayGuard, RetconAu
 from .replay import ReplayService
 from .historical import SceneStateCheckpointService
 from .state_delta import StateDeltaCandidateBuilder
+from .state_delta_validation import StateDeltaValidator
 
 router = APIRouter()
 
@@ -128,6 +129,25 @@ def get_state_delta_batch(project_id: str, batch_id: str, db: Session = Depends(
     if not batch or batch.project_id != project_id:
         raise HTTPException(status_code=404, detail="State Delta Batch not found")
     return state_delta_batch_payload(db, batch)
+
+@router.post("/projects/{project_id}/state-delta-batches/{batch_id}/validate")
+def validate_state_delta_batch(project_id: str, batch_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    batch = db.get(StateDeltaBatch, batch_id)
+    if not batch or batch.project_id != project_id:
+        raise HTTPException(status_code=404, detail="State Delta Batch not found")
+    try:
+        result = StateDeltaValidator().validate(db, project_id, batch_id)
+        if not result.idempotent:
+            db.commit()
+            db.refresh(result.batch)
+        return state_delta_batch_payload(db, result.batch) | {"idempotent": result.idempotent}
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 
 @router.post("/projects/{project_id}/retcon/requests", status_code=status.HTTP_201_CREATED)
 def create_retcon_request(project_id: str, payload: RetconRequestPayload, db: Session = Depends(get_db)):

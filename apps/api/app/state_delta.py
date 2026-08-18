@@ -25,6 +25,28 @@ DERIVATION_VERSION = "state-delta-v1"
 _MISSING = object()
 
 
+class StateDeltaInputFingerprintBuilder:
+    """Single canonical input fingerprint contract for derivation and validation."""
+
+    def build(self, resolution: WorldResolution, turn: ScenePerformanceTurn, performance: ScenePerformance, base_world_fingerprint: str) -> str:
+        source_payload = {
+            "id": resolution.id, "status": _enum(resolution.status), "outcome": _enum(resolution.outcome),
+            "objective_facts": resolution.objective_facts or [], "turn_id": turn.id,
+            "performance_id": performance.id, "state_effects": resolution.state_effects or [],
+            "world_context_fingerprint": resolution.world_context_fingerprint,
+        }
+        return stable_fingerprint({"source": source_payload, "base_world_fingerprint": base_world_fingerprint, "derivation_version": DERIVATION_VERSION}, "state-delta-input-v1")
+
+
+def state_delta_item_fingerprint(project_id: str, resolution_id: str, turn_id: str, effect: StateEffectPayload, before: Any, after: Any, evidence: dict[str, Any]) -> str:
+    return stable_fingerprint({
+        "project_id": project_id, "source_resolution_id": resolution_id, "source_turn_id": turn_id,
+        "target_type": effect.target_type.value, "target_id": effect.target_id,
+        "domain": effect.domain.value, "operation": effect.operation.value, "path": effect.path,
+        "before": before, "after": after, "evidence": evidence,
+    }, "state-delta-item-v1")
+
+
 class FormalWorldStateReader:
     """Reads formal state without any authority to mutate it."""
 
@@ -106,15 +128,8 @@ class StateDeltaCandidateBuilder:
             raise ValueError("STATE_DELTA_SOURCE_LINEAGE_INVALID")
 
         _, base_fingerprint = WorldSnapshotBuilder().build(db, project_id)
-        source_payload = {
-            "id": resolution.id, "status": _enum(resolution.status), "outcome": _enum(resolution.outcome),
-            "objective_facts": resolution.objective_facts or [], "turn_id": turn.id,
-            "performance_id": performance.id,
-            "state_effects": resolution.state_effects or [],
-            "world_context_fingerprint": resolution.world_context_fingerprint,
-        }
-        input_fingerprint = stable_fingerprint({"source": source_payload, "base_world_fingerprint": base_fingerprint, "derivation_version": DERIVATION_VERSION}, "state-delta-input-v1")
-        existing = db.scalar(select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id, StateDeltaBatch.input_fingerprint == input_fingerprint, StateDeltaBatch.status == StateDeltaBatchStatus.CANDIDATE))
+        input_fingerprint = StateDeltaInputFingerprintBuilder().build(resolution, turn, performance, base_fingerprint)
+        existing = db.scalar(select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id, StateDeltaBatch.input_fingerprint == input_fingerprint))
         if existing:
             return existing, self.items(db, existing.id), True
 
@@ -156,12 +171,7 @@ class StateDeltaCandidateBuilder:
                         "state_effect": effect.model_dump(mode="json"), "translator_version": DERIVATION_VERSION,
                         "objective_fact": effect.evidence.get("objective_fact"),
                     }
-                    semantic_fingerprint = stable_fingerprint({
-                        "project_id": project_id, "source_resolution_id": resolution.id, "source_turn_id": turn.id,
-                        "target_type": effect.target_type.value, "target_id": effect.target_id,
-                        "domain": effect.domain.value, "operation": effect.operation.value, "path": effect.path,
-                        "before": before, "after": after, "evidence": evidence,
-                    }, "state-delta-item-v1")
+                    semantic_fingerprint = state_delta_item_fingerprint(project_id, resolution.id, turn.id, effect, before, after, evidence)
                     item = StateDeltaItem(
                         project_id=project_id, batch_id=batch.id, ordinal=ordinal, target_type=effect.target_type,
                         target_id=effect.target_id, domain=effect.domain, operation=effect.operation, path=effect.path,
@@ -172,7 +182,7 @@ class StateDeltaCandidateBuilder:
                     db.add(item); items.append(item)
                 db.flush()
         except IntegrityError:
-            existing = db.scalar(select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id, StateDeltaBatch.input_fingerprint == input_fingerprint, StateDeltaBatch.status == StateDeltaBatchStatus.CANDIDATE))
+            existing = db.scalar(select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id, StateDeltaBatch.input_fingerprint == input_fingerprint))
             if existing:
                 return existing, self.items(db, existing.id), True
             raise

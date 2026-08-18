@@ -369,6 +369,11 @@ class StateDeltaBatch(Base):
     status: Mapped[StateDeltaBatchStatus] = mapped_column(Enum(StateDeltaBatchStatus), default=StateDeltaBatchStatus.CANDIDATE, nullable=False, index=True)
     derivation_version: Mapped[str] = mapped_column(String(40), nullable=False)
     derivation_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    validation_version: Mapped[str | None] = mapped_column(String(40))
+    validation_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default=text("'{}'"), nullable=False)
+    validation_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    validated_world_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    validation_completed_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class StateDeltaItem(Base):
