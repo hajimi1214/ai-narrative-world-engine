@@ -88,22 +88,14 @@ class SelectiveReplayQueue:
         queue = []
         from .models import RetconImpactItem
         items = db.scalars(select(RetconImpactItem).where(RetconImpactItem.plan_id == application.retcon_plan_id)).all()
-        resources = {}
-        for item in items:
-            scene_id = item.scene_id
-            if not scene_id:
-                for node in item.dependency_path or []:
-                    if node.get("type") == "SCENE": scene_id = node.get("id"); break
-            if scene_id: resources.setdefault(scene_id, {"decision_ids": [], "turn_ids": [], "resolution_ids": [], "cognition_resource_ids": []})
-            if scene_id:
-                key = "cognition_resource_ids" if item.resource_type in {"CHARACTER_KNOWLEDGE", "CHARACTER_MEMORY"} else {"CHARACTER_DECISION": "decision_ids", "SCENE_PERFORMANCE_TURN": "turn_ids", "WORLD_RESOLUTION": "resolution_ids"}.get(item.resource_type)
-                if key: resources[scene_id][key].append(item.resource_id)
+        scene_ids = [scene.id for scene in scenes]
+        mapped = ReplayResourceMapper().map(db, application, scene_ids)
         for scene in scenes:
             keep = any(r.get("sequence_start", 0) <= scene.sequence <= r.get("sequence_end", 0) for r in preserved)
             if scene.id in replay_ids:
-                queue.append({"sequence": scene.sequence, "scene_id": scene.id, "mode": "REPLAY", "reason": "INITIAL_PLAN", "dynamic_expansion_reason": None, **resources.get(scene.id, {})})
+                queue.append({"sequence": scene.sequence, "scene_id": scene.id, "mode": "REPLAY", "reason": "INITIAL_PLAN", "dynamic_expansion_reason": None, **mapped.get(scene.id, {"decision_ids": [], "turn_ids": [], "resolution_ids": [], "knowledge_ids": [], "memory_ids": []})})
             elif keep:
-                queue.append({"sequence": scene.sequence, "scene_id": scene.id, "mode": "VALIDATE_PRESERVED", "reason": "PRESERVED_HISTORY", "dynamic_expansion_reason": None, **resources.get(scene.id, {})})
+                queue.append({"sequence": scene.sequence, "scene_id": scene.id, "mode": "VALIDATE_PRESERVED", "reason": "PRESERVED_HISTORY", "dynamic_expansion_reason": None, **mapped.get(scene.id, {"decision_ids": [], "turn_ids": [], "resolution_ids": [], "knowledge_ids": [], "memory_ids": []})})
         return sorted(queue, key=lambda item: (item["sequence"], item["scene_id"]))
 
 class ReplayService:
@@ -162,6 +154,7 @@ class ReplayService:
             queue_item = session.queue[session.cursor]
             situation = {"sequence": scene.sequence, "location": scene.location, "participants": list(scene.participants or []), "intent": scene.intent}
             staged_decisions = []
+            staged_turns = []
             staged_outcome = {"objective_facts": [], "outcome": "UNRESOLVED", "source": "HEURISTIC_REPLAY"}
             for old_id in queue_item.get("decision_ids", []):
                 old = db.get(CharacterDecision, old_id)
@@ -178,7 +171,10 @@ class ReplayService:
                 action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, candidate, parsed.action, list(scene.participants or []))
                 if not action_report.valid:
                     run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_ACTION_CONSTRAINT_FAILED", "report": action_report.as_dict()}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
-                staged_decisions.append({"replay_of_id": old_id, "character_id": old.character_id, "decision": output["decision"], "action": output["action"], "context_fingerprint": _fingerprint(context)})
+                decision_temp = f"replay-decision:{session.id}:{scene.id}:{len(staged_decisions)+1}"
+                turn_temp = f"replay-turn:{session.id}:{scene.id}:{len(staged_turns)+1}"
+                staged_decisions.append({"temp_id": decision_temp, "replay_of_id": old_id, "character_id": old.character_id, "decision": output["decision"], "action": output["action"], "context_fingerprint": _fingerprint(context)})
+                staged_turns.append({"temp_id": turn_temp, "replay_of_id": queue_item.get("turn_ids", [None])[len(staged_turns)] if queue_item.get("turn_ids") else None, "decision_temp_id": decision_temp, "sequence": len(staged_turns)+1, "actor_character_id": old.character_id, "visibility": output["action"]["visibility"], "observable_action": output["action"].get("observable_action"), "spoken_content": output["action"].get("spoken_content"), "recipient_character_ids": list(scene.participants or []), "requires_world_resolution": output["action"].get("requires_world_resolution", False), "world_resolution_request": output["action"].get("world_resolution_request"), "validation": {"valid": True}})
                 if output["action"].get("requires_world_resolution"):
                     request = output["action"].get("world_resolution_request") or {}
                     view = ReplayWorldView(session); entity = view.entity(request.get("target_entity_id"))
@@ -189,8 +185,8 @@ class ReplayService:
                     resolution_report = WorldResolutionConstraintChecker().validate(db, world_context, WorldResolutionPayload.model_validate(staged_outcome), session.project_id)
                     if not resolution_report["valid"]:
                         run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_RESOLUTION_CONSTRAINT_FAILED", "report": resolution_report}; session.status = ReplaySessionStatus.BLOCKED; return run
-            session.staged_world_state = dict(session.staged_world_state or {}) | {str(scene.sequence): {"situation": situation, "decisions": staged_decisions, "resolution": staged_outcome}}
-            state = deepcopy(session.staged_world_state); state.setdefault("scene_results", {})[scene.id] = {"mode": "REPLAY", "sequence": scene.sequence, "situation": situation, "decisions": staged_decisions, "turns": [], "resolutions": [staged_outcome] if staged_outcome.get("outcome") != "UNRESOLVED" else [], "validation": {"code": "REPLAY_VALIDATED"}}; session.staged_world_state = state
+            session.staged_world_state = dict(session.staged_world_state or {}) | {str(scene.sequence): {"situation": situation, "decisions": staged_decisions, "turns": staged_turns, "resolutions": [staged_outcome] if staged_outcome.get("outcome") != "UNRESOLVED" else [], "resolution": staged_outcome}}
+            state = deepcopy(session.staged_world_state); state.setdefault("scene_results", {})[scene.id] = {"mode": "REPLAY", "sequence": scene.sequence, "situation": situation, "performance": {"temp_id": f"replay-performance:{session.id}:{scene.id}", "participant_ids": list(scene.participants or [])}, "decisions": staged_decisions, "turns": staged_turns, "resolutions": [staged_outcome] if staged_outcome.get("outcome") != "UNRESOLVED" else [], "knowledge": [], "memories": [], "validation": {"code": "REPLAY_VALIDATED"}}; session.staged_world_state = state
             run.validation_report = {"code": "REPLAY_VALIDATED", "deterministic": True, "staged": True}
             run.status = ReplaySceneRunStatus.VALIDATED
         run.completed_at = datetime.utcnow(); session.cursor += 1; session.current_sequence = session.queue[session.cursor]["sequence"] if session.cursor < len(session.queue) else None; session.status = ReplaySessionStatus.RUNNING; session.current_fingerprint = _fingerprint({"world": (session.staged_world_state or {}).get("current_world"), "queue": session.queue, "cursor": session.cursor}); db.flush(); return run
@@ -227,7 +223,8 @@ class ReplayService:
                             payload = item["decision"]; action = item["action"]
                             decision = CharacterDecision(project_id=session.project_id, scene_proposal_id=proposal_id, character_id=item["character_id"], context_fingerprint=item["context_fingerprint"], replay_session_id=session.id, replay_of_id=item["replay_of_id"], **payload)
                             db.add(decision); db.flush()
-                            turn = ScenePerformanceTurn(project_id=session.project_id, performance_id=performance.id, sequence=idx, actor_character_id=item["character_id"], actor_context_fingerprint=item["context_fingerprint"], character_decision_id=decision.id, action_visibility=action["visibility"], observable_action=action.get("observable_action"), spoken_content=action.get("spoken_content"), recipient_character_ids=list(new.participants or []), requires_world_resolution=action.get("requires_world_resolution", False), world_resolution_request=action.get("world_resolution_request"), validation_result={"valid": True}, replay_session_id=session.id, replay_of_id=item["replay_of_id"])
+                            staged_turn = next((turn for turn in staged.get("turns", []) if turn.get("decision_temp_id") == item.get("temp_id")), None) or {}
+                            turn = ScenePerformanceTurn(project_id=session.project_id, performance_id=performance.id, sequence=staged_turn.get("sequence", idx), actor_character_id=item["character_id"], actor_context_fingerprint=item["context_fingerprint"], character_decision_id=decision.id, action_visibility=staged_turn.get("visibility", action["visibility"]), observable_action=staged_turn.get("observable_action", action.get("observable_action")), spoken_content=staged_turn.get("spoken_content", action.get("spoken_content")), recipient_character_ids=staged_turn.get("recipient_character_ids", list(new.participants or [])), requires_world_resolution=staged_turn.get("requires_world_resolution", action.get("requires_world_resolution", False)), world_resolution_request=staged_turn.get("world_resolution_request", action.get("world_resolution_request")), validation_result=staged_turn.get("validation", {"valid": True}), replay_session_id=session.id, replay_of_id=staged_turn.get("replay_of_id"))
                             db.add(turn); db.flush(); run.new_decision_ids = list(run.new_decision_ids or []) + [decision.id]; run.new_turn_ids = list(run.new_turn_ids or []) + [turn.id]
         replacement_by_old = {run.original_scene_id: run.replacement_scene_id for run in final_runs.values() if run.replacement_scene_id}
         # A rebuild is complete only when the affected resource was covered by a replayed scene.
