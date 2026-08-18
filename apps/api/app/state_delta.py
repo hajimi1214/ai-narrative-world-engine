@@ -110,6 +110,8 @@ class StateDeltaCandidateBuilder:
             "id": resolution.id, "status": _enum(resolution.status), "outcome": _enum(resolution.outcome),
             "objective_facts": resolution.objective_facts or [], "turn_id": turn.id,
             "performance_id": performance.id,
+            "state_effects": resolution.state_effects or [],
+            "world_context_fingerprint": resolution.world_context_fingerprint,
         }
         input_fingerprint = stable_fingerprint({"source": source_payload, "base_world_fingerprint": base_fingerprint, "derivation_version": DERIVATION_VERSION}, "state-delta-input-v1")
         existing = db.scalar(select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id, StateDeltaBatch.input_fingerprint == input_fingerprint, StateDeltaBatch.status == StateDeltaBatchStatus.CANDIDATE))

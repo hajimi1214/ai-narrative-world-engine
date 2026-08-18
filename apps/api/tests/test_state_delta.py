@@ -60,6 +60,12 @@ def test_state_effect_payload_is_strict():
     assert valid.effect_kind == "STATE_CHANGE"
     with pytest.raises(ValidationError):
         StateEffectPayload.model_validate({**valid.model_dump(), "freeform_patch": "forbidden"})
+    with pytest.raises(ValidationError):
+        StateEffectPayload.model_validate({**valid.model_dump(), "evidence": {}})
+    missing_evidence = valid.model_dump()
+    missing_evidence.pop("evidence")
+    with pytest.raises(ValidationError):
+        StateEffectPayload.model_validate(missing_evidence)
 
 
 def test_safe_entity_effect_creates_candidate_without_mutating_formal_world(session, monkeypatch):
@@ -83,16 +89,16 @@ def test_character_allowlist_inventory_relationship_time_and_thread_effects(sess
     actor.current_state = {"location_id": "old"}; actor.inventory = ["coin"]; actor.relationships = {}; actor.physical_state = {"healthy": True}; actor.emotional_state = {"mood": "calm"}; location.active = True
     session.add_all([other, thread]); session.flush()
     facts = [
-        fact_with_effect("CHARACTER", actor.id, "current_state.location_id", location.id, effect("CHARACTER", actor.id, "CHARACTER_LOCATION", "SET", "/current_state/location_id", location.id)),
-        fact_with_effect("CHARACTER", actor.id, "inventory", "key", effect("CHARACTER", actor.id, "CHARACTER_INVENTORY", "ADD", "/inventory", "key")),
-        fact_with_effect("CHARACTER", actor.id, "trust", 0.8, effect("CHARACTER", actor.id, "CHARACTER_RELATIONSHIP", "UPSERT", f"/relationships/{other.id}/trust", 0.8)),
-        fact_with_effect("CHARACTER", actor.id, "healthy", False, effect("CHARACTER", actor.id, "CHARACTER_PHYSICAL_STATE", "SET", "/physical_state/healthy", False)),
-        fact_with_effect("CHARACTER", actor.id, "mood", "afraid", effect("CHARACTER", actor.id, "CHARACTER_EMOTIONAL_STATE", "SET", "/emotional_state/mood", "afraid")),
-        fact_with_effect("ENTITY", location.id, "active", False, effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_ACTIVE", "SET", "/active", False)),
-        fact_with_effect("SCENE", thread.id, "progress", 0.5, effect("STORY_THREAD", thread.id, "STORY_THREAD_PROGRESS", "SET", "/progress", 0.5)),
-        fact_with_effect("SCENE", thread.id, "phase", "middle", effect("STORY_THREAD", thread.id, "STORY_THREAD_STATE", "SET", "/state/phase", "middle")),
-        fact_with_effect("SCENE", thread.id, "status", "PAUSED", effect("STORY_THREAD", thread.id, "STORY_THREAD_STATUS", "SET", "/status", "PAUSED")),
-        fact_with_effect("SCENE", project.id, "world_time", "2040-01-01T00:00:00", effect("PROJECT", project.id, "WORLD_TIME", "SET", "/current_world_time", "2040-01-01T00:00:00")),
+        {"subject_type": "CHARACTER", "subject_id": actor.id, "predicate": "current_state.location_id", "value": location.id},
+        {"subject_type": "CHARACTER", "subject_id": actor.id, "predicate": "inventory", "value": "key"},
+        {"subject_type": "CHARACTER", "subject_id": actor.id, "predicate": "trust", "value": 0.8},
+        {"subject_type": "CHARACTER", "subject_id": actor.id, "predicate": "healthy", "value": False},
+        {"subject_type": "CHARACTER", "subject_id": actor.id, "predicate": "mood", "value": "afraid"},
+        {"subject_type": "ENTITY", "subject_id": location.id, "predicate": "active", "value": False},
+        {"subject_type": "SCENE", "subject_id": thread.id, "predicate": "progress", "value": 0.5},
+        {"subject_type": "SCENE", "subject_id": thread.id, "predicate": "phase", "value": "middle"},
+        {"subject_type": "SCENE", "subject_id": thread.id, "predicate": "status", "value": "PAUSED"},
+        {"subject_type": "SCENE", "subject_id": project.id, "predicate": "world_time", "value": "2040-01-01T00:00:00"},
     ]
     resolution.objective_facts = facts
     resolution.state_effects = [
@@ -114,8 +120,12 @@ def test_character_allowlist_inventory_relationship_time_and_thread_effects(sess
 
 
 def test_unsupported_character_objective_fact_is_not_guessed(session, monkeypatch):
-    with pytest.raises(ValidationError):
-        WorldResolutionPayload.model_validate({"outcome": "SUCCESS", "outcome_summary": "x", "objective_facts": [{"subject_type": "ENTITY", "subject_id": "door", "predicate": "opened", "value": True, "state_effect": {}}], "actor_observation": None, "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": ["door"], "resolution_basis_summary": None, "missing_information": []})
+    base = {"outcome": "SUCCESS", "outcome_summary": "x", "objective_facts": [{"subject_type": "ENTITY", "subject_id": "door", "predicate": "opened", "value": True}], "actor_observation": None, "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": ["door"], "resolution_basis_summary": None, "missing_information": []}
+    for extra in ("state_effect", "effect_kind"):
+        invalid = copy.deepcopy(base)
+        invalid["objective_facts"][0][extra] = {}
+        with pytest.raises(ValidationError):
+            WorldResolutionPayload.model_validate(invalid)
 
 
 def test_real_heuristic_interact_payload_persists_effect_and_derives_candidate(session, monkeypatch):
@@ -243,3 +253,86 @@ def test_state_delta_api_source_errors(session, monkeypatch):
     client = client_for(session, monkeypatch)
     assert client.post(f"/projects/{project.id}/state-delta-batches/derive", json={"source_resolution_id": resolution.id}).json()["detail"]["code"] == "STATE_DELTA_SOURCE_INVALID"
     assert client.post(f"/projects/{project.id}/state-delta-batches/derive", json={"source_resolution_id": "missing"}).json()["detail"]["code"] == "STATE_DELTA_SOURCE_NOT_FOUND"
+
+
+def test_state_effect_change_changes_input_and_item_fingerprints(session, monkeypatch):
+    project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
+    location.profile = {"opened": False, "latched": False}
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "opened", "value": True}]
+    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/opened", True)]
+    session.commit()
+    first, first_items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+    session.commit()
+    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/latched", True)]
+    session.commit()
+    second, second_items, existing = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+    assert not existing and second.id != first.id
+    assert second.input_fingerprint != first.input_fingerprint
+    assert first_items[0].semantic_fingerprint != second_items[0].semantic_fingerprint
+    assert second_items[0].after_value is True
+
+
+def test_state_effect_removal_creates_distinct_noop_batch(session, monkeypatch):
+    project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
+    location.profile = {"opened": False}
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "opened", "value": True}]
+    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/opened", True)]
+    session.commit()
+    first, first_items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+    session.commit()
+    resolution.state_effects = []
+    session.commit()
+    second, second_items, existing = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+    assert not existing and second.id != first.id and first_items
+    assert second.input_fingerprint != first.input_fingerprint
+    assert second_items == []
+    assert any(entry["code"] == "NO_STATE_CHANGE" for entry in second.derivation_report["entries"])
+
+
+def test_integrity_error_recovery_returns_existing_candidate(session, monkeypatch):
+    project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
+    location.profile = {"opened": False}
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "opened", "value": True}]
+    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/opened", True)]
+    session.commit()
+    first, _items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+    session.commit()
+    original_scalar = session.scalar
+    skipped = {"value": False}
+
+    def hide_first_existing_lookup(statement, *args, **kwargs):
+        rendered = str(statement)
+        if not skipped["value"] and "state_delta_batches" in rendered and "input_fingerprint" in rendered:
+            skipped["value"] = True
+            return None
+        return original_scalar(statement, *args, **kwargs)
+
+    monkeypatch.setattr(session, "scalar", hide_first_existing_lookup)
+    recovered, recovered_items, existing = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+    assert skipped["value"] and existing and recovered.id == first.id and len(recovered_items) == 1
+    assert session.query(StateDeltaBatch).filter(StateDeltaBatch.project_id == project.id).count() == 1
+
+
+def test_production_resolve_api_persists_effect_then_derives_candidate(session, monkeypatch):
+    from app.director import DirectorContextBuilder
+    from test_world_resolution import _pending_world_turn
+
+    project, location, actor, other, proposal, client = approved_setup(session, monkeypatch)
+    location.profile = {"openable": True, "opened": False, "locked": False}
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    session.add_all([location, proposal])
+    session.commit()
+    take, turn = _pending_world_turn(session, project, actor, other, proposal, client)
+    turn.world_resolution_request = {"kind": "INTERACT", "description": "open", "target_entity_id": location.id, "target_character_id": None}
+    session.add(turn)
+    session.commit()
+    resolved = client.post(f"/projects/{project.id}/performances/{take.id}/world/resolve", json={"mode": "HEURISTIC"})
+    assert resolved.status_code == 201, resolved.text
+    resolution = session.get(WorldResolution, resolved.json()["resolution"]["id"])
+    assert resolution.state_effects and resolution.state_effects[0]["path"] == "/profile/opened"
+    derived = client.post(f"/projects/{project.id}/state-delta-batches/derive", json={"source_resolution_id": resolution.id})
+    assert derived.status_code == 201, derived.text
+    assert derived.json()["items"][0]["before_value"] is False
+    assert derived.json()["items"][0]["after_value"] is True
+    session.refresh(location)
+    assert location.profile["opened"] is False
