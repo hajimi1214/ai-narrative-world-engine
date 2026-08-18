@@ -1,4 +1,5 @@
 import copy
+import json
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -14,7 +15,7 @@ from app.director import DirectorContextBuilder
 from app.main import app
 from app.models import (
     ActionVisibility, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType,
-    CharacterKnowledge, CharacterMemory, EntityType, ExecutionStage, ExecutionStatus, ExecutionTrace,
+    Character, CharacterKnowledge, CharacterMemory, EntityType, ExecutionStage, ExecutionStatus, ExecutionTrace,
     PerformanceMode, PerformanceStatus, ProposalStatus, ResolutionOutcome, ResolutionStatus,
     ResolverMode, Scene, SceneCommit, SceneExecutionBinding, ScenePerformance,
     RetconImpactItem, ScenePerformanceTurn, SceneStateCheckpoint, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem,
@@ -366,7 +367,7 @@ def test_commit_materializes_observation_cognition_without_hidden_fact_leak(sess
 
 
 def test_commit_checkpoint_contains_pre_and_post_formal_world(session, monkeypatch):
-    project, location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    project, location, actor, _other, _proposal, performance, _turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
     body = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()
     checkpoint = session.get(SceneStateCheckpoint, body["checkpoint"]["id"])
     pre = session.get(WorldSnapshot, checkpoint.pre_snapshot_id)
@@ -376,6 +377,8 @@ def test_commit_checkpoint_contains_pre_and_post_formal_world(session, monkeypat
     assert pre_entity["profile"]["opened"] is False and post_entity["profile"]["opened"] is True
     assert not any(row["id"] == body["scene"]["id"] for row in pre.payload["scenes"])
     assert any(row["id"] == body["scene"]["id"] for row in post.payload["scenes"])
+    assert not any(row.get("source") == body["scene"]["id"] for row in pre.payload["character_knowledge"])
+    assert any(row.get("character_id") == actor.id and row.get("source") == body["scene"]["id"] for row in post.payload["character_knowledge"])
 
 
 def test_commit_invalidates_sibling_performances(session, monkeypatch):
@@ -621,3 +624,183 @@ def test_scene_commit_never_calls_an_ai_provider(session, monkeypatch):
     monkeypatch.setattr(api, "get_model_provider", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Scene Commit must be deterministic")))
     response = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
     assert response.status_code == 200, response.text
+
+
+def test_public_turn_uses_persisted_recipients_not_participant_order(session, monkeypatch):
+    project, _location, actor, other, _proposal, performance, turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    withdrawn = session.scalar(select(Character).where(
+        Character.project_id == project.id,
+        Character.name == "Outsider",
+    ))
+    performance.participant_order = [actor.id, other.id, withdrawn.id]
+    performance.active_participant_ids = [actor.id, other.id]
+    turn.action_visibility = ActionVisibility.PUBLIC
+    turn.recipient_character_ids = [other.id]
+    session.commit()
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    action_memories = session.scalars(select(CharacterMemory).where(
+        CharacterMemory.source_scene == scene_id, CharacterMemory.content == "opens the entity"
+    )).all()
+    assert {row.character_id for row in action_memories} == {actor.id, other.id}
+    assert not any(row.character_id == withdrawn.id for row in action_memories)
+
+
+def test_public_resolution_uses_persisted_recipients_not_participant_order(session, monkeypatch):
+    project, _location, actor, other, _proposal, performance, _turn, resolution, _batch, client = prepared_commit(session, monkeypatch)
+    withdrawn = session.scalar(select(Character).where(Character.project_id == project.id, Character.name == "Outsider"))
+    performance.participant_order = [actor.id, other.id, withdrawn.id]
+    performance.active_participant_ids = [actor.id, other.id]
+    resolution.recipient_character_ids = [other.id]
+    session.commit()
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    memories = session.scalars(select(CharacterMemory).where(
+        CharacterMemory.source_scene == scene_id, CharacterMemory.content == "The entity opens."
+    )).all()
+    assert sorted(row.character_id for row in memories) == sorted([actor.id, other.id])
+
+
+def test_actor_keeps_own_action_memory_when_turn_has_no_recipients(session, monkeypatch):
+    project, _location, actor, other, _proposal, performance, turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    turn.recipient_character_ids = []
+    session.commit()
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    action_memories = session.scalars(select(CharacterMemory).where(
+        CharacterMemory.source_scene == scene_id, CharacterMemory.content == "opens the entity"
+    )).all()
+    assert {row.character_id for row in action_memories} == {actor.id}
+    assert not any(row.character_id == other.id for row in action_memories)
+
+
+def test_turn_preserves_distinct_observable_action_and_spoken_content(session, monkeypatch):
+    project, _location, actor, other, _proposal, performance, turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    turn.spoken_content = "The door is open."
+    session.commit()
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    action_memories = session.scalars(select(CharacterMemory).where(
+        CharacterMemory.source_scene == scene_id,
+        CharacterMemory.content.in_(["opens the entity", "The door is open."]),
+    )).all()
+    assert {(row.character_id, row.content) for row in action_memories} == {
+        (actor.id, "opens the entity"), (actor.id, "The door is open."),
+        (other.id, "opens the entity"), (other.id, "The door is open."),
+    }
+
+
+def test_same_action_content_is_deduplicated_per_turn_and_recipient(session, monkeypatch):
+    project, _location, actor, other, _proposal, performance, turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    turn.spoken_content = turn.observable_action
+    session.commit()
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    action_memories = session.scalars(select(CharacterMemory).where(
+        CharacterMemory.source_scene == scene_id, CharacterMemory.content == "opens the entity"
+    )).all()
+    assert sorted(row.character_id for row in action_memories) == sorted([actor.id, other.id])
+
+
+def test_actor_and_public_resolution_observation_are_deduplicated(session, monkeypatch):
+    project, _location, actor, other, _proposal, performance, _turn, resolution, _batch, client = prepared_commit(session, monkeypatch)
+    assert resolution.actor_observation == resolution.public_observation == "The entity opens."
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    observations = session.scalars(select(CharacterMemory).where(
+        CharacterMemory.source_scene == scene_id, CharacterMemory.content == "The entity opens."
+    )).all()
+    assert sorted(row.character_id for row in observations) == sorted([actor.id, other.id])
+
+
+def test_distinct_actor_and_public_resolution_observations_remain_distinct(session, monkeypatch):
+    project, _location, actor, other, _proposal, performance, _turn, resolution, _batch, client = prepared_commit(session, monkeypatch)
+    resolution.actor_observation = "I opened the entity."
+    resolution.public_observation = "The entity opens for everyone."
+    session.commit()
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    observations = session.scalars(select(CharacterMemory).where(
+        CharacterMemory.source_scene == scene_id,
+        CharacterMemory.content.in_([resolution.actor_observation, resolution.public_observation]),
+    )).all()
+    assert {(row.character_id, row.content) for row in observations} == {
+        (actor.id, resolution.actor_observation),
+        (actor.id, resolution.public_observation),
+        (other.id, resolution.public_observation),
+    }
+
+
+def test_knowledge_uses_canonical_json_and_is_replay_matcher_compatible(session, monkeypatch):
+    project, location, actor, _other, proposal, performance, _turn, resolution, _batch, client = prepared_commit(session, monkeypatch)
+    location.profile = {**location.profile, "label": "closed", "metadata": {}}
+    resolution.objective_facts = [
+        {"subject_type": "ENTITY", "subject_id": location.id, "predicate": "opened", "value": True},
+        {"subject_type": "ENTITY", "subject_id": location.id, "predicate": "label", "value": "open"},
+        {"subject_type": "ENTITY", "subject_id": location.id, "predicate": "metadata", "value": {"a": 1}},
+    ]
+    resolution.state_effects = [
+        effect(location.id, True, "/profile/opened"),
+        effect(location.id, "open", "/profile/label"),
+        effect(location.id, {"a": 1}, "/profile/metadata"),
+    ]
+    session.commit()
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    performance.proposal_context_fingerprint = proposal.context_fingerprint
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]
+    session.commit(); StateDeltaValidator().validate(session, project.id, batch.id); session.commit()
+    body = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()
+    scene_id = body["scene"]["id"]
+    assert body["scene_commit"]["applied_delta_count"] == body["scene"]["result"]["applied_item_count"] == 3
+    rows = session.scalars(select(CharacterKnowledge).where(
+        CharacterKnowledge.character_id == actor.id, CharacterKnowledge.source == scene_id
+    )).all()
+    propositions = {row.proposition for row in rows}
+    assert propositions == {
+        f"ENTITY {location.id}: opened = true",
+        f"ENTITY {location.id}: label = {json.dumps('open', ensure_ascii=True, sort_keys=True)}",
+        f"ENTITY {location.id}: metadata = {json.dumps({'a': 1}, ensure_ascii=True, sort_keys=True)}",
+    }
+    from app.replay import ReplayCognitionReplacementMatcher
+    for row in rows:
+        predicate, raw_value = row.proposition.split(": ", 1)[1].split(" = ", 1)
+        assert ReplayCognitionReplacementMatcher().knowledge(row, {
+            "character_id": actor.id,
+            "fact_identity": {"subject_type": "ENTITY", "subject_id": location.id, "predicate": predicate, "value": json.loads(raw_value)},
+        }, scene_id)
+
+
+@pytest.mark.parametrize("facts", [
+    [
+        {"subject_type": "ENTITY", "subject_id": "LOCATION_ID", "predicate": "hidden", "value": True},
+        {"subject_type": "ENTITY", "subject_id": "LOCATION_ID", "predicate": "opened", "value": True},
+        {"subject_type": "ENTITY", "subject_id": "LOCATION_ID", "predicate": "locked", "value": False},
+        {"subject_type": "ENTITY", "subject_id": "LOCATION_ID", "predicate": "color", "value": "red"},
+    ],
+    [
+        {"subject_type": "ENTITY", "subject_id": "LOCATION_ID", "predicate": "color", "value": "red"},
+        {"subject_type": "ENTITY", "subject_id": "LOCATION_ID", "predicate": "locked", "value": False},
+        {"subject_type": "ENTITY", "subject_id": "LOCATION_ID", "predicate": "opened", "value": True},
+        {"subject_type": "ENTITY", "subject_id": "LOCATION_ID", "predicate": "hidden", "value": True},
+    ],
+])
+def test_knowledge_uses_exact_effect_fact_regardless_of_fact_order(session, monkeypatch, facts):
+    project, location, actor, _other, _proposal, performance, _turn, resolution, _batch, client = prepared_commit(session, monkeypatch)
+    resolution.objective_facts = [{**fact, "subject_id": location.id} for fact in facts]
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]
+    session.commit(); StateDeltaValidator().validate(session, project.id, batch.id); session.commit()
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    knowledge = session.scalars(select(CharacterKnowledge).where(
+        CharacterKnowledge.character_id == actor.id, CharacterKnowledge.source == scene_id
+    )).all()
+    assert [row.proposition for row in knowledge] == [f"ENTITY {location.id}: opened = true"]
+
+
+def test_unmatched_effect_fact_applies_world_change_without_creating_knowledge(session, monkeypatch):
+    project, location, actor, _other, _proposal, performance, _turn, resolution, _batch, client = prepared_commit(session, monkeypatch)
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "hidden", "value": True}]
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]
+    session.commit(); StateDeltaValidator().validate(session, project.id, batch.id); session.commit()
+    scene_id = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()["scene"]["id"]
+    session.refresh(location)
+    knowledge = session.scalars(select(CharacterKnowledge).where(
+        CharacterKnowledge.character_id == actor.id, CharacterKnowledge.source == scene_id
+    )).all()
+    assert location.profile["opened"] is True
+    assert knowledge == []

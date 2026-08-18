@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -20,7 +21,6 @@ from .models import (
     StateDeltaBatchStatus, StateDeltaDomain, StateDeltaItem, StateDeltaTargetType,
     StoryThread, ThreadStatus, WorldResolution,
 )
-from .performance import PerformanceObservationRouter
 from .retcon_apply import RetconPendingReplayGuard
 from .revision import _pointer
 from .state_delta import (
@@ -133,38 +133,104 @@ class SceneDeltaApplyEngine:
         return actual == expected
 
 
+class SceneCommitObservedFactMatcher:
+    """Match a state effect to an exact structured, observable resolution fact."""
+
+    @staticmethod
+    def canonical_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=True, sort_keys=True)
+
+    def match(self, resolution: WorldResolution, effect: StateEffectPayload) -> dict[str, Any] | None:
+        expected = self._expected_identity(effect)
+        if expected is None:
+            return None
+        subject_types, predicate = expected
+        for fact in resolution.objective_facts or []:
+            if not isinstance(fact, dict):
+                continue
+            if (
+                fact.get("subject_type") in subject_types
+                and fact.get("subject_id") == effect.target_id
+                and fact.get("predicate") == predicate
+                and self.canonical_json(fact.get("value")) == self.canonical_json(effect.value)
+            ):
+                return {
+                    "subject_type": fact["subject_type"],
+                    "subject_id": fact["subject_id"],
+                    "predicate": fact["predicate"],
+                    "value": fact.get("value"),
+                }
+        return None
+
+    def identity(self, fact: dict[str, Any]) -> tuple[str, str, str, str]:
+        return (
+            str(fact["subject_type"]),
+            str(fact["subject_id"]),
+            str(fact["predicate"]),
+            self.canonical_json(fact.get("value")),
+        )
+
+    def _expected_identity(self, effect: StateEffectPayload) -> tuple[set[str], str] | None:
+        parts = _pointer(effect.path)
+        if effect.target_type == StateDeltaTargetType.WORLD_ENTITY:
+            if effect.domain == StateDeltaDomain.WORLD_ENTITY_PROFILE and len(parts) == 2 and parts[0] == "profile":
+                return {"ENTITY", "LOCATION"}, parts[1]
+            if effect.domain == StateDeltaDomain.WORLD_ENTITY_ACTIVE and parts == ["active"]:
+                return {"ENTITY", "LOCATION"}, "active"
+            return None
+        if effect.target_type != StateDeltaTargetType.CHARACTER:
+            return None
+        roots = {
+            StateDeltaDomain.CHARACTER_LOCATION: ("current_state", "location_id"),
+            StateDeltaDomain.CHARACTER_INVENTORY: ("inventory", None),
+            StateDeltaDomain.CHARACTER_PHYSICAL_STATE: ("physical_state", None),
+            StateDeltaDomain.CHARACTER_EMOTIONAL_STATE: ("emotional_state", None),
+            StateDeltaDomain.CHARACTER_CURRENT_STATE: ("current_state", None),
+        }
+        rule = roots.get(effect.domain)
+        if rule is None:
+            return None
+        root, fixed_predicate = rule
+        if fixed_predicate is not None:
+            predicate = fixed_predicate if parts == [root, fixed_predicate] else None
+        else:
+            predicate = root if parts == [root] else (parts[1] if len(parts) == 2 and parts[0] == root else None)
+        return ({"CHARACTER"}, predicate) if predicate else None
+
+
 class SceneCommitCognitionBuilder:
     """Deterministic observation-only cognition materialization."""
 
     def build(self, db: Session, scene: Scene, performance: ScenePerformance, turns: list[ScenePerformanceTurn], resolutions: dict[str, WorldResolution], items: list[StateDeltaItem]) -> tuple[list[CharacterKnowledge], list[CharacterMemory]]:
         knowledge: list[CharacterKnowledge] = []
         memories: list[CharacterMemory] = []
-        seen_knowledge: set[tuple[str, str]] = set()
+        seen_knowledge: set[tuple[str, str, str, str, str]] = set()
         seen_memory: set[tuple[str, str, str]] = set()
         item_by_resolution: dict[str, list[StateDeltaItem]] = {}
         for item in items:
             item_by_resolution.setdefault(item.source_resolution_id or "", []).append(item)
-        action_router = PerformanceObservationRouter()
+        matcher = SceneCommitObservedFactMatcher()
         for turn in turns:
-            action_text = turn.observable_action or turn.spoken_content
-            if action_text:
-                recipients = {turn.actor_character_id, *action_router.recipients(turn.action_visibility, list(performance.participant_order or []), turn.actor_character_id, None)}
-                recipients.update(turn.recipient_character_ids or [])
+            contents = []
+            for content in (turn.observable_action, turn.spoken_content):
+                if content and content not in contents:
+                    contents.append(content)
+            for content in contents:
+                recipients = {turn.actor_character_id, *(turn.recipient_character_ids or [])}
                 for character_id in sorted(recipients):
-                    self._memory(memories, seen_memory, character_id, scene.id, f"ACTION:{turn.id}", action_text)
+                    self._memory(memories, seen_memory, character_id, scene.id, f"TURN:{turn.id}", content)
             resolution = resolutions.get(turn.id)
             if not resolution:
                 continue
             if resolution.actor_observation:
-                self._memory(memories, seen_memory, turn.actor_character_id, scene.id, f"ACTOR:{resolution.id}", resolution.actor_observation)
+                self._memory(memories, seen_memory, turn.actor_character_id, scene.id, f"RESOLUTION:{resolution.id}", resolution.actor_observation)
             if resolution.public_observation:
                 for character_id in sorted(set(resolution.recipient_character_ids or [])):
-                    self._memory(memories, seen_memory, character_id, scene.id, f"PUBLIC:{resolution.id}", resolution.public_observation)
-            facts = [fact for fact in resolution.objective_facts or [] if isinstance(fact, dict)]
-            for item in item_by_resolution.get(resolution.id, []):
+                    self._memory(memories, seen_memory, character_id, scene.id, f"RESOLUTION:{resolution.id}", resolution.public_observation)
+            for item in sorted(item_by_resolution.get(resolution.id, []), key=lambda row: (row.ordinal, row.id)):
                 effect = StateEffectPayload.model_validate(item.evidence["state_effect"])
-                fact = effect.evidence.get("objective_fact") if isinstance(effect.evidence, dict) else None
-                if not isinstance(fact, dict) or fact not in facts:
+                fact = matcher.match(resolution, effect)
+                if fact is None:
                     continue
                 recipients: set[str] = set()
                 if resolution.actor_observation:
@@ -172,9 +238,10 @@ class SceneCommitCognitionBuilder:
                 observed = effect.evidence.get("observed_by_character_ids") if isinstance(effect.evidence, dict) else None
                 if isinstance(observed, list):
                     recipients.update(set(observed) & set(resolution.recipient_character_ids or []))
-                proposition = f"{fact.get('subject_type')} {fact.get('subject_id')}: {fact.get('predicate')} = {fact.get('value')!r}"
+                subject_type, subject_id, predicate, value = matcher.identity(fact)
+                proposition = f"{subject_type} {subject_id}: {predicate} = {value}"
                 for character_id in sorted(recipients):
-                    key = (character_id, proposition)
+                    key = (character_id, subject_type, subject_id, predicate, value)
                     if key not in seen_knowledge:
                         seen_knowledge.add(key)
                         knowledge.append(CharacterKnowledge(character_id=character_id, proposition=proposition, status=KnowledgeStatus.KNOWN, source=scene.id, confidence=1.0))
@@ -334,7 +401,8 @@ class SceneCommitService:
         record.post_snapshot_id = post_snapshot.id
         record.checkpoint_id = checkpoint.id
         record.post_world_fingerprint = post_fingerprint
-        record.applied_delta_count = len(prepared.batches)
+        # This is an applied StateDeltaItem count; batch count is retained in delta_batch_ids.
+        record.applied_delta_count = len(prepared.items)
         record.created_knowledge_count = len(knowledge)
         record.created_memory_count = len(memories)
         record.completed_at = datetime.utcnow()
