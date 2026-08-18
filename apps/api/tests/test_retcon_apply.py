@@ -1,5 +1,6 @@
 import pytest
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from fastapi.testclient import TestClient
@@ -8,11 +9,14 @@ from app.db import Base
 from app.main import app
 import app.api as api
 from app.models import (
-    CanonFact, CharacterKnowledge, CharacterMemory, RetconApplication,
-    RetconCognitionInvalidation, RetconApplicationStatus, RevisionStatus, StoryThread, StoryArc, Chapter, WorldEntity, SceneProposal, ScenePerformance,
+    CanonFact, CharacterKnowledge, CharacterMemory, RetconApplication, Project,
+    RetconCognitionInvalidation, RetconApplicationStatus, RevisionStatus, StoryThread, StoryArc, Chapter, WorldEntity, Scene, SceneProposal, ScenePerformance, RevisionApplication, WorldSnapshot, WorldRevision, RetconRequest,
 )
 from app.character_mind import ActiveCharacterCognitionReader
+from app.revision import RevisionStateFingerprintBuilder
+from app.retcon_apply import RetconApplyService
 from test_retcon_planning import prepared
+from test_scene_performance import approved_setup
 
 
 @pytest.fixture()
@@ -140,6 +144,28 @@ def test_core_override_reason_required(session, monkeypatch):
     result = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": ""})
     assert result.status_code == 409 and result.json()["detail"]["code"] == "AUTHOR_OVERRIDE_REQUIRED"
 
+def test_core_override_with_author_reason_allows_apply(session, monkeypatch):
+    project, *_unused, request, analyzed, client = analyzed_setup(session, monkeypatch)
+    result = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={
+        "plan_id": analyzed["plan"]["id"], "explicit_confirmation": True,
+        "author_override": True, "author_override_reason": "作者确认核心规则修订",
+    })
+    assert result.status_code == 200, result.text
+
+def test_normal_world_fact_apply_does_not_require_override(session, monkeypatch):
+    project = Project(name="Normal fact retcon")
+    session.add(project); session.flush()
+    fact = CanonFact(project_id=project.id, fact_type="WORLD_FACT", proposition="old", data={}, locked=False)
+    session.add(fact); session.commit()
+    client = client_for(session, monkeypatch)
+    revision = client.post(f"/projects/{project.id}/revisions", json={"title": "normal fact", "changes": [{"target_type": "CANON_FACT", "target_id": fact.id, "operation": "SET", "path": "/proposition", "value": "new"}]}).json()
+    assert client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").status_code == 200
+    request = client.post(f"/projects/{project.id}/retcon/requests", json={"source_revision_id": revision["id"], "reason": "normal"}).json()
+    analyzed = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze").json()
+    assert analyzed["plan"]["apply_requirements"]["author_override_required"] is False
+    result = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True, "author_override": False})
+    assert result.status_code == 200, result.text
+
 def test_apply_requirements_expose_core_target_label(session, monkeypatch):
     project, _, _, _, _, _, analyzed, client = analyzed_setup(session, monkeypatch)
     requirements = analyzed["plan"]["apply_requirements"]
@@ -172,6 +198,37 @@ def test_project_snapshot_excludes_quarantined_knowledge(session, monkeypatch):
     values = apply_success(session, monkeypatch); project, _, knowledge, _, _, _, _, client, _ = values
     snapshot = client.get(f"/projects/{project.id}/snapshot").json()
     assert knowledge.id not in [item.get("id") for item in snapshot["character_knowledge_summary"]]
+
+def test_snapshot_and_active_reader_hide_only_affected_cognition(session, monkeypatch):
+    project, canon, affected_knowledge, scene, _, revision, client = prepared(session, monkeypatch)
+    affected_memory = CharacterMemory(character_id=affected_knowledge.character_id, content="saw old location", importance=0.8, emotional_weight=0.1, confidence=1.0, distortion={}, source_scene=scene.id)
+    unaffected_knowledge = CharacterKnowledge(character_id=affected_knowledge.character_id, proposition="unrelated", status="KNOWN", source=None)
+    unaffected_memory = CharacterMemory(character_id=affected_knowledge.character_id, content="unrelated memory", importance=0.1, emotional_weight=0, confidence=1.0, distortion={}, source_scene=None)
+    session.add_all([affected_memory, unaffected_knowledge, unaffected_memory]); session.commit()
+    assert client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").status_code == 200
+    request = client.post(f"/projects/{project.id}/retcon/requests", json={"source_revision_id": revision["id"], "reason": "cognition"}).json()
+    analyzed = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze").json()
+    applied = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "cognition"})
+    assert applied.status_code == 200, applied.text
+    reader = ActiveCharacterCognitionReader()
+    assert affected_knowledge.id not in {row.id for row in reader.knowledge(session, project.id, affected_knowledge.character_id)}
+    assert affected_memory.id not in {row.id for row in reader.memories(session, project.id, affected_knowledge.character_id)}
+    assert unaffected_knowledge.id in {row.id for row in reader.knowledge(session, project.id, affected_knowledge.character_id)}
+    assert unaffected_memory.id in {row.id for row in reader.memories(session, project.id, affected_knowledge.character_id)}
+    snapshot = client.get(f"/projects/{project.id}/snapshot").json()
+    assert affected_memory.id not in {row["id"] for row in snapshot["character_memory_summary"]}
+    assert unaffected_memory.id in {row["id"] for row in snapshot["character_memory_summary"]}
+    assert session.query(CharacterKnowledge).count() == 2 and session.query(CharacterMemory).count() == 2
+    assert session.get(CharacterKnowledge, affected_knowledge.id).proposition == "old location truth"
+    assert session.get(CharacterMemory, affected_memory.id).content == "saw old location"
+
+def test_named_retcon_application_integrity_error_is_normalized(session, monkeypatch):
+    project, _, _, _, _, request, analyzed, client = analyzed_setup(session, monkeypatch)
+    def conflict(*_args, **_kwargs):
+        raise IntegrityError("insert", {}, Exception("uq_retcon_application_request"))
+    monkeypatch.setattr(RetconApplyService, "apply", conflict)
+    result = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "constraint"})
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "RETCON_ALREADY_APPLIED"
 
 def test_knowledge_and_memory_rows_are_not_deleted(session, monkeypatch):
     values = apply_success(session, monkeypatch); project, _, knowledge, _, _, _, _, _, _ = values
@@ -277,4 +334,115 @@ def test_pending_replay_guard_covers_progression_and_revision_boundaries(session
     }
     url, method, payload = urls[action]
     result = client.request(method, url, json=payload)
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "RETCON_REPLAY_REQUIRED"
+
+def test_injected_cognition_failure_rolls_back_real_api_transaction(session, monkeypatch):
+    project, canon, knowledge, scene, revision, request, analyzed, client = analyzed_setup(session, monkeypatch)
+    monkeypatch.setattr(RetconApplyService, "_create_cognition_invalidations", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("INJECTED_RETCON_FAILURE")))
+    result = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "failure test"})
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "INJECTED_RETCON_FAILURE"
+    session.expire_all()
+    assert session.get(CanonFact, canon.id).proposition == "old location truth"
+    assert session.get(WorldRevision, revision["id"]).status == RevisionStatus.PREVIEWED
+    assert session.get(RetconRequest, request["id"]).status == "PLANNED"
+    assert session.query(RetconApplication).count() == 0
+    assert session.query(RevisionApplication).count() == 0
+    assert session.query(WorldSnapshot).count() == 0
+    assert session.query(RetconCognitionInvalidation).count() == 0
+    assert session.get(Scene, scene.id).facts == ["old location truth"]
+
+def test_unrelated_memory_change_allows_target_scoped_retcon_apply(session, monkeypatch):
+    project, canon, knowledge, scene, revision, request, analyzed, client = analyzed_setup(session, monkeypatch)
+    unrelated = CharacterMemory(character_id=knowledge.character_id, content="unrelated memory", importance=0.1, emotional_weight=0, confidence=1, distortion={}, source_scene=None)
+    session.add(unrelated); session.commit()
+    assert client.get(f"/projects/{project.id}/retcon/plans/{analyzed['plan']['id']}").json()["plan"]["is_stale"] is False
+    with sessionmaker(bind=session.bind, autoflush=False, expire_on_commit=False)() as fresh:
+        actual_before = RevisionStateFingerprintBuilder().build(fresh, project.id)
+    result = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "unrelated"})
+    assert result.status_code == 200
+    app_body = result.json()["revision_application"]
+    assert app_body["actual_base_fingerprint"] == actual_before
+    assert app_body["actual_base_fingerprint"] != revision["base_state_fingerprint"]
+
+def test_normal_revision_still_rejects_global_unrelated_stale(session, monkeypatch):
+    project, *_ = prepared(session, monkeypatch)
+    revision = client_for(session, monkeypatch).post(f"/projects/{project.id}/revisions", json={"title": "normal", "changes": []}).json()
+    client = client_for(session, monkeypatch)
+    assert client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").status_code == 200
+    # An unrelated row changes the global revision-state basis.
+    character = session.query(__import__("app.models", fromlist=["Character"]).Character).filter_by(project_id=project.id).first()
+    character.goals = {"changed": True}; session.add(character); session.commit()
+    result = client.post(f"/projects/{project.id}/revisions/{revision['id']}/apply", json={})
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "REVISION_STALE"
+
+def test_old_plan_is_rejected_and_latest_plan_can_apply(session, monkeypatch):
+    project, _, _, _, _, request, first, client = analyzed_setup(session, monkeypatch)
+    second = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze").json()
+    old = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": first["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "old"})
+    assert old.status_code == 409 and old.json()["detail"]["code"] == "RETCON_PLAN_NOT_LATEST"
+    latest = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": second["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "latest"})
+    assert latest.status_code == 200
+
+def test_blocked_plan_is_rejected_without_mutation(session, monkeypatch):
+    project, canon, _, _, _, request, analyzed, client = analyzed_setup(session, monkeypatch)
+    plan = session.get(__import__("app.models", fromlist=["RetconImpactPlan"]).RetconImpactPlan, analyzed["plan"]["id"]); plan.status = "BLOCKED"; session.add(plan); session.commit()
+    result = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": plan.id, "explicit_confirmation": True, "author_override": True, "author_override_reason": "blocked"})
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "RETCON_PLAN_BLOCKED"
+    session.expire_all(); assert session.get(CanonFact, canon.id).proposition == "old location truth"
+
+def test_revalidate_item_is_rejected_without_application(session, monkeypatch):
+    project, canon, _, _, _, request, analyzed, client = analyzed_setup(session, monkeypatch)
+    item = session.query(__import__("app.models", fromlist=["RetconImpactItem"]).RetconImpactItem).filter_by(plan_id=analyzed["plan"]["id"]).first(); item.classification = "REVALIDATE"; session.add(item); session.commit()
+    result = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "revalidate"})
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "RETCON_REVALIDATION_REQUIRED"
+    assert session.query(RetconApplication).count() == 0 and session.get(CanonFact, canon.id).proposition == "old location truth"
+
+def test_world_entity_retcon_apply_modifies_only_entity_target(session, monkeypatch):
+    project = Project(name="Entity retcon")
+    session.add(project); session.flush()
+    location = WorldEntity(project_id=project.id, entity_type="LOCATION", name="Archive", profile={})
+    session.add(location); session.commit()
+    client = client_for(session, monkeypatch)
+    revision = client.post(f"/projects/{project.id}/revisions", json={"title": "entity", "changes": [{"target_type": "WORLD_ENTITY", "target_id": location.id, "operation": "SET", "path": "/name", "value": "New Place"}]}).json()
+    assert client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").status_code == 200
+    request = client.post(f"/projects/{project.id}/retcon/requests", json={"source_revision_id": revision["id"], "reason": "entity"}).json(); analyzed = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze").json()
+    response = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True})
+    assert response.status_code == 200, response.text
+    applied = response.json()
+    with sessionmaker(bind=session.bind, autoflush=False, expire_on_commit=False)() as fresh:
+        assert fresh.get(WorldEntity, location.id).name == "New Place"
+    assert applied["revision"]["status"] == "APPLIED"
+
+def test_character_retcon_apply_modifies_only_character_target(session, monkeypatch):
+    project, location, actor, *_ = approved_setup(session, monkeypatch)
+    client = client_for(session, monkeypatch)
+    revision = client.post(f"/projects/{project.id}/revisions", json={"title": "character", "changes": [{"target_type": "CHARACTER", "target_id": actor.id, "operation": "SET", "path": "/current_state", "value": {"mood": "calm"}}]}).json()
+    assert client.post(f"/projects/{project.id}/revisions/{revision['id']}/preview").status_code == 200
+    request = client.post(f"/projects/{project.id}/retcon/requests", json={"source_revision_id": revision["id"], "reason": "character"}).json(); analyzed = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze").json()
+    applied = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True}).json()
+    session.expire_all(); assert session.get(__import__("app.models", fromlist=["Character"]).Character, actor.id).current_state == {"mood": "calm"} and applied["revision"]["status"] == "APPLIED"
+
+def test_rollback_stale_does_not_overwrite_external_target(session, monkeypatch):
+    values = apply_success(session, monkeypatch); project, canon, _, _, _, _, _, client, body = values
+    canon.proposition = "external change"; session.add(canon); session.commit()
+    result = client.post(f"/projects/{project.id}/retcon/applications/{body['application']['id']}/rollback")
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "RETCON_ROLLBACK_STALE"
+    session.expire_all(); assert session.get(CanonFact, canon.id).proposition == "external change"
+
+def test_formal_history_state_is_unchanged_except_direct_target(session, monkeypatch):
+    values = analyzed_setup(session, monkeypatch); project, canon, _, scene, _, request, analyzed, client = values
+    before = (scene.facts, scene.result, session.query(Scene).count(), session.query(StoryThread).count(), session.query(Chapter).count())
+    assert client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/apply", json={"plan_id": analyzed["plan"]["id"], "explicit_confirmation": True, "author_override": True, "author_override_reason": "history"}).status_code == 200
+    session.expire_all(); after = (session.get(Scene, scene.id).facts, session.get(Scene, scene.id).result, session.query(Scene).count(), session.query(StoryThread).count(), session.query(Chapter).count())
+    assert after == before
+
+def test_post_and_delete_formal_mutations_are_blocked(session, monkeypatch):
+    values = apply_success(session, monkeypatch); project, _, _, _, _, _, _, client, _ = values
+    assert client.post(f"/projects/{project.id}/scenes", json={"sequence": 99, "participants": [], "facts": [], "result": {}}).status_code == 409
+    thread = StoryThread(project_id=project.id, title="delete", type="CONFLICT", status="OPEN", weight=1, goal="g", progress=0, state={}); session.add(thread); session.commit()
+    assert client.delete(f"/story-threads/{thread.id}").status_code == 409
+
+def test_recovery_adopt_is_blocked_during_pending_replay(session, monkeypatch):
+    values = apply_success(session, monkeypatch); project, _, _, _, _, _, _, client, _ = values
+    result = client.post(f"/projects/{project.id}/recovery-candidates/not-a-real-candidate/adopt")
     assert result.status_code == 409 and result.json()["detail"]["code"] == "RETCON_REPLAY_REQUIRED"

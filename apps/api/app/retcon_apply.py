@@ -60,6 +60,33 @@ class RetconApplyService:
     def _author_override_required(self, db, project_id, revision, items) -> bool:
         return RetconAuthorOverrideResolver().resolve(db, project_id, revision).get("author_override_required", False)
 
+    def _create_cognition_invalidations(self, db: Session, project_id: str, application: RetconApplication, items):
+        invalidations = []
+        seen = set()
+        for item in items:
+            if item.classification != "REBUILD_COGNITION" or item.resource_type not in {"CHARACTER_KNOWLEDGE", "CHARACTER_MEMORY"}:
+                continue
+            key = (item.resource_type, item.resource_id)
+            if key in seen:
+                continue
+            row = db.get(CharacterKnowledge if item.resource_type == "CHARACTER_KNOWLEDGE" else CharacterMemory, item.resource_id)
+            if not row:
+                self._fail("COGNITION_TARGET_NOT_FOUND")
+            invalidation = RetconCognitionInvalidation(
+                project_id=project_id, retcon_application_id=application.id,
+                character_id=item.character_id or row.character_id,
+                resource_type="KNOWLEDGE" if item.resource_type == "CHARACTER_KNOWLEDGE" else "MEMORY",
+                resource_id=item.resource_id, source_impact_item_id=item.id,
+                reason=item.reason_summary or item.reason_code,
+                original_semantic_fingerprint=semantic_fingerprint(_record(row)),
+                status=RetconCognitionInvalidationStatus.ACTIVE,
+            )
+            db.add(invalidation)
+            invalidations.append(invalidation)
+            seen.add(key)
+        db.flush()
+        return invalidations
+
     def _prepare(self, db: Session, project_id: str, request: RetconRequest, plan: RetconImpactPlan,
                  revision, author_override: bool, author_override_reason: str | None):
         if request.project_id != project_id or plan.project_id != project_id or revision.project_id != project_id:
@@ -129,28 +156,7 @@ class RetconApplyService:
             prepared=(actual_revision_state_fingerprint, changes, candidates),
         )
         application.revision_application_id = revision_application.id
-        invalidations = []
-        seen = set()
-        for item in items:
-            if item.classification != "REBUILD_COGNITION" or item.resource_type not in {"CHARACTER_KNOWLEDGE", "CHARACTER_MEMORY"}:
-                continue
-            key = (item.resource_type, item.resource_id)
-            if key in seen:
-                continue
-            row = db.get(CharacterKnowledge if item.resource_type == "CHARACTER_KNOWLEDGE" else CharacterMemory, item.resource_id)
-            if not row:
-                self._fail("COGNITION_TARGET_NOT_FOUND")
-            character_id = item.character_id or row.character_id
-            invalidation = RetconCognitionInvalidation(
-                project_id=project_id, retcon_application_id=application.id,
-                character_id=character_id, resource_type="KNOWLEDGE" if item.resource_type == "CHARACTER_KNOWLEDGE" else "MEMORY",
-                resource_id=item.resource_id, source_impact_item_id=item.id,
-                reason=item.reason_summary or item.reason_code,
-                original_semantic_fingerprint=semantic_fingerprint(_record(row)),
-                status=RetconCognitionInvalidationStatus.ACTIVE,
-            )
-            db.add(invalidation); invalidations.append(invalidation); seen.add(key)
-        db.flush()
+        invalidations = self._create_cognition_invalidations(db, project_id, application, items)
         post_snapshot = db.get(WorldSnapshot, revision_application.post_snapshot_id)
         application.post_apply_world_fingerprint = post_snapshot.state_fingerprint if post_snapshot else None
         application.cognition_summary = {

@@ -180,7 +180,9 @@ def apply_retcon(project_id: str, request_id: str, payload: RetconApplyPayload, 
         return {"application": retcon_application_payload(db, application), "revision_application": record_dict(revision_application), "revision": record_dict(revision), "cognition_invalidations": [record_dict(item) for item in invalidations], "replay_summary": application.replay_summary}
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail={"code": "RETCON_ALREADY_APPLIED"}) from exc
+        constraint = str(getattr(exc, "orig", exc))
+        code = "RETCON_ALREADY_APPLIED" if "uq_retcon_application_request" in constraint or db.scalar(select(RetconApplication.id).where(RetconApplication.retcon_request_id == request_id)) else "RETCON_APPLY_INTEGRITY_ERROR"
+        raise HTTPException(status_code=409, detail={"code": code}) from exc
     except ValueError as exc:
         db.rollback()
         code = str(exc)
@@ -306,7 +308,7 @@ def project_snapshot(project_id: str, db: Session = Depends(get_db)):
         "active_characters": [record_dict(item) for item in characters],
         "character_states": [{"character_id": item.id, "current_state": serialize(item.current_state), "physical_state": serialize(item.physical_state), "emotional_state": serialize(item.emotional_state), "goals": serialize(item.goals)} for item in characters],
         "character_knowledge_summary": [{"id": item.id, "character_id": item.character_id, "proposition": item.proposition, "status": item.status.value, "confidence": item.confidence} for item in knowledge],
-        "character_memory_summary": [{"character_id": item.character_id, "content": item.content, "importance": item.importance, "confidence": item.confidence} for item in memories],
+        "character_memory_summary": [{"id": item.id, "character_id": item.character_id, "content": item.content, "importance": item.importance, "confidence": item.confidence} for item in memories],
         "world_entities": [record_dict(item) for item in db.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True))).all()],
         "active_story_threads": [record_dict(item) for item in db.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status.in_(["OPEN", "PAUSED"]))).all()],
         "current_story_arc": next((record_dict(item) for item in db.scalars(select(StoryArc).where(StoryArc.project_id == project_id, StoryArc.status == "ACTIVE").order_by(StoryArc.id.desc())).all()), None),
