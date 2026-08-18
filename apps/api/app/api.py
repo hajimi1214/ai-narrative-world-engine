@@ -46,6 +46,12 @@ def retcon_plan_payload(db: Session, plan: RetconImpactPlan) -> dict[str, Any]:
     stale = RetconPlanStalenessChecker().is_stale(db, plan)
     return record_dict(plan) | {"status": "STALE" if stale else plan.status, "is_stale": stale, "classification_labels": CLASSIFICATION_LABELS}
 
+def retcon_request_payload(db: Session, request: RetconRequest, latest: RetconImpactPlan | None = None) -> dict[str, Any]:
+    if latest is None:
+        latest = db.scalar(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id == request.id).order_by(RetconImpactPlan.version.desc()))
+    effective_status = "STALE" if latest and RetconPlanStalenessChecker().is_stale(db, latest) else request.status
+    return record_dict(request) | {"effective_status": effective_status, "available_actions": retcon_actions(effective_status)}
+
 # Retcon routes are declared before the main CRUD helpers; FastAPI evaluates
 # dependency defaults while importing the module.
 def get_db():
@@ -63,7 +69,7 @@ def create_retcon_request(project_id: str, payload: RetconRequestPayload, db: Se
         raise HTTPException(status_code=409, detail={"code": "SOURCE_REVISION_STALE"})
     request = RetconRequest(project_id=project_id, source_revision_id=revision.id, reason=payload.reason, status="DRAFT", current_plan_version=0)
     db.add(request); db.commit(); db.refresh(request)
-    return record_dict(request) | {"available_actions": retcon_actions(request.status)}
+    return retcon_request_payload(db, request)
 
 @router.get("/projects/{project_id}/retcon/requests")
 def list_retcon_requests(project_id: str, db: Session = Depends(get_db)):
@@ -72,7 +78,7 @@ def list_retcon_requests(project_id: str, db: Session = Depends(get_db)):
     result = []
     for request in requests:
         latest = db.scalar(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id == request.id).order_by(RetconImpactPlan.version.desc()))
-        result.append(record_dict(request) | {"available_actions": retcon_actions(request.status), "latest_plan": retcon_plan_payload(db, latest) if latest else None})
+        result.append(retcon_request_payload(db, request, latest) | {"latest_plan": retcon_plan_payload(db, latest) if latest else None})
     return result
 
 @router.get("/projects/{project_id}/retcon/requests/{request_id}")
@@ -80,7 +86,7 @@ def get_retcon_request(project_id: str, request_id: str, db: Session = Depends(g
     request = db.get(RetconRequest, request_id)
     if not request or request.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon request not found")
     plans = db.scalars(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id == request.id).order_by(RetconImpactPlan.version.desc())).all()
-    return record_dict(request) | {"available_actions": retcon_actions(request.status), "plans": [retcon_plan_payload(db, plan) for plan in plans]}
+    return retcon_request_payload(db, request, plans[0] if plans else None) | {"plans": [retcon_plan_payload(db, plan) for plan in plans]}
 
 @router.post("/projects/{project_id}/retcon/requests/{request_id}/analyze")
 def analyze_retcon_request(project_id: str, request_id: str, db: Session = Depends(get_db)):
@@ -93,12 +99,17 @@ def analyze_retcon_request(project_id: str, request_id: str, db: Session = Depen
     if revision.status != RevisionStatus.PREVIEWED or revision.base_state_fingerprint != current_basis:
         request.status = "STALE"; db.commit()
         raise HTTPException(status_code=409, detail={"code": "SOURCE_REVISION_STALE"})
+    target_models = {"CANON_FACT": CanonFact, "WORLD_ENTITY": WorldEntity, "CHARACTER": Character}
+    for change in revision.normalized_changes or []:
+        target = db.get(target_models.get(change.get("target_type")), change.get("target_id")) if change.get("target_type") in target_models else None
+        if not target or target.project_id != project_id:
+            raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE" if target else "TARGET_NOT_FOUND"})
     plan, items = RetconImpactPlanner().analyze(db, request, revision)
     db.add(plan); db.flush()
     for item in items: item.plan_id = plan.id; db.add(item)
     request.current_plan_version = plan.version; request.status = "PLANNED"
     db.commit(); db.refresh(plan)
-    return {"request": record_dict(request) | {"available_actions": retcon_actions(request.status)}, "plan": retcon_plan_payload(db, plan), "items": [retcon_item_payload(item) for item in items]}
+    return {"request": retcon_request_payload(db, request, plan), "plan": retcon_plan_payload(db, plan), "items": [retcon_item_payload(item) for item in items]}
 
 @router.get("/projects/{project_id}/retcon/plans/{plan_id}")
 def get_retcon_plan(project_id: str, plan_id: str, db: Session = Depends(get_db)):
@@ -112,7 +123,7 @@ def abort_retcon_request(project_id: str, request_id: str, db: Session = Depends
     request = db.get(RetconRequest, request_id)
     if not request or request.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon request not found")
     request.status = "ABORTED"; db.commit(); db.refresh(request)
-    return record_dict(request) | {"available_actions": []}
+    return retcon_request_payload(db, request)
 
 def routed_provider(settings, route):
     return get_model_provider(settings, route.provider, route.base_url)

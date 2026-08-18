@@ -354,6 +354,7 @@ class RetconRequest(TimestampMixin, Base):
 
 class RetconImpactPlan(Base):
     __tablename__ = "retcon_impact_plans"
+    __table_args__ = (UniqueConstraint("retcon_request_id", "version", name="uq_retcon_impact_plan_request_version"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     retcon_request_id: Mapped[str] = mapped_column(ForeignKey("retcon_requests.id"), nullable=False, index=True)

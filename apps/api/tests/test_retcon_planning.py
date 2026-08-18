@@ -7,9 +7,10 @@ from fastapi.testclient import TestClient
 from app.db import Base
 from app.main import app
 import app.api as api
-from app.models import CanonFact, CharacterKnowledge, Scene, WorldRevision, RetconImpactPlan, RetconImpactItem, CharacterDecision, CharacterDecisionType, CharacterDecisionStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ActionVisibility, PerformanceMode, PerformanceStatus, ResolverMode, ResolutionStatus, ResolutionOutcome
+from app.models import CanonFact, CharacterKnowledge, CharacterMemory, Scene, WorldRevision, RetconImpactPlan, RetconImpactItem, CharacterDecision, CharacterDecisionType, CharacterDecisionStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ActionVisibility, PerformanceMode, PerformanceStatus, ResolverMode, ResolutionStatus, ResolutionOutcome
 from app.revision import RevisionStateFingerprintBuilder
-from app.retcon import HistoricalDependencyGraphBuilder
+from app.retcon import HistoricalDependencyGraphBuilder, ReplayBoundaryFinder, RetconBasisFingerprintBuilder
+from app.revision import StructuredReferenceScanner
 from test_character_mind import seed
 
 @pytest.fixture()
@@ -143,3 +144,125 @@ def test_canon_knowledge_decision_turn_resolution_chain(session, monkeypatch):
     assert states[("CHARACTER_DECISION",decision.id)] == "REPLAY_REQUIRED"
     assert states[("SCENE_PERFORMANCE_TURN",turn.id)] == "REPLAY_REQUIRED"
     assert states[("WORLD_RESOLUTION",resolution.id)] == "INVALIDATED"
+
+def test_full_causal_dependency_path_contains_all_lineage_nodes(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    proposal = session.query(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first()
+    decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=knowledge.character_id, context_fingerprint="ctx", decision_type=CharacterDecisionType.INVESTIGATE, intent="x", chosen_action="x", motivation="x", goal_refs=[], knowledge_used=[{"knowledge_id":knowledge.id}], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, uncertainties=[], refused_options=[], decision_summary="x", status=CharacterDecisionStatus.VALID)
+    session.add(decision); session.flush()
+    performance = ScenePerformance(project_id=project.id, scene_proposal_id=proposal.id, take_number=101, proposal_context_fingerprint="ctx", mode=PerformanceMode.HEURISTIC, status=PerformanceStatus.RUNNING, participant_order=[], active_participant_ids=[], max_turns=3, turn_count=1)
+    session.add(performance); session.flush()
+    turn = ScenePerformanceTurn(project_id=project.id, performance_id=performance.id, sequence=1, actor_character_id=knowledge.character_id, actor_context_fingerprint="ctx", character_decision_id=decision.id, action_visibility=ActionVisibility.PUBLIC, observable_action="x", recipient_character_ids=[], requires_world_resolution=True, world_resolution_request={}, validation_result={})
+    session.add(turn); session.flush()
+    resolution = WorldResolution(project_id=project.id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode=ResolverMode.HEURISTIC, world_context_fingerprint="ctx", status=ResolutionStatus.VALID, outcome=ResolutionOutcome.SUCCESS, outcome_summary="x", objective_facts=[], actor_observation=None, public_observation=None, recipient_character_ids=[], canon_fact_ids_used=[canon.id], world_entity_ids_used=[], resolution_basis_summary=None, missing_information=[])
+    session.add(resolution); session.commit()
+    stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit()
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"path"}).json()
+    items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    path=next(i["dependency_path"] for i in items if i["resource_id"]==resolution.id)
+    assert [x["type"] for x in path] == ["CANON_FACT","CHARACTER_KNOWLEDGE","CHARACTER_DECISION","SCENE_PERFORMANCE_TURN","WORLD_RESOLUTION"]
+
+def test_exact_value_without_lineage_is_revalidate(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    knowledge.source = None; session.commit(); stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit(); req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"lineage"}).json()
+    items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    assert next(i for i in items if i["resource_id"]==knowledge.id)["classification"] == "REVALIDATE"
+
+def test_summary_text_does_not_create_scene_dependency(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    independent.summary=canon.proposition; session.commit(); stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit(); req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"summary"}).json()
+    items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    assert next(i for i in items if i["resource_id"]==independent.id and i["resource_type"]=="SCENE")["classification"] == "UNCHANGED"
+
+def test_graph_cycle_is_visited_once(session):
+    builder=HistoricalDependencyGraphBuilder(max_nodes=10)
+    assert builder.visited_nodes == set(); assert builder.limit_reached is False
+
+@pytest.mark.parametrize("max_nodes", [1, 2])
+def test_graph_limit_is_unique_node_limit(session, monkeypatch, max_nodes):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    builder=HistoricalDependencyGraphBuilder(max_nodes=max_nodes)
+    builder.build(session,project.id,{canon.id},{canon.proposition},{canon.id:"CANON_FACT"})
+    assert builder.limit_reached is True
+
+def test_replay_boundary_duplicate_sequence_blocks():
+    class SceneStub:
+        def __init__(self,id,sequence): self.id=id; self.sequence=sequence
+    _, _, report=ReplayBoundaryFinder().find([SceneStub("a",10),SceneStub("b",10)],{"a","b"})
+    assert report["issues"][0]["code"] == "REPLAY_BOUNDARY_UNRESOLVED"
+
+def test_replay_boundary_missing_sequence_blocks():
+    class SceneStub:
+        def __init__(self,id,sequence): self.id=id; self.sequence=sequence
+    _, _, report=ReplayBoundaryFinder().find([SceneStub("a",None)],{"a"})
+    assert report["issues"][0]["code"] == "REPLAY_BOUNDARY_UNRESOLVED"
+
+def test_request_effective_status_becomes_stale(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"effective"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    canon.proposition="new"; session.commit(); body=client.get(f"/projects/{project.id}/retcon/requests/{req['id']}").json()
+    assert body["effective_status"] == "STALE" and body["available_actions"] == ["REANALYZE","ABORT"]
+
+def test_cognition_impacts_are_in_plan_summary(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"cognition"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    assert plan["impact_summary"]["cognition_impacts"]
+
+def test_basis_ignores_unrelated_scene_and_story_thread(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"basis"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    independent.facts=["other"]; session.commit(); assert client.get(f"/projects/{project.id}/retcon/plans/{plan['id']}").json()["plan"]["is_stale"] is False
+
+def test_plan_append_only_parent_and_unique_versions(session, monkeypatch):
+    project, *_unused, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"versions"}).json(); first=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]; second=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    assert second["version"]==2 and second["parent_plan_id"]==first["id"]
+
+def test_no_provider_or_replay_routes(session, monkeypatch):
+    project, *_unused, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"routes"}).json()
+    assert client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/apply").status_code==404
+    assert client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/replay").status_code==404
+
+def test_related_knowledge_change_stales_plan(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"knowledge stale"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    knowledge.proposition="edited"; session.commit()
+    assert client.get(f"/projects/{project.id}/retcon/plans/{plan['id']}").json()["plan"]["is_stale"] is True
+
+def test_unrelated_memory_does_not_stale_plan(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"memory"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    memory=CharacterMemory(character_id=knowledge.character_id,content="unrelated",source_scene=independent.id,distortion={}); session.add(memory); session.commit()
+    assert client.get(f"/projects/{project.id}/retcon/plans/{plan['id']}").json()["plan"]["is_stale"] is False
+
+def test_maintenance_timestamps_do_not_stale_plan(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"timestamps"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    canon.updated_at=canon.updated_at; session.commit()
+    assert client.get(f"/projects/{project.id}/retcon/plans/{plan['id']}").json()["plan"]["is_stale"] is False
+
+def test_abort_exposes_no_actions(session, monkeypatch):
+    project, *_unused, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"abort"}).json(); result=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/abort")
+    assert result.status_code==200 and result.json()["available_actions"]==[]
+
+def test_draft_actions_are_analyze_and_abort(session, monkeypatch):
+    project, *_unused, revision, client = prepared(session, monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"draft"}).json()
+    assert req["available_actions"]==["ANALYZE","ABORT"]
+
+@pytest.mark.parametrize("value,target,expected", [
+    ({"id":"x"}, "x", ["/id"]),
+    ({"items":["x"]}, "x", ["/items/0"]),
+    ({"x":{"value":1}}, "x", ["/x"]),
+    ({"nested":{"id":"x"}}, "x", ["/nested/id"]),
+    ({"a/b":"x"}, "x", ["/a~1b"]),
+    ({"a~b":"x"}, "x", ["/a~0b"]),
+    (["x"], "x", ["/0"]),
+    ({"id":"prefix-x"}, "x", []),
+    ({"text":"x is only prose"}, "x", []),
+    ({"items":["y","x"]}, "x", ["/items/1"]),
+])
+def test_structured_exact_scanner_never_uses_substrings(value, target, expected):
+    assert StructuredReferenceScanner().paths(value,target) == expected
