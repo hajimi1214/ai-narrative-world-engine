@@ -95,7 +95,9 @@ def test_historical_execution_atomic_failure_rolls_back_all_formal_rows(session,
         if state["cursor"] >= len(state["queue"]): break
         stepped = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step")
         assert stepped.status_code == 200, stepped.text
-    counts = {model: session.query(model).count() for model in (Scene, ScenePerformance, CharacterDecision, ScenePerformanceTurn, CharacterKnowledge, CharacterMemory, SceneExecutionBinding)}
+    staged_results = session.get(RetconReplaySession, session_id).staged_world_state["scene_results"]
+    assert any(result["resolutions"] for result in staged_results.values())
+    counts = {model: session.query(model).count() for model in (Scene, ScenePerformance, CharacterDecision, ScenePerformanceTurn, WorldResolution, CharacterKnowledge, CharacterMemory, SceneExecutionBinding)}
     old_binding = session.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
     monkeypatch.setattr(ReplayService, "failure_injector", lambda stage: (_ for _ in ()).throw(RuntimeError("TEST_REPLAY_COMMIT_FAILURE")) if stage == "AFTER_FORMAL_MATERIALIZATION" else None)
     response = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/commit", json={"explicit_confirmation": True})
@@ -104,6 +106,31 @@ def test_historical_execution_atomic_failure_rolls_back_all_formal_rows(session,
     assert {model: session.query(model).count() for model in counts} == counts
     assert session.get(Scene, scene.id).history_status == "ACTIVE"
     assert session.get(SceneExecutionBinding, old_binding.id).active is True
+    assert session.query(WorldSnapshot).filter(WorldSnapshot.snapshot_type.in_(["PRE_REPLAY_COMMIT", "POST_REPLAY_COMMIT"])).count() == 0
+
+def test_failed_commit_rolls_back_staged_dynamic_cognition_invalidation(session, monkeypatch):
+    project, scene, actor, _proposal, client, application_id = historical_replay_world(session, monkeypatch)
+    dynamic_memory = CharacterMemory(character_id=actor.id, content="dynamic rollback evidence", source_scene=scene.id)
+    session.add(dynamic_memory); session.commit()
+    created = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    while True:
+        state = client.get(f"/projects/{project.id}/retcon/replay-sessions/{session_id}").json()
+        if state["cursor"] >= len(state["queue"]): break
+        assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step").status_code == 200
+    replay_session = session.get(RetconReplaySession, session_id)
+    staged = dict(replay_session.staged_world_state)
+    staged["dynamic_cognition_invalidations"] = [{"resource_type": "MEMORY", "resource_id": dynamic_memory.id, "character_id": actor.id, "scene_id": scene.id, "sequence": scene.sequence, "fingerprint": "dynamic-rollback-test"}]
+    replay_session.staged_world_state = staged
+    session.commit()
+    counts = {model: session.query(model).count() for model in (Scene, ScenePerformance, CharacterDecision, ScenePerformanceTurn, WorldResolution, CharacterKnowledge, CharacterMemory, SceneExecutionBinding, RetconCognitionInvalidation)}
+    monkeypatch.setattr(ReplayService, "failure_injector", lambda stage: (_ for _ in ()).throw(RuntimeError("TEST_REPLAY_COMMIT_FAILURE")) if stage == "AFTER_FORMAL_MATERIALIZATION" else None)
+    response = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/commit", json={"explicit_confirmation": True})
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "REPLAY_COMMIT_FAILED"
+    session.expire_all()
+    assert {model: session.query(model).count() for model in counts} == counts
+    assert session.query(RetconCognitionInvalidation).filter(RetconCognitionInvalidation.reason == "DYNAMIC_REPLAY_EXPANSION").count() == 0
     assert session.query(WorldSnapshot).filter(WorldSnapshot.snapshot_type.in_(["PRE_REPLAY_COMMIT", "POST_REPLAY_COMMIT"])).count() == 0
 
 def test_historical_execution_commit_materializes_replay_lineage(session, monkeypatch):
@@ -151,6 +178,7 @@ def test_dynamic_expansion_promotes_execution_and_quarantines_scene_cognition(se
     assert promoted["mode"] == "REPLAY" and promoted["reason"] == "DYNAMIC_EXPANSION"
     assert promoted["decision_ids"] == [old_decision.id] and promoted["turn_ids"] == [old_turn.id] and promoted["resolution_ids"] == [old_resolution.id]
     assert replay_session.failure_report is None and replay_session.staged_world_state["dynamic_cognition_invalidations"]
+    assert session.query(RetconCognitionInvalidation).filter(RetconCognitionInvalidation.reason == "DYNAMIC_REPLAY_EXPANSION").count() == 0
     replayed = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step")
     assert replayed.status_code == 200 and replayed.json()["status"] == "RUNNING", replayed.text
     session.expire_all()
@@ -163,6 +191,13 @@ def test_dynamic_expansion_promotes_execution_and_quarantines_scene_cognition(se
     assert session.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == new_scene3.id, SceneExecutionBinding.active.is_(True))) is not None
     assert old_knowledge.id not in {row.id for row in ActiveCharacterCognitionReader().knowledge(session, project.id, actor.id)}
     assert old_memory.id not in {row.id for row in ActiveCharacterCognitionReader().memories(session, project.id, actor.id)}
+    knowledge_invalidation = session.scalar(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.resource_id == old_knowledge.id))
+    memory_invalidation = session.scalar(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.resource_id == old_memory.id))
+    assert knowledge_invalidation.status == RetconCognitionInvalidationStatus.RESOLVED
+    assert knowledge_invalidation.resolution_report["result"] == "REPLACED"
+    assert knowledge_invalidation.resolution_report["replacement_resource_id"]
+    assert memory_invalidation.status == RetconCognitionInvalidationStatus.RESOLVED
+    assert memory_invalidation.resolution_report["result"] == "INVALIDATED_WITHOUT_REPLACEMENT"
 
 def test_replay_session_initial_queue_is_frozen_and_deterministic(session, monkeypatch):
     values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
