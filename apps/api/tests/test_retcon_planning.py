@@ -1,16 +1,18 @@
 import json
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from fastapi.testclient import TestClient
 from app.db import Base
 from app.main import app
 import app.api as api
-from app.models import CanonFact, CharacterKnowledge, CharacterMemory, Scene, WorldRevision, RetconImpactPlan, RetconImpactItem, CharacterDecision, CharacterDecisionType, CharacterDecisionStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ActionVisibility, PerformanceMode, PerformanceStatus, ResolverMode, ResolutionStatus, ResolutionOutcome
+from app.models import CanonFact, CharacterKnowledge, CharacterMemory, Scene, WorldRevision, RetconRequest, RetconImpactPlan, RetconImpactItem, CharacterDecision, CharacterDecisionType, CharacterDecisionStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ActionVisibility, PerformanceMode, PerformanceStatus, ResolverMode, ResolutionStatus, ResolutionOutcome
 from app.revision import RevisionStateFingerprintBuilder
 from app.retcon import HistoricalDependencyGraphBuilder, ReplayBoundaryFinder, RetconBasisFingerprintBuilder
 from app.revision import StructuredReferenceScanner
+import app.retcon as retcon_module
 from test_character_mind import seed
 
 @pytest.fixture()
@@ -76,7 +78,8 @@ def test_classifications_and_preserved_history(session, monkeypatch):
     by_resource = {(item["resource_type"], item["resource_id"]):item["classification"] for item in body["items"]}
     assert by_resource[("CHARACTER_KNOWLEDGE", knowledge.id)] == "REBUILD_COGNITION"
     assert by_resource[("SCENE", scene.id)] == "REPLAY_REQUIRED"
-    assert by_resource[("SCENE", independent.id)] == "UNCHANGED"
+    assert body["plan"]["impact_summary"]["preserved_scene_count"] == 1
+    assert body["plan"]["impact_summary"]["preserved_scene_ranges"] == [{"sequence_start": 11, "sequence_end": 11, "count": 1}]
     assert body["plan"]["earliest_affected_scene_id"] == scene.id
 
 def test_dependency_path_and_reason_are_auditable(session, monkeypatch):
@@ -121,8 +124,7 @@ def test_text_only_scene_does_not_create_dependency(session, monkeypatch):
     stored = session.get(WorldRevision, revision["id"]); stored.base_state_fingerprint = RevisionStateFingerprintBuilder().build(session, project.id); session.add(stored); session.commit()
     request = client.post(f"/projects/{project.id}/retcon/requests", json={"source_revision_id":revision["id"],"reason":"text"}).json()
     items = client.post(f"/projects/{project.id}/retcon/requests/{request['id']}/analyze").json()["items"]
-    item = next(item for item in items if item["resource_id"] == independent.id and item["resource_type"] == "SCENE")
-    assert item["classification"] == "UNCHANGED"
+    assert not any(item["resource_id"] == independent.id and item["resource_type"] == "SCENE" for item in items)
 
 def test_dependency_graph_has_bounded_traversal():
     graph = HistoricalDependencyGraphBuilder(max_nodes=0)
@@ -172,7 +174,7 @@ def test_summary_text_does_not_create_scene_dependency(session, monkeypatch):
     project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
     independent.summary=canon.proposition; session.commit(); stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit(); req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"summary"}).json()
     items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
-    assert next(i for i in items if i["resource_id"]==independent.id and i["resource_type"]=="SCENE")["classification"] == "UNCHANGED"
+    assert not any(i["resource_id"]==independent.id and i["resource_type"]=="SCENE" for i in items)
 
 def test_graph_cycle_is_visited_once(session):
     builder=HistoricalDependencyGraphBuilder(max_nodes=10)
@@ -266,3 +268,81 @@ def test_draft_actions_are_analyze_and_abort(session, monkeypatch):
 ])
 def test_structured_exact_scanner_never_uses_substrings(value, target, expected):
     assert StructuredReferenceScanner().paths(value,target) == expected
+
+def _memory_decision_chain(session, project, canon, scene, character_id):
+    proposal=session.query(__import__("app.models",fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first()
+    memory=CharacterMemory(character_id=character_id,content="I saw the old location",importance=.7,emotional_weight=.2,confidence=.9,distortion={},source_scene=scene.id)
+    session.add(memory); session.flush()
+    decision=CharacterDecision(project_id=project.id,scene_proposal_id=proposal.id,character_id=character_id,context_fingerprint="ctx",decision_type=CharacterDecisionType.INVESTIGATE,intent="investigate",chosen_action="investigate",motivation="memory",goal_refs=[],knowledge_used=[],memory_refs=[memory.id],ability_refs=[],inventory_refs=[],relationship_factors={},uncertainties=[],refused_options=[],decision_summary="continue investigating",status=CharacterDecisionStatus.VALID)
+    session.add(decision); session.commit(); return memory,decision
+
+@pytest.mark.parametrize("field,value", [("content","changed memory"),("importance",.1),("distortion",{"altered":True}),("source_scene",None)])
+def test_related_memory_semantic_fields_stale_plan(session, monkeypatch, field, value):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch)
+    memory,_=_memory_decision_chain(session,project,canon,scene,knowledge.character_id)
+    stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit()
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"memory stale"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    setattr(memory,field,value); session.commit()
+    assert client.get(f"/projects/{project.id}/retcon/plans/{plan['id']}").json()["plan"]["is_stale"] is True
+
+def test_revision_status_is_part_of_stale_basis(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"revision status"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    stored=session.get(WorldRevision,revision["id"]); stored.status="CANCELLED"; session.commit()
+    assert client.get(f"/projects/{project.id}/retcon/plans/{plan['id']}").json()["plan"]["is_stale"] is True
+
+def test_normalized_changes_are_part_of_stale_basis(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"revision changes"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    stored=session.get(WorldRevision,revision["id"]); stored.normalized_changes[0]["after_value"]="tampered"; from sqlalchemy.orm.attributes import flag_modified; flag_modified(stored,"normalized_changes"); session.commit()
+    assert client.get(f"/projects/{project.id}/retcon/plans/{plan['id']}").json()["plan"]["is_stale"] is True
+
+def test_uncertain_lineage_stays_revalidate_downstream(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); knowledge.source=None
+    proposal=session.query(__import__("app.models",fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first()
+    decision=CharacterDecision(project_id=project.id,scene_proposal_id=proposal.id,character_id=knowledge.character_id,context_fingerprint="ctx",decision_type=CharacterDecisionType.INVESTIGATE,intent="x",chosen_action="x",motivation="x",goal_refs=[],knowledge_used=[{"knowledge_id":knowledge.id}],memory_refs=[],ability_refs=[],inventory_refs=[],relationship_factors={},uncertainties=[],refused_options=[],decision_summary="x",status=CharacterDecisionStatus.VALID)
+    performance=ScenePerformance(project_id=project.id,scene_proposal_id=proposal.id,take_number=200,proposal_context_fingerprint="ctx",mode=PerformanceMode.HEURISTIC,status=PerformanceStatus.RUNNING,participant_order=[],active_participant_ids=[],max_turns=3,turn_count=1); session.add_all([decision,performance]); session.flush()
+    turn=ScenePerformanceTurn(project_id=project.id,performance_id=performance.id,sequence=1,actor_character_id=knowledge.character_id,actor_context_fingerprint="ctx",character_decision_id=decision.id,action_visibility=ActionVisibility.PUBLIC,observable_action="x",recipient_character_ids=[],requires_world_resolution=True,world_resolution_request={},validation_result={}); session.add(turn); session.flush()
+    resolution=WorldResolution(project_id=project.id,performance_id=performance.id,performance_turn_id=turn.id,resolver_mode=ResolverMode.HEURISTIC,world_context_fingerprint="ctx",status=ResolutionStatus.VALID,outcome=ResolutionOutcome.SUCCESS,outcome_summary="x",objective_facts=[],actor_observation=None,public_observation=None,recipient_character_ids=[],canon_fact_ids_used=[],world_entity_ids_used=[],resolution_basis_summary=None,missing_information=[]); session.add(resolution); session.commit()
+    stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit(); req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"uncertain"}).json(); items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    states={(i["resource_type"],i["resource_id"]):i["classification"] for i in items}; assert all(states[(typ,ident)]=="REVALIDATE" for typ,ident in [("CHARACTER_KNOWLEDGE",knowledge.id),("CHARACTER_DECISION",decision.id),("SCENE_PERFORMANCE_TURN",turn.id),("WORLD_RESOLUTION",resolution.id)])
+
+def test_confirmed_scene_lineage_upgrades_decision_to_replay(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); knowledge.source=scene.id
+    proposal=session.query(__import__("app.models",fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first()
+    decision=CharacterDecision(project_id=project.id,scene_proposal_id=proposal.id,character_id=knowledge.character_id,context_fingerprint="ctx",decision_type=CharacterDecisionType.INVESTIGATE,intent="x",chosen_action="x",motivation="x",goal_refs=[],knowledge_used=[{"knowledge_id":knowledge.id}],memory_refs=[],ability_refs=[],inventory_refs=[],relationship_factors={},uncertainties=[],refused_options=[],decision_summary="x",status=CharacterDecisionStatus.VALID); session.add(decision); session.commit()
+    stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit(); req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"confirmed"}).json(); items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    assert next(i for i in items if i["resource_id"]==decision.id)["classification"]=="REPLAY_REQUIRED"
+
+def test_real_cycle_graph_terminates(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch)
+    other=CanonFact(project_id=project.id,fact_type="WORLD_FACT",proposition="B",data={"canon_fact_id":canon.id},locked=False); canon.data={"canon_fact_id":"pending"}; session.add(other); session.flush(); canon.data={"canon_fact_id":other.id}; session.commit()
+    graph=HistoricalDependencyGraphBuilder(max_nodes=20); edges=graph.build(session,project.id,{canon.id},{canon.proposition},{canon.id:"CANON_FACT"})
+    assert graph.limit_reached is False and len(graph.visited_nodes)<=20 and len({(e.source_id,e.target_id,e.edge_type) for e in edges})==len(edges)
+
+def test_graph_limit_blocks_api_plan(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch)
+    original=retcon_module.HistoricalDependencyGraphBuilder
+    class TinyGraph(original):
+        def __init__(self,*args,**kwargs): super().__init__(max_nodes=1)
+    monkeypatch.setattr(retcon_module,"HistoricalDependencyGraphBuilder",TinyGraph)
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"limited"}).json(); body=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()
+    assert body["plan"]["status"]=="BLOCKED" and any(i["code"]=="PLAN_GRAPH_LIMIT_REACHED" for i in body["plan"]["validation_report"]["issues"])
+
+def test_poisoned_cross_project_revision_blocks_without_artifacts(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); foreign, *_=seed(session); foreign_canon=CanonFact(project_id=foreign.id,fact_type="WORLD_FACT",proposition="foreign",data={},locked=False); session.add(foreign_canon); session.flush()
+    poisoned=WorldRevision(project_id=project.id,title="poisoned",status="PREVIEWED",base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id),normalized_changes=[{"target_type":"CANON_FACT","target_id":foreign_canon.id,"path":"/proposition","before_value":"x","after_value":"y"}],impact_report={}); session.add(poisoned); session.commit()
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":poisoned.id,"reason":"poison"}).json(); response=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze")
+    assert response.status_code==409 and response.json()["detail"]["code"]=="CROSS_PROJECT_REFERENCE" and session.scalar(select(func.count(RetconImpactPlan.id)).where(RetconImpactPlan.retcon_request_id==req["id"]))==0
+
+def test_unique_constraint_rejects_duplicate_request_version(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); request=RetconRequest(project_id=project.id,source_revision_id=revision["id"],reason="unique",status="DRAFT",current_plan_version=0); session.add(request); session.flush()
+    session.add_all([RetconImpactPlan(project_id=project.id,retcon_request_id=request.id,version=1,basis_fingerprint="a",status="READY",impact_summary={},validation_report={}),RetconImpactPlan(project_id=project.id,retcon_request_id=request.id,version=1,basis_fingerprint="b",status="READY",impact_summary={},validation_report={})])
+    with pytest.raises(IntegrityError): session.commit()
+    session.rollback()
+
+def test_analyze_never_calls_ai_provider(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch)
+    monkeypatch.setattr(api,"get_model_provider",lambda *args,**kwargs:(_ for _ in ()).throw(AssertionError("AI must not be used")))
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"deterministic"}).json()
+    assert client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").status_code==200

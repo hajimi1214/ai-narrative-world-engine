@@ -37,9 +37,19 @@ class RetconRequestPayload(BaseModel):
 def retcon_actions(status: str) -> list[str]:
     return {"DRAFT": ["ANALYZE", "ABORT"], "PLANNED": ["REANALYZE", "ABORT"], "STALE": ["REANALYZE", "ABORT"], "ABORTED": []}.get(status, [])
 
-def retcon_item_payload(item: RetconImpactItem) -> dict[str, Any]:
+def retcon_item_payload(item: RetconImpactItem, db: Session | None = None) -> dict[str, Any]:
     result = record_dict(item)
     result["classification_label"] = CLASSIFICATION_LABELS.get(item.classification, item.classification)
+    if db:
+        model = {"CHARACTER_KNOWLEDGE": CharacterKnowledge, "CHARACTER_MEMORY": CharacterMemory, "CHARACTER_DECISION": CharacterDecision, "SCENE_PERFORMANCE_TURN": ScenePerformanceTurn, "WORLD_RESOLUTION": WorldResolution, "SCENE": Scene}.get(item.resource_type)
+        row = db.get(model, item.resource_id) if model else None
+        if row:
+            summary = getattr(row, "proposition", None) or getattr(row, "content", None) or getattr(row, "decision_summary", None) or getattr(row, "observable_action", None) or getattr(row, "outcome_summary", None)
+            if item.resource_type == "SCENE": summary = f"场景 {row.sequence}"
+            result["display_summary"] = summary
+            if item.character_id:
+                character = db.get(Character, item.character_id)
+                result["display_character_name"] = character.name if character else None
     return result
 
 def retcon_plan_payload(db: Session, plan: RetconImpactPlan) -> dict[str, Any]:
@@ -109,14 +119,14 @@ def analyze_retcon_request(project_id: str, request_id: str, db: Session = Depen
     for item in items: item.plan_id = plan.id; db.add(item)
     request.current_plan_version = plan.version; request.status = "PLANNED"
     db.commit(); db.refresh(plan)
-    return {"request": retcon_request_payload(db, request, plan), "plan": retcon_plan_payload(db, plan), "items": [retcon_item_payload(item) for item in items]}
+    return {"request": retcon_request_payload(db, request, plan), "plan": retcon_plan_payload(db, plan), "items": [retcon_item_payload(item, db) for item in items]}
 
 @router.get("/projects/{project_id}/retcon/plans/{plan_id}")
 def get_retcon_plan(project_id: str, plan_id: str, db: Session = Depends(get_db)):
     plan = db.get(RetconImpactPlan, plan_id)
     if not plan or plan.project_id != project_id: raise HTTPException(status_code=404, detail="Retcon plan not found")
     items = db.scalars(select(RetconImpactItem).where(RetconImpactItem.plan_id == plan.id).order_by(RetconImpactItem.resource_type, RetconImpactItem.resource_id)).all()
-    return {"plan": retcon_plan_payload(db, plan), "items": [retcon_item_payload(item) for item in items]}
+    return {"plan": retcon_plan_payload(db, plan), "items": [retcon_item_payload(item, db) for item in items]}
 
 @router.post("/projects/{project_id}/retcon/requests/{request_id}/abort")
 def abort_retcon_request(project_id: str, request_id: str, db: Session = Depends(get_db)):

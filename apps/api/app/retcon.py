@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib, json
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 from sqlalchemy import cast, or_, select, Text
 from sqlalchemy.orm import Session
-from .models import (CanonFact, Character, CharacterDecision, CharacterKnowledge, CharacterMemory, Scene, ScenePerformanceTurn, WorldEntity, WorldResolution, RevealConstraint, RetconImpactItem, RetconImpactPlan, RetconRequest)
+from .models import (CanonFact, Character, CharacterDecision, CharacterKnowledge, CharacterMemory, Scene, ScenePerformanceTurn, WorldEntity, WorldResolution, RevealConstraint, RetconImpactItem, RetconImpactPlan, RetconRequest, WorldRevision)
 from .revision import StructuredReferenceScanner, _record
 
 CLASSIFICATION_LABELS = {"UNCHANGED":"可以保留","REVALIDATE":"需要重新验证","REBUILD_COGNITION":"需要重建认知","REPLAY_REQUIRED":"需要重新演出","INVALIDATED":"修改后将失效"}
@@ -16,7 +17,7 @@ def semantic_fingerprint(value: Any) -> str:
 
 @dataclass(frozen=True)
 class DependencyEdge:
-    source_type:str; source_id:str; target_type:str; target_id:str; edge_type:str; reason:str; path:list[dict[str,str]]
+    source_type:str; source_id:str; target_type:str; target_id:str; edge_type:str; reason:str; path:list[dict[str,str]]; certainty:str = "CONFIRMED"
 
 class HistoricalDependencyGraphBuilder:
     """Target-driven BFS over explicit FK and structured JSON lineage."""
@@ -31,9 +32,9 @@ class HistoricalDependencyGraphBuilder:
                 clauses.extend(cast(column,Text).contains(str(n)) for n in needles)
         return session.scalars(select(model).where(model.project_id==project_id,or_(*clauses))).all() if clauses else []
     def build(self,session:Session,project_id:str,target_ids:set[str],old_values:set[str],target_types:dict[str,str]|None=None):
-        target_types=target_types or {}; queue=deque(); node_paths={}; edges=[]
+        target_types=target_types or {}; queue=deque(); node_paths={}; node_certainty={}; edges=[]
         def enqueue(node,path=None):
-            if node not in node_paths: node_paths[node]=path or [{"type":node[0],"id":node[1]}]; queue.append(node)
+            if node not in node_paths: node_paths[node]=path or [{"type":node[0],"id":node[1],"certainty":"CONFIRMED"}]; node_certainty[node]="CONFIRMED"; queue.append(node)
         for ident in sorted(target_ids):
             typ=target_types.get(ident)
             if typ is None:
@@ -45,10 +46,13 @@ class HistoricalDependencyGraphBuilder:
             key=(*source,*target,edge_type)
             if key in self.visited_edges: return
             if len(self.visited_edges)>=self.max_edges: self.limit_reached=True; return
-            self.visited_edges.add(key); path=list(node_paths[source]); path.append({"type":target[0],"id":target[1],**({"path":evidence_path} if evidence_path else {})})
-            edges.append(DependencyEdge(source[0],source[1],target[0],target[1],edge_type,reason,path))
-            if target not in node_paths: node_paths[target]=path; queue.append(target)
-            elif len(path)<len(node_paths[target]): node_paths[target]=path
+            certainty = "UNCERTAIN" if edge_type in {"EXACT_VALUE_WITHOUT_LINEAGE", "DEPENDENCY_LINEAGE_MISSING"} or node_certainty.get(source) == "UNCERTAIN" else "CONFIRMED"
+            self.visited_edges.add(key); path=list(node_paths[source]); path.append({"type":target[0],"id":target[1],"certainty":certainty,**({"path":evidence_path} if evidence_path else {})})
+            edges.append(DependencyEdge(source[0],source[1],target[0],target[1],edge_type,reason,path,certainty))
+            if target not in node_paths:
+                node_paths[target]=path; node_certainty[target]=certainty; queue.append(target)
+            elif certainty == "CONFIRMED" and node_certainty.get(target) == "UNCERTAIN" or (certainty == node_certainty.get(target) and len(path)<len(node_paths[target])):
+                node_paths[target]=path; node_certainty[target]=certainty
         def exact(value,needles):
             for needle in sorted(needles):
                 paths=self.scanner.paths(value,needle)
@@ -107,7 +111,7 @@ class HistoricalDependencyGraphBuilder:
 
 class ImpactClassificationResolver:
     def classify(self,edge):
-        if edge.edge_type=="EXACT_VALUE_WITHOUT_LINEAGE":return "REVALIDATE","EXACT_VALUE_WITHOUT_LINEAGE"
+        if edge.certainty == "UNCERTAIN" or edge.edge_type in {"EXACT_VALUE_WITHOUT_LINEAGE", "DEPENDENCY_LINEAGE_MISSING"}:return "REVALIDATE",edge.edge_type
         if edge.target_type=="CHARACTER_KNOWLEDGE":return "REBUILD_COGNITION","该人物认知直接依赖被修改的世界事实。"
         if edge.target_type=="CHARACTER_MEMORY":return "REBUILD_COGNITION","该人物记忆包含被修改事实的结构化依赖。"
         if edge.target_type in {"CHARACTER_DECISION","SCENE_PERFORMANCE_TURN"}:return "REPLAY_REQUIRED","演出使用了需要重新建立的认知或决策。"
@@ -120,7 +124,8 @@ class ReplayBoundaryFinder:
     def find(self,scenes,affected_scene_ids):
         affected=[s for s in scenes if s.id in affected_scene_ids]
         if not affected:return None,None,{"issues":[]}
-        if any(s.sequence is None for s in affected) or len({s.sequence for s in affected})!=len(affected):return None,None,{"issues":[{"code":"REPLAY_BOUNDARY_UNRESOLVED","severity":"BLOCKING","message":"受影响场景缺少可靠历史顺序。"}]}
+        all_sequences=[s.sequence for s in scenes]
+        if any(s.sequence is None for s in scenes) or len(all_sequences)!=len(set(all_sequences)) or any(s.sequence is None for s in affected) or len({s.sequence for s in affected})!=len(affected):return None,None,{"issues":[{"code":"REPLAY_BOUNDARY_UNRESOLVED","severity":"BLOCKING","message":"项目历史场景存在无法唯一确定的顺序。"}]}
         first=min(affected,key=lambda s:s.sequence); return first.id,first.sequence,{"issues":[]}
 
 class CharacterCognitionImpactPlanner:
@@ -140,17 +145,30 @@ class RetconBasisFingerprintBuilder:
         for typ,ident in sorted(seen):
             model=self.MODELS.get(typ); row=session.get(model,ident) if model else None
             if not row:continue
-            record=_record(row)
-            for key in ("created_at","updated_at","content","word_count"):record.pop(key,None)
-            data.append({"type":typ,"id":ident,"state":record})
-        data.extend({"type":"CHANGE","id":i["target_id"],"path":i.get("path"),"after":i.get("after_value")} for i in normalized)
+            data.append({"type":typ,"id":ident,"state":self._semantic_state(typ,row)})
+        data.append({"type":"SOURCE_REVISION","id":revision.id,"status":getattr(revision.status,"value",revision.status),"normalized_changes":sorted(normalized,key=lambda x:json.dumps(x,sort_keys=True,default=str))})
         return semantic_fingerprint(sorted(data,key=lambda x:(x["type"],x["id"],json.dumps(x,sort_keys=True,default=str))))
+    def _semantic_state(self,typ,row):
+        record=_record(row)
+        record.pop("created_at",None); record.pop("updated_at",None)
+        fields={
+            "CANON_FACT":["fact_type","proposition","data","locked"], "WORLD_ENTITY":["entity_type","name","profile","active"],
+            "CHARACTER":["name","profile","personality","core_values","boundaries","goals","current_state","physical_state","emotional_state","abilities","voice_profile","relationships","inventory","secrets","active"],
+            "CHARACTER_KNOWLEDGE":["proposition","status","source","confidence"],
+            "CHARACTER_MEMORY":["content","importance","emotional_weight","confidence","distortion","source_scene","happened_at"],
+            "CHARACTER_DECISION":["knowledge_used","memory_refs","ability_refs","inventory_refs","relationship_factors","chosen_action","decision_type","status"],
+            "SCENE":["sequence","participants","facts","result","story_threads","status","location_id","world_time"],
+            "SCENE_PERFORMANCE_TURN":["character_decision_id","observable_action","recipient_character_ids","requires_world_resolution","world_resolution_request"],
+            "WORLD_RESOLUTION":["performance_turn_id","status","outcome","objective_facts","canon_fact_ids_used","world_entity_ids_used","recipient_character_ids","actor_observation","public_observation"],
+        }
+        return {key:record.get(key) for key in fields.get(typ,[]) if key in record}
 
 class RetconPlanStalenessChecker:
     def is_stale(self,session,plan):
         request=session.get(RetconRequest,plan.retcon_request_id)
-        revision=session.get(__import__("app.models",fromlist=["WorldRevision"]).WorldRevision,request.source_revision_id) if request else None
-        return not request or not revision or RetconBasisFingerprintBuilder().build(session,plan.project_id,revision)!=plan.basis_fingerprint
+        revision=session.get(WorldRevision,request.source_revision_id) if request else None
+        if not request or not revision or revision.project_id != plan.project_id or getattr(revision.status,"value",revision.status) != "PREVIEWED": return True
+        return RetconBasisFingerprintBuilder().build(session,plan.project_id,revision)!=plan.basis_fingerprint
 
 class RetconImpactPlanner:
     def analyze(self,session,request,revision):
@@ -161,12 +179,17 @@ class RetconImpactPlanner:
             if e.target_type in {"CHARACTER_KNOWLEDGE","CHARACTER_MEMORY"}:
                 row=session.get(CharacterKnowledge if e.target_type=="CHARACTER_KNOWLEDGE" else CharacterMemory,e.target_id); cid=row.character_id if row else None
             items.append(RetconImpactItem(plan_id="",resource_type=e.target_type,resource_id=e.target_id,classification=cls,reason_code=e.edge_type,reason_summary=reason,character_id=cid,scene_id=e.target_id if e.target_type=="SCENE" else None,dependency_path=e.path))
-        scenes=session.scalars(select(__import__("app.models",fromlist=["Scene"]).Scene).where(__import__("app.models",fromlist=["Scene"]).Scene.project_id==request.project_id)).all()
-        for scene in scenes:
-            if scene.id not in affected:items.append(RetconImpactItem(plan_id="",resource_type="SCENE",resource_id=scene.id,classification="UNCHANGED",reason_code="NO_EXPLICIT_DEPENDENCY",reason_summary="没有发现连接待修改目标的结构化历史引用。",scene_id=scene.id,dependency_path=[]))
+        scene_meta=[SimpleNamespace(id=row[0],sequence=row[1]) for row in session.execute(select(Scene.id,Scene.sequence).where(Scene.project_id==request.project_id)).all()]
+        scenes=scene_meta
         earliest_id,earliest_seq,validation=ReplayBoundaryFinder().find(scenes,affected)
         if builder.limit_reached:validation["issues"].append({"code":"PLAN_GRAPH_LIMIT_REACHED","severity":"BLOCKING","resource_type":"RETCON_GRAPH","resource_id":request.id,"message":"依赖图超过规划节点上限。"})
-        cognition=CharacterCognitionImpactPlanner().plan(session,request.project_id,[{"resource_type":i.resource_type,"resource_id":i.resource_id,"character_id":i.character_id} for i in items]); summary={k:sum(i.classification==k for i in items) for k in ("UNCHANGED","REVALIDATE","REBUILD_COGNITION","REPLAY_REQUIRED","INVALIDATED")}; summary.update(total_impacts=len(items),affected_characters=len({i.character_id for i in items if i.character_id}),replay_scene_count=sum(i.resource_type=="SCENE" and i.classification=="REPLAY_REQUIRED" for i in items),preserved_scene_count=sum(i.resource_type=="SCENE" and i.classification=="UNCHANGED" for i in items),cognition_impacts=cognition)
+        cognition=CharacterCognitionImpactPlanner().plan(session,request.project_id,[{"resource_type":i.resource_type,"resource_id":i.resource_id,"character_id":i.character_id} for i in items])
+        affected_sequences=sorted(s.sequence for s in scenes if s.id in affected); preserved=[s.sequence for s in scenes if s.id not in affected]
+        ranges=[]
+        for sequence in preserved:
+            if not ranges or sequence != ranges[-1]["sequence_end"]+1:ranges.append({"sequence_start":sequence,"sequence_end":sequence,"count":1})
+            else:ranges[-1]["sequence_end"]=sequence; ranges[-1]["count"]+=1
+        summary={k:sum(i.classification==k for i in items) for k in ("REVALIDATE","REBUILD_COGNITION","REPLAY_REQUIRED","INVALIDATED")}; summary.update(total_impacts=len(items),affected_characters=len({i.character_id for i in items if i.character_id}),replay_scene_count=sum(i.resource_type=="SCENE" and i.classification=="REPLAY_REQUIRED" for i in items),preserved_scene_count=len(preserved),preserved_scene_ranges=ranges,cognition_impacts=cognition)
         parent=session.scalar(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id==request.id).order_by(RetconImpactPlan.version.desc())); blocked=bool(validation["issues"])
         plan=RetconImpactPlan(project_id=request.project_id,retcon_request_id=request.id,version=request.current_plan_version+1,parent_plan_id=parent.id if parent else None,basis_fingerprint=RetconBasisFingerprintBuilder().build(session,request.project_id,revision,edges),status="BLOCKED" if blocked else "READY",earliest_affected_scene_id=earliest_id,earliest_affected_sequence=earliest_seq,impact_summary=summary,validation_report=validation)
         return plan,items
