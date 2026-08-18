@@ -10,7 +10,7 @@ from .models import (
     ReplaySceneRunStatus, ReplaySessionStatus, RetconApplication,
     RetconApplicationStatus, RetconCognitionInvalidation,
     RetconCognitionInvalidationStatus, RetconReplaySession, Scene, ScenePerformance,
-    ScenePerformanceTurn, WorldResolution, PerformanceStatus,
+    ScenePerformanceTurn, WorldResolution, PerformanceStatus, SceneExecutionBinding, PerformanceMode, ResolutionStatus, ResolutionOutcome, ResolverMode, ActionVisibility,
 )
 from .versioning import WorldSnapshotBuilder
 from .performance import HeuristicCharacterPerformer, CharacterPerformancePayload, PerformanceActionConstraintChecker
@@ -44,6 +44,21 @@ class ReplayCharacterContextBuilder:
         context = {"project": {"id": session.project_id}, "character": {"id": character_id, "name": character.get("name"), "personality": character.get("personality") or {}, "core_values": character.get("core_values") or [], "boundaries": character.get("boundaries") or [], "goals": character.get("goals") or {}, "current_state": character.get("current_state") or {}, "physical_state": character.get("physical_state") or {}, "emotional_state": character.get("emotional_state") or {}, "relationships": relationships}, "scene": {"proposal_id": proposal.id, "location": location, "visible_context": getattr(proposal, "entry_state", {}) or {}, "actor_visible_context": getattr(proposal, "entry_state", {}) or {}, "other_participants": [{"id": row["id"], "name": row.get("name")} for row in others], "active_participant_ids": list(scene.participants or []), "performance_observations": [], "world_observations": [], "self_turn_history": [], "world_affordances": (getattr(proposal, "entry_state", {}) or {}).get("world_affordances", [])}, "knowledge": {"KNOWN": [{"id": row.id, "proposition": row.proposition, "confidence": row.confidence} for row in cognition["knowledge"]], "SUSPECTED": [], "FALSE_BELIEF": [], "UNKNOWN": []}, "memories": [{"memory_id": row.id, "content": row.content} for row in cognition["memories"]], "inventory": list(character.get("inventory") or []), "abilities": list(character.get("abilities") or [])}
         context["fingerprint"] = _fingerprint(context); context["version"] = context["fingerprint"]
         return context
+
+class ReplayResourceMapper:
+    """Deterministic execution-lineage mapper; never guesses from prose."""
+    def map(self, db, application, scene_ids):
+        from .models import RetconImpactItem
+        result = {sid: {"decision_ids": [], "turn_ids": [], "resolution_ids": [], "knowledge_ids": [], "memory_ids": []} for sid in scene_ids}
+        items = db.scalars(select(RetconImpactItem).where(RetconImpactItem.plan_id == application.retcon_plan_id)).all()
+        for item in items:
+            candidates = [sid for sid in scene_ids if item.scene_id == sid or any(node.get("type") == "SCENE" and node.get("id") == sid for node in (item.dependency_path or []))]
+            if len(candidates) != 1 and item.resource_type in {"CHARACTER_DECISION", "SCENE_PERFORMANCE_TURN", "WORLD_RESOLUTION"}:
+                raise ValueError("REPLAY_RESOURCE_SCENE_UNRESOLVED" if not candidates else "REPLAY_RESOURCE_MAPPING_AMBIGUOUS")
+            if candidates:
+                key = {"CHARACTER_DECISION":"decision_ids","SCENE_PERFORMANCE_TURN":"turn_ids","WORLD_RESOLUTION":"resolution_ids","CHARACTER_KNOWLEDGE":"knowledge_ids","CHARACTER_MEMORY":"memory_ids"}.get(item.resource_type)
+                if key: result[candidates[0]][key].append(item.resource_id)
+        return result
 
 def _fingerprint(value):
     return "replay-input-v1:" + hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
@@ -169,13 +184,16 @@ class ReplayService:
                     view = ReplayWorldView(session); entity = view.entity(request.get("target_entity_id"))
                     world_context = {"request": request, "target_entity": entity, "location": entity, "allowed_world_entity_ids": [entity["id"]] if entity else [], "canon": view.canon(), "scope": {"location_id": entity["id"] if entity else None, "actor_character_id": old.character_id, "target_character_id": None, "performance_id": scene.id}, "forbidden_canon_ids": [], "forbidden_propositions": []}
                     staged_outcome, _ = HeuristicWorldResolver().resolve(world_context)
+                    if staged_outcome.get("objective_facts"):
+                        state = deepcopy(session.staged_world_state); state.setdefault("staged_facts", []).extend(staged_outcome["objective_facts"]); state["current_world"] = deepcopy(state.get("current_world", {})); state["current_world"]["staged_facts"] = list(state["staged_facts"]); session.staged_world_state = state
                     resolution_report = WorldResolutionConstraintChecker().validate(db, world_context, WorldResolutionPayload.model_validate(staged_outcome), session.project_id)
                     if not resolution_report["valid"]:
                         run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_RESOLUTION_CONSTRAINT_FAILED", "report": resolution_report}; session.status = ReplaySessionStatus.BLOCKED; return run
             session.staged_world_state = dict(session.staged_world_state or {}) | {str(scene.sequence): {"situation": situation, "decisions": staged_decisions, "resolution": staged_outcome}}
+            state = deepcopy(session.staged_world_state); state.setdefault("scene_results", {})[scene.id] = {"mode": "REPLAY", "sequence": scene.sequence, "situation": situation, "decisions": staged_decisions, "turns": [], "resolutions": [staged_outcome] if staged_outcome.get("outcome") != "UNRESOLVED" else [], "validation": {"code": "REPLAY_VALIDATED"}}; session.staged_world_state = state
             run.validation_report = {"code": "REPLAY_VALIDATED", "deterministic": True, "staged": True}
             run.status = ReplaySceneRunStatus.VALIDATED
-        run.completed_at = datetime.utcnow(); session.cursor += 1; session.current_sequence = session.queue[session.cursor]["sequence"] if session.cursor < len(session.queue) else None; session.status = ReplaySessionStatus.RUNNING; db.flush(); return run
+        run.completed_at = datetime.utcnow(); session.cursor += 1; session.current_sequence = session.queue[session.cursor]["sequence"] if session.cursor < len(session.queue) else None; session.status = ReplaySessionStatus.RUNNING; session.current_fingerprint = _fingerprint({"world": (session.staged_world_state or {}).get("current_world"), "queue": session.queue, "cursor": session.cursor}); db.flush(); return run
 
     def commit(self, db: Session, session: RetconReplaySession, explicit_confirmation: bool):
         if not explicit_confirmation: self._fail("EXPLICIT_CONFIRMATION_REQUIRED")
@@ -183,7 +201,11 @@ class ReplayService:
         app = db.get(RetconApplication, session.retcon_application_id)
         session.pre_commit_snapshot_id = WorldSnapshotBuilder().create(db, session.project_id, __import__("app.models", fromlist=["SnapshotType"]).SnapshotType.PRE_REPLAY_COMMIT).id
         runs = db.scalars(select(ReplaySceneRun).where(ReplaySceneRun.replay_session_id == session.id)).all()
+        final_runs = {}
         for run in runs:
+            if run.mode == "REPLAY" and run.status == ReplaySceneRunStatus.VALIDATED:
+                final_runs[run.original_scene_id] = run
+        for run in final_runs.values():
             if not run.replacement_scene_id:
                 old = db.get(Scene, run.original_scene_id)
                 staged = (session.staged_world_state or {}).get(str(run.original_sequence), {})
@@ -193,7 +215,7 @@ class ReplayService:
             old = db.get(Scene, run.original_scene_id); new = db.get(Scene, run.replacement_scene_id) if run.replacement_scene_id else None
             if old and new:
                 old.history_status = "SUPERSEDED"; old.superseded_by_scene_id = new.id; db.flush(); new.history_status = "ACTIVE"; run.status = ReplaySceneRunStatus.COMMITTED
-        replacement_by_old = {run.original_scene_id: run.replacement_scene_id for run in runs if run.replacement_scene_id}
+        replacement_by_old = {run.original_scene_id: run.replacement_scene_id for run in final_runs.values() if run.replacement_scene_id}
         # A rebuild is complete only when the affected resource was covered by a replayed scene.
         for inv in db.scalars(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.retcon_application_id == app.id, RetconCognitionInvalidation.status == RetconCognitionInvalidationStatus.ACTIVE)).all():
             covered = any(inv.resource_id in ((item.get("knowledge_ids", []) + item.get("memory_ids", []) + item.get("cognition_resource_ids", []))) for item in session.queue) or bool(replacement_by_old)
