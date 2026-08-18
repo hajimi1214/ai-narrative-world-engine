@@ -90,13 +90,6 @@ def get_db():
     try: yield db
     finally: db.close()
 
-@router.post("/projects/{project_id}/scenes/{scene_id}/checkpoint", status_code=status.HTTP_201_CREATED)
-def capture_scene_checkpoint(project_id: str, scene_id: str, db: Session = Depends(get_db)):
-    try:
-        checkpoint = SceneStateCheckpointService().capture(db, project_id, scene_id); db.commit(); db.refresh(checkpoint); return record_dict(checkpoint)
-    except ValueError as exc:
-        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
-
 @router.post("/projects/{project_id}/retcon/requests", status_code=status.HTTP_201_CREATED)
 def create_retcon_request(project_id: str, payload: RetconRequestPayload, db: Session = Depends(get_db)):
     require_project(db, project_id)

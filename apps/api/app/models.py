@@ -33,7 +33,7 @@ class ResolutionOutcome(str, enum.Enum): SUCCESS = "SUCCESS"; PARTIAL = "PARTIAL
 class RevisionStatus(str, enum.Enum): DRAFT = "DRAFT"; PREVIEWED = "PREVIEWED"; STALE = "STALE"; CANCELLED = "CANCELLED"; APPLIED = "APPLIED"; ROLLED_BACK = "ROLLED_BACK"
 class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVISION"; POST_REVISION="POST_REVISION"; ROLLBACK_POINT="ROLLBACK_POINT"; PRE_REPLAY_COMMIT="PRE_REPLAY_COMMIT"; POST_REPLAY_COMMIT="POST_REPLAY_COMMIT"
 class RevisionApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED="APPLIED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
-class RetconApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED_PENDING_REPLAY="APPLIED_PENDING_REPLAY"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
+class RetconApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED_PENDING_REPLAY="APPLIED_PENDING_REPLAY"; REPLAY_COMPLETED="REPLAY_COMPLETED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
 class RetconCognitionInvalidationStatus(str, enum.Enum): ACTIVE="ACTIVE"; RESOLVED="RESOLVED"; ROLLED_BACK="ROLLED_BACK"
 class ReplaySessionStatus(str, enum.Enum): READY="READY"; RUNNING="RUNNING"; BLOCKED="BLOCKED"; COMPLETED="COMPLETED"; ABORTED="ABORTED"
 class ReplaySceneRunStatus(str, enum.Enum): PENDING="PENDING"; RUNNING="RUNNING"; VALIDATED="VALIDATED"; BLOCKED="BLOCKED"; COMMITTED="COMMITTED"
@@ -462,6 +462,18 @@ class SceneStateCheckpoint(Base):
     pre_snapshot_id: Mapped[str] = mapped_column(ForeignKey("world_snapshots.id"), nullable=False)
     post_snapshot_id: Mapped[str] = mapped_column(ForeignKey("world_snapshots.id"), nullable=False)
     current_scene_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    capture_protocol_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+class SceneExecutionBinding(Base):
+    __tablename__ = "scene_execution_bindings"
+    __table_args__ = (UniqueConstraint("scene_id", "active", name="uq_scene_execution_binding_active"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id"), nullable=False)
+    performance_id: Mapped[str] = mapped_column(ForeignKey("scene_performances.id"), nullable=False)
+    replay_session_id: Mapped[str | None] = mapped_column(String(36))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class ReplaySceneRun(Base):

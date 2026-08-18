@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from app.db import Base
 from app.main import app
 import app.api as api
-from app.models import RetconReplaySession, ReplaySceneRun, RetconApplication, RetconApplicationStatus, Scene
+from app.models import RetconReplaySession, ReplaySceneRun, RetconApplication, RetconApplicationStatus, Scene, WorldSnapshot, SceneStateCheckpoint
 from app.historical import SceneStateCheckpointService
 from app.historical import TemporalCharacterCognitionReader
 from app.character_mind import ActiveCharacterCognitionReader
@@ -24,7 +24,9 @@ def session():
 def replay_ready(session, monkeypatch):
     values = apply_success(session, monkeypatch)
     project, canon, knowledge, scene, revision, request, plan, client, applied = values
-    SceneStateCheckpointService().capture(session, project.id, scene.id)
+    pre = SceneStateCheckpointService().capture_pre(session, project.id, scene.id)
+    session.flush()
+    SceneStateCheckpointService().finalize(session, project.id, scene.id, pre.id)
     session.commit()
     return values + (applied["application"]["id"],)
 
@@ -86,6 +88,24 @@ def test_missing_historical_checkpoint_blocks_session(session, monkeypatch):
     values = apply_success(session, monkeypatch); project, _, _, _, _, _, _, client, applied = values
     result = client.post(f"/projects/{project.id}/retcon/applications/{applied['application']['id']}/replay-sessions")
     assert result.status_code == 409 and result.json()["detail"]["code"] == "HISTORICAL_BASELINE_UNAVAILABLE"
+
+def test_checkpoint_is_two_phase_and_legacy_protocol_is_rejected(session, monkeypatch):
+    values = apply_success(session, monkeypatch); project, _, _, scene, _, _, _, client, applied = values
+    pre = SceneStateCheckpointService().capture_pre(session, project.id, scene.id)
+    assert session.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.scene_id == scene.id)) is None
+    checkpoint = SceneStateCheckpointService().finalize(session, project.id, scene.id, pre.id); session.commit()
+    assert checkpoint.capture_protocol_version == 2 and checkpoint.pre_snapshot_id != checkpoint.post_snapshot_id
+    checkpoint.capture_protocol_version = 1; session.commit()
+    blocked = client.post(f"/projects/{project.id}/retcon/applications/{applied['application']['id']}/replay-sessions")
+    assert blocked.status_code == 409 and blocked.json()["detail"]["code"] == "HISTORICAL_BASELINE_UNAVAILABLE"
+
+def test_replay_baseline_overlays_retcon_target_without_future_world_state(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, canon, _, scene, revision, _, _, client, _, application_id = values
+    replay = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
+    assert replay.status_code == 201, replay.text
+    state = session.get(RetconReplaySession, replay.json()["id"]).staged_world_state
+    baseline_canon = next(row for row in state["baseline"]["canon_facts"] if row["id"] == canon.id)
+    assert baseline_canon["proposition"] == revision["change_set"][0]["value"]
 
 def test_replay_abort_cleans_staging_and_allows_retcon_rollback(session, monkeypatch):
     values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
