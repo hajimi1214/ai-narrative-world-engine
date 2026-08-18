@@ -30,6 +30,10 @@ class ActionVisibility(str, enum.Enum): PUBLIC = "PUBLIC"; TARGETED = "TARGETED"
 class ResolverMode(str, enum.Enum): HEURISTIC = "HEURISTIC"; LLM = "LLM"
 class ResolutionStatus(str, enum.Enum): VALID = "VALID"; REJECTED = "REJECTED"; UNRESOLVED = "UNRESOLVED"
 class ResolutionOutcome(str, enum.Enum): SUCCESS = "SUCCESS"; PARTIAL = "PARTIAL"; FAILURE = "FAILURE"; NO_EFFECT = "NO_EFFECT"; INTERRUPTED = "INTERRUPTED"; UNRESOLVED = "UNRESOLVED"
+class StateDeltaBatchStatus(str, enum.Enum): CANDIDATE = "CANDIDATE"; VALIDATED = "VALIDATED"; REJECTED = "REJECTED"; APPLIED = "APPLIED"
+class StateDeltaTargetType(str, enum.Enum): CHARACTER = "CHARACTER"; WORLD_ENTITY = "WORLD_ENTITY"; STORY_THREAD = "STORY_THREAD"; PROJECT = "PROJECT"
+class StateDeltaDomain(str, enum.Enum): CHARACTER_LOCATION = "CHARACTER_LOCATION"; CHARACTER_INVENTORY = "CHARACTER_INVENTORY"; CHARACTER_RELATIONSHIP = "CHARACTER_RELATIONSHIP"; CHARACTER_PHYSICAL_STATE = "CHARACTER_PHYSICAL_STATE"; CHARACTER_EMOTIONAL_STATE = "CHARACTER_EMOTIONAL_STATE"; CHARACTER_CURRENT_STATE = "CHARACTER_CURRENT_STATE"; WORLD_ENTITY_PROFILE = "WORLD_ENTITY_PROFILE"; WORLD_ENTITY_ACTIVE = "WORLD_ENTITY_ACTIVE"; STORY_THREAD_STATE = "STORY_THREAD_STATE"; STORY_THREAD_STATUS = "STORY_THREAD_STATUS"; STORY_THREAD_PROGRESS = "STORY_THREAD_PROGRESS"; WORLD_TIME = "WORLD_TIME"
+class StateDeltaOperation(str, enum.Enum): SET = "SET"; ADD = "ADD"; REMOVE = "REMOVE"; UPSERT = "UPSERT"
 class RevisionStatus(str, enum.Enum): DRAFT = "DRAFT"; PREVIEWED = "PREVIEWED"; STALE = "STALE"; CANCELLED = "CANCELLED"; APPLIED = "APPLIED"; ROLLED_BACK = "ROLLED_BACK"
 class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVISION"; POST_REVISION="POST_REVISION"; ROLLBACK_POINT="ROLLBACK_POINT"; PRE_REPLAY_COMMIT="PRE_REPLAY_COMMIT"; POST_REPLAY_COMMIT="POST_REPLAY_COMMIT"
 class RevisionApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED="APPLIED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
@@ -346,6 +350,45 @@ class WorldResolution(Base):
     missing_information: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     replay_session_id: Mapped[str | None] = mapped_column(String(36))
     replay_of_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class StateDeltaBatch(Base):
+    __tablename__ = "state_delta_batches"
+    __table_args__ = (UniqueConstraint("project_id", "input_fingerprint", name="uq_state_delta_batch_project_input"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    source_scene_proposal_id: Mapped[str | None] = mapped_column(ForeignKey("scene_proposals.id"))
+    source_performance_id: Mapped[str | None] = mapped_column(ForeignKey("scene_performances.id"), index=True)
+    source_turn_id: Mapped[str | None] = mapped_column(ForeignKey("scene_performance_turns.id"), index=True)
+    source_resolution_id: Mapped[str | None] = mapped_column(ForeignKey("world_resolutions.id"), index=True)
+    base_world_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    status: Mapped[StateDeltaBatchStatus] = mapped_column(Enum(StateDeltaBatchStatus), default=StateDeltaBatchStatus.CANDIDATE, nullable=False, index=True)
+    derivation_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    derivation_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class StateDeltaItem(Base):
+    __tablename__ = "state_delta_items"
+    __table_args__ = (UniqueConstraint("batch_id", "ordinal", name="uq_state_delta_item_batch_ordinal"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("state_delta_batches.id"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_type: Mapped[StateDeltaTargetType] = mapped_column(Enum(StateDeltaTargetType), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    domain: Mapped[StateDeltaDomain] = mapped_column(Enum(StateDeltaDomain), nullable=False)
+    operation: Mapped[StateDeltaOperation] = mapped_column(Enum(StateDeltaOperation), nullable=False)
+    path: Mapped[str] = mapped_column(String(300), nullable=False)
+    before_value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    after_value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    causal_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    source_turn_id: Mapped[str | None] = mapped_column(ForeignKey("scene_performance_turns.id"))
+    source_resolution_id: Mapped[str | None] = mapped_column(ForeignKey("world_resolutions.id"))
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    semantic_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class WorldRevision(TimestampMixin, Base):

@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -27,6 +27,7 @@ from .retcon import RetconImpactPlanner, RetconPlanStalenessChecker, CLASSIFICAT
 from .retcon_apply import RetconApplyService, RetconPendingReplayGuard, RetconAuthorOverrideResolver, has_pending_replay
 from .replay import ReplayService
 from .historical import SceneStateCheckpointService
+from .state_delta import StateDeltaCandidateBuilder
 
 router = APIRouter()
 
@@ -44,6 +45,10 @@ class RetconApplyPayload(BaseModel):
     explicit_confirmation: bool = False
     author_override: bool = False
     author_override_reason: str | None = None
+
+class StateDeltaDerivePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_resolution_id: str
 
 def retcon_actions(status: str) -> list[str]:
     return {"DRAFT": ["ANALYZE", "ABORT"], "PLANNED": ["REANALYZE", "ABORT", "APPLY"], "STALE": ["REANALYZE", "ABORT"], "APPLIED_PENDING_REPLAY": [], "ROLLED_BACK": [], "ABORTED": []}.get(status, [])
@@ -89,6 +94,40 @@ def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
+
+def state_delta_batch_payload(db: Session, batch: StateDeltaBatch) -> dict[str, Any]:
+    items = db.scalars(select(StateDeltaItem).where(StateDeltaItem.batch_id == batch.id).order_by(StateDeltaItem.ordinal, StateDeltaItem.id)).all()
+    return record_dict(batch) | {"items": [record_dict(item) for item in items]}
+
+@router.post("/projects/{project_id}/state-delta-batches/derive", status_code=status.HTTP_201_CREATED)
+def derive_state_delta_batch(project_id: str, payload: StateDeltaDerivePayload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        batch, _items, existing = StateDeltaCandidateBuilder().derive(db, project_id, payload.source_resolution_id)
+        if not existing:
+            db.commit(); db.refresh(batch)
+        return state_delta_batch_payload(db, batch) | {"idempotent": existing}
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+@router.get("/projects/{project_id}/state-delta-batches")
+def list_state_delta_batches(project_id: str, source_resolution_id: str | None = None, status_filter: str | None = Query(None, alias="status"), db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    query = select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id)
+    if source_resolution_id:
+        query = query.where(StateDeltaBatch.source_resolution_id == source_resolution_id)
+    if status_filter:
+        query = query.where(StateDeltaBatch.status == status_filter)
+    rows = db.scalars(query.order_by(StateDeltaBatch.created_at.desc(), StateDeltaBatch.id.desc())).all()
+    return [state_delta_batch_payload(db, row) for row in rows]
+
+@router.get("/projects/{project_id}/state-delta-batches/{batch_id}")
+def get_state_delta_batch(project_id: str, batch_id: str, db: Session = Depends(get_db)):
+    batch = db.get(StateDeltaBatch, batch_id)
+    if not batch or batch.project_id != project_id:
+        raise HTTPException(status_code=404, detail="State Delta Batch not found")
+    return state_delta_batch_payload(db, batch)
 
 @router.post("/projects/{project_id}/retcon/requests", status_code=status.HTTP_201_CREATED)
 def create_retcon_request(project_id: str, payload: RetconRequestPayload, db: Session = Depends(get_db)):
