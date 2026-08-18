@@ -9,6 +9,7 @@ depends_on = None
 
 
 def upgrade():
+    op.add_column("world_resolutions", sa.Column("state_effects", sa.JSON(), nullable=False, server_default=sa.text("'[]'")))
     op.create_table(
         "state_delta_batches",
         sa.Column("id", sa.String(36), primary_key=True),
@@ -67,3 +68,4 @@ def downgrade():
     op.drop_index("ix_state_delta_batches_source_resolution_id", table_name="state_delta_batches")
     op.drop_index("ix_state_delta_batches_project_id", table_name="state_delta_batches")
     op.drop_table("state_delta_batches")
+    op.drop_column("world_resolutions", "state_effects", if_exists=True)

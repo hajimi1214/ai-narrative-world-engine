@@ -2,12 +2,13 @@
 import hashlib
 import json
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .ai.provider import ModelProvider, ModelResult
 from .llm_actor import _extract_single_json_object, _validation_diagnostics
 from .models import CanonFact, CanonType, Character, ResolutionOutcome, ResolutionStatus, RevealConstraint, RevealStatus, ScenePerformance, ScenePerformanceTurn, WorldEntity, WorldResolution
+from .state_effect_contract import StateEffectPayload
 
 
 class WorldFactPayload(BaseModel):
@@ -23,6 +24,7 @@ class WorldResolutionPayload(BaseModel):
     outcome: ResolutionOutcome
     outcome_summary: str
     objective_facts: list[WorldFactPayload]
+    state_effects: list[StateEffectPayload] = Field(default_factory=list)
     actor_observation: str | None
     public_observation: str | None
     canon_fact_ids_used: list[str]
@@ -32,7 +34,7 @@ class WorldResolutionPayload(BaseModel):
 
 
 def world_resolution_contract() -> dict[str, Any]:
-    return {"fields": {"outcome": {"type": "enum", "values": [item.value for item in ResolutionOutcome]}, "outcome_summary": "string", "objective_facts": "WorldFact[]", "actor_observation": "string|null", "public_observation": "string|null", "canon_fact_ids_used": "string[]", "world_entity_ids_used": "string[]", "resolution_basis_summary": "string|null", "missing_information": "string[]"}, "WorldFact": {"subject_type": ["ENTITY", "CHARACTER", "LOCATION", "SCENE"], "subject_id": "string", "predicate": "string", "value": "JSON value"}, "rules": ["All fields are required.", "Use [] for empty lists and null for absent optional text.", "Do not add fields.", "UNRESOLVED requires missing_information and no objective facts."]}
+    return {"fields": {"outcome": {"type": "enum", "values": [item.value for item in ResolutionOutcome]}, "outcome_summary": "string", "objective_facts": "WorldFact[]", "state_effects": "StateEffect[]", "actor_observation": "string|null", "public_observation": "string|null", "canon_fact_ids_used": "string[]", "world_entity_ids_used": "string[]", "resolution_basis_summary": "string|null", "missing_information": "string[]"}, "WorldFact": {"subject_type": ["ENTITY", "CHARACTER", "LOCATION", "SCENE"], "subject_id": "string", "predicate": "string", "value": "JSON value"}, "StateEffect": {"target_type": "CHARACTER|WORLD_ENTITY|STORY_THREAD|PROJECT", "domain": "structured state delta domain", "operation": "SET|ADD|REMOVE|UPSERT", "path": "RFC6901 JSON pointer", "value": "JSON value", "reason": "string", "evidence": "object"}, "rules": ["All fields are required except state_effects, which defaults to [].", "Observation-only resolutions use state_effects=[] .", "Only effects directly caused by this resolution are allowed.", "State effects never modify Canon and must not be inferred from prose.", "Every effect requires explicit structured evidence.", "UNRESOLVED requires missing_information and no objective facts."]}
 
 
 def world_context_fingerprint(context: dict[str, Any]) -> str:
@@ -113,14 +115,16 @@ class HeuristicWorldResolver:
         profile = entity.get("profile") or {}
         if request.get("kind") == "INSPECT" and profile.get("inspectable") is not None:
             value = profile["inspectable"]
-            return {"outcome":"SUCCESS", "outcome_summary":"The inspection attempt completed.", "objective_facts":[{"subject_type":"ENTITY", "subject_id":entity["id"], "predicate":"inspection.result", "value":value}], "actor_observation":str(value), "public_observation":"The character examines the entity.", "canon_fact_ids_used":[], "world_entity_ids_used":[entity["id"]], "resolution_basis_summary":"The entity exposes an explicitly structured inspectable profile.", "missing_information":[]}, None
+            return {"outcome":"SUCCESS", "outcome_summary":"The inspection attempt completed.", "objective_facts":[{"subject_type":"ENTITY", "subject_id":entity["id"], "predicate":"inspection.result", "value":value}], "state_effects":[], "actor_observation":str(value), "public_observation":"The character examines the entity.", "canon_fact_ids_used":[], "world_entity_ids_used":[entity["id"]], "resolution_basis_summary":"The entity exposes an explicitly structured inspectable profile.", "missing_information":[]}, None
+        if request.get("kind") == "INTERACT" and profile.get("openable") is True and profile.get("opened") is False and profile.get("locked") is False:
+            return {"outcome":"SUCCESS", "outcome_summary":"The entity opens.", "objective_facts":[{"subject_type":"ENTITY", "subject_id":entity["id"], "predicate":"opened", "value":True}], "state_effects":[{"target_type":"WORLD_ENTITY", "target_id":entity["id"], "domain":"WORLD_ENTITY_PROFILE", "operation":"SET", "path":"/profile/opened", "value":True, "reason":"The structured interaction opens an explicitly openable entity.", "evidence":{"request_kind":"INTERACT", "target_entity_id":entity["id"]}}], "actor_observation":"The entity opens.", "public_observation":"The entity opens.", "canon_fact_ids_used":[], "world_entity_ids_used":[entity["id"]], "resolution_basis_summary":"The entity is explicitly openable, unlocked, and closed.", "missing_information":[]}, None
         if request.get("kind") == "INTERACT" and profile.get("locked") is True:
-            return {"outcome":"FAILURE", "outcome_summary":"The interaction did not change the entity.", "objective_facts":[{"subject_type":"ENTITY", "subject_id":entity["id"], "predicate":"locked", "value":True}], "actor_observation":"The mechanism resists the attempt.", "public_observation":"The attempted interaction produces no visible change.", "canon_fact_ids_used":[], "world_entity_ids_used":[entity["id"]], "resolution_basis_summary":"The entity profile explicitly marks it locked.", "missing_information":[]}, None
+            return {"outcome":"FAILURE", "outcome_summary":"The interaction did not change the entity.", "objective_facts":[{"subject_type":"ENTITY", "subject_id":entity["id"], "predicate":"locked", "value":True}], "state_effects":[], "actor_observation":"The mechanism resists the attempt.", "public_observation":"The attempted interaction produces no visible change.", "canon_fact_ids_used":[], "world_entity_ids_used":[entity["id"]], "resolution_basis_summary":"The entity profile explicitly marks it locked.", "missing_information":[]}, None
         return _unresolved("The supplied world state cannot determine this result.", "structured resolution rule", [entity["id"]]), None
 
 
 def _unresolved(summary: str, missing: str, entities: list[str] | None = None) -> dict[str, Any]:
-    return {"outcome":"UNRESOLVED", "outcome_summary":summary, "objective_facts":[], "actor_observation":None, "public_observation":None, "canon_fact_ids_used":[], "world_entity_ids_used":entities or [], "resolution_basis_summary":None, "missing_information":[missing]}
+    return {"outcome":"UNRESOLVED", "outcome_summary":summary, "objective_facts":[], "state_effects":[], "actor_observation":None, "public_observation":None, "canon_fact_ids_used":[], "world_entity_ids_used":entities or [], "resolution_basis_summary":None, "missing_information":[missing]}
 
 
 class LLMWorldResolver:
@@ -162,6 +166,12 @@ class WorldResolutionConstraintChecker:
             expected = {"ENTITY": allowed_entities, "LOCATION": {scope["location_id"]} - {None}, "CHARACTER": {scope["actor_character_id"], scope["target_character_id"]} - {None}, "SCENE": {scope["performance_id"]}}[fact.subject_type]
             if fact.subject_id not in expected: add("INVALID_FACT_SUBJECT", "Objective fact subject is outside the explicit resolution scope.", [fact.subject_id])
             if fact.predicate.startswith(("project.", "story_thread.", "chapter.", "canon.")): add("UNSUPPORTED_FACT_SCOPE", "Resolver cannot mutate formal project/story/canon scope.", [fact.predicate])
+        fact_subject_ids = {fact.subject_id for fact in payload.objective_facts}
+        for effect in payload.state_effects:
+            if effect.target_type.value == "WORLD_ENTITY" and effect.target_id not in set(payload.world_entity_ids_used) | fact_subject_ids:
+                add("UNSUPPORTED_STATE_EFFECT", "Entity StateEffect is outside the resolution scope.", [effect.target_id])
+            if effect.target_type.value == "CHARACTER" and effect.target_id not in {scope["actor_character_id"], scope["target_character_id"]}:
+                add("UNSUPPORTED_STATE_EFFECT", "Character StateEffect is outside the resolution scope.", [effect.target_id])
         for canon in context.get("canon", []):
             data = canon.get("data") or {}
             if not canon.get("locked") or not {"subject_id", "predicate", "value"}.issubset(data):

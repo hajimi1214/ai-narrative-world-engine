@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import copy
-from datetime import datetime
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .execution_trace import stable_fingerprint
@@ -18,25 +18,11 @@ from .models import (
 )
 from .revision import _pointer, _record
 from .versioning import WorldSnapshotBuilder
+from .state_effect_contract import StateEffectPayload
 
 
 DERIVATION_VERSION = "state-delta-v1"
 _MISSING = object()
-
-
-class StateEffectPayload(BaseModel):
-    """Explicit structured proof that a runtime consequence changes state."""
-
-    model_config = ConfigDict(extra="forbid")
-    effect_kind: Literal["STATE_CHANGE"] = "STATE_CHANGE"
-    target_type: StateDeltaTargetType
-    target_id: str
-    domain: StateDeltaDomain
-    operation: StateDeltaOperation
-    path: str
-    value: Any
-    reason: str = Field(min_length=1, max_length=1000)
-    evidence: dict[str, Any] = Field(default_factory=dict)
 
 
 class FormalWorldStateReader:
@@ -80,44 +66,17 @@ class WorldResolutionStateDeltaTranslator:
     def translate(self, resolution: WorldResolution) -> tuple[list[StateEffectPayload], list[dict[str, Any]]]:
         effects: list[StateEffectPayload] = []
         report: list[dict[str, Any]] = []
-        for index, fact in enumerate(resolution.objective_facts or []):
-            if not isinstance(fact, dict):
-                report.append({"index": index, "code": "UNSUPPORTED_STATE_EFFECT"})
-                continue
-            raw_effect = fact.get("state_effect")
-            explicitly_state_changing = fact.get("effect_kind") == "STATE_CHANGE"
-            if raw_effect is None and explicitly_state_changing:
-                raw_effect = self._effect_from_state_change_fact(fact)
-            if raw_effect is None:
-                report.append({"index": index, "code": "UNSUPPORTED_STATE_EFFECT" if explicitly_state_changing else "NO_STATE_CHANGE"})
-                continue
+        for index, raw_effect in enumerate(resolution.state_effects or []):
             try:
                 effect = StateEffectPayload.model_validate(raw_effect)
-            except Exception:
+            except ValidationError:
                 report.append({"index": index, "code": "UNSUPPORTED_STATE_EFFECT"})
                 continue
+            fact = next((item for item in resolution.objective_facts or [] if isinstance(item, dict) and item.get("subject_id") == effect.target_id), None)
             evidence = dict(effect.evidence)
-            evidence["objective_fact"] = {
-                "subject_type": fact.get("subject_type"), "subject_id": fact.get("subject_id"),
-                "predicate": fact.get("predicate"), "value": fact.get("value"),
-            }
+            evidence["objective_fact"] = {"subject_type": fact.get("subject_type"), "subject_id": fact.get("subject_id"), "predicate": fact.get("predicate"), "value": fact.get("value")} if fact else None
             effects.append(effect.model_copy(update={"evidence": evidence}))
         return effects, report
-
-    def _effect_from_state_change_fact(self, fact: dict[str, Any]) -> dict[str, Any] | None:
-        subject_type, subject_id, predicate = fact.get("subject_type"), fact.get("subject_id"), fact.get("predicate")
-        value = fact.get("value")
-        if subject_type in {"ENTITY", "LOCATION"} and isinstance(subject_id, str) and isinstance(predicate, str) and predicate:
-            return {"target_type": "WORLD_ENTITY", "target_id": subject_id, "domain": "WORLD_ENTITY_PROFILE", "operation": "SET", "path": f"/profile/{_escape(predicate)}", "value": value, "reason": "validated structured world-resolution state change", "evidence": {"effect_kind": "STATE_CHANGE"}}
-        if subject_type == "CHARACTER" and isinstance(subject_id, str) and isinstance(predicate, str):
-            for prefix, domain, root in (
-                ("current_state.", "CHARACTER_CURRENT_STATE", "/current_state/"),
-                ("physical_state.", "CHARACTER_PHYSICAL_STATE", "/physical_state/"),
-                ("emotional_state.", "CHARACTER_EMOTIONAL_STATE", "/emotional_state/"),
-            ):
-                if predicate.startswith(prefix) and len(predicate) > len(prefix):
-                    return {"target_type": "CHARACTER", "target_id": subject_id, "domain": domain, "operation": "SET", "path": root + _escape(predicate[len(prefix):]), "value": value, "reason": "validated structured character state change", "evidence": {"effect_kind": "STATE_CHANGE"}}
-        return None
 
 
 class StateDeltaCandidateBuilder:
@@ -139,10 +98,12 @@ class StateDeltaCandidateBuilder:
         performance = db.get(ScenePerformance, resolution.performance_id)
         turn = db.get(ScenePerformanceTurn, resolution.performance_turn_id)
         if not performance or not turn or performance.project_id != project_id or turn.project_id != project_id:
-            raise ValueError("STATE_DELTA_CROSS_PROJECT_REFERENCE")
+            raise ValueError("STATE_DELTA_SOURCE_LINEAGE_INVALID")
+        if resolution.performance_id != performance.id or resolution.performance_turn_id != turn.id or turn.performance_id != performance.id:
+            raise ValueError("STATE_DELTA_SOURCE_LINEAGE_INVALID")
         proposal = db.get(SceneProposal, performance.scene_proposal_id)
-        if proposal and proposal.project_id != project_id:
-            raise ValueError("STATE_DELTA_CROSS_PROJECT_REFERENCE")
+        if not proposal or proposal.project_id != project_id:
+            raise ValueError("STATE_DELTA_SOURCE_LINEAGE_INVALID")
 
         _, base_fingerprint = WorldSnapshotBuilder().build(db, project_id)
         source_payload = {
@@ -156,10 +117,13 @@ class StateDeltaCandidateBuilder:
             return existing, self.items(db, existing.id), True
 
         effects, report = self.translator.translate(resolution)
+        if not effects and not report:
+            report.append({"code": "NO_STATE_CHANGE"})
         prepared = []
         for effect in effects:
             self._validate_effect(effect)
             before, found = self.reader.before_value(db, project_id, effect)
+            self._validate_resolution_scope(resolution, turn, effect)
             if not found and effect.operation != StateDeltaOperation.UPSERT:
                 raise ValueError("STATE_DELTA_PATH_UNRESOLVED")
             after = self._after_value(before, found, effect)
@@ -172,37 +136,44 @@ class StateDeltaCandidateBuilder:
             item[0].target_type.value, item[0].target_id, item[0].domain.value,
             item[0].path, item[0].operation.value,
         ))
-        batch = StateDeltaBatch(
-            project_id=project_id, source_type="WORLD_RESOLUTION", source_id=resolution.id,
-            source_scene_proposal_id=proposal.id if proposal else None, source_performance_id=performance.id,
-            source_turn_id=turn.id, source_resolution_id=resolution.id,
-            base_world_fingerprint=base_fingerprint, input_fingerprint=input_fingerprint,
-            status=StateDeltaBatchStatus.CANDIDATE, derivation_version=DERIVATION_VERSION,
-            derivation_report={"entries": report, "item_count": len(prepared)},
-        )
-        db.add(batch); db.flush()
-        items = []
-        for ordinal, (effect, before, after) in enumerate(prepared, start=1):
-            evidence = {
-                "source_resolution_id": resolution.id, "source_turn_id": turn.id,
-                "state_effect": effect.model_dump(mode="json"), "translator_version": DERIVATION_VERSION,
-                "objective_fact": effect.evidence.get("objective_fact"),
-            }
-            semantic_fingerprint = stable_fingerprint({
-                "project_id": project_id, "source_resolution_id": resolution.id, "source_turn_id": turn.id,
-                "target_type": effect.target_type.value, "target_id": effect.target_id,
-                "domain": effect.domain.value, "operation": effect.operation.value, "path": effect.path,
-                "before": before, "after": after, "evidence": evidence,
-            }, "state-delta-item-v1")
-            item = StateDeltaItem(
-                project_id=project_id, batch_id=batch.id, ordinal=ordinal, target_type=effect.target_type,
-                target_id=effect.target_id, domain=effect.domain, operation=effect.operation, path=effect.path,
-                before_value=before, after_value=after, causal_reason=effect.reason,
-                source_turn_id=turn.id, source_resolution_id=resolution.id, evidence=evidence,
-                semantic_fingerprint=semantic_fingerprint,
-            )
-            db.add(item); items.append(item)
-        db.flush()
+        try:
+            with db.begin_nested():
+                batch = StateDeltaBatch(
+                    project_id=project_id, source_type="WORLD_RESOLUTION", source_id=resolution.id,
+                    source_scene_proposal_id=proposal.id, source_performance_id=performance.id,
+                    source_turn_id=turn.id, source_resolution_id=resolution.id,
+                    base_world_fingerprint=base_fingerprint, input_fingerprint=input_fingerprint,
+                    status=StateDeltaBatchStatus.CANDIDATE, derivation_version=DERIVATION_VERSION,
+                    derivation_report={"entries": report, "item_count": len(prepared)},
+                )
+                db.add(batch); db.flush()
+                items = []
+                for ordinal, (effect, before, after) in enumerate(prepared, start=1):
+                    evidence = {
+                        "source_resolution_id": resolution.id, "source_turn_id": turn.id,
+                        "state_effect": effect.model_dump(mode="json"), "translator_version": DERIVATION_VERSION,
+                        "objective_fact": effect.evidence.get("objective_fact"),
+                    }
+                    semantic_fingerprint = stable_fingerprint({
+                        "project_id": project_id, "source_resolution_id": resolution.id, "source_turn_id": turn.id,
+                        "target_type": effect.target_type.value, "target_id": effect.target_id,
+                        "domain": effect.domain.value, "operation": effect.operation.value, "path": effect.path,
+                        "before": before, "after": after, "evidence": evidence,
+                    }, "state-delta-item-v1")
+                    item = StateDeltaItem(
+                        project_id=project_id, batch_id=batch.id, ordinal=ordinal, target_type=effect.target_type,
+                        target_id=effect.target_id, domain=effect.domain, operation=effect.operation, path=effect.path,
+                        before_value=before, after_value=after, causal_reason=effect.reason,
+                        source_turn_id=turn.id, source_resolution_id=resolution.id, evidence=evidence,
+                        semantic_fingerprint=semantic_fingerprint,
+                    )
+                    db.add(item); items.append(item)
+                db.flush()
+        except IntegrityError:
+            existing = db.scalar(select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id, StateDeltaBatch.input_fingerprint == input_fingerprint, StateDeltaBatch.status == StateDeltaBatchStatus.CANDIDATE))
+            if existing:
+                return existing, self.items(db, existing.id), True
+            raise
         return batch, items, False
 
     def items(self, db: Session, batch_id: str) -> list[StateDeltaItem]:
@@ -229,6 +200,16 @@ class StateDeltaCandidateBuilder:
             raise ValueError("UNSUPPORTED_STATE_EFFECT")
         if effect.domain == StateDeltaDomain.CHARACTER_RELATIONSHIP and len(_pointer(path)) < 3:
             raise ValueError("UNSUPPORTED_STATE_EFFECT")
+
+    def _validate_resolution_scope(self, resolution: WorldResolution, turn: ScenePerformanceTurn, effect: StateEffectPayload) -> None:
+        facts = [item for item in resolution.objective_facts or [] if isinstance(item, dict)]
+        if effect.target_type == StateDeltaTargetType.WORLD_ENTITY:
+            if effect.target_id not in set(resolution.world_entity_ids_used or []) and not any(item.get("subject_id") == effect.target_id for item in facts):
+                raise ValueError("UNSUPPORTED_STATE_EFFECT")
+        if effect.target_type == StateDeltaTargetType.CHARACTER:
+            target_id = (turn.world_resolution_request or {}).get("target_character_id")
+            if effect.target_id not in {turn.actor_character_id, target_id}:
+                raise ValueError("UNSUPPORTED_STATE_EFFECT")
 
     def _after_value(self, before: Any, found: bool, effect: StateEffectPayload) -> Any:
         if effect.operation in {StateDeltaOperation.SET, StateDeltaOperation.UPSERT}:

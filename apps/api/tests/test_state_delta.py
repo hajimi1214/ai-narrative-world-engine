@@ -17,6 +17,7 @@ from app.models import (
     WorldResolution,
 )
 from app.state_delta import StateDeltaCandidateBuilder, StateEffectPayload
+from app.world_resolution import HeuristicWorldResolver, WorldResolutionPayload
 from test_scene_performance import approved_setup
 
 
@@ -54,10 +55,6 @@ def effect(target_type, target_id, domain, operation, path, value, reason="struc
     return {"effect_kind": "STATE_CHANGE", "target_type": target_type, "target_id": target_id, "domain": domain, "operation": operation, "path": path, "value": value, "reason": reason, "evidence": {"kind": "test"}}
 
 
-def fact_with_effect(subject_type, subject_id, predicate, value, state_effect):
-    return {"subject_type": subject_type, "subject_id": subject_id, "predicate": predicate, "value": value, "state_effect": state_effect}
-
-
 def test_state_effect_payload_is_strict():
     valid = StateEffectPayload.model_validate(effect("WORLD_ENTITY", "door", "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True))
     assert valid.effect_kind == "STATE_CHANGE"
@@ -68,7 +65,8 @@ def test_state_effect_payload_is_strict():
 def test_safe_entity_effect_creates_candidate_without_mutating_formal_world(session, monkeypatch):
     project, location, actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
     location.profile = {"locked": False}; actor.current_state = {"location_id": location.id}; session.commit()
-    resolution.objective_facts = [fact_with_effect("ENTITY", location.id, "locked", True, effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True))]
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "locked", "value": True}]
+    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True)]
     session.commit(); before = copy.deepcopy(location.profile)
     batch, items, existing = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
     assert not existing and len(items) == 1
@@ -96,7 +94,19 @@ def test_character_allowlist_inventory_relationship_time_and_thread_effects(sess
         fact_with_effect("SCENE", thread.id, "status", "PAUSED", effect("STORY_THREAD", thread.id, "STORY_THREAD_STATUS", "SET", "/status", "PAUSED")),
         fact_with_effect("SCENE", project.id, "world_time", "2040-01-01T00:00:00", effect("PROJECT", project.id, "WORLD_TIME", "SET", "/current_world_time", "2040-01-01T00:00:00")),
     ]
-    resolution.objective_facts = facts; session.commit()
+    resolution.objective_facts = facts
+    resolution.state_effects = [
+        effect("CHARACTER", actor.id, "CHARACTER_LOCATION", "SET", "/current_state/location_id", location.id),
+        effect("CHARACTER", actor.id, "CHARACTER_INVENTORY", "ADD", "/inventory", "key"),
+        effect("CHARACTER", actor.id, "CHARACTER_RELATIONSHIP", "UPSERT", f"/relationships/{other.id}/trust", 0.8),
+        effect("CHARACTER", actor.id, "CHARACTER_PHYSICAL_STATE", "SET", "/physical_state/healthy", False),
+        effect("CHARACTER", actor.id, "CHARACTER_EMOTIONAL_STATE", "SET", "/emotional_state/mood", "afraid"),
+        effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_ACTIVE", "SET", "/active", False),
+        effect("STORY_THREAD", thread.id, "STORY_THREAD_PROGRESS", "SET", "/progress", 0.5),
+        effect("STORY_THREAD", thread.id, "STORY_THREAD_STATE", "SET", "/state/phase", "middle"),
+        effect("STORY_THREAD", thread.id, "STORY_THREAD_STATUS", "SET", "/status", "PAUSED"),
+        effect("PROJECT", project.id, "WORLD_TIME", "SET", "/current_world_time", "2040-01-01T00:00:00"),
+    ]; session.commit()
     _batch, items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
     assert len(items) == 10
     assert {item.domain.value for item in items} >= {"CHARACTER_LOCATION", "CHARACTER_INVENTORY", "CHARACTER_RELATIONSHIP", "WORLD_TIME", "STORY_THREAD_PROGRESS"}
@@ -104,22 +114,44 @@ def test_character_allowlist_inventory_relationship_time_and_thread_effects(sess
 
 
 def test_unsupported_character_objective_fact_is_not_guessed(session, monkeypatch):
-    project, _location, actor, _proposal, resolution = resolution_source(session, monkeypatch, [{"subject_type": "CHARACTER", "subject_id": "missing", "predicate": "arbitrary", "value": "x", "effect_kind": "STATE_CHANGE"}])
-    before = copy.deepcopy(actor.current_state)
-    batch, items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
-    assert items == [] and any(row["code"] == "UNSUPPORTED_STATE_EFFECT" for row in batch.derivation_report["entries"])
-    assert actor.current_state == before
+    with pytest.raises(ValidationError):
+        WorldResolutionPayload.model_validate({"outcome": "SUCCESS", "outcome_summary": "x", "objective_facts": [{"subject_type": "ENTITY", "subject_id": "door", "predicate": "opened", "value": True, "state_effect": {}}], "actor_observation": None, "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": ["door"], "resolution_basis_summary": None, "missing_information": []})
+
+
+def test_real_heuristic_interact_payload_persists_effect_and_derives_candidate(session, monkeypatch):
+    project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
+    location.profile = {"openable": True, "opened": False, "locked": False}; session.commit()
+    context = {"request": {"kind": "INTERACT", "target_entity_id": location.id}, "target_entity": {"id": location.id, "profile": location.profile}, "location": {"id": location.id, "profile": location.profile}}
+    raw, _ = HeuristicWorldResolver().resolve(context)
+    payload = WorldResolutionPayload.model_validate(raw)
+    assert payload.outcome == ResolutionOutcome.SUCCESS and len(payload.state_effects) == 1
+    resolution.objective_facts = payload.model_dump(mode="json")["objective_facts"]; resolution.state_effects = payload.model_dump(mode="json")["state_effects"]; session.commit()
+    before = copy.deepcopy(location.profile)
+    _batch, items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+    assert items[0].before_value is False and items[0].after_value is True
+    assert session.get(type(location), location.id).profile == before
+
+
+def test_real_heuristic_inspect_and_locked_interact_have_no_delta(session, monkeypatch):
+    project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
+    for request in ({"kind": "INSPECT", "target_entity_id": location.id}, {"kind": "INTERACT", "target_entity_id": location.id}):
+        location.profile = {"inspectable": "red", "locked": True}; session.commit()
+        context = {"request": request, "target_entity": {"id": location.id, "profile": location.profile}, "location": {"id": location.id, "profile": location.profile}}
+        raw, _ = HeuristicWorldResolver().resolve(context); payload = WorldResolutionPayload.model_validate(raw)
+        assert payload.state_effects == []
+        resolution.objective_facts = payload.model_dump(mode="json")["objective_facts"]; resolution.state_effects = payload.model_dump(mode="json")["state_effects"]; resolution.status = ResolutionStatus.VALID; resolution.id = resolution.id
+        session.commit()
+        _batch, items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+        assert items == []
 
 
 def test_observation_only_and_noop_are_suppressed(session, monkeypatch):
     project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
     location.profile = {"locked": True}; session.commit()
-    resolution.objective_facts = [
-        {"subject_type": "ENTITY", "subject_id": location.id, "predicate": "color", "value": "red"},
-        fact_with_effect("ENTITY", location.id, "locked", True, effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True)),
-    ]; session.commit()
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "color", "value": "red"}, {"subject_type": "ENTITY", "subject_id": location.id, "predicate": "locked", "value": True}]
+    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True)]; session.commit()
     batch, items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
-    assert items == [] and len([row for row in batch.derivation_report["entries"] if row["code"] == "NO_STATE_CHANGE"]) == 2
+    assert items == [] and len([row for row in batch.derivation_report["entries"] if row["code"] == "NO_STATE_CHANGE"]) == 1
 
 
 @pytest.mark.parametrize("resolution_status,code", [(ResolutionStatus.REJECTED, "STATE_DELTA_SOURCE_INVALID"), (ResolutionStatus.UNRESOLVED, "STATE_DELTA_SOURCE_UNRESOLVED")])
@@ -134,14 +166,31 @@ def test_source_and_target_project_isolation(session, monkeypatch):
     other_project = Project(name="other"); session.add(other_project); session.flush()
     with pytest.raises(ValueError, match="STATE_DELTA_CROSS_PROJECT_REFERENCE"):
         StateDeltaCandidateBuilder().derive(session, other_project.id, resolution.id)
-    resolution.objective_facts = [fact_with_effect("ENTITY", location.id, "locked", True, effect("WORLD_ENTITY", "missing", "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True))]; session.commit()
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "locked", "value": True}]
+    resolution.state_effects = [effect("WORLD_ENTITY", "missing", "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True)]; session.commit()
     with pytest.raises(ValueError, match="STATE_DELTA_TARGET_NOT_FOUND"):
+        StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+
+
+def test_source_lineage_requires_matching_turn_and_existing_proposal(session, monkeypatch):
+    project, _location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
+    turn = session.get(ScenePerformanceTurn, resolution.performance_turn_id)
+    turn.performance_id = "wrong-performance"; session.commit()
+    with pytest.raises(ValueError, match="STATE_DELTA_SOURCE_LINEAGE_INVALID"):
+        StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
+
+
+def test_source_lineage_requires_existing_proposal(session, monkeypatch):
+    project, _location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
+    performance = session.get(ScenePerformance, resolution.performance_id)
+    performance.scene_proposal_id = "missing-proposal"; session.commit()
+    with pytest.raises(ValueError, match="STATE_DELTA_SOURCE_LINEAGE_INVALID"):
         StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
 
 
 def test_fingerprint_determinism_and_idempotency(session, monkeypatch):
     project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
-    location.profile = {"locked": False}; resolution.objective_facts = [fact_with_effect("ENTITY", location.id, "locked", True, effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True))]; session.commit()
+    location.profile = {"locked": False}; resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "locked", "value": True}]; resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True)]; session.commit()
     first, first_items, first_existing = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id); session.commit()
     second, second_items, second_existing = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
     assert not first_existing and second_existing and first.id == second.id
@@ -149,13 +198,24 @@ def test_fingerprint_determinism_and_idempotency(session, monkeypatch):
     assert session.query(StateDeltaBatch).filter(StateDeltaBatch.project_id == project.id).count() == 1
 
 
+def test_idempotency_is_stable_across_independent_sessions(session, monkeypatch):
+    project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
+    location.profile = {"locked": False}; resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "locked", "value": True}]; resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True)]; session.commit()
+    first, _items, existing = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id); session.commit()
+    other = sessionmaker(bind=session.bind, autoflush=False, expire_on_commit=False)()
+    try:
+        second, _items, existing_second = StateDeltaCandidateBuilder().derive(other, project.id, resolution.id)
+        assert existing is False and existing_second is True and second.id == first.id
+        assert other.query(StateDeltaBatch).filter(StateDeltaBatch.project_id == project.id).count() == 1
+    finally:
+        other.close()
+
+
 def test_multiple_items_have_stable_ordinals(session, monkeypatch):
     project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
     location.profile = {"a": False, "b": False}; session.commit()
-    resolution.objective_facts = [
-        fact_with_effect("ENTITY", location.id, "b", True, effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/b", True)),
-        fact_with_effect("ENTITY", location.id, "a", True, effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/a", True)),
-    ]; session.commit()
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "b", "value": True}, {"subject_type": "ENTITY", "subject_id": location.id, "predicate": "a", "value": True}]
+    resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/b", True), effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/a", True)]; session.commit()
     _batch, items, _ = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)
     assert [item.ordinal for item in items] == [1, 2]
     assert [item.path for item in items] == ["/profile/a", "/profile/b"]
@@ -163,7 +223,7 @@ def test_multiple_items_have_stable_ordinals(session, monkeypatch):
 
 def test_state_delta_api_read_list_and_project_isolation(session, monkeypatch):
     project, location, _actor, _proposal, resolution = resolution_source(session, monkeypatch, [])
-    location.profile = {"locked": False}; resolution.objective_facts = [fact_with_effect("ENTITY", location.id, "locked", True, effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True))]; session.commit()
+    location.profile = {"locked": False}; resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "locked", "value": True}]; resolution.state_effects = [effect("WORLD_ENTITY", location.id, "WORLD_ENTITY_PROFILE", "SET", "/profile/locked", True)]; session.commit()
     client = client_for(session, monkeypatch)
     monkeypatch.setattr(api, "get_model_provider", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("provider must not run")))
     created = client.post(f"/projects/{project.id}/state-delta-batches/derive", json={"source_resolution_id": resolution.id})

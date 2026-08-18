@@ -341,6 +341,7 @@ class WorldResolution(Base):
     outcome: Mapped[ResolutionOutcome] = mapped_column(Enum(ResolutionOutcome), nullable=False)
     outcome_summary: Mapped[str] = mapped_column(Text, nullable=False)
     objective_facts: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    state_effects: Mapped[list[Any]] = mapped_column(JSON, default=list, server_default=text("'[]'"), nullable=False)
     actor_observation: Mapped[str | None] = mapped_column(Text)
     public_observation: Mapped[str | None] = mapped_column(Text)
     recipient_character_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
