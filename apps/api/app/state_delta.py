@@ -43,8 +43,19 @@ def state_delta_item_fingerprint(project_id: str, resolution_id: str, turn_id: s
         "project_id": project_id, "source_resolution_id": resolution_id, "source_turn_id": turn_id,
         "target_type": effect.target_type.value, "target_id": effect.target_id,
         "domain": effect.domain.value, "operation": effect.operation.value, "path": effect.path,
-        "before": before, "after": after, "evidence": evidence,
+        "before": _semantic_json(before), "after": _semantic_json(after), "evidence": _semantic_json(evidence),
     }, "state-delta-item-v1")
+
+
+def _semantic_json(value: Any) -> Any:
+    """Normalize JSON-equivalent numeric values across SQLite and PostgreSQL."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, list):
+        return [_semantic_json(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _semantic_json(item) for key, item in value.items()}
+    return value
 
 
 def compute_state_delta_after(before: Any, found: bool, effect: StateEffectPayload) -> Any:

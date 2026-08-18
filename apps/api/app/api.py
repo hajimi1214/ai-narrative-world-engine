@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -29,6 +29,7 @@ from .replay import ReplayService
 from .historical import SceneStateCheckpointService
 from .state_delta import StateDeltaCandidateBuilder
 from .state_delta_validation import StateDeltaValidator
+from .scene_commit import SceneCommitService
 
 router = APIRouter()
 
@@ -145,6 +146,33 @@ def validate_state_delta_batch(project_id: str, batch_id: str, db: Session = Dep
     except LookupError as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+@router.post("/projects/{project_id}/performances/{performance_id}/commit-scene")
+def commit_scene(project_id: str, performance_id: str, db: Session = Depends(get_db)):
+    try:
+        result = SceneCommitService().commit(db, project_id, performance_id)
+        if not result.idempotent:
+            db.commit()
+            db.refresh(result.commit)
+        return {
+            "scene": record_dict(result.scene),
+            "scene_commit": record_dict(result.commit),
+            "delta_batches": [state_delta_batch_payload(db, batch) for batch in result.batches],
+            "checkpoint": record_dict(result.checkpoint),
+            "idempotent": result.idempotent,
+        }
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "SCENE_COMMIT_INTEGRITY_ERROR"}) from exc
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "SCENE_COMMIT_FAILED"}) from exc
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc

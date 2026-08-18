@@ -34,14 +34,15 @@ class StateDeltaBatchStatus(str, enum.Enum): CANDIDATE = "CANDIDATE"; VALIDATED 
 class StateDeltaTargetType(str, enum.Enum): CHARACTER = "CHARACTER"; WORLD_ENTITY = "WORLD_ENTITY"; STORY_THREAD = "STORY_THREAD"; PROJECT = "PROJECT"
 class StateDeltaDomain(str, enum.Enum): CHARACTER_LOCATION = "CHARACTER_LOCATION"; CHARACTER_INVENTORY = "CHARACTER_INVENTORY"; CHARACTER_RELATIONSHIP = "CHARACTER_RELATIONSHIP"; CHARACTER_PHYSICAL_STATE = "CHARACTER_PHYSICAL_STATE"; CHARACTER_EMOTIONAL_STATE = "CHARACTER_EMOTIONAL_STATE"; CHARACTER_CURRENT_STATE = "CHARACTER_CURRENT_STATE"; WORLD_ENTITY_PROFILE = "WORLD_ENTITY_PROFILE"; WORLD_ENTITY_ACTIVE = "WORLD_ENTITY_ACTIVE"; STORY_THREAD_STATE = "STORY_THREAD_STATE"; STORY_THREAD_STATUS = "STORY_THREAD_STATUS"; STORY_THREAD_PROGRESS = "STORY_THREAD_PROGRESS"; WORLD_TIME = "WORLD_TIME"
 class StateDeltaOperation(str, enum.Enum): SET = "SET"; ADD = "ADD"; REMOVE = "REMOVE"; UPSERT = "UPSERT"
+class SceneCommitStatus(str, enum.Enum): PENDING = "PENDING"; COMMITTED = "COMMITTED"
 class RevisionStatus(str, enum.Enum): DRAFT = "DRAFT"; PREVIEWED = "PREVIEWED"; STALE = "STALE"; CANCELLED = "CANCELLED"; APPLIED = "APPLIED"; ROLLED_BACK = "ROLLED_BACK"
-class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVISION"; POST_REVISION="POST_REVISION"; ROLLBACK_POINT="ROLLBACK_POINT"; PRE_REPLAY_COMMIT="PRE_REPLAY_COMMIT"; POST_REPLAY_COMMIT="POST_REPLAY_COMMIT"
+class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVISION"; POST_REVISION="POST_REVISION"; ROLLBACK_POINT="ROLLBACK_POINT"; PRE_REPLAY_COMMIT="PRE_REPLAY_COMMIT"; POST_REPLAY_COMMIT="POST_REPLAY_COMMIT"; PRE_SCENE_COMMIT="PRE_SCENE_COMMIT"; POST_SCENE_COMMIT="POST_SCENE_COMMIT"
 class RevisionApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED="APPLIED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
 class RetconApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED_PENDING_REPLAY="APPLIED_PENDING_REPLAY"; REPLAY_COMPLETED="REPLAY_COMPLETED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
 class RetconCognitionInvalidationStatus(str, enum.Enum): ACTIVE="ACTIVE"; RESOLVED="RESOLVED"; ROLLED_BACK="ROLLED_BACK"
 class ReplaySessionStatus(str, enum.Enum): READY="READY"; RUNNING="RUNNING"; BLOCKED="BLOCKED"; COMPLETED="COMPLETED"; ABORTED="ABORTED"
 class ReplaySceneRunStatus(str, enum.Enum): PENDING="PENDING"; RUNNING="RUNNING"; VALIDATED="VALIDATED"; BLOCKED="BLOCKED"; COMMITTED="COMMITTED"
-class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; WRITER="WRITER"; CRITIC="CRITIC"
+class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; SCENE_COMMIT="SCENE_COMMIT"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
@@ -374,6 +375,9 @@ class StateDeltaBatch(Base):
     validation_fingerprint: Mapped[str | None] = mapped_column(String(120))
     validated_world_fingerprint: Mapped[str | None] = mapped_column(String(120))
     validation_completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    applied_scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id"), index=True)
+    applied_commit_id: Mapped[str | None] = mapped_column(ForeignKey("scene_commits.id"), index=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class StateDeltaItem(Base):
@@ -396,6 +400,32 @@ class StateDeltaItem(Base):
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     semantic_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class SceneCommit(Base):
+    __tablename__ = "scene_commits"
+    __table_args__ = (
+        UniqueConstraint("project_id", "performance_id", name="uq_scene_commit_project_performance"),
+        UniqueConstraint("scene_id", name="uq_scene_commit_scene"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    proposal_id: Mapped[str] = mapped_column(ForeignKey("scene_proposals.id"), nullable=False)
+    performance_id: Mapped[str] = mapped_column(ForeignKey("scene_performances.id"), nullable=False)
+    scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id"))
+    status: Mapped[SceneCommitStatus] = mapped_column(Enum(SceneCommitStatus, native_enum=False, length=20), default=SceneCommitStatus.PENDING, server_default=text("'PENDING'"), nullable=False, index=True)
+    delta_batch_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, server_default=text("'[]'"), nullable=False)
+    pre_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("world_snapshots.id"))
+    post_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("world_snapshots.id"))
+    checkpoint_id: Mapped[str | None] = mapped_column(ForeignKey("scene_state_checkpoints.id"))
+    pre_world_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    post_world_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    source_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    commit_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    applied_delta_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    created_knowledge_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    created_memory_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 class WorldRevision(TimestampMixin, Base):
     __tablename__ = "world_revisions"

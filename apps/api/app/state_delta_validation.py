@@ -131,8 +131,7 @@ class StateDeltaValidator:
                 self._issue(issues, "STATE_DELTA_PATH_UNRESOLVED", item)
         for item, effect in valid_items:
             self._validate_domain(db, view, batch, item, effect, issues)
-        self._validate_final_world(view, issues)
-        self._validate_canon(db, view, items, issues)
+        issues.extend(self.validate_final_overlay(db, view, items))
 
         issues = self._sorted_issues(issues)
         report = {
@@ -159,6 +158,13 @@ class StateDeltaValidator:
         db.add(batch)
         db.flush()
         return ValidationResult(batch, report, False)
+
+    def validate_final_overlay(self, db: Session, view: StateDeltaValidationWorldView, items: list[StateDeltaItem]) -> list[dict[str, Any]]:
+        """Shared candidate-world invariants for one batch or a combined scene commit."""
+        issues: list[dict[str, Any]] = []
+        self._validate_final_world(view, issues)
+        self._validate_canon(db, view, items, issues)
+        return self._sorted_issues(issues)
 
     def _source(self, db: Session, batch: StateDeltaBatch, issues: list[dict[str, Any]]):
         if batch.source_type != "WORLD_RESOLUTION" or batch.source_id != batch.source_resolution_id:
