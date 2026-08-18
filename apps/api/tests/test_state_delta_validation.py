@@ -392,3 +392,58 @@ def test_core_canon_and_unstructured_canon_rules(canon_data, value, conflict, se
         assert "STATE_DELTA_CANON_CONFLICT" in issue_codes(response.json())
     else:
         assert "STATE_DELTA_CANON_CONFLICT" not in issue_codes(response.json())
+
+
+def nested_canon_batch(session, project, location, resolution, effects):
+    location.profile = {
+        "opened": False,
+        "locked": False,
+        "security": {"locked": True, "alarm": True},
+    }
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "security", "value": location.profile["security"]}]
+    resolution.state_effects = effects
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]
+    session.commit()
+    return batch
+
+
+@pytest.mark.parametrize("canon_path, expected, effect_path, effect_value, conflict", [
+    ("/profile/security", {"locked": True, "alarm": True}, "/profile/security/locked", False, True),
+    ("/profile/security/locked", True, "/profile/security", {"locked": False, "alarm": True}, True),
+    ("/profile/security/locked", True, "/profile/security/alarm", False, False),
+    ("/profile/security/locked", True, "/profile/security", {"locked": True, "alarm": False}, False),
+])
+def test_structured_canon_uses_final_overlay_for_nested_paths(canon_path, expected, effect_path, effect_value, conflict, session, monkeypatch):
+    project, location, _actor, _other, _proposal, _performance, _turn, resolution, _batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
+    session.add(CanonFact(project_id=project.id, fact_type=CanonType.CORE_CANON, proposition="Structured Canon", data={"target_type": "WORLD_ENTITY", "target_id": location.id, "path": canon_path, "value": expected}, locked=True))
+    batch = nested_canon_batch(session, project, location, resolution, [make_effect(location.id, path=effect_path, value=effect_value)])
+    response = validate(client, project, batch)
+    if conflict:
+        assert "STATE_DELTA_CANON_CONFLICT" in issue_codes(response.json())
+    else:
+        assert response.json()["status"] == "VALIDATED"
+
+
+def test_legacy_structured_canon_reads_final_overlay(session, monkeypatch):
+    project, location, _actor, _other, _proposal, _performance, _turn, resolution, _batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
+    location.profile = {"opened": False, "locked": True}
+    resolution.objective_facts = [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "locked", "value": False}]
+    resolution.state_effects = [make_effect(location.id, path="/profile/locked", value=False)]
+    session.add(CanonFact(project_id=project.id, fact_type=CanonType.CORE_CANON, proposition="Legacy structured Canon", data={"subject_type": "ENTITY", "subject_id": location.id, "predicate": "locked", "value": True}, locked=True))
+    session.commit()
+    batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]
+    session.commit()
+    assert "STATE_DELTA_CANON_CONFLICT" in issue_codes(validate(client, project, batch).json())
+
+
+def test_secret_nested_canon_conflict_is_redacted(session, monkeypatch):
+    project, location, _actor, _other, _proposal, _performance, _turn, resolution, _batch, client = source_fixture(session, monkeypatch, effects=[], facts=[])
+    secret = "SECRET SECURITY CONFIGURATION"
+    session.add(CanonFact(project_id=project.id, fact_type=CanonType.SECRET_CANON, proposition=secret, data={"target_type": "WORLD_ENTITY", "target_id": location.id, "path": "/profile/security", "value": {"locked": True, "alarm": True}}, locked=True))
+    batch = nested_canon_batch(session, project, location, resolution, [make_effect(location.id, path="/profile/security/locked", value=False)])
+    body = validate(client, project, batch).json()
+    conflicts = [issue for issue in body["validation_report"]["issues"] if issue["code"] == "STATE_DELTA_CANON_CONFLICT"]
+    assert len(conflicts) == 1
+    assert secret not in str(body)
+    assert conflicts[0]["details"] == {}

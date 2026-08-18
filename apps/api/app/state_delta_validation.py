@@ -132,7 +132,7 @@ class StateDeltaValidator:
         for item, effect in valid_items:
             self._validate_domain(db, view, batch, item, effect, issues)
         self._validate_final_world(view, issues)
-        self._validate_canon(db, view, valid_items, issues)
+        self._validate_canon(db, view, items, issues)
 
         issues = self._sorted_issues(issues)
         report = {
@@ -336,24 +336,33 @@ class StateDeltaValidator:
             if len(owners) > 1:
                 self._issue(issues, "STATE_DELTA_ITEM_MULTIPLE_OWNERS", related_ids=[item_id, *sorted(owners)])
 
-    def _validate_canon(self, db: Session, view: StateDeltaValidationWorldView, items: list[tuple[StateDeltaItem, StateEffectPayload]], issues: list[dict[str, Any]]) -> None:
+    def _validate_canon(self, db: Session, view: StateDeltaValidationWorldView, items: list[StateDeltaItem], issues: list[dict[str, Any]]) -> None:
         canons = db.scalars(select(CanonFact).where(CanonFact.project_id == view.project["id"])).all()
         for canon in canons:
             if not canon.locked and canon.fact_type not in {CanonType.CORE_CANON, CanonType.SECRET_CANON}:
                 continue
-            data = canon.data or {}
-            target_type = data.get("target_type")
-            target_id = data.get("target_id")
-            path = data.get("path")
-            expected = data.get("value")
-            if not (target_type and target_id and path):
-                if data.get("subject_type") == "ENTITY" and data.get("subject_id") and data.get("predicate"):
-                    target_type, target_id, path, expected = "WORLD_ENTITY", data["subject_id"], f"/profile/{data['predicate']}", data.get("value")
-                else:
-                    continue
-            for item, _effect in items:
-                if item.target_type.value == target_type and item.target_id == target_id and item.path == path and item.after_value != expected:
-                    self._issue(issues, "STATE_DELTA_CANON_CONFLICT", item, [canon.id, target_id], "Structured Canon conflicts with the candidate world state.")
+            scope = _structured_canon_scope(canon)
+            if scope is None:
+                continue
+            target_type, target_id, path, expected = scope
+            affected = [
+                item for item in items
+                if item.target_type == target_type
+                and item.target_id == target_id
+                and _paths_overlap(item.path, path)
+            ]
+            if not affected:
+                continue
+            document = view.document(target_type, target_id)
+            found, final_value = read_overlay_path(document, path)
+            if not found or final_value != expected:
+                self._issue(
+                    issues,
+                    "STATE_DELTA_CANON_CONFLICT",
+                    affected[0],
+                    [canon.id, target_id],
+                    "Structured Canon conflicts with the candidate world state.",
+                )
 
     def _issue(self, issues: list[dict[str, Any]], code: str, item: StateDeltaItem | None = None, related_ids: list[str] | None = None, message: str | None = None) -> None:
         issues.append({"code": code, "severity": "BLOCKING", "item_id": item.id if item else None, "ordinal": item.ordinal if item else None, "message": message or code.replace("_", " ").title(), "related_ids": sorted(related_ids or []), "details": {}})
@@ -372,6 +381,54 @@ def _item_ref(value: Any) -> str | None:
 
 def _value(value: Any) -> Any:
     return value.value if hasattr(value, "value") else value
+
+
+def read_overlay_path(document: dict[str, Any] | None, path: str) -> tuple[bool, Any]:
+    """Read an RFC6901 path from an in-memory candidate overlay without mutation."""
+    if document is None:
+        return False, None
+    try:
+        parts = _pointer(path)
+    except ValueError:
+        return False, None
+    current: Any = document
+    for part in parts:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and part.isdigit() and 0 <= int(part) < len(current):
+            current = current[int(part)]
+        else:
+            return False, None
+    return True, copy.deepcopy(current)
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    """Whether either RFC6901 path is an ancestor of the other."""
+    try:
+        left_parts = _pointer(left)
+        right_parts = _pointer(right)
+    except ValueError:
+        return False
+    return left_parts[:len(right_parts)] == right_parts or right_parts[:len(left_parts)] == left_parts
+
+
+def _structured_canon_scope(canon: CanonFact) -> tuple[StateDeltaTargetType, str, str, Any] | None:
+    data = canon.data or {}
+    target_type = data.get("target_type")
+    target_id = data.get("target_id")
+    path = data.get("path")
+    expected = data.get("value")
+    if not (target_type and target_id and path and "value" in data):
+        if data.get("subject_type") != "ENTITY" or not data.get("subject_id") or not data.get("predicate") or "value" not in data:
+            return None
+        target_type = StateDeltaTargetType.WORLD_ENTITY
+        target_id = data["subject_id"]
+        path = f"/profile/{data['predicate']}"
+        expected = data["value"]
+    try:
+        return StateDeltaTargetType(_value(target_type)), target_id, path, expected
+    except (TypeError, ValueError):
+        return None
 
 
 def _time(value: Any) -> datetime | None:
