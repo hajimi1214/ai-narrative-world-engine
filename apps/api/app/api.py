@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -26,7 +26,7 @@ from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_
 from .retcon import RetconImpactPlanner, RetconPlanStalenessChecker, CLASSIFICATION_LABELS, semantic_fingerprint
 from .retcon_apply import RetconApplyService, RetconPendingReplayGuard, RetconAuthorOverrideResolver, has_pending_replay
 from .replay import ReplayService
-from .historical import SceneStateCheckpointService
+from .historical import SceneStateCheckpointService, CurrentSceneCheckpointResolver
 from .state_delta import StateDeltaCandidateBuilder
 from .state_delta_validation import StateDeltaValidator
 from .scene_commit import SceneCommitService
@@ -100,6 +100,23 @@ def get_db():
 def state_delta_batch_payload(db: Session, batch: StateDeltaBatch) -> dict[str, Any]:
     items = db.scalars(select(StateDeltaItem).where(StateDeltaItem.batch_id == batch.id).order_by(StateDeltaItem.ordinal, StateDeltaItem.id)).all()
     return record_dict(batch) | {"items": [record_dict(item) for item in items]}
+
+def scene_checkpoint_payload(checkpoint: SceneStateCheckpoint) -> dict[str, Any]:
+    """Metadata only: checkpoint snapshots may contain secret canon/cognition."""
+    return {
+        "id": checkpoint.id, "project_id": checkpoint.project_id, "scene_id": checkpoint.scene_id,
+        "sequence": checkpoint.sequence, "version": checkpoint.version, "active": checkpoint.active,
+        "origin": getattr(checkpoint.origin, "value", checkpoint.origin),
+        "capture_protocol_version": checkpoint.capture_protocol_version,
+        "pre_snapshot_id": checkpoint.pre_snapshot_id, "post_snapshot_id": checkpoint.post_snapshot_id,
+        "pre_state_fingerprint": checkpoint.pre_state_fingerprint,
+        "post_state_fingerprint": checkpoint.post_state_fingerprint,
+        "checkpoint_fingerprint": checkpoint.checkpoint_fingerprint,
+        "source_scene_commit_id": checkpoint.source_scene_commit_id,
+        "source_replay_session_id": checkpoint.source_replay_session_id,
+        "supersedes_checkpoint_id": checkpoint.supersedes_checkpoint_id,
+        "created_at": checkpoint.created_at,
+    }
 
 @router.post("/projects/{project_id}/state-delta-batches/derive", status_code=status.HTTP_201_CREATED)
 def derive_state_delta_batch(project_id: str, payload: StateDeltaDerivePayload, db: Session = Depends(get_db)):
@@ -176,6 +193,23 @@ def commit_scene(project_id: str, performance_id: str, db: Session = Depends(get
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+@router.get("/projects/{project_id}/scenes/{scene_id}/checkpoint")
+def get_current_scene_checkpoint(project_id: str, scene_id: str, db: Session = Depends(get_db)):
+    scene = db.get(Scene, scene_id)
+    if not scene or scene.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Scene not found")
+    try:
+        return scene_checkpoint_payload(CurrentSceneCheckpointResolver().current(db, project_id, scene_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if str(exc) == "SCENE_CHECKPOINT_MISSING" else 409, detail={"code": str(exc)}) from exc
+
+@router.get("/projects/{project_id}/scenes/{scene_id}/checkpoints")
+def list_scene_checkpoints(project_id: str, scene_id: str, db: Session = Depends(get_db)):
+    scene = db.get(Scene, scene_id)
+    if not scene or scene.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Scene not found")
+    return [scene_checkpoint_payload(row) for row in CurrentSceneCheckpointResolver().history(db, project_id, scene_id)]
 
 @router.post("/projects/{project_id}/retcon/requests", status_code=status.HTTP_201_CREATED)
 def create_retcon_request(project_id: str, payload: RetconRequestPayload, db: Session = Depends(get_db)):

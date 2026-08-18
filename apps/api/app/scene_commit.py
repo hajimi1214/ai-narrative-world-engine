@@ -31,6 +31,7 @@ from .state_delta import (
 from .state_delta_validation import StateDeltaValidationWorldView, StateDeltaValidator, normalize_world_time
 from .state_effect_contract import StateEffectPayload
 from .versioning import WorldSnapshotBuilder
+from .historical import SceneCheckpointService, SceneCheckpointOrigin
 
 
 @dataclass
@@ -355,7 +356,9 @@ class SceneCommitService:
         prepared = self.preflight(db, project_id, performance_id)
         if isinstance(prepared, SceneCommitResult):
             return prepared
-        pre_snapshot = WorldSnapshotBuilder().create(db, project_id, SnapshotType.PRE_SCENE_COMMIT)
+        # PRE_SCENE_COMMIT remains the global legacy audit boundary.  The
+        # current-history boundary is always the v3 service checkpoint.
+        pre_snapshot = SceneCheckpointService().capture_formal_pre(db, project_id)
         record = SceneCommit(project_id=project_id, proposal_id=prepared.proposal.id, performance_id=prepared.performance.id, status=SceneCommitStatus.PENDING, delta_batch_ids=[batch.id for batch in prepared.batches], pre_snapshot_id=pre_snapshot.id, pre_world_fingerprint=prepared.pre_fingerprint, source_fingerprint=prepared.source_fingerprint)
         db.add(record)
         db.flush()
@@ -392,10 +395,8 @@ class SceneCommitService:
             sibling.status = PerformanceStatus.INVALIDATED
             sibling.stop_reason = "PROPOSAL_EXECUTED"
         db.flush()
-        post_snapshot = WorldSnapshotBuilder().create(db, project_id, SnapshotType.POST_SCENE_COMMIT)
-        checkpoint = SceneStateCheckpoint(project_id=project_id, scene_id=scene.id, sequence=scene.sequence, pre_snapshot_id=pre_snapshot.id, post_snapshot_id=post_snapshot.id, current_scene_id=scene.id, capture_protocol_version=2)
-        db.add(checkpoint)
-        db.flush()
+        post_snapshot = SceneCheckpointService().finalize_formal_post(db, project_id)
+        checkpoint = SceneCheckpointService().create_from_snapshots(db, project_id, scene, pre_snapshot, post_snapshot, origin=SceneCheckpointOrigin.NORMAL_COMMIT, source_scene_commit_id=record.id)
         _, post_fingerprint = WorldSnapshotBuilder().build(db, project_id)
         record.scene_id = scene.id
         record.post_snapshot_id = post_snapshot.id

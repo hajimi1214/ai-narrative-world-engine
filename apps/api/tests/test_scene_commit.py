@@ -22,6 +22,7 @@ from app.models import (
     StoryThread, ThreadStatus, WorldEntity, WorldResolution, WorldSnapshot,
 )
 from app.scene_commit import SceneCommitService
+from app.historical import SceneCheckpointIntegrityValidator
 from app.state_delta import StateDeltaCandidateBuilder
 from app.state_delta_validation import StateDeltaValidator
 from app.world_resolution import WorldResolutionPayload
@@ -166,7 +167,9 @@ def test_commit_scene_applies_validated_entity_delta_and_materializes_history(se
     assert batch.status == StateDeltaBatchStatus.APPLIED and batch.applied_scene_id == body["scene"]["id"]
     assert performance.status == PerformanceStatus.COMPLETED and proposal.status == ProposalStatus.EXECUTED
     assert session.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == body["scene"]["id"], SceneExecutionBinding.active.is_(True)))
-    assert session.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.scene_id == body["scene"]["id"]))
+    checkpoint = session.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.scene_id == body["scene"]["id"]))
+    assert checkpoint.capture_protocol_version == 3 and checkpoint.version == 1 and checkpoint.active is True
+    assert checkpoint.origin == "NORMAL_COMMIT" and checkpoint.source_scene_commit_id == body["scene_commit"]["id"]
 
 
 def test_commit_scene_is_idempotent(session, monkeypatch):
@@ -379,6 +382,20 @@ def test_commit_checkpoint_contains_pre_and_post_formal_world(session, monkeypat
     assert any(row["id"] == body["scene"]["id"] for row in post.payload["scenes"])
     assert not any(row.get("source") == body["scene"]["id"] for row in pre.payload["character_knowledge"])
     assert any(row.get("character_id") == actor.id and row.get("source") == body["scene"]["id"] for row in post.payload["character_knowledge"])
+    assert checkpoint.pre_state_fingerprint == pre.state_fingerprint
+    assert checkpoint.post_state_fingerprint == post.state_fingerprint
+    assert checkpoint.checkpoint_fingerprint
+    SceneCheckpointIntegrityValidator().validate_integrity(session, checkpoint)
+
+
+def test_checkpoint_read_api_is_metadata_only(session, monkeypatch):
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    committed = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()
+    current = client.get(f"/projects/{project.id}/scenes/{committed['scene']['id']}/checkpoint")
+    history = client.get(f"/projects/{project.id}/scenes/{committed['scene']['id']}/checkpoints")
+    assert current.status_code == history.status_code == 200
+    assert current.json()["id"] == committed["checkpoint"]["id"] and current.json()["capture_protocol_version"] == 3
+    assert "payload" not in current.json() and [row["version"] for row in history.json()] == [1]
 
 
 def test_commit_invalidates_sibling_performances(session, monkeypatch):
