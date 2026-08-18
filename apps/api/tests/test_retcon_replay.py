@@ -42,7 +42,7 @@ def historical_replay_world(session, monkeypatch):
     actor.current_state = {"location_id": location_id}; actor.inventory = []; actor.relationships = {"trust": 0.2}; actor.physical_state = {"condition": "healthy"}; actor.emotional_state = {"mood": "calm"}; knowledge.source = scene.id
     pre = SceneStateCheckpointService().capture_pre(session, project.id, scene.id)
     proposal = session.query(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first()
-    decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=actor.id, context_fingerprint="historical", decision_type=CharacterDecisionType.OBSERVE, intent="observe", chosen_action="observe", target_character_id=None, target_entity_id=None, motivation="historical", goal_refs=[], knowledge_used=[], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, perceived_risk=None, accepted_cost=None, expected_personal_result=None, uncertainties=[], refused_options=[], boundary_override_reason=None, decision_summary="historical", status=CharacterDecisionStatus.VALID)
+    decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=actor.id, context_fingerprint="historical", decision_type=CharacterDecisionType.OBSERVE, intent="observe", chosen_action="observe", target_character_id=None, target_entity_id=None, motivation="historical", goal_refs=[], knowledge_used=[{"knowledge_id": knowledge.id, "proposition": knowledge.proposition}], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, perceived_risk=None, accepted_cost=None, expected_personal_result=None, uncertainties=[], refused_options=[], boundary_override_reason=None, decision_summary="historical", status=CharacterDecisionStatus.VALID)
     performance = ScenePerformance(project_id=project.id, scene_proposal_id=proposal.id, take_number=77, proposal_context_fingerprint="historical", mode=PerformanceMode.HEURISTIC, status=PerformanceStatus.COMPLETED, participant_order=[actor.id], active_participant_ids=[actor.id], max_turns=1, turn_count=1)
     session.add_all([decision, performance]); session.flush()
     turn = ScenePerformanceTurn(project_id=project.id, performance_id=performance.id, sequence=1, actor_character_id=actor.id, actor_context_fingerprint="historical", character_decision_id=decision.id, action_visibility=ActionVisibility.PRIVATE, observable_action="observe", spoken_content=None, recipient_character_ids=[], requires_world_resolution=False, world_resolution_request=None, validation_result={"valid": True})
@@ -77,6 +77,46 @@ def test_historical_fixture_replay_context_excludes_future_character_state(sessi
     assert context["character"]["relationships"] == {}
     assert context["character"]["physical_state"] == {"condition": "healthy"}
     assert context["character"]["emotional_state"] == {"mood": "calm"}
+
+def test_historical_execution_atomic_failure_rolls_back_all_formal_rows(session, monkeypatch):
+    project, scene, _actor, _proposal, client, application_id = historical_replay_world(session, monkeypatch)
+    created = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    while True:
+        state = client.get(f"/projects/{project.id}/retcon/replay-sessions/{session_id}").json()
+        if state["cursor"] >= len(state["queue"]): break
+        stepped = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step")
+        assert stepped.status_code == 200, stepped.text
+    counts = {model: session.query(model).count() for model in (Scene, ScenePerformance, CharacterDecision, ScenePerformanceTurn, CharacterKnowledge, CharacterMemory, SceneExecutionBinding)}
+    old_binding = session.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
+    monkeypatch.setattr(ReplayService, "failure_injector", lambda stage: (_ for _ in ()).throw(RuntimeError("TEST_REPLAY_COMMIT_FAILURE")) if stage == "AFTER_FORMAL_MATERIALIZATION" else None)
+    response = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/commit", json={"explicit_confirmation": True})
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "REPLAY_COMMIT_FAILED"
+    session.expire_all()
+    assert {model: session.query(model).count() for model in counts} == counts
+    assert session.get(Scene, scene.id).history_status == "ACTIVE"
+    assert session.get(SceneExecutionBinding, old_binding.id).active is True
+    assert session.query(WorldSnapshot).filter(WorldSnapshot.snapshot_type.in_(["PRE_REPLAY_COMMIT", "POST_REPLAY_COMMIT"])).count() == 0
+
+def test_historical_execution_commit_materializes_replay_lineage(session, monkeypatch):
+    project, scene, _actor, _proposal, client, application_id = historical_replay_world(session, monkeypatch)
+    created = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    while True:
+        state = client.get(f"/projects/{project.id}/retcon/replay-sessions/{session_id}").json()
+        if state["cursor"] >= len(state["queue"]): break
+        assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step").status_code == 200
+    committed = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/commit", json={"explicit_confirmation": True})
+    assert committed.status_code == 200, committed.text
+    session.expire_all(); old = session.get(Scene, scene.id); replacement = session.get(Scene, old.superseded_by_scene_id)
+    assert old.history_status == "SUPERSEDED" and replacement.history_status == "ACTIVE"
+    new_decision = session.scalar(select(CharacterDecision).where(CharacterDecision.replay_session_id == session_id))
+    new_turn = session.scalar(select(ScenePerformanceTurn).where(ScenePerformanceTurn.replay_session_id == session_id))
+    assert new_decision and new_turn and new_turn.replay_of_id and new_turn.character_decision_id == new_decision.id
+    assert session.get(RetconApplication, application_id).status == RetconApplicationStatus.REPLAY_COMPLETED
+    assert session.get(RetconReplaySession, session_id).status == "COMPLETED"
 
 def test_replay_session_initial_queue_is_frozen_and_deterministic(session, monkeypatch):
     values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
