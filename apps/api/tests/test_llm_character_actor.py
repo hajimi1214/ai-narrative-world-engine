@@ -88,7 +88,7 @@ def test_initial_request_contains_explicit_output_contract():
     LLMCharacterActor(provider, "test").decide({"character": {"name": "Ning Mo"}})
     request = json.loads(provider.messages[0][1]["content"])
     assert request["actor_view"]["character"]["name"] == "Ning Mo"
-    assert request["output_contract"]["fields"]["knowledge_used"]["item"]["proposition"] == "string"
+    assert request["output_contract"]["fields"]["knowledge_used"]["item"]["knowledge_id"] == "string"
     assert request["output_contract"]["fields"]["decision_type"]["allowed_values"] == ["ACT", "WAIT", "ASK", "INVESTIGATE", "CONFRONT", "WITHDRAW", "REFUSE", "HELP", "HIDE", "NEGOTIATE", "OBSERVE", "CUSTOM"]
 
 
@@ -135,8 +135,8 @@ def test_llm_actor_rejects_two_invalid_json_outputs():
 
 
 @pytest.mark.parametrize("payload,code", [
-    (valid_payload(knowledge_used=[{"proposition": "invented fact", "accepted_statuses": ["KNOWN"]}]), "KNOWLEDGE_LEAK"),
-    (valid_payload(memory_refs=["foreign-memory"]), "FOREIGN_MEMORY"),
+    (valid_payload(knowledge_used=[{"knowledge_id": "invented", "proposition": "invented fact", "accepted_statuses": ["KNOWN"]}]), "KNOWLEDGE_NOT_RECALLED"),
+    (valid_payload(memory_refs=["foreign-memory"]), "MEMORY_NOT_RECALLED"),
     (valid_payload(inventory_refs=["missing-item"]), "INVENTORY_MISSING"),
     (valid_payload(ability_refs=["unknown"]), "ABILITY_UNKNOWN"),
     (valid_payload(ability_refs=["sealed"]), "ABILITY_UNAVAILABLE"),
@@ -151,12 +151,12 @@ def test_llm_payload_constraints_block_invalid_references(session, payload, code
 
 def test_llm_allows_refuse_and_false_belief_only_when_explicit(session):
     project, _, actor, _, _, proposal = seed(session)
-    session.add(CharacterKnowledge(character_id=actor.id, proposition="Liu Bai is harmless", status=KnowledgeStatus.FALSE_BELIEF)); session.commit()
+    belief = CharacterKnowledge(character_id=actor.id, proposition="Liu Bai is harmless", status=KnowledgeStatus.FALSE_BELIEF); session.add(belief); session.commit()
     ctx = context(session, project, actor, proposal)
-    allowed, _ = LLMCharacterActor(FakeModelProvider(valid_payload(decision_type="REFUSE", knowledge_used=[{"proposition": "Liu Bai is harmless", "accepted_statuses": ["FALSE_BELIEF"]}])), "test").decide({})
-    disguised, _ = LLMCharacterActor(FakeModelProvider(valid_payload(knowledge_used=[{"proposition": "Liu Bai is harmless", "accepted_statuses": ["KNOWN"]}])), "test").decide({})
-    assert not any(issue.code == "KNOWLEDGE_LEAK" for issue in CharacterDecisionConstraintChecker().validate(session, ctx, decision(project, actor, proposal, ctx, **allowed)).issues)
-    assert any(issue.code == "KNOWLEDGE_LEAK" for issue in CharacterDecisionConstraintChecker().validate(session, ctx, decision(project, actor, proposal, ctx, **disguised)).issues)
+    allowed, _ = LLMCharacterActor(FakeModelProvider(valid_payload(decision_type="REFUSE", knowledge_used=[{"knowledge_id": belief.id, "proposition": belief.proposition, "accepted_statuses": ["FALSE_BELIEF"]}])), "test").decide({})
+    disguised, _ = LLMCharacterActor(FakeModelProvider(valid_payload(knowledge_used=[{"knowledge_id": belief.id, "proposition": belief.proposition, "accepted_statuses": ["KNOWN"]}])), "test").decide({})
+    assert not any(issue.code == "KNOWLEDGE_NOT_RECALLED" for issue in CharacterDecisionConstraintChecker().validate(session, ctx, decision(project, actor, proposal, ctx, **allowed)).issues)
+    assert any(issue.code == "KNOWLEDGE_NOT_RECALLED" for issue in CharacterDecisionConstraintChecker().validate(session, ctx, decision(project, actor, proposal, ctx, **disguised)).issues)
 
 
 def test_ai_dry_run_uses_fake_provider_and_only_adds_decision(session, monkeypatch):

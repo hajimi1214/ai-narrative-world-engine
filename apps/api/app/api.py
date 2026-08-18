@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .db import SessionLocal
 from .director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector
-from .character_mind import ActiveCharacterCognitionReader, ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor
+from .character_mind import ActiveCharacterCognitionReader, ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, CharacterMindViewBuilder, HeuristicCharacterActor
 from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MODEL_OUTPUT_INVALID, ModelProviderError
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
@@ -665,6 +665,22 @@ def create_character_memory(character_id: str, payload: Payload, db: Session = D
     if not character: raise HTTPException(status_code=404, detail="Character not found")
     ensure_replay_not_pending(db, character.project_id)
     return record_dict(create_record(db, CharacterMemory, payload.model_dump() | {"character_id": character_id}))
+
+@router.get("/projects/{project_id}/characters/{character_id}/mind")
+def character_mind_view(project_id: str, character_id: str, proposal_id: str | None = Query(default=None), db: Session = Depends(get_db)):
+    """Read-only subjective recall for one character and one explicit Scene context."""
+    require_project(db, project_id)
+    character = db.get(Character, character_id)
+    if not character or character.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Character not found")
+    proposal = db.get(SceneProposal, proposal_id) if proposal_id else next((item for item in db.scalars(
+        select(SceneProposal).where(SceneProposal.project_id == project_id).order_by(SceneProposal.created_at.desc(), SceneProposal.id.desc())
+    ).all() if character_id in (item.participants or [])), None)
+    if not proposal or proposal.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Scene Proposal not found")
+    if character_id not in (proposal.participants or []):
+        raise HTTPException(status_code=409, detail={"code": "NOT_SCENE_PARTICIPANT", "message": "Character is not a participant in this Scene Proposal."})
+    return CharacterMindViewBuilder().build(db, project_id, character_id, proposal)
 
 def context_summary(context: dict[str, Any]) -> dict[str, Any]:
     return {"version": context["version"], "fingerprint": context["fingerprint"], "project": context["project"], "current_story_arc": context["current_story_arc"], "active_story_threads": context["active_story_threads"], "paused_story_threads": context["paused_story_threads"], "active_characters": context["active_characters"], "recent_scene_count": len(context["recent_scenes"]), "world_entity_count": len(context["world_entities"]), "canon_count": len(context["canon"])}

@@ -76,15 +76,16 @@ def test_foreign_memory_and_knowledge_leak_block(session):
     foreign_memory = CharacterMemory(character_id=other.id, content="Foreign", importance=1, emotional_weight=0, distortion={})
     session.add(foreign_memory); session.commit(); ctx = context(session, project, actor, proposal)
     report = CharacterDecisionConstraintChecker().validate(session, ctx, decision(project, actor, proposal, ctx, memory_refs=[foreign_memory.id], knowledge_used=["unknown fact"]))
-    assert {issue.code for issue in report.issues}.issuperset({"FOREIGN_MEMORY", "KNOWLEDGE_LEAK"})
+    assert {issue.code for issue in report.issues}.issuperset({"MEMORY_NOT_RECALLED", "KNOWLEDGE_NOT_RECALLED"})
 
 def test_false_belief_requires_explicit_status(session):
     project, _, actor, _, _, proposal = seed(session)
-    session.add(CharacterKnowledge(character_id=actor.id, proposition="Liu Bai is harmless", status=KnowledgeStatus.FALSE_BELIEF)); session.commit(); ctx = context(session, project, actor, proposal)
-    allowed = decision(project, actor, proposal, ctx, knowledge_used=[{"proposition": "Liu Bai is harmless", "accepted_statuses": ["FALSE_BELIEF"]}])
-    disguised = decision(project, actor, proposal, ctx, knowledge_used=[{"proposition": "Liu Bai is harmless", "accepted_statuses": ["KNOWN"]}])
-    assert not any(issue.code == "KNOWLEDGE_LEAK" for issue in CharacterDecisionConstraintChecker().validate(session, ctx, allowed).issues)
-    assert any(issue.code == "KNOWLEDGE_LEAK" for issue in CharacterDecisionConstraintChecker().validate(session, ctx, disguised).issues)
+    belief = CharacterKnowledge(character_id=actor.id, proposition="Liu Bai is harmless", status=KnowledgeStatus.FALSE_BELIEF)
+    session.add(belief); session.commit(); ctx = context(session, project, actor, proposal)
+    allowed = decision(project, actor, proposal, ctx, knowledge_used=[{"knowledge_id": belief.id, "proposition": belief.proposition, "accepted_statuses": ["FALSE_BELIEF"]}])
+    disguised = decision(project, actor, proposal, ctx, knowledge_used=[{"knowledge_id": belief.id, "proposition": belief.proposition, "accepted_statuses": ["KNOWN"]}])
+    assert not any(issue.code == "KNOWLEDGE_NOT_RECALLED" for issue in CharacterDecisionConstraintChecker().validate(session, ctx, allowed).issues)
+    assert any(issue.code == "KNOWLEDGE_NOT_RECALLED" for issue in CharacterDecisionConstraintChecker().validate(session, ctx, disguised).issues)
 
 def test_inventory_and_ability_constraints(session):
     project, _, actor, _, _, proposal = seed(session); ctx = context(session, project, actor, proposal)

@@ -19,6 +19,7 @@ Return only one JSON object matching the requested decision fields. No Markdown 
 
 class KnowledgeReference(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    knowledge_id: str
     proposition: str
     accepted_statuses: list[Literal["KNOWN", "SUSPECTED", "FALSE_BELIEF"]]
 
@@ -57,7 +58,7 @@ def build_character_decision_contract() -> dict[str, Any]:
             "decision_type": {"type": "enum string", "allowed_values": [item.value for item in CharacterDecisionType]},
             "intent": {"type": "string"}, "chosen_action": {"type": "string"}, "motivation": {"type": "string"}, "target_character_id": {"type": "string | null"}, "target_entity_id": {"type": "string | null"},
             "goal_refs": {"type": "string[]"},
-            "knowledge_used": {"type": "object[]", "item": {"proposition": "string", "accepted_statuses": ["KNOWN | SUSPECTED | FALSE_BELIEF"]}},
+            "knowledge_used": {"type": "object[]", "item": {"knowledge_id": "string", "proposition": "string", "accepted_statuses": ["KNOWN | SUSPECTED | FALSE_BELIEF"]}},
             "memory_refs": {"type": "string[]"}, "ability_refs": {"type": "string[]"}, "inventory_refs": {"type": "string[]"},
             "relationship_factors": {"type": "object"}, "perceived_risk": {"type": "string | null"}, "accepted_cost": {"type": "string | null"},
             "expected_personal_result": {"type": "string | null"}, "uncertainties": {"type": "string[]"}, "refused_options": {"type": "string[]"},
