@@ -1,5 +1,6 @@
 """Independent Phase 7D semantic tests for pure checkpoint boundary logic."""
 from types import SimpleNamespace
+import pytest
 from app.replay import PreservedSceneStateTransitionProjector, ReplayCheckpointStateBuilder
 from app.historical import snapshot_fingerprint
 
@@ -60,3 +61,8 @@ def test_snapshot_fingerprint_changes_state():
     assert snapshot_fingerprint({"a": 1}) != snapshot_fingerprint({"a": 2})
 def test_snapshot_fingerprint_is_string():
     assert snapshot_fingerprint({"a": 1}).startswith("world-snapshot-v1:")
+
+@pytest.mark.parametrize("predicate,value", [("locked", True), ("opened", True), ("color", "blue"), ("count", 2), ("security", {"alarm": False})])
+def test_checkpoint_fact_overlay_preserves_structured_value(predicate, value):
+    session = SimpleNamespace(staged_world_state={"current_world": world(), "staged_facts": [{"subject_type": "ENTITY", "subject_id": "door", "predicate": predicate, "value": value}], "staged_cognition": {}})
+    assert ReplayCheckpointStateBuilder().build(session)["world_entities"][0]["profile"][predicate] == value
