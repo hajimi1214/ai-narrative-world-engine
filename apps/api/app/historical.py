@@ -36,11 +36,11 @@ class SceneCheckpointIntegrityValidator:
         origin = getattr(checkpoint.origin, "value", checkpoint.origin)
         if origin == "NORMAL_COMMIT":
             commit = db.get(SceneCommit, checkpoint.source_scene_commit_id) if checkpoint.source_scene_commit_id else None
-            if not commit or checkpoint.source_replay_session_id or commit.project_id != checkpoint.project_id or commit.scene_id != scene.id or commit.checkpoint_id != checkpoint.id: raise ValueError("SCENE_CHECKPOINT_PROVENANCE_INVALID")
+            if not commit or checkpoint.source_replay_session_id or commit.project_id != checkpoint.project_id or commit.scene_id != scene.id or commit.checkpoint_id != checkpoint.id or getattr(commit.status, "value", commit.status) != "COMMITTED": raise ValueError("SCENE_CHECKPOINT_PROVENANCE_INVALID")
         elif origin == "REPLAY_COMMIT":
             from .models import RetconReplaySession
             replay = db.get(RetconReplaySession, checkpoint.source_replay_session_id) if checkpoint.source_replay_session_id else None
-            if not replay or checkpoint.source_scene_commit_id or replay.project_id != checkpoint.project_id: raise ValueError("SCENE_CHECKPOINT_PROVENANCE_INVALID")
+            if not replay or checkpoint.source_scene_commit_id or replay.project_id != checkpoint.project_id or getattr(replay.status, "value", replay.status) != "COMPLETED": raise ValueError("SCENE_CHECKPOINT_PROVENANCE_INVALID")
         else: raise ValueError("SCENE_CHECKPOINT_PROVENANCE_INVALID")
         before = next((row for row in pre.payload.get("scenes", []) if row.get("id") == scene.id and row.get("history_status") == "ACTIVE"), None)
         after = next((row for row in post.payload.get("scenes", []) if row.get("id") == scene.id), None)

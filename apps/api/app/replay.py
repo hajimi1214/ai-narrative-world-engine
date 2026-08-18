@@ -11,7 +11,7 @@ from .models import (
     ReplaySceneRunStatus, ReplaySessionStatus, RetconApplication,
     RetconApplicationStatus, RetconCognitionInvalidation,
     RetconCognitionInvalidationStatus, RetconReplaySession, Scene, ScenePerformance,
-    ScenePerformanceTurn, WorldResolution, PerformanceStatus, SceneExecutionBinding, PerformanceMode, ResolutionStatus, ResolutionOutcome, ResolverMode, ActionVisibility,
+    ScenePerformanceTurn, WorldResolution, PerformanceStatus, SceneExecutionBinding, PerformanceMode, ResolutionStatus, ResolutionOutcome, ResolverMode, ActionVisibility, Project,
 )
 from .versioning import WorldSnapshotBuilder
 from .performance import HeuristicCharacterPerformer, CharacterPerformancePayload, PerformanceActionConstraintChecker, PerformanceObservationRouter
@@ -23,8 +23,9 @@ from .revision import _record
 
 class PreservedSceneStateTransitionProjector:
     """Apply only structured PRE -> POST changes onto a new sandbox payload."""
-    def project(self, old_pre, old_post, new_pre):
+    def project(self, old_pre, old_post, new_pre, invalidated_ids=()):
         result = deepcopy(new_pre)
+        invalidated_ids = set(invalidated_ids)
         def walk(before, after, target, path=()):
             if isinstance(before, dict) and isinstance(after, dict) and isinstance(target, dict):
                 for key in set(before) | set(after):
@@ -40,8 +41,11 @@ class PreservedSceneStateTransitionProjector:
             elif before != after:
                 return deepcopy(after)
             return target
+        if isinstance(old_pre.get("project"), dict) and isinstance(old_post.get("project"), dict):
+            result["project"] = walk(old_pre["project"], old_post["project"], deepcopy(result.get("project", {})))
         # Snapshot collections are keyed by stable row id.  This prevents an
-        # old POST from replacing unrelated state introduced by earlier replay.
+        # old POST from replacing unrelated state introduced by earlier replay,
+        # while retaining additions/removals caused by the preserved scene.
         for key in set(old_pre) | set(old_post):
             if key not in result or not isinstance(old_pre.get(key), list) or not isinstance(old_post.get(key), list):
                 continue
@@ -50,8 +54,34 @@ class PreservedSceneStateTransitionProjector:
             result_rows = {row.get("id"): row for row in result.get(key, []) if isinstance(row, dict) and row.get("id")}
             for ident in set(pre_rows) & set(post_rows) & set(result_rows):
                 result_rows[ident] = walk(pre_rows[ident], post_rows[ident], result_rows[ident])
-            result[key] = list(result_rows.values()) + [row for row in result.get(key, []) if not isinstance(row, dict) or not row.get("id")]
+            for ident in set(post_rows) - set(pre_rows):
+                if ident not in invalidated_ids:
+                    result_rows[ident] = deepcopy(post_rows[ident])
+            for ident in set(pre_rows) - set(post_rows):
+                result_rows.pop(ident, None)
+            result[key] = [result_rows[ident] for ident in sorted(result_rows)] + [row for row in result.get(key, []) if not isinstance(row, dict) or not row.get("id")]
         return result
+
+
+class ReplayCheckpointStateBuilder:
+    """Build a WorldSnapshot-compatible effective sandbox payload, pure only."""
+    KEYS = ("project", "canon_facts", "world_entities", "characters", "character_knowledge", "character_memories", "reveal_constraints", "story_threads", "story_arcs", "scenes", "chapters")
+    def build(self, session):
+        state = session.staged_world_state or {}
+        payload = {key: deepcopy((state.get("current_world") or {}).get(key, {} if key == "project" else [])) for key in self.KEYS}
+        entities = {row.get("id"): row for row in payload["world_entities"] if row.get("id")}
+        for fact in state.get("staged_facts", []):
+            if fact.get("subject_type") == "ENTITY" and fact.get("subject_id") in entities:
+                entities[fact["subject_id"]].setdefault("profile", {})[fact.get("predicate")] = fact.get("value")
+        payload["world_entities"] = [entities[key] for key in sorted(entities)]
+        cognition = state.get("staged_cognition", {})
+        for key, target in (("knowledge", "character_knowledge"), ("memories", "character_memories")):
+            rows = {row.get("id"): row for row in payload[target] if row.get("id")}
+            for value in cognition.get(key, []):
+                row = deepcopy(value); row["id"] = row.get("temp_id")
+                rows[row["id"]] = row
+            payload[target] = [rows[key] for key in sorted(rows)]
+        return payload
 
 class ReplayWorldView:
     """Read-only runtime view; replay never uses current formal state as world truth."""
@@ -315,7 +345,7 @@ class ReplayService:
         state_before = deepcopy(session.staged_world_state or {})
         boundary = state_before.setdefault("scene_checkpoints", {}).setdefault(scene.id, {"sequence": scene.sequence, "mode": item["mode"]})
         if "pre_payload" not in boundary:
-            boundary["pre_payload"] = deepcopy(state_before.get("current_world", {}))
+            boundary["pre_payload"] = ReplayCheckpointStateBuilder().build(session)
             boundary["pre_fingerprint"] = snapshot_fingerprint(boundary["pre_payload"])
         session.staged_world_state = state_before
         run = ReplaySceneRun(project_id=session.project_id, replay_session_id=session.id, original_scene_id=scene.id, original_sequence=scene.sequence, mode=item["mode"], status=ReplaySceneRunStatus.RUNNING, input_fingerprint=_fingerprint({"scene": scene.id, "sequence": scene.sequence, "baseline": session.baseline_fingerprint}), started_at=datetime.utcnow())
@@ -359,7 +389,9 @@ class ReplayService:
                 old_pre = db.get(__import__("app.models", fromlist=["WorldSnapshot"]).WorldSnapshot, old_checkpoint.pre_snapshot_id)
                 old_post = db.get(__import__("app.models", fromlist=["WorldSnapshot"]).WorldSnapshot, old_checkpoint.post_snapshot_id)
                 state = deepcopy(session.staged_world_state or {})
-                state["current_world"] = PreservedSceneStateTransitionProjector().project(old_pre.payload, old_post.payload, state.get("current_world", {}))
+                invalidated = set(db.scalars(select(RetconCognitionInvalidation.resource_id).where(RetconCognitionInvalidation.project_id == session.project_id, RetconCognitionInvalidation.status != RetconCognitionInvalidationStatus.ROLLED_BACK)).all())
+                invalidated.update(value["resource_id"] for value in state.get("dynamic_cognition_invalidations", []))
+                state["current_world"] = PreservedSceneStateTransitionProjector().project(old_pre.payload, old_post.payload, state.get("current_world", {}), invalidated)
                 session.staged_world_state = state
             run.status = ReplaySceneRunStatus.VALIDATED; run.validation_report = report
         else:
@@ -420,7 +452,7 @@ class ReplayService:
             run.status = ReplaySceneRunStatus.VALIDATED
         state_after = deepcopy(session.staged_world_state or {})
         boundary = state_after.setdefault("scene_checkpoints", {}).setdefault(scene.id, {"sequence": scene.sequence, "mode": item["mode"]})
-        boundary["post_payload"] = deepcopy(state_after.get("current_world", {}))
+        boundary["post_payload"] = ReplayCheckpointStateBuilder().build(session)
         boundary["post_fingerprint"] = snapshot_fingerprint(boundary["post_payload"])
         session.staged_world_state = state_after
         run.completed_at = datetime.utcnow(); session.cursor += 1; session.current_sequence = session.queue[session.cursor]["sequence"] if session.cursor < len(session.queue) else None; session.status = ReplaySessionStatus.RUNNING; session.current_fingerprint = _fingerprint({"world": (session.staged_world_state or {}).get("current_world"), "queue": session.queue, "cursor": session.cursor}); db.flush(); return run
@@ -428,6 +460,9 @@ class ReplayService:
     def commit(self, db: Session, session: RetconReplaySession, explicit_confirmation: bool):
         if not explicit_confirmation: self._fail("EXPLICIT_CONFIRMATION_REQUIRED")
         if session.status != ReplaySessionStatus.RUNNING or session.cursor < len(session.queue): self._fail("REPLAY_NOT_VALIDATED")
+        # Shares normal SceneCommit serialization before allocating versions.
+        if not db.scalar(select(Project).where(Project.id == session.project_id).with_for_update()):
+            self._fail("REPLAY_PROJECT_NOT_FOUND")
         app = db.get(RetconApplication, session.retcon_application_id)
         session.pre_commit_snapshot_id = WorldSnapshotBuilder().create(db, session.project_id, __import__("app.models", fromlist=["SnapshotType"]).SnapshotType.PRE_REPLAY_COMMIT).id
         runs = db.scalars(select(ReplaySceneRun).where(ReplaySceneRun.replay_session_id == session.id).order_by(ReplaySceneRun.original_sequence, ReplaySceneRun.completed_at, ReplaySceneRun.id)).all()
@@ -525,11 +560,22 @@ class ReplayService:
         # history is active.  No step ever creates a formal snapshot.
         checkpoint_service = SceneCheckpointService()
         boundaries = state.get("scene_checkpoints", {})
+        temp_to_formal = {}
+        for run in final_runs.values():
+            staged = state.get("scene_results", {}).get(run.original_scene_id, {})
+            for item, formal_id in zip(staged.get("knowledge", []), run.new_knowledge_ids or []): temp_to_formal[item.get("temp_id")] = formal_id
+            for item, formal_id in zip(staged.get("memories", []), run.new_memory_ids or []): temp_to_formal[item.get("temp_id")] = formal_id
+        def formalize_cognition(payload):
+            value = deepcopy(payload)
+            for key in ("character_knowledge", "character_memories"):
+                for row in value.get(key, []):
+                    if row.get("id") in temp_to_formal: row["id"] = temp_to_formal[row["id"]]
+            return value
         for run, old, new, _binding in materialized:
             boundary = boundaries.get(old.id)
             if not boundary or "pre_payload" not in boundary or "post_payload" not in boundary:
                 self._fail("SCENE_CHECKPOINT_MISSING")
-            post_payload = deepcopy(boundary["post_payload"])
+            post_payload = formalize_cognition(boundary["post_payload"])
             scene_rows = [row for row in post_payload.get("scenes", []) if row.get("id") != old.id]
             scene_rows.append(_record(new)); post_payload["scenes"] = scene_rows
             checkpoint_service.materialize_from_payloads(db, session.project_id, new, boundary["pre_payload"], post_payload, origin=SceneCheckpointOrigin.REPLAY_COMMIT, source_replay_session_id=session.id)

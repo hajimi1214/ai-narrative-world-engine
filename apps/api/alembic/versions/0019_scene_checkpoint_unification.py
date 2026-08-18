@@ -30,6 +30,22 @@ def upgrade():
 
 
 def downgrade():
+    # 0018 can only express one checkpoint per (project, scene).  Preserve
+    # the active/latest boundary and intentionally discard older index rows;
+    # snapshots remain append-only audit records and are never cascaded here.
+    op.execute("""
+        DELETE FROM scene_state_checkpoints
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id, ROW_NUMBER() OVER (
+                    PARTITION BY project_id, scene_id
+                    ORDER BY active DESC, version DESC, id DESC
+                ) AS row_number
+                FROM scene_state_checkpoints
+            ) ranked
+            WHERE ranked.row_number > 1
+        )
+    """)
     op.drop_index("ix_scene_state_checkpoints_checkpoint_fingerprint", table_name="scene_state_checkpoints")
     op.drop_index("uq_scene_state_checkpoint_active", table_name="scene_state_checkpoints")
     with op.batch_alter_table("scene_state_checkpoints") as batch:
