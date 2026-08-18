@@ -57,7 +57,7 @@ class DirectorContextBuilder:
         character_ids = [character.id for character in characters]
         open_threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status == ThreadStatus.OPEN).order_by(StoryThread.weight.desc(), StoryThread.id)).all()
         paused_threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status == ThreadStatus.PAUSED).order_by(StoryThread.weight.desc(), StoryThread.id)).all()
-        recent_scenes = session.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == SceneStatus.OCCURRED).order_by(Scene.sequence.desc(), Scene.id.desc()).limit(RECENT_SCENE_LIMIT)).all()
+        recent_scenes = session.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == SceneStatus.OCCURRED, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc(), Scene.id.desc()).limit(RECENT_SCENE_LIMIT)).all()
         active_arc = session.scalar(select(StoryArc).where(StoryArc.project_id == project_id, StoryArc.status == "ACTIVE").order_by(StoryArc.id.desc()))
         reader = ActiveCharacterCognitionReader()
         knowledge = [item for character in characters for item in reader.knowledge(session, project_id, character.id)] if character_ids else []
