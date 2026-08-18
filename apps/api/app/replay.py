@@ -121,6 +121,23 @@ class PreservedSceneValidator:
         missing = sorted(set(participants) - available)
         if missing:
             return "REPLAY_ESCALATED", {"code": "PARTICIPANT_UNAVAILABLE", "participants": missing}
+        binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
+        proposal = None
+        if binding:
+            performance = db.get(ScenePerformance, binding.performance_id)
+            proposal = db.get(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal, performance.scene_proposal_id) if performance else None
+        prerequisites = ((proposal.entry_state if proposal else {}) or {}).get("replay_prerequisites", {})
+        view = world or ReplayWorldView(type("ReplayState", (), {"staged_world_state": {"current_world": {}}})())
+        for required in prerequisites.get("required_entity_facts", []):
+            if view.fact("ENTITY", required.get("entity_id"), required.get("predicate")) != required.get("expected"):
+                return "REPLAY_ESCALATED", {"code": "STRUCTURED_PREREQUISITE_FAILED", "entity_id": required.get("entity_id"), "predicate": required.get("predicate")}
+        for entity_id in prerequisites.get("required_active_entities", []):
+            entity = view.entity(entity_id)
+            if not entity or not entity.get("active", False): return "REPLAY_ESCALATED", {"code": "ENTITY_UNAVAILABLE", "entity_id": entity_id}
+        if prerequisites.get("location_id") and not view.entity(prerequisites["location_id"]): return "REPLAY_ESCALATED", {"code": "LOCATION_UNAVAILABLE", "location_id": prerequisites["location_id"]}
+        for character_id in prerequisites.get("required_active_characters", []):
+            character = view.character(character_id)
+            if not character or not character.get("active", False): return "REPLAY_ESCALATED", {"code": "CHARACTER_UNAVAILABLE", "character_id": character_id}
         return "PRESERVED", {"code": "PRESERVED_PREREQUISITES_VALID"}
 
 class SelectiveReplayQueue:
@@ -259,6 +276,8 @@ class ReplayService:
         if session.status != ReplaySessionStatus.RUNNING or session.cursor < len(session.queue): self._fail("REPLAY_NOT_VALIDATED")
         app = db.get(RetconApplication, session.retcon_application_id)
         session.pre_commit_snapshot_id = WorldSnapshotBuilder().create(db, session.project_id, __import__("app.models", fromlist=["SnapshotType"]).SnapshotType.PRE_REPLAY_COMMIT).id
+        if type(self).failure_injector:
+            type(self).failure_injector("AFTER_REPLAY_MATERIALIZATION")
         runs = db.scalars(select(ReplaySceneRun).where(ReplaySceneRun.replay_session_id == session.id).order_by(ReplaySceneRun.original_sequence, ReplaySceneRun.completed_at, ReplaySceneRun.id)).all()
         final_runs = {}
         for run in runs:
@@ -302,8 +321,8 @@ class ReplayService:
                         old_binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == old.id, SceneExecutionBinding.active.is_(True)))
                         if old_binding: old_binding.active = False
                         db.flush(); binding.active = True
-                        if self.failure_injector:
-                            self.failure_injector("AFTER_REPLAY_MATERIALIZATION")
+                        if type(self).failure_injector:
+                            type(self).failure_injector("AFTER_REPLAY_MATERIALIZATION")
         replacement_by_old = {run.original_scene_id: run.replacement_scene_id for run in final_runs.values() if run.replacement_scene_id}
         # A rebuild is complete only when the affected resource was covered by a replayed scene.
         for inv in db.scalars(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.retcon_application_id == app.id, RetconCognitionInvalidation.status == RetconCognitionInvalidationStatus.ACTIVE)).all():

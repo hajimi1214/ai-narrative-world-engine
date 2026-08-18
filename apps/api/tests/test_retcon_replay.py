@@ -10,6 +10,7 @@ import app.api as api
 from app.models import RetconReplaySession, ReplaySceneRun, RetconApplication, RetconApplicationStatus, Scene, WorldSnapshot, SceneStateCheckpoint
 from app.historical import SceneStateCheckpointService
 from app.historical import TemporalCharacterCognitionReader
+from app.replay import ReplayService
 from app.character_mind import ActiveCharacterCognitionReader
 from app.models import RetconCognitionInvalidation, RetconCognitionInvalidationStatus
 from test_retcon_apply import analyzed_setup, apply_success, client_for
@@ -143,3 +144,15 @@ def test_replay_queue_ignores_superseded_scene(session, monkeypatch):
     result = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
     assert result.status_code == 201, result.text
     assert scene.id not in {item["scene_id"] for item in result.json()["queue"]}
+
+def test_commit_failure_hook_rolls_back_real_api(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, scene, _, _, _, client, _, application_id = values
+    session_id = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]
+    while True:
+        body = client.get(f"/projects/{project.id}/retcon/replay-sessions/{session_id}").json()
+        if body["cursor"] >= len(body["queue"]): break
+        assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/step").status_code == 200
+    monkeypatch.setattr(ReplayService, "failure_injector", lambda _: (_ for _ in ()).throw(RuntimeError("TEST_REPLAY_COMMIT_FAILURE")))
+    failed = client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/commit", json={"explicit_confirmation": True})
+    assert failed.status_code == 409 and failed.json()["detail"]["code"] == "REPLAY_COMMIT_FAILED"
+    session.expire_all(); assert session.get(Scene, scene.id).history_status == "ACTIVE"
