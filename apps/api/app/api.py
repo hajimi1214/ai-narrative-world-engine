@@ -13,7 +13,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -23,6 +23,7 @@ from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fing
 from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryContextStaleError, RecoveryEditPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 from .retcon import RetconImpactPlanner, RetconPlanStalenessChecker, CLASSIFICATION_LABELS, semantic_fingerprint
+from .retcon_apply import RetconApplyService, has_pending_replay
 
 router = APIRouter()
 
@@ -33,6 +34,13 @@ class RetconRequestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source_revision_id: str
     reason: str = Field(min_length=1, max_length=4000)
+
+class RetconApplyPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    plan_id: str
+    explicit_confirmation: bool = False
+    author_override: bool = False
+    author_override_reason: str | None = None
 
 def retcon_actions(status: str) -> list[str]:
     return {"DRAFT": ["ANALYZE", "ABORT"], "PLANNED": ["REANALYZE", "ABORT"], "STALE": ["REANALYZE", "ABORT"], "ABORTED": []}.get(status, [])
@@ -61,6 +69,10 @@ def retcon_request_payload(db: Session, request: RetconRequest, latest: RetconIm
         latest = db.scalar(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id == request.id).order_by(RetconImpactPlan.version.desc()))
     effective_status = "STALE" if latest and RetconPlanStalenessChecker().is_stale(db, latest) else request.status
     return record_dict(request) | {"effective_status": effective_status, "available_actions": retcon_actions(effective_status)}
+
+def retcon_application_payload(db: Session, application: RetconApplication) -> dict[str, Any]:
+    invalidations = db.scalars(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.retcon_application_id == application.id).order_by(RetconCognitionInvalidation.created_at, RetconCognitionInvalidation.id)).all()
+    return record_dict(application) | {"pending_replay": application.status == RetconApplicationStatus.APPLIED_PENDING_REPLAY, "cognition_invalidations": [record_dict(item) for item in invalidations]}
 
 # Retcon routes are declared before the main CRUD helpers; FastAPI evaluates
 # dependency defaults while importing the module.
@@ -135,8 +147,73 @@ def abort_retcon_request(project_id: str, request_id: str, db: Session = Depends
     request.status = "ABORTED"; db.commit(); db.refresh(request)
     return retcon_request_payload(db, request)
 
+@router.post("/projects/{project_id}/retcon/requests/{request_id}/apply")
+def apply_retcon(project_id: str, request_id: str, payload: RetconApplyPayload | None = None, db: Session = Depends(get_db)):
+    # Preserve the historical route-probe behavior for callers that send no body;
+    # an explicit Phase 6B payload is required to mutate the formal world.
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Retcon apply requires explicit confirmation payload")
+    request = db.get(RetconRequest, request_id)
+    if not request or request.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Retcon request not found")
+    plan = db.get(RetconImpactPlan, payload.plan_id)
+    revision = db.get(WorldRevision, request.source_revision_id)
+    if not plan or plan.retcon_request_id != request_id or plan.project_id != project_id:
+        raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE" if plan else "RETCON_PLAN_NOT_FOUND"})
+    if not revision or revision.project_id != project_id:
+        raise HTTPException(status_code=409, detail={"code": "CROSS_PROJECT_REFERENCE"})
+    try:
+        application, revision_application, invalidations = RetconApplyService().apply(
+            db, project_id, request, plan, revision, payload.explicit_confirmation,
+            payload.author_override, payload.author_override_reason,
+        )
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_APPLY, source_type="WORLD_REVISION", source_id=revision.id, status=ExecutionStatus.SUCCEEDED, input_fingerprint=plan.basis_fingerprint, output_fingerprint=application.post_apply_world_fingerprint)
+        db.commit(); db.refresh(application)
+        return {"application": retcon_application_payload(db, application), "revision_application": record_dict(revision_application), "revision": record_dict(revision), "cognition_invalidations": [record_dict(item) for item in invalidations], "replay_summary": application.replay_summary}
+    except ValueError as exc:
+        db.rollback()
+        code = str(exc)
+        trace_status = ExecutionStatus.FAILED if code in {"APPLY_RESULT_MISMATCH", "INVALID_TARGET_STATE", "COGNITION_TARGET_NOT_FOUND"} else ExecutionStatus.BLOCKED
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_APPLY, source_type="WORLD_REVISION", source_id=request.source_revision_id, status=trace_status, error_code=code, input_fingerprint=getattr(revision, "base_state_fingerprint", None))
+        db.commit()
+        raise HTTPException(status_code=409, detail={"code": code}) from exc
+
+@router.get("/projects/{project_id}/retcon/applications")
+def list_retcon_applications(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    rows = db.scalars(select(RetconApplication).where(RetconApplication.project_id == project_id).order_by(RetconApplication.created_at.desc(), RetconApplication.id.desc())).all()
+    return [retcon_application_payload(db, row) for row in rows]
+
+@router.get("/projects/{project_id}/retcon/applications/{application_id}")
+def get_retcon_application(project_id: str, application_id: str, db: Session = Depends(get_db)):
+    row = db.get(RetconApplication, application_id)
+    if not row or row.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Retcon application not found")
+    return retcon_application_payload(db, row)
+
+@router.post("/projects/{project_id}/retcon/applications/{application_id}/rollback")
+def rollback_retcon(project_id: str, application_id: str, db: Session = Depends(get_db)):
+    row = db.get(RetconApplication, application_id)
+    if not row or row.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Retcon application not found")
+    try:
+        application = RetconApplyService().rollback(db, project_id, row)
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_ROLLBACK, source_type="RETCON_APPLICATION", source_id=row.id, status=ExecutionStatus.SUCCEEDED, output_fingerprint=application.post_apply_world_fingerprint)
+        db.commit(); db.refresh(application)
+        return retcon_application_payload(db, application)
+    except ValueError as exc:
+        db.rollback()
+        code = "RETCON_ROLLBACK_STALE" if str(exc) in {"ROLLBACK_TARGET_STALE", "ROLLBACK_RESULT_MISMATCH"} else str(exc)
+        ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_ROLLBACK, source_type="RETCON_APPLICATION", source_id=application_id, status=ExecutionStatus.BLOCKED, error_code=code)
+        db.commit()
+        raise HTTPException(status_code=409, detail={"code": code}) from exc
+
 def routed_provider(settings, route):
     return get_model_provider(settings, route.provider, route.base_url)
+
+def ensure_replay_not_pending(db: Session, project_id: str) -> None:
+    if has_pending_replay(db, project_id):
+        raise HTTPException(status_code=409, detail={"code": "RETCON_REPLAY_REQUIRED"})
 
 def primary_issue(report):
     issues = report.get("issues", []) if isinstance(report, dict) else report.as_dict().get("issues", [])
@@ -316,6 +393,7 @@ def context_summary(context: dict[str, Any]) -> dict[str, Any]:
 @router.post("/projects/{project_id}/director/dry-run", status_code=status.HTTP_201_CREATED)
 def director_dry_run(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
+    ensure_replay_not_pending(db, project_id)
     context = DirectorContextBuilder().build(db, project_id)
     proposal = SceneProposal(project_id=project_id, context_fingerprint=context["fingerprint"], **HeuristicDirector().propose(context))
     report = DirectorConstraintChecker().validate(db, context, proposal)
@@ -338,6 +416,7 @@ def get_director_proposal(project_id: str, proposal_id: str, db: Session = Depen
 
 @router.post("/projects/{project_id}/director/proposals/{proposal_id}/approve")
 def approve_director_proposal(project_id: str, proposal_id: str, db: Session = Depends(get_db)):
+    ensure_replay_not_pending(db, project_id)
     proposal = db.get(SceneProposal, proposal_id)
     if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
     context = DirectorContextBuilder().build(db, project_id)
@@ -379,6 +458,7 @@ def character_context_summary(context: dict[str, Any]) -> dict[str, Any]:
 
 def require_character_simulation_inputs(db: Session, project_id: str, proposal_id: str, character_id: str) -> tuple[SceneProposal, Character]:
     require_project(db, project_id)
+    ensure_replay_not_pending(db, project_id)
     proposal = db.get(SceneProposal, proposal_id)
     character = db.get(Character, character_id)
     if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
@@ -498,6 +578,7 @@ def get_snapshot(project_id:str,snapshot_id:str,db:Session=Depends(get_db)):
     return record_dict(item)
 @router.post("/projects/{project_id}/revisions/{revision_id}/apply")
 def apply_revision(project_id:str,revision_id:str,payload:Payload,db:Session=Depends(get_db)):
+    ensure_replay_not_pending(db, project_id)
     revision=db.get(WorldRevision,revision_id)
     if not revision or revision.project_id!=project_id: raise HTTPException(status_code=404,detail="World Revision not found")
     service = RevisionApplyService()
@@ -715,6 +796,7 @@ def _performance_payload(performance: ScenePerformance, turns: list[ScenePerform
 
 @router.post("/projects/{project_id}/director/proposals/{proposal_id}/performances", status_code=status.HTTP_201_CREATED)
 def create_performance(project_id: str, proposal_id: str, payload: Payload, db: Session = Depends(get_db)):
+    ensure_replay_not_pending(db, project_id)
     require_project(db, project_id)
     proposal = db.get(SceneProposal, proposal_id)
     if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
@@ -744,6 +826,7 @@ def get_performance(project_id: str, performance_id: str, db: Session = Depends(
 
 @router.post("/projects/{project_id}/performances/{performance_id}/step", status_code=status.HTTP_201_CREATED)
 def performance_step(project_id: str, performance_id: str, db: Session = Depends(get_db)):
+    ensure_replay_not_pending(db, project_id)
     performance = db.get(ScenePerformance, performance_id)
     if not performance or performance.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Performance not found")
     if performance.status in {PerformanceStatus.AWAITING_WORLD, PerformanceStatus.PAUSED, PerformanceStatus.COMPLETED, PerformanceStatus.INVALIDATED, PerformanceStatus.FAILED}: raise HTTPException(status_code=409, detail={"code": "PERFORMANCE_NOT_RUNNABLE", "status": performance.status.value, "stop_reason": performance.stop_reason})
@@ -808,6 +891,7 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
 
 @router.post("/projects/{project_id}/performances/{performance_id}/world/resolve", status_code=status.HTTP_201_CREATED)
 def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Session = Depends(get_db)):
+    ensure_replay_not_pending(db, project_id)
     performance = db.get(ScenePerformance, performance_id)
     if not performance or performance.project_id != project_id:
         raise HTTPException(status_code=404, detail="Scene Performance not found")

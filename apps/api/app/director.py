@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .models import AntiAIBible, CanonFact, CanonType, Character, CharacterKnowledge, EntityType, KnowledgeStatus, Project, ProposalStatus, ProposalType, RevealConstraint, RevealStatus, Scene, SceneProposal, SceneStatus, StoryArc, StoryThread, ThreadStatus, WorldEntity, WritingBible
+from .character_mind import ActiveCharacterCognitionReader
 
 RECENT_SCENE_LIMIT = 10
 
@@ -58,7 +59,8 @@ class DirectorContextBuilder:
         paused_threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status == ThreadStatus.PAUSED).order_by(StoryThread.weight.desc(), StoryThread.id)).all()
         recent_scenes = session.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == SceneStatus.OCCURRED).order_by(Scene.sequence.desc(), Scene.id.desc()).limit(RECENT_SCENE_LIMIT)).all()
         active_arc = session.scalar(select(StoryArc).where(StoryArc.project_id == project_id, StoryArc.status == "ACTIVE").order_by(StoryArc.id.desc()))
-        knowledge = session.scalars(select(CharacterKnowledge).where(CharacterKnowledge.character_id.in_(character_ids), CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF])).order_by(CharacterKnowledge.character_id, CharacterKnowledge.status, CharacterKnowledge.id)).all() if character_ids else []
+        reader = ActiveCharacterCognitionReader()
+        knowledge = [item for character in characters for item in reader.knowledge(session, project_id, character.id)] if character_ids else []
         related_ids = self._related_entity_ids(characters, open_threads + paused_threads, recent_scenes)
         entities = session.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True)).order_by(WorldEntity.id)).all()
         selected_entities = [entity for entity in entities if entity.id in related_ids or entity.name in related_ids]

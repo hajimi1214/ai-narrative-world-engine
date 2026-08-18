@@ -33,6 +33,8 @@ class ResolutionOutcome(str, enum.Enum): SUCCESS = "SUCCESS"; PARTIAL = "PARTIAL
 class RevisionStatus(str, enum.Enum): DRAFT = "DRAFT"; PREVIEWED = "PREVIEWED"; STALE = "STALE"; CANCELLED = "CANCELLED"; APPLIED = "APPLIED"; ROLLED_BACK = "ROLLED_BACK"
 class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVISION"; POST_REVISION="POST_REVISION"; ROLLBACK_POINT="ROLLBACK_POINT"
 class RevisionApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED="APPLIED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
+class RetconApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED_PENDING_REPLAY="APPLIED_PENDING_REPLAY"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
+class RetconCognitionInvalidationStatus(str, enum.Enum): ACTIVE="ACTIVE"; RESOLVED="RESOLVED"; ROLLED_BACK="ROLLED_BACK"
 class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
@@ -380,6 +382,40 @@ class RetconImpactItem(Base):
     character_id: Mapped[str | None] = mapped_column(String(36))
     scene_id: Mapped[str | None] = mapped_column(String(36))
     dependency_path: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class RetconApplication(Base):
+    __tablename__ = "retcon_applications"
+    __table_args__ = (UniqueConstraint("retcon_request_id", name="uq_retcon_application_request"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    retcon_request_id: Mapped[str] = mapped_column(ForeignKey("retcon_requests.id"), nullable=False, index=True)
+    retcon_plan_id: Mapped[str] = mapped_column(ForeignKey("retcon_impact_plans.id"), nullable=False)
+    source_revision_id: Mapped[str] = mapped_column(ForeignKey("world_revisions.id"), nullable=False)
+    revision_application_id: Mapped[str | None] = mapped_column(ForeignKey("revision_applications.id"))
+    status: Mapped[RetconApplicationStatus] = mapped_column(String(40), default=RetconApplicationStatus.PENDING, nullable=False)
+    plan_basis_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    pre_apply_world_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    post_apply_world_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    cognition_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    replay_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    failure_report: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+class RetconCognitionInvalidation(Base):
+    __tablename__ = "retcon_cognition_invalidations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    retcon_application_id: Mapped[str] = mapped_column(ForeignKey("retcon_applications.id"), nullable=False, index=True)
+    character_id: Mapped[str] = mapped_column(ForeignKey("characters.id"), nullable=False, index=True)
+    resource_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    source_impact_item_id: Mapped[str | None] = mapped_column(ForeignKey("retcon_impact_items.id"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    original_semantic_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[RetconCognitionInvalidationStatus] = mapped_column(String(20), default=RetconCognitionInvalidationStatus.ACTIVE, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class WorldSnapshot(Base):

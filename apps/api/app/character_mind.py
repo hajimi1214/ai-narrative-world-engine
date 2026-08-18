@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from .models import Character, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType, CharacterKnowledge, CharacterMemory, KnowledgeStatus, ProposalType, SceneProposal, WorldEntity
+from .models import Character, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType, CharacterKnowledge, CharacterMemory, KnowledgeStatus, ProposalType, SceneProposal, WorldEntity, RetconCognitionInvalidation, RetconCognitionInvalidationStatus
 
 MAX_CHARACTER_MEMORIES = 12
 
@@ -30,8 +30,9 @@ class CharacterContextBuilder:
         participants = session.scalars(select(Character).where(Character.project_id == project_id, Character.id.in_(proposal.participants)).order_by(Character.id)).all() if proposal.participants else []
         other_participants = [{"id": item.id, "name": item.name} for item in participants if item.id != character.id]
         location = session.get(WorldEntity, proposal.location_id) if proposal.location_id else None
-        knowledge = session.scalars(select(CharacterKnowledge).where(CharacterKnowledge.character_id == character.id, CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF])).order_by(CharacterKnowledge.status, CharacterKnowledge.id)).all()
-        memories = self._memories(session, character, proposal, other_participants)
+        reader = ActiveCharacterCognitionReader()
+        knowledge = reader.knowledge(session, project_id, character.id)
+        memories = self._memories(session, character, proposal, other_participants, reader=reader, project_id=project_id)
         relationships = {item["id"]: character.relationships.get(item["id"], {}) for item in other_participants}
         context = {
             "character": {"id": character.id, "name": character.name, "personality": character.personality, "core_values": character.core_values, "boundaries": character.boundaries, "goals": character.goals, "current_state": character.current_state, "physical_state": character.physical_state, "emotional_state": character.emotional_state},
@@ -53,8 +54,8 @@ class CharacterContextBuilder:
             values[status].append({"id": record.id, "proposition": record.proposition, "confidence": record.confidence})
         return values
 
-    def _memories(self, session, character, proposal, participants):
-        records = session.scalars(select(CharacterMemory).where(CharacterMemory.character_id == character.id).order_by(CharacterMemory.id)).all()
+    def _memories(self, session, character, proposal, participants, reader=None, project_id=None):
+        records = (reader or ActiveCharacterCognitionReader()).memories(session, project_id, character.id)
         related = {proposal.location_id, proposal.primary_thread_id, *[item["id"] for item in participants]}
         def rank(memory):
             distortion = memory.distortion or {}
@@ -69,6 +70,26 @@ class CharacterContextBuilder:
             if isinstance(ability, dict): result.append({key: value for key, value in ability.items() if key != "director_only"})
             else: result.append(ability)
         return result
+
+
+class ActiveCharacterCognitionReader:
+    """Read current cognition while preserving the immutable historical rows."""
+    def _hidden(self, session, project_id, character_id, resource_type):
+        return set(session.scalars(select(RetconCognitionInvalidation.resource_id).where(
+            RetconCognitionInvalidation.project_id == project_id,
+            RetconCognitionInvalidation.character_id == character_id,
+            RetconCognitionInvalidation.resource_type == resource_type,
+            RetconCognitionInvalidation.status == RetconCognitionInvalidationStatus.ACTIVE,
+        )).all())
+
+    def knowledge(self, session, project_id, character_id):
+        hidden = self._hidden(session, project_id, character_id, "KNOWLEDGE")
+        query = select(CharacterKnowledge).where(CharacterKnowledge.character_id == character_id, CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF])).order_by(CharacterKnowledge.status, CharacterKnowledge.id)
+        return [item for item in session.scalars(query).all() if item.id not in hidden]
+
+    def memories(self, session, project_id, character_id):
+        hidden = self._hidden(session, project_id, character_id, "MEMORY")
+        return [item for item in session.scalars(select(CharacterMemory).where(CharacterMemory.character_id == character_id).order_by(CharacterMemory.id)).all() if item.id not in hidden]
 
 
 class ActorPerceptionSanitizer:
