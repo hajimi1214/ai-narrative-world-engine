@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 from typing import Any
-from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, JSON as SAJSON, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, JSON as SAJSON, String, Text, UniqueConstraint, Index, text, func
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -183,6 +183,7 @@ class StoryArc(Base):
 
 class Scene(Base):
     __tablename__ = "scenes"
+    __table_args__ = (Index("uq_scene_active_sequence", "project_id", "sequence", unique=True, postgresql_where=text("history_status = 'ACTIVE'"), sqlite_where=text("history_status = 'ACTIVE'")),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -430,6 +431,7 @@ class RetconCognitionInvalidation(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     original_semantic_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
     status: Mapped[RetconCognitionInvalidationStatus] = mapped_column(String(20), default=RetconCognitionInvalidationStatus.ACTIVE, nullable=False)
+    resolution_report: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class RetconReplaySession(TimestampMixin, Base):
@@ -467,7 +469,7 @@ class SceneStateCheckpoint(Base):
 
 class SceneExecutionBinding(Base):
     __tablename__ = "scene_execution_bindings"
-    __table_args__ = (UniqueConstraint("scene_id", "active", name="uq_scene_execution_binding_active"),)
+    __table_args__ = (Index("uq_scene_active_execution_binding", "scene_id", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id"), nullable=False)

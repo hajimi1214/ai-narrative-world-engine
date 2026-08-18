@@ -15,7 +15,33 @@ from .models import (
 from .versioning import WorldSnapshotBuilder
 from .performance import HeuristicCharacterPerformer, CharacterPerformancePayload, PerformanceActionConstraintChecker
 from .character_mind import CharacterContextBuilder, CharacterDecisionConstraintChecker
-from .world_resolution import HeuristicWorldResolver
+from .world_resolution import HeuristicWorldResolver, WorldResolutionPayload, WorldResolutionConstraintChecker
+
+class ReplayWorldView:
+    """Read-only runtime view; replay never uses current formal state as world truth."""
+    def __init__(self, session): self.state = (session.staged_world_state or {}).get("current_world", {})
+    def rows(self, key): return self.state.get(key, [])
+    def one(self, key, ident): return next((row for row in self.rows(key) if row.get("id") == ident), None)
+    def character(self, ident): return self.one("characters", ident)
+    def entity(self, ident): return self.one("world_entities", ident)
+    def canon(self): return self.rows("canon_facts")
+    def apply_facts(self, facts):
+        state = deepcopy(self.state)
+        state.setdefault("staged_facts", []).extend(facts)
+        self.state = state
+        return state
+
+class ReplayCharacterContextBuilder:
+    def build(self, db, session, scene, proposal, character_id):
+        from .historical import TemporalCharacterCognitionReader
+        world = ReplayWorldView(session); character = world.character(character_id)
+        if not character: raise ValueError("REPLAY_CHARACTER_STATE_UNAVAILABLE")
+        others = [world.character(item) for item in scene.participants or [] if item != character_id and world.character(item)]
+        cognition = TemporalCharacterCognitionReader().read(db, session.project_id, character_id, session, scene.sequence)
+        location = next((row for row in world.rows("world_entities") if row.get("name") == scene.location), None)
+        context = {"project": {"id": session.project_id}, "character": {"id": character_id, "name": character.get("name"), "goals": character.get("goals") or {}, "current_state": character.get("current_state") or {}, "physical_state": character.get("physical_state") or {}, "emotional_state": character.get("emotional_state") or {}, "relationships": character.get("relationships") or {}}, "scene": {"location": location, "other_participants": [{"id": row["id"], "name": row.get("name")} for row in others], "active_participant_ids": list(scene.participants or []), "performance_observations": [], "world_observations": [], "self_turn_history": []}, "knowledge": {"KNOWN": [{"id": row.id, "proposition": row.proposition} for row in cognition["knowledge"]], "SUSPECTED": [], "FALSE_BELIEF": [], "UNKNOWN": []}, "memories": [{"memory_id": row.id, "content": row.content} for row in cognition["memories"]], "inventory": list((character.get("current_state") or {}).get("inventory", [])), "abilities": list(character.get("abilities") or [])}
+        context["fingerprint"] = _fingerprint(context); context["version"] = context["fingerprint"]
+        return context
 
 def _fingerprint(value):
     return "replay-input-v1:" + hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
@@ -28,9 +54,9 @@ class CurrentSceneHistoryResolver:
         return rows[0] if rows else None
 
 class PreservedSceneValidator:
-    def validate(self, db: Session, scene: Scene):
+    def validate(self, db: Session, scene: Scene, world=None):
         participants = scene.participants or []
-        available = {row.id for row in db.query(__import__("app.models", fromlist=["Character"]).Character).filter_by(project_id=scene.project_id).all()}
+        available = {row.get("id") for row in world.rows("characters")} if world else {row.id for row in db.query(__import__("app.models", fromlist=["Character"]).Character).filter_by(project_id=scene.project_id).all()}
         missing = sorted(set(participants) - available)
         if missing:
             return "REPLAY_ESCALATED", {"code": "PARTICIPANT_UNAVAILABLE", "participants": missing}
@@ -110,7 +136,7 @@ class ReplayService:
         run = ReplaySceneRun(project_id=session.project_id, replay_session_id=session.id, original_scene_id=scene.id, original_sequence=scene.sequence, mode=item["mode"], status=ReplaySceneRunStatus.RUNNING, input_fingerprint=_fingerprint({"scene": scene.id, "sequence": scene.sequence, "baseline": session.baseline_fingerprint}), started_at=datetime.utcnow())
         db.add(run); db.flush()
         if item["mode"] == "VALIDATE_PRESERVED":
-            result, report = PreservedSceneValidator().validate(db, scene)
+            result, report = PreservedSceneValidator().validate(db, scene, ReplayWorldView(session))
             if result == "REPLAY_ESCALATED":
                 queue = deepcopy(session.queue); queue[session.cursor] = {**queue[session.cursor], "mode": "REPLAY", "reason": "DYNAMIC_EXPANSION", "dynamic_expansion_reason": report}; session.queue = queue
                 run.status = ReplaySceneRunStatus.VALIDATED; run.validation_report = {"result": "REPLAY_ESCALATED", **report}; session.status = ReplaySessionStatus.RUNNING; session.failure_report = {"code": "DYNAMIC_REPLAY_EXPANSION", "reason": report}; db.flush(); return run
@@ -125,25 +151,25 @@ class ReplayService:
                 if not old: continue
                 proposal = db.get(__import__("app.models", fromlist=["SceneProposal"]).SceneProposal, old.scene_proposal_id)
                 if not proposal: continue
-                context = CharacterContextBuilder().build(db, session.project_id, old.character_id, proposal)
-                temporal = __import__("app.historical", fromlist=["TemporalCharacterCognitionReader"]).TemporalCharacterCognitionReader().read(db, session.project_id, old.character_id, session, scene.sequence)
-                context["knowledge"] = {"KNOWN": [{"id": row.id, "proposition": row.proposition} for row in temporal["knowledge"]], "SUSPECTED": [], "FALSE_BELIEF": [], "UNKNOWN": []}
-                context["memories"] = [{"memory_id": row.id, "content": row.content} for row in temporal["memories"]]
+                context = ReplayCharacterContextBuilder().build(db, session, scene, proposal, old.character_id)
                 output, _ = HeuristicCharacterPerformer().perform(context)
                 candidate = CharacterDecision(project_id=session.project_id, scene_proposal_id=proposal.id, character_id=old.character_id, context_fingerprint=context["fingerprint"], **output["decision"])
                 decision_report = CharacterDecisionConstraintChecker().validate(db, context, candidate)
                 if not decision_report.valid:
-                    run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_DECISION_CONSTRAINT_FAILED", "report": decision_report.as_dict()}; session.status = ReplaySessionStatus.BLOCKED; self._fail("REPLAY_DECISION_CONSTRAINT_FAILED")
+                    run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_DECISION_CONSTRAINT_FAILED", "report": decision_report.as_dict()}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
                 parsed = CharacterPerformancePayload.model_validate(output)
                 action_report = PerformanceActionConstraintChecker().validate(db, context, proposal, candidate, parsed.action, list(scene.participants or []))
                 if not action_report.valid:
-                    run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_ACTION_CONSTRAINT_FAILED", "report": action_report.as_dict()}; session.status = ReplaySessionStatus.BLOCKED; self._fail("REPLAY_ACTION_CONSTRAINT_FAILED")
+                    run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_ACTION_CONSTRAINT_FAILED", "report": action_report.as_dict()}; session.status = ReplaySessionStatus.BLOCKED; session.failure_report = run.validation_report; db.flush(); return run
                 staged_decisions.append({"replay_of_id": old_id, "character_id": old.character_id, "decision": output["decision"], "action": output["action"], "context_fingerprint": _fingerprint(context)})
                 if output["action"].get("requires_world_resolution"):
                     request = output["action"].get("world_resolution_request") or {}
-                    entity = next((e for e in (session.staged_world_state or {}).get("current_world", {}).get("world_entities", []) if e.get("id") == request.get("target_entity_id")), None)
-                    world_context = {"request": request, "target_entity": entity, "location": entity, "allowed_world_entity_ids": [entity["id"]] if entity else [], "canon": [], "scope": {"location_id": entity["id"] if entity else None, "actor_character_id": old.character_id, "target_character_id": None, "performance_id": scene.id}, "forbidden_canon_ids": [], "forbidden_propositions": []}
+                    view = ReplayWorldView(session); entity = view.entity(request.get("target_entity_id"))
+                    world_context = {"request": request, "target_entity": entity, "location": entity, "allowed_world_entity_ids": [entity["id"]] if entity else [], "canon": view.canon(), "scope": {"location_id": entity["id"] if entity else None, "actor_character_id": old.character_id, "target_character_id": None, "performance_id": scene.id}, "forbidden_canon_ids": [], "forbidden_propositions": []}
                     staged_outcome, _ = HeuristicWorldResolver().resolve(world_context)
+                    resolution_report = WorldResolutionConstraintChecker().validate(db, world_context, WorldResolutionPayload.model_validate(staged_outcome), session.project_id)
+                    if not resolution_report["valid"]:
+                        run.status = ReplaySceneRunStatus.BLOCKED; run.validation_report = {"code": "REPLAY_RESOLUTION_CONSTRAINT_FAILED", "report": resolution_report}; session.status = ReplaySessionStatus.BLOCKED; return run
             session.staged_world_state = dict(session.staged_world_state or {}) | {str(scene.sequence): {"situation": situation, "decisions": staged_decisions, "resolution": staged_outcome}}
             run.validation_report = {"code": "REPLAY_VALIDATED", "deterministic": True, "staged": True}
             run.status = ReplaySceneRunStatus.VALIDATED
@@ -160,11 +186,11 @@ class ReplayService:
                 old = db.get(Scene, run.original_scene_id)
                 staged = (session.staged_world_state or {}).get(str(run.original_sequence), {})
                 if old:
-                    new = Scene(project_id=old.project_id, sequence=old.sequence, world_time=old.world_time, location=old.location, participants=list(old.participants or []), intent=old.intent, facts=list(staged.get("resolution", {}).get("objective_facts", [])), result=dict(staged.get("resolution", {})), summary="Deterministic replay scene", story_threads=list(old.story_threads or []), status=old.status, history_status="ACTIVE")
+                    new = Scene(project_id=old.project_id, sequence=old.sequence, world_time=old.world_time, location=old.location, participants=list(old.participants or []), intent=old.intent, facts=list(staged.get("resolution", {}).get("objective_facts", [])), result=dict(staged.get("resolution", {})), summary="Deterministic replay scene", story_threads=list(old.story_threads or []), status=old.status, history_status="STAGED")
                     db.add(new); db.flush(); run.replacement_scene_id = new.id
             old = db.get(Scene, run.original_scene_id); new = db.get(Scene, run.replacement_scene_id) if run.replacement_scene_id else None
             if old and new:
-                old.history_status = "SUPERSEDED"; old.superseded_by_scene_id = new.id; run.status = ReplaySceneRunStatus.COMMITTED
+                old.history_status = "SUPERSEDED"; old.superseded_by_scene_id = new.id; db.flush(); new.history_status = "ACTIVE"; run.status = ReplaySceneRunStatus.COMMITTED
         replacement_by_old = {run.original_scene_id: run.replacement_scene_id for run in runs if run.replacement_scene_id}
         # A rebuild is complete only when the affected resource was covered by a replayed scene.
         for inv in db.scalars(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.retcon_application_id == app.id, RetconCognitionInvalidation.status == RetconCognitionInvalidationStatus.ACTIVE)).all():
