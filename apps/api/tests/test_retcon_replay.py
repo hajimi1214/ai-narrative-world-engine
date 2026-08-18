@@ -8,6 +8,10 @@ from app.db import Base
 from app.main import app
 import app.api as api
 from app.models import RetconReplaySession, ReplaySceneRun, RetconApplication, RetconApplicationStatus, Scene
+from app.historical import SceneStateCheckpointService
+from app.historical import TemporalCharacterCognitionReader
+from app.character_mind import ActiveCharacterCognitionReader
+from app.models import RetconCognitionInvalidation, RetconCognitionInvalidationStatus
 from test_retcon_apply import analyzed_setup, apply_success, client_for
 
 @pytest.fixture()
@@ -20,6 +24,8 @@ def session():
 def replay_ready(session, monkeypatch):
     values = apply_success(session, monkeypatch)
     project, canon, knowledge, scene, revision, request, plan, client, applied = values
+    SceneStateCheckpointService().capture(session, project.id, scene.id)
+    session.commit()
     return values + (applied["application"]["id"],)
 
 def test_create_replay_session_requires_pending_application(session, monkeypatch):
@@ -75,3 +81,43 @@ def test_replay_commit_requires_confirmation(session, monkeypatch):
 def test_replay_endpoint_without_session_context_does_not_exist(session, monkeypatch):
     project, *_unused, revision, client = __import__("test_retcon_planning", fromlist=["prepared"]).prepared(session, monkeypatch)
     assert client.post(f"/projects/{project.id}/retcon/replay").status_code == 404
+
+def test_missing_historical_checkpoint_blocks_session(session, monkeypatch):
+    values = apply_success(session, monkeypatch); project, _, _, _, _, _, _, client, applied = values
+    result = client.post(f"/projects/{project.id}/retcon/applications/{applied['application']['id']}/replay-sessions")
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "HISTORICAL_BASELINE_UNAVAILABLE"
+
+def test_replay_abort_cleans_staging_and_allows_retcon_rollback(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    session_id = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]
+    assert client.post(f"/projects/{project.id}/retcon/replay-sessions/{session_id}/abort").json()["status"] == "ABORTED"
+    assert client.post(f"/projects/{project.id}/retcon/applications/{application_id}/rollback").status_code == 200
+
+def test_active_replay_blocks_retcon_rollback(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
+    result = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/rollback")
+    assert result.status_code == 409 and result.json()["detail"]["code"] == "REPLAY_SESSION_ACTIVE"
+
+def test_temporal_reader_excludes_invalidated_cognition(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, knowledge, _, _, _, _, client, _, application_id = values
+    session_id = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()["id"]
+    replay_session = session.get(RetconReplaySession, session_id)
+    result = TemporalCharacterCognitionReader().read(session, project.id, knowledge.character_id, replay_session, 1)
+    assert knowledge.id not in {row.id for row in result["knowledge"]}
+
+def test_resolved_invalidation_keeps_old_cognition_hidden(session, monkeypatch):
+    values = apply_success(session, monkeypatch); project, _, knowledge, _, _, _, _, client, applied = values
+    invalidation = session.scalar(select(RetconCognitionInvalidation).where(RetconCognitionInvalidation.resource_id == knowledge.id)); invalidation.status = RetconCognitionInvalidationStatus.RESOLVED; session.commit()
+    assert knowledge.id not in {row.id for row in ActiveCharacterCognitionReader().knowledge(session, project.id, knowledge.character_id)}
+
+def test_replay_status_ready_before_first_step(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, _, _, _, _, client, _, application_id = values
+    body = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions").json()
+    assert body["status"] == "READY" and body["cursor"] == 0
+
+def test_replay_queue_ignores_superseded_scene(session, monkeypatch):
+    values = replay_ready(session, monkeypatch); project, _, _, scene, _, _, _, client, _, application_id = values
+    scene.history_status = "SUPERSEDED"; session.commit()
+    result = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
+    assert result.status_code == 201 and scene.id not in {item["scene_id"] for item in result.json()["queue"]}

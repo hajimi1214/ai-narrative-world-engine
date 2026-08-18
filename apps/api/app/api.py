@@ -26,6 +26,7 @@ from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_
 from .retcon import RetconImpactPlanner, RetconPlanStalenessChecker, CLASSIFICATION_LABELS, semantic_fingerprint
 from .retcon_apply import RetconApplyService, RetconPendingReplayGuard, RetconAuthorOverrideResolver, has_pending_replay
 from .replay import ReplayService
+from .historical import SceneStateCheckpointService
 
 router = APIRouter()
 
@@ -88,6 +89,13 @@ def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
+
+@router.post("/projects/{project_id}/scenes/{scene_id}/checkpoint", status_code=status.HTTP_201_CREATED)
+def capture_scene_checkpoint(project_id: str, scene_id: str, db: Session = Depends(get_db)):
+    try:
+        checkpoint = SceneStateCheckpointService().capture(db, project_id, scene_id); db.commit(); db.refresh(checkpoint); return record_dict(checkpoint)
+    except ValueError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 
 @router.post("/projects/{project_id}/retcon/requests", status_code=status.HTTP_201_CREATED)
 def create_retcon_request(project_id: str, payload: RetconRequestPayload, db: Session = Depends(get_db)):
@@ -210,6 +218,9 @@ def rollback_retcon(project_id: str, application_id: str, db: Session = Depends(
     row = db.get(RetconApplication, application_id)
     if not row or row.project_id != project_id:
         raise HTTPException(status_code=404, detail="Retcon application not found")
+    active_replay = db.scalar(select(RetconReplaySession).where(RetconReplaySession.retcon_application_id == row.id, RetconReplaySession.status.in_([ReplaySessionStatus.READY, ReplaySessionStatus.RUNNING, ReplaySessionStatus.BLOCKED])))
+    if active_replay:
+        raise HTTPException(status_code=409, detail={"code": "REPLAY_SESSION_ACTIVE"})
     try:
         application = RetconApplyService().rollback(db, project_id, row)
         ExecutionTraceRecorder().create(db, project_id=project_id, stage=ExecutionStage.REVISION_ROLLBACK, source_type="RETCON_APPLICATION", source_id=row.id, status=ExecutionStatus.SUCCEEDED, output_fingerprint=application.post_apply_world_fingerprint)
@@ -262,6 +273,14 @@ def commit_replay_session(project_id: str, session_id: str, payload: ReplayCommi
         ReplayService().commit(db, session, payload.explicit_confirmation); db.commit(); db.refresh(session); return replay_session_payload(db, session)
     except ValueError as exc:
         db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+@router.post("/projects/{project_id}/retcon/replay-sessions/{session_id}/abort")
+def abort_replay_session(project_id: str, session_id: str, db: Session = Depends(get_db)):
+    session = db.get(RetconReplaySession, session_id)
+    if not session or session.project_id != project_id: raise HTTPException(status_code=404, detail="Replay session not found")
+    if session.status == ReplaySessionStatus.COMPLETED: raise HTTPException(status_code=409, detail={"code": "REPLAY_SESSION_COMPLETED"})
+    session.status = ReplaySessionStatus.ABORTED; session.staged_world_state = {}; db.query(ReplaySceneRun).filter(ReplaySceneRun.replay_session_id == session.id).delete(synchronize_session=False); db.commit(); db.refresh(session)
+    return replay_session_payload(db, session)
 
 def routed_provider(settings, route):
     return get_model_provider(settings, route.provider, route.base_url)

@@ -31,7 +31,7 @@ class ResolverMode(str, enum.Enum): HEURISTIC = "HEURISTIC"; LLM = "LLM"
 class ResolutionStatus(str, enum.Enum): VALID = "VALID"; REJECTED = "REJECTED"; UNRESOLVED = "UNRESOLVED"
 class ResolutionOutcome(str, enum.Enum): SUCCESS = "SUCCESS"; PARTIAL = "PARTIAL"; FAILURE = "FAILURE"; NO_EFFECT = "NO_EFFECT"; INTERRUPTED = "INTERRUPTED"; UNRESOLVED = "UNRESOLVED"
 class RevisionStatus(str, enum.Enum): DRAFT = "DRAFT"; PREVIEWED = "PREVIEWED"; STALE = "STALE"; CANCELLED = "CANCELLED"; APPLIED = "APPLIED"; ROLLED_BACK = "ROLLED_BACK"
-class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVISION"; POST_REVISION="POST_REVISION"; ROLLBACK_POINT="ROLLBACK_POINT"
+class SnapshotType(str, enum.Enum): BASELINE="BASELINE"; PRE_REVISION="PRE_REVISION"; POST_REVISION="POST_REVISION"; ROLLBACK_POINT="ROLLBACK_POINT"; PRE_REPLAY_COMMIT="PRE_REPLAY_COMMIT"; POST_REPLAY_COMMIT="POST_REPLAY_COMMIT"
 class RevisionApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED="APPLIED"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
 class RetconApplicationStatus(str, enum.Enum): PENDING="PENDING"; APPLIED_PENDING_REPLAY="APPLIED_PENDING_REPLAY"; FAILED="FAILED"; ROLLED_BACK="ROLLED_BACK"
 class RetconCognitionInvalidationStatus(str, enum.Enum): ACTIVE="ACTIVE"; RESOLVED="RESOLVED"; ROLLED_BACK="ROLLED_BACK"
@@ -448,6 +448,21 @@ class RetconReplaySession(TimestampMixin, Base):
     failure_report: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    staged_world_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    pre_commit_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("world_snapshots.id"))
+    post_commit_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("world_snapshots.id"))
+
+class SceneStateCheckpoint(Base):
+    __tablename__ = "scene_state_checkpoints"
+    __table_args__ = (UniqueConstraint("project_id", "scene_id", name="uq_scene_state_checkpoint"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id"), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    pre_snapshot_id: Mapped[str] = mapped_column(ForeignKey("world_snapshots.id"), nullable=False)
+    post_snapshot_id: Mapped[str] = mapped_column(ForeignKey("world_snapshots.id"), nullable=False)
+    current_scene_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class ReplaySceneRun(Base):
     __tablename__ = "replay_scene_runs"

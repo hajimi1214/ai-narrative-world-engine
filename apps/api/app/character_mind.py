@@ -79,7 +79,7 @@ class ActiveCharacterCognitionReader:
             RetconCognitionInvalidation.project_id == project_id,
             RetconCognitionInvalidation.character_id == character_id,
             RetconCognitionInvalidation.resource_type == resource_type,
-            RetconCognitionInvalidation.status == RetconCognitionInvalidationStatus.ACTIVE,
+            RetconCognitionInvalidation.status.in_([RetconCognitionInvalidationStatus.ACTIVE, RetconCognitionInvalidationStatus.RESOLVED]),
         )).all())
 
     def knowledge(self, session, project_id, character_id):
