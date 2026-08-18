@@ -51,7 +51,7 @@ class HistoricalDependencyGraphBuilder:
             edges.append(DependencyEdge(source[0],source[1],target[0],target[1],edge_type,reason,path,certainty))
             if target not in node_paths:
                 node_paths[target]=path; node_certainty[target]=certainty; queue.append(target)
-            elif certainty == "CONFIRMED" and node_certainty.get(target) == "UNCERTAIN" or (certainty == node_certainty.get(target) and len(path)<len(node_paths[target])):
+            elif (certainty == "CONFIRMED" and node_certainty.get(target) == "UNCERTAIN") or (certainty == node_certainty.get(target) and len(path)<len(node_paths[target])):
                 node_paths[target]=path; node_certainty[target]=certainty
         def exact(value,needles):
             for needle in sorted(needles):
@@ -64,13 +64,16 @@ class HistoricalDependencyGraphBuilder:
             self.visited_nodes.add(source); typ,ident=source; needles=set(target_ids)|set(old_values)
             if typ=="CANON_FACT":
                 for row in session.scalars(select(CharacterKnowledge).join(Character).where(Character.project_id==project_id,CharacterKnowledge.source==ident)).all(): add(source,("CHARACTER_KNOWLEDGE",row.id),"CANON_TO_KNOWLEDGE","人物认知直接来自待修改世界事实")
-                for row in self._candidate_json(session,Scene,project_id,["participants","facts","result"],needles):
+                for row in self._candidate_json(session,Scene,project_id,["participants","facts","result"],{ident}|old_values):
                     hit,path=exact({"participants":row.participants,"facts":row.facts,"result":row.result},{ident}|old_values)
                     if hit:add(source,("SCENE",row.id),"EXPLICIT_SCENE_REFERENCE","场景包含结构化历史事实引用",path)
                 if old_values:
                     for row in session.scalars(select(CharacterKnowledge).join(Character).where(Character.project_id==project_id,CharacterKnowledge.proposition.in_(old_values))).all():
                         if row.source!=ident:add(source,("CHARACTER_KNOWLEDGE",row.id),"EXACT_VALUE_WITHOUT_LINEAGE","认知文本与旧命题完全相等但缺少来源链")
                 for row in session.scalars(select(RevealConstraint).where(RevealConstraint.project_id==project_id,RevealConstraint.canon_fact_id==ident)).all():add(source,("REVEAL_CONSTRAINT",row.id),"CANON_TO_REVEAL","揭示约束直接引用世界事实")
+                for row in self._candidate_json(session,WorldResolution,project_id,["canon_fact_ids_used"],{ident}):
+                    hit,path=exact(row.canon_fact_ids_used,{ident})
+                    if hit:add(source,("WORLD_RESOLUTION",row.id),"CANON_TO_WORLD_RESOLUTION","世界响应使用待修改世界事实",path)
                 for row in self._candidate_json(session,CanonFact,project_id,["data"],{ident}):
                     if row.id!=ident:
                         hit,path=exact(row.data,{ident})
@@ -84,6 +87,9 @@ class HistoricalDependencyGraphBuilder:
                     if row.id!=ident:
                         hit,path=exact({"current_state":row.current_state,"profile":row.profile,"inventory":row.inventory,"secrets":row.secrets},{ident})
                         if hit:add(source,("CHARACTER",row.id),"ENTITY_STRUCTURED_REFERENCE","人物状态包含结构化实体引用",path)
+                for row in self._candidate_json(session,WorldResolution,project_id,["world_entity_ids_used"],{ident}):
+                    hit,path=exact(row.world_entity_ids_used,{ident})
+                    if hit:add(source,("WORLD_RESOLUTION",row.id),"ENTITY_TO_WORLD_RESOLUTION","世界响应使用待修改世界实体",path)
             elif typ=="CHARACTER":
                 for row in self._candidate_json(session,Character,project_id,["relationships","current_state","profile","inventory","secrets"],{ident}):
                     if row.id!=ident:
@@ -120,6 +126,21 @@ class ImpactClassificationResolver:
         if edge.target_type=="REVEAL_CONSTRAINT":return "REVALIDATE","揭示约束直接引用被修改事实。"
         return "REVALIDATE","存在明确结构化引用，需要重新验证。"
 
+class ImpactAggregationResolver:
+    """Produce one deterministic impact conclusion for each affected resource."""
+    def __init__(self): self.classifier=ImpactClassificationResolver()
+    def aggregate(self, edges):
+        grouped={}
+        for edge in edges: grouped.setdefault((edge.target_type,edge.target_id),[]).append(edge)
+        result=[]
+        stable=lambda edge:(len(edge.path),json.dumps(edge.path,sort_keys=True,ensure_ascii=True),edge.edge_type)
+        for key in sorted(grouped):
+            paths=grouped[key]; confirmed=sorted((edge for edge in paths if edge.certainty=="CONFIRMED"),key=stable)
+            primary=(confirmed or sorted(paths,key=stable))[0]
+            classification,reason=self.classifier.classify(primary)
+            result.append((primary,classification,reason))
+        return result
+
 class ReplayBoundaryFinder:
     def find(self,scenes,affected_scene_ids):
         affected=[s for s in scenes if s.id in affected_scene_ids]
@@ -130,8 +151,8 @@ class ReplayBoundaryFinder:
 
 class CharacterCognitionImpactPlanner:
     def plan(self,session,project_id,items):
-        ids={i.get("character_id") for i in items if i.get("character_id")}; out=[]
-        for cid in sorted(ids):out.append({"character_id":cid,"affected_knowledge_ids":sorted({i["resource_id"] for i in items if i.get("character_id")==cid and i["resource_type"]=="CHARACTER_KNOWLEDGE"}),"affected_memory_ids":sorted({i["resource_id"] for i in items if i.get("character_id")==cid and i["resource_type"]=="CHARACTER_MEMORY"}),"reason":"来自受影响世界事实的明确认知依赖"})
+        ids={i.get("character_id") for i in items if i.get("character_id") and i.get("classification")=="REBUILD_COGNITION"}; out=[]
+        for cid in sorted(ids):out.append({"character_id":cid,"affected_knowledge_ids":sorted({i["resource_id"] for i in items if i.get("character_id")==cid and i["resource_type"]=="CHARACTER_KNOWLEDGE" and i.get("classification")=="REBUILD_COGNITION"}),"affected_memory_ids":sorted({i["resource_id"] for i in items if i.get("character_id")==cid and i["resource_type"]=="CHARACTER_MEMORY" and i.get("classification")=="REBUILD_COGNITION"}),"reason":"来自受影响世界事实的明确认知依赖"})
         return out
 
 class RetconBasisFingerprintBuilder:
@@ -173,9 +194,9 @@ class RetconPlanStalenessChecker:
 class RetconImpactPlanner:
     def analyze(self,session,request,revision):
         normalized=revision.normalized_changes or []; ids={i["target_id"] for i in normalized}; types={i["target_id"]:i["target_type"] for i in normalized}; old={str(i["before_value"]) for i in normalized if i.get("path")=="/proposition" and i.get("before_value") is not None}
-        builder=HistoricalDependencyGraphBuilder(); edges=builder.build(session,request.project_id,ids,old,types); resolver=ImpactClassificationResolver(); items=[]; affected={e.target_id for e in edges if e.target_type=="SCENE"}
-        for e in edges:
-            cls,reason=resolver.classify(e); cid=None
+        builder=HistoricalDependencyGraphBuilder(); edges=builder.build(session,request.project_id,ids,old,types); items=[]; affected={e.target_id for e in edges if e.target_type=="SCENE"}
+        for e,cls,reason in ImpactAggregationResolver().aggregate(edges):
+            cid=None
             if e.target_type in {"CHARACTER_KNOWLEDGE","CHARACTER_MEMORY"}:
                 row=session.get(CharacterKnowledge if e.target_type=="CHARACTER_KNOWLEDGE" else CharacterMemory,e.target_id); cid=row.character_id if row else None
             items.append(RetconImpactItem(plan_id="",resource_type=e.target_type,resource_id=e.target_id,classification=cls,reason_code=e.edge_type,reason_summary=reason,character_id=cid,scene_id=e.target_id if e.target_type=="SCENE" else None,dependency_path=e.path))
@@ -183,13 +204,13 @@ class RetconImpactPlanner:
         scenes=scene_meta
         earliest_id,earliest_seq,validation=ReplayBoundaryFinder().find(scenes,affected)
         if builder.limit_reached:validation["issues"].append({"code":"PLAN_GRAPH_LIMIT_REACHED","severity":"BLOCKING","resource_type":"RETCON_GRAPH","resource_id":request.id,"message":"依赖图超过规划节点上限。"})
-        cognition=CharacterCognitionImpactPlanner().plan(session,request.project_id,[{"resource_type":i.resource_type,"resource_id":i.resource_id,"character_id":i.character_id} for i in items])
+        cognition=CharacterCognitionImpactPlanner().plan(session,request.project_id,[{"resource_type":i.resource_type,"resource_id":i.resource_id,"character_id":i.character_id,"classification":i.classification} for i in items])
         affected_sequences=sorted(s.sequence for s in scenes if s.id in affected); preserved=[s.sequence for s in scenes if s.id not in affected]
         ranges=[]
         for sequence in preserved:
             if not ranges or sequence != ranges[-1]["sequence_end"]+1:ranges.append({"sequence_start":sequence,"sequence_end":sequence,"count":1})
             else:ranges[-1]["sequence_end"]=sequence; ranges[-1]["count"]+=1
-        summary={k:sum(i.classification==k for i in items) for k in ("REVALIDATE","REBUILD_COGNITION","REPLAY_REQUIRED","INVALIDATED")}; summary.update(total_impacts=len(items),affected_characters=len({i.character_id for i in items if i.character_id}),replay_scene_count=sum(i.resource_type=="SCENE" and i.classification=="REPLAY_REQUIRED" for i in items),preserved_scene_count=len(preserved),preserved_scene_ranges=ranges,cognition_impacts=cognition)
+        summary={k:sum(i.classification==k for i in items) for k in ("REVALIDATE","REBUILD_COGNITION","REPLAY_REQUIRED","INVALIDATED")}; summary.update(total_impacts=len(items),affected_characters=len({i.character_id for i in items if i.character_id and i.classification=="REBUILD_COGNITION"}),replay_scene_count=sum(i.resource_type=="SCENE" and i.classification=="REPLAY_REQUIRED" for i in items),preserved_scene_count=len(preserved),preserved_scene_ranges=ranges,cognition_impacts=cognition)
         parent=session.scalar(select(RetconImpactPlan).where(RetconImpactPlan.retcon_request_id==request.id).order_by(RetconImpactPlan.version.desc())); blocked=bool(validation["issues"])
         plan=RetconImpactPlan(project_id=request.project_id,retcon_request_id=request.id,version=request.current_plan_version+1,parent_plan_id=parent.id if parent else None,basis_fingerprint=RetconBasisFingerprintBuilder().build(session,request.project_id,revision,edges),status="BLOCKED" if blocked else "READY",earliest_affected_scene_id=earliest_id,earliest_affected_sequence=earliest_seq,impact_summary=summary,validation_report=validation)
         return plan,items

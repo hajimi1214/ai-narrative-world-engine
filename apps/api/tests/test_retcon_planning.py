@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from app.db import Base
 from app.main import app
 import app.api as api
-from app.models import CanonFact, CharacterKnowledge, CharacterMemory, Scene, WorldRevision, RetconRequest, RetconImpactPlan, RetconImpactItem, CharacterDecision, CharacterDecisionType, CharacterDecisionStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ActionVisibility, PerformanceMode, PerformanceStatus, ResolverMode, ResolutionStatus, ResolutionOutcome
+from app.models import CanonFact, CharacterKnowledge, CharacterMemory, Scene, WorldEntity, WorldRevision, RetconRequest, RetconImpactPlan, RetconImpactItem, CharacterDecision, CharacterDecisionType, CharacterDecisionStatus, ScenePerformance, ScenePerformanceTurn, WorldResolution, ActionVisibility, PerformanceMode, PerformanceStatus, ResolverMode, ResolutionStatus, ResolutionOutcome
 from app.revision import RevisionStateFingerprintBuilder
 from app.retcon import HistoricalDependencyGraphBuilder, ReplayBoundaryFinder, RetconBasisFingerprintBuilder
 from app.revision import StructuredReferenceScanner
@@ -146,6 +146,8 @@ def test_canon_knowledge_decision_turn_resolution_chain(session, monkeypatch):
     assert states[("CHARACTER_DECISION",decision.id)] == "REPLAY_REQUIRED"
     assert states[("SCENE_PERFORMANCE_TURN",turn.id)] == "REPLAY_REQUIRED"
     assert states[("WORLD_RESOLUTION",resolution.id)] == "INVALIDATED"
+    resolution_items=[item for item in items if item["resource_type"]=="WORLD_RESOLUTION" and item["resource_id"]==resolution.id]
+    assert len(resolution_items)==1 and [node["type"] for node in resolution_items[0]["dependency_path"]]==["CANON_FACT","WORLD_RESOLUTION"]
 
 def test_full_causal_dependency_path_contains_all_lineage_nodes(session, monkeypatch):
     project, canon, knowledge, scene, independent, revision, client = prepared(session, monkeypatch)
@@ -156,7 +158,7 @@ def test_full_causal_dependency_path_contains_all_lineage_nodes(session, monkeyp
     session.add(performance); session.flush()
     turn = ScenePerformanceTurn(project_id=project.id, performance_id=performance.id, sequence=1, actor_character_id=knowledge.character_id, actor_context_fingerprint="ctx", character_decision_id=decision.id, action_visibility=ActionVisibility.PUBLIC, observable_action="x", recipient_character_ids=[], requires_world_resolution=True, world_resolution_request={}, validation_result={})
     session.add(turn); session.flush()
-    resolution = WorldResolution(project_id=project.id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode=ResolverMode.HEURISTIC, world_context_fingerprint="ctx", status=ResolutionStatus.VALID, outcome=ResolutionOutcome.SUCCESS, outcome_summary="x", objective_facts=[], actor_observation=None, public_observation=None, recipient_character_ids=[], canon_fact_ids_used=[canon.id], world_entity_ids_used=[], resolution_basis_summary=None, missing_information=[])
+    resolution = WorldResolution(project_id=project.id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode=ResolverMode.HEURISTIC, world_context_fingerprint="ctx", status=ResolutionStatus.VALID, outcome=ResolutionOutcome.SUCCESS, outcome_summary="x", objective_facts=[], actor_observation=None, public_observation=None, recipient_character_ids=[], canon_fact_ids_used=[], world_entity_ids_used=[], resolution_basis_summary=None, missing_information=[])
     session.add(resolution); session.commit()
     stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit()
     req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"path"}).json()
@@ -346,3 +348,35 @@ def test_analyze_never_calls_ai_provider(session, monkeypatch):
     monkeypatch.setattr(api,"get_model_provider",lambda *args,**kwargs:(_ for _ in ()).throw(AssertionError("AI must not be used")))
     req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"deterministic"}).json()
     assert client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").status_code==200
+
+def test_mixed_confirmed_and_uncertain_knowledge_aggregates_to_one_confirmed_item(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); knowledge.source=scene.id; session.commit()
+    stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit()
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"mixed"}).json(); items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    matched=[item for item in items if item["resource_type"]=="CHARACTER_KNOWLEDGE" and item["resource_id"]==knowledge.id]
+    assert len(matched)==1 and matched[0]["classification"]=="REBUILD_COGNITION"
+    assert [node["type"] for node in matched[0]["dependency_path"]]==["CANON_FACT","SCENE","CHARACTER_KNOWLEDGE"]
+
+def test_pure_uncertain_cognition_is_not_counted_as_rebuild(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); knowledge.source=None; session.commit()
+    stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit()
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"uncertain cognition"}).json(); plan=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["plan"]
+    assert plan["impact_summary"]["affected_characters"]==0 and plan["impact_summary"]["cognition_impacts"]==[]
+
+def test_direct_canon_to_world_resolution_is_invalidated(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); proposal=session.query(__import__("app.models",fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first()
+    decision=CharacterDecision(project_id=project.id,scene_proposal_id=proposal.id,character_id=knowledge.character_id,context_fingerprint="ctx",decision_type=CharacterDecisionType.INVESTIGATE,intent="x",chosen_action="x",motivation="x",goal_refs=[],knowledge_used=[],memory_refs=[],ability_refs=[],inventory_refs=[],relationship_factors={},uncertainties=[],refused_options=[],decision_summary="x",status=CharacterDecisionStatus.VALID); session.add(decision); session.flush()
+    performance=ScenePerformance(project_id=project.id,scene_proposal_id=proposal.id,take_number=300,proposal_context_fingerprint="ctx",mode=PerformanceMode.HEURISTIC,status=PerformanceStatus.RUNNING,participant_order=[],active_participant_ids=[],max_turns=1,turn_count=0); session.add(performance); session.flush(); turn=ScenePerformanceTurn(project_id=project.id,performance_id=performance.id,sequence=1,actor_character_id=knowledge.character_id,actor_context_fingerprint="ctx",character_decision_id=decision.id,action_visibility=ActionVisibility.PUBLIC,observable_action="x",recipient_character_ids=[],requires_world_resolution=True,world_resolution_request={},validation_result={}); session.add(turn); session.flush(); resolution=WorldResolution(project_id=project.id,performance_id=performance.id,performance_turn_id=turn.id,resolver_mode=ResolverMode.HEURISTIC,world_context_fingerprint="ctx",status=ResolutionStatus.VALID,outcome=ResolutionOutcome.SUCCESS,outcome_summary="canon",objective_facts=[],actor_observation=None,public_observation=None,recipient_character_ids=[],canon_fact_ids_used=[canon.id],world_entity_ids_used=[],resolution_basis_summary=None,missing_information=[]); session.add(resolution); session.commit()
+    stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit(); req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"direct canon"}).json(); items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    item=next(i for i in items if i["resource_id"]==resolution.id); assert item["classification"]=="INVALIDATED" and [node["type"] for node in item["dependency_path"]]==["CANON_FACT","WORLD_RESOLUTION"]
+
+def test_direct_entity_to_world_resolution_is_invalidated(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); entity=session.scalar(select(WorldEntity).where(WorldEntity.project_id==project.id)); entity_revision=client.post(f"/projects/{project.id}/revisions",json={"title":"entity","changes":[{"target_type":"WORLD_ENTITY","target_id":entity.id,"operation":"SET","path":"/name","value":"changed"}]}).json(); assert client.post(f"/projects/{project.id}/revisions/{entity_revision['id']}/preview").status_code==200
+    proposal=session.query(__import__("app.models",fromlist=["SceneProposal"]).SceneProposal).filter_by(project_id=project.id).first(); decision=CharacterDecision(project_id=project.id,scene_proposal_id=proposal.id,character_id=knowledge.character_id,context_fingerprint="ctx",decision_type=CharacterDecisionType.INVESTIGATE,intent="x",chosen_action="x",motivation="x",goal_refs=[],knowledge_used=[],memory_refs=[],ability_refs=[],inventory_refs=[],relationship_factors={},uncertainties=[],refused_options=[],decision_summary="x",status=CharacterDecisionStatus.VALID); session.add(decision); session.flush(); performance=ScenePerformance(project_id=project.id,scene_proposal_id=proposal.id,take_number=301,proposal_context_fingerprint="ctx",mode=PerformanceMode.HEURISTIC,status=PerformanceStatus.RUNNING,participant_order=[],active_participant_ids=[],max_turns=1,turn_count=0); session.add(performance); session.flush(); turn=ScenePerformanceTurn(project_id=project.id,performance_id=performance.id,sequence=1,actor_character_id=knowledge.character_id,actor_context_fingerprint="ctx",character_decision_id=decision.id,action_visibility=ActionVisibility.PUBLIC,observable_action="x",recipient_character_ids=[],requires_world_resolution=True,world_resolution_request={},validation_result={}); session.add(turn); session.flush(); resolution=WorldResolution(project_id=project.id,performance_id=performance.id,performance_turn_id=turn.id,resolver_mode=ResolverMode.HEURISTIC,world_context_fingerprint="ctx",status=ResolutionStatus.VALID,outcome=ResolutionOutcome.SUCCESS,outcome_summary="entity",objective_facts=[],actor_observation=None,public_observation=None,recipient_character_ids=[],canon_fact_ids_used=[],world_entity_ids_used=[entity.id],resolution_basis_summary=None,missing_information=[]); session.add(resolution); session.commit(); stored=session.get(WorldRevision,entity_revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit()
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":entity_revision["id"],"reason":"direct entity"}).json(); items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    assert next(i for i in items if i["resource_id"]==resolution.id)["classification"]=="INVALIDATED"
+
+def test_derived_canon_reference_reaches_scene(session, monkeypatch):
+    project, canon, knowledge, scene, independent, revision, client=prepared(session,monkeypatch); derived=CanonFact(project_id=project.id,fact_type="WORLD_FACT",proposition="derived",data={"canon_fact_id":canon.id},locked=False); session.add(derived); session.flush(); independent.facts=[derived.id]; session.commit(); stored=session.get(WorldRevision,revision["id"]); stored.base_state_fingerprint=RevisionStateFingerprintBuilder().build(session,project.id); session.commit()
+    req=client.post(f"/projects/{project.id}/retcon/requests",json={"source_revision_id":revision["id"],"reason":"derived"}).json(); items=client.post(f"/projects/{project.id}/retcon/requests/{req['id']}/analyze").json()["items"]
+    item=next(i for i in items if i["resource_id"]==independent.id and i["resource_type"]=="SCENE"); assert item["classification"]=="REPLAY_REQUIRED" and [node["type"] for node in item["dependency_path"]]==["CANON_FACT","CANON_FACT","SCENE"]
