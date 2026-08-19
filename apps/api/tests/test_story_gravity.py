@@ -384,3 +384,57 @@ def test_dry_run_selects_highest_valid_candidate_without_persisting_invalid(sess
     response = TestClient(app).post(f"/projects/{world.project.id}/director/dry-run")
     assert response.status_code == 201 and response.json()["selected_candidate"]["candidate_key"] == "valid"
     assert session.scalar(select(func.count(SceneProposal.id))) == 1
+
+
+def _knowledge_proposal(project_id, character_id, reference):
+    return SceneProposal(project_id=project_id, proposal_type=ProposalType.CHARACTER_DRIVEN, participants=[character_id], character_motivations={character_id: {"required_knowledge": [reference]}}, entry_state={}, scene_goal="respond", expected_progress={"character_arc": True}, allowed_reveals=[], forbidden_reveals=[], required_canon=[], possible_outcomes=[], new_entity_requests=[], risk_flags=[])
+
+
+def test_normal_director_explicit_knowledge_binding(session, world):
+    knowledge = CharacterKnowledge(character_id=world.lead.id, proposition="ENTITY door: opened = true", status=KnowledgeStatus.KNOWN); session.add(knowledge); session.commit()
+    context = DirectorContextBuilder().build(session, world.project.id)
+    proposal = _knowledge_proposal(world.project.id, world.lead.id, {"knowledge_id": knowledge.id, "proposition": knowledge.proposition, "accepted_statuses": ["KNOWN"]})
+    report = DirectorConstraintChecker().validate(session, context, proposal)
+    assert not any(issue.code == "KNOWLEDGE_LEAK" for issue in report.issues)
+    assert any(item["status"] == "KNOWN" and item["knowledge_id"] == knowledge.id for item in context["character_knowledge"][world.lead.id]["KNOWN"])
+
+
+@pytest.mark.parametrize("reference_factory", [
+    lambda k: {"knowledge_id": k.id, "proposition": "ENTITY door: opened = false", "accepted_statuses": ["KNOWN"]},
+    lambda k: {"knowledge_id": k.id, "proposition": k.proposition, "accepted_statuses": ["KNOWN"]},
+])
+def test_normal_director_explicit_knowledge_mismatch_blocks(session, world, reference_factory):
+    knowledge = CharacterKnowledge(character_id=world.lead.id, proposition="ENTITY door: opened = true", status=KnowledgeStatus.SUSPECTED); session.add(knowledge); session.commit()
+    context = DirectorContextBuilder().build(session, world.project.id)
+    report = DirectorConstraintChecker().validate(session, context, _knowledge_proposal(world.project.id, world.lead.id, reference_factory(knowledge)))
+    assert any(issue.code == "KNOWLEDGE_LEAK" and issue.severity == "BLOCKING" for issue in report.issues)
+
+
+def test_normal_director_foreign_knowledge_blocks(session, world):
+    knowledge = CharacterKnowledge(character_id=world.support.id, proposition="ENTITY door: opened = true", status=KnowledgeStatus.KNOWN); session.add(knowledge); session.commit()
+    context = DirectorContextBuilder().build(session, world.project.id)
+    report = DirectorConstraintChecker().validate(session, context, _knowledge_proposal(world.project.id, world.lead.id, {"knowledge_id": knowledge.id, "proposition": knowledge.proposition, "accepted_statuses": ["KNOWN"]}))
+    assert any(issue.code == "KNOWLEDGE_LEAK" for issue in report.issues)
+
+
+def test_candidate_key_distinguishes_consequence_paths(session, world):
+    session.add_all([_state_event(world, target_type="CHARACTER", target_id=world.support.id, path="/physical_state/injured", source_key="path-a"), _state_event(world, target_type="CHARACTER", target_id=world.support.id, path="/inventory/sword", source_key="path-b")]); session.commit()
+    context = StoryGravityContextBuilder().build(session, world.project.id); candidates = [item for item in DirectorCandidateEngine().generate(context, StoryGravityEngine().build(context)) if item.proposal_type == ProposalType.CONSEQUENCE.value]
+    assert len(candidates) >= 2 and len({item.candidate_key for item in candidates}) == len(candidates)
+    assert {item.evidence["path"] for item in candidates}.issuperset({"/physical_state/injured", "/inventory/sword"})
+
+
+def test_candidate_key_evidence_is_order_and_score_independent(session, world):
+    context = StoryGravityContextBuilder().build(session, world.project.id); report = StoryGravityEngine().build(context); engine = DirectorCandidateEngine()
+    first = engine._candidate("CONSEQUENCE", None, (world.lead.id,), world.a.id, "CHARACTER", (world.lead.id,), "consequence", {"raw": 1}, (), gravity=report, expected_progress={}, evidence={"path": "/x", "timeline_event_ids": ["b", "a"]})
+    second = engine._candidate("CONSEQUENCE", None, (world.lead.id,), world.a.id, "CHARACTER", (world.lead.id,), "consequence", {"raw": 99}, (), gravity=report, expected_progress={}, evidence={"timeline_event_ids": ["a", "b"], "path": "/x"})
+    assert first.candidate_key == second.candidate_key
+
+
+def test_top_diverse_is_distinct_first_then_deterministic_fill(session, world):
+    def item(key, score, participant):
+        return StoryGravityCandidate(key, ProposalType.CHARACTER_DRIVEN.value, None, (participant,), world.a.id, "CHARACTER", (participant,), "goal", {}, score)
+    engine = DirectorCandidateEngine()
+    candidates = [item("a1", 10, world.lead.id), item("a2", 9, world.lead.id), item("b1", 8, world.support.id), item("b2", 7, world.support.id)]
+    selected = engine.top_diverse(candidates, 3)
+    assert [item.candidate_key for item in selected] == ["a1", "b1", "a2"]

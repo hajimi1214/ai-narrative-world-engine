@@ -11,6 +11,41 @@ from .character_mind import ActiveCharacterCognitionReader, CharacterBeliefViewB
 
 RECENT_SCENE_LIMIT = 10
 
+
+def _canonical_semantic(value: Any) -> Any:
+    """Normalize structured identity data without using insertion or hash order."""
+    if isinstance(value, dict):
+        return {str(key): _canonical_semantic(value[key]) for key in sorted(value, key=str)}
+    if isinstance(value, (list, tuple, set)):
+        values = [_canonical_semantic(item) for item in value]
+        return sorted(values, key=lambda item: json.dumps(item, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    return value
+
+
+class DirectorKnowledgeReferenceValidator:
+    """Single strict binding rule shared by normal and AI Director paths."""
+    @staticmethod
+    def validate(reference: Any, character_id: str, available: Any) -> bool:
+        if not isinstance(reference, dict) or not isinstance(reference.get("knowledge_id"), str) or not reference["knowledge_id"]:
+            return False
+        rows = []
+        if isinstance(available, dict):
+            for values in available.values():
+                rows.extend(values if isinstance(values, list) else [])
+        elif isinstance(available, list):
+            rows = available
+        row = next((item for item in rows if isinstance(item, dict) and (item.get("knowledge_id") or item.get("id")) == reference["knowledge_id"]), None)
+        if not row or row.get("character_id") not in (None, character_id):
+            return False
+        if "proposition" in reference and reference.get("proposition") != row.get("proposition"):
+            return False
+        accepted = reference.get("accepted_statuses")
+        if accepted is not None:
+            statuses = {getattr(value, "value", value) for value in accepted} if isinstance(accepted, list) else set()
+            if row.get("status") not in statuses:
+                return False
+        return True
+
 def extract_entity_references(*values: Any) -> set[str]:
     """Extract only documented entity reference keys; never infer from arbitrary text."""
     references: set[str] = set()
@@ -306,7 +341,9 @@ class DirectorCandidateEngine:
             "participant_repetition_penalty": -sum(repetition["participants"].get(value, 0) for value in participants) * self.weights.participant_repetition,
             "location_repetition_penalty": -repetition["locations"].get(location, 0) * self.weights.location_repetition if location else 0.0,
         })
-        key = "|".join([proposal_type, thread_id or "", ",".join(sorted(participants)), location or "", focus_type, ",".join(sorted(str(value) for value in focus_ids)), ",".join(sorted(reveal_ids))])
+        canonical_evidence = json.dumps(_canonical_semantic(evidence), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        evidence_identity = hashlib.sha256(canonical_evidence.encode()).hexdigest()
+        key = "|".join([proposal_type, thread_id or "", ",".join(sorted(participants)), location or "", focus_type, ",".join(sorted(str(value) for value in focus_ids)), pressure, ",".join(sorted(reveal_ids)), f"evidence:{evidence_identity}"])
         score = round(sum(float(value) for value in components.values()), 8)
         return StoryGravityCandidate(key, proposal_type, thread_id, tuple(sorted(participants)), location, focus_type, tuple(sorted(str(value) for value in focus_ids)), pressure, {key: round(float(value), 8) for key, value in components.items()}, score, tuple(reasons), expected_progress, tuple(sorted(reveal_ids)), evidence)
     def rank(self, candidates):
@@ -314,13 +351,18 @@ class DirectorCandidateEngine:
     def select(self, candidates):
         return self.rank(candidates)[0] if candidates else None
     def top_diverse(self, candidates, k=3):
+        ranked = self.rank(candidates)
         result = []
         seen = set()
-        for candidate in self.rank(candidates):
+        remaining = []
+        for candidate in ranked:
             identity = (candidate.proposal_type, candidate.primary_thread_id, candidate.participant_ids, candidate.location_id)
-            if identity not in seen or len(result) + 1 >= k:
+            if identity not in seen and len(result) < k:
                 result.append(candidate); seen.add(identity)
-            if len(result) == k: break
+            else:
+                remaining.append(candidate)
+        if len(result) < k:
+            result.extend(remaining[:k - len(result)])
         return result
 
 
@@ -385,9 +427,7 @@ class LLMDirectorCandidateGenerator:
         references = candidate.required_knowledge.items() if isinstance(candidate.required_knowledge, dict) else ((ref.get("character_id"), [ref]) for ref in candidate.required_knowledge)
         for character_id, refs in references:
             for ref in refs:
-                row = knowledge.get(ref.get("knowledge_id")) if isinstance(ref, dict) else None
-                statuses = ref.get("accepted_statuses") if isinstance(ref, dict) else None
-                if character_id not in character_ids or not row or row.get("character_id") != character_id or ("proposition" in ref and ref.get("proposition") != row.get("proposition")) or (statuses is not None and row.get("status") not in {getattr(value, "value", value) for value in statuses}):
+                if character_id not in character_ids or not DirectorKnowledgeReferenceValidator.validate(ref, character_id, context.get("knowledge", [])):
                     errors.append("INVALID_GRAVITY_REFERENCE")
         forbidden = {"required_action", "forced_action", "must_accept", "must_succeed", "forced_outcome"}
         def contains(value):
@@ -482,7 +522,7 @@ class DirectorContextBuilder:
     def _character(self, character): return {"id": character.id, "name": character.name, "role_level": character.profile.get("role_level", "SUPPORTING"), "current_location": character.current_state.get("location_id", character.current_state.get("location")), "current_goals": character.goals, "core_values": character.core_values, "boundaries": character.boundaries, "physical_state": character.physical_state, "emotional_state": character.emotional_state, "relevant_abilities": character.abilities, "narrative_relevance": character.narrative_relevance}
     def _knowledge(self, knowledge):
         result: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        for item in knowledge: result.setdefault(item.character_id, {"KNOWN": [], "SUSPECTED": [], "FALSE_BELIEF": []})[item.status.value].append({"id": item.id, "knowledge_id": item.id, "proposition": item.proposition, "confidence": item.confidence})
+        for item in knowledge: result.setdefault(item.character_id, {"KNOWN": [], "SUSPECTED": [], "FALSE_BELIEF": []})[item.status.value].append({"id": item.id, "knowledge_id": item.id, "proposition": item.proposition, "confidence": item.confidence, "status": item.status.value})
         return result
     def _scene(self, scene): return {"id": scene.id, "sequence": scene.sequence, "location": scene.location, "participants": scene.participants, "intent": scene.intent, "story_threads": scene.story_threads, "result": scene.result}
     def _canon(self, fact): return {"id": fact.id, "type": fact.fact_type.value, "proposition": fact.proposition, "locked": fact.locked, "data": fact.data}
@@ -533,8 +573,7 @@ class DirectorConstraintChecker:
                     proposition, accepted = requirement.get("proposition"), requirement.get("accepted_statuses", ["KNOWN"])
                     knowledge_id = requirement.get("knowledge_id")
                     if knowledge_id:
-                        row = next((item for values in knowledge.get(character_id, {}).values() for item in values if item.get("knowledge_id", item.get("id")) == knowledge_id), None)
-                        valid = bool(row) and ("proposition" not in requirement or proposition == row.get("proposition")) and row.get("status") in {getattr(value, "value", value) for value in accepted}
+                        valid = DirectorKnowledgeReferenceValidator.validate(requirement, character_id, knowledge.get(character_id, {}))
                     else:
                         valid = bool(proposition) and any(proposition in available.get(status, set()) for status in accepted)
                 if not valid: missing.append(proposition or "unspecified proposition")
