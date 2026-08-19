@@ -462,3 +462,128 @@ def test_rebuilt_tail_records_supersession_link(session, project):
     service.sync(session, project.id, config(chapter_boundary_threshold=1))
     replacement = session.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.active.is_(True), Chapter.supersedes_chapter_id == old.id))
     assert replacement is not None and old.active is False
+
+
+def test_healthy_idempotent_sync_audits_before_existing(session, project):
+    scene(session, project, 1); service = NarrativeStructureService()
+    first, _ = service.sync(session, project.id)
+    revision_count = session.scalar(select(func.count(NarrativeStructureRevision.id)))
+    second, existing = service.sync(session, project.id)
+    assert existing and second.id == first.id and session.scalar(select(func.count(NarrativeStructureRevision.id))) == revision_count
+
+
+def test_corrupt_chapter_binding_forces_full_rebuild(session, project):
+    scene(session, project, 1); scene(session, project, 2)
+    service = NarrativeStructureService(); first, _ = service.sync(session, project.id)
+    binding = session.scalar(select(ChapterSceneBinding))
+    session.delete(binding); session.flush()
+    repaired, existing = service.sync(session, project.id)
+    assert not existing and repaired.id != first.id
+    active_chapter = session.scalar(select(Chapter).where(Chapter.active.is_(True)))
+    assert session.scalar(select(func.count(ChapterSceneBinding.id)).where(ChapterSceneBinding.chapter_id == active_chapter.id)) == 2
+    assert session.scalar(select(func.count(Chapter.id)).where(Chapter.active.is_(True))) == 1
+    NarrativeStructureAudit().audit(session, project.id)
+
+
+def test_corrupt_source_scene_ids_forces_repair(session, project):
+    item = scene(session, project, 1); service = NarrativeStructureService(); first, _ = service.sync(session, project.id)
+    chapter = session.scalar(select(Chapter).where(Chapter.active.is_(True)))
+    chapter.source_scene_ids = ["wrong-scene"]; session.flush()
+    repaired, existing = service.sync(session, project.id)
+    assert not existing and repaired.id != first.id
+    current = session.scalar(select(Chapter).where(Chapter.active.is_(True)))
+    assert current.source_scene_ids == [item.id]
+    NarrativeStructureAudit().audit(session, project.id)
+
+
+def test_corrupt_arc_coverage_forces_repair(session, project):
+    for sequence, thread in enumerate(["a", "a", "b", "b"], 1):
+        scene(session, project, sequence, thread=thread, location=thread)
+    formation_config = config(chapter_min_scenes=1, chapter_target_scenes=1, chapter_max_scenes=1, arc_min_chapters=2, arc_max_chapters=4)
+    service = NarrativeStructureService(); first, _ = service.sync(session, project.id, formation_config)
+    binding = session.scalar(select(NarrativeArcChapterBinding))
+    session.delete(binding); session.flush()
+    repaired, existing = service.sync(session, project.id, formation_config)
+    assert not existing and repaired.id != first.id
+    NarrativeStructureAudit().audit(session, project.id)
+    active_arcs = session.scalars(select(NarrativeArc).where(NarrativeArc.active.is_(True))).all()
+    current_binding_count = sum(session.scalar(select(func.count(NarrativeArcChapterBinding.id)).where(NarrativeArcChapterBinding.narrative_arc_id == arc.id)) for arc in active_arcs)
+    assert current_binding_count == session.scalar(select(func.count(Chapter.id)).where(Chapter.active.is_(True)))
+
+
+def test_corrupt_volume_coverage_forces_repair(session, project):
+    for sequence in range(1, 4): scene(session, project, sequence)
+    service = NarrativeStructureService(); first, _ = service.sync(session, project.id)
+    binding = session.scalar(select(NarrativeVolumeArcBinding))
+    session.delete(binding); session.flush()
+    repaired, existing = service.sync(session, project.id)
+    assert not existing and repaired.id != first.id
+    NarrativeStructureAudit().audit(session, project.id)
+    assert session.scalar(select(func.count(NarrativeVolumeArcBinding.id))) == session.scalar(select(func.count(NarrativeArc.id)).where(NarrativeArc.active.is_(True)))
+
+
+def test_sealed_chapter_creation_revision_is_immutable_on_append(session, project):
+    for sequence in range(1, 5):
+        scene(session, project, sequence, thread="a" if sequence <= 2 else "b", location="a" if sequence <= 2 else "b")
+    service = NarrativeStructureService(); first, _ = service.sync(session, project.id, config())
+    sealed = session.scalar(select(Chapter).where(Chapter.active.is_(True), Chapter.structure_status == "SEALED"))
+    provenance = (sealed.id, sealed.structure_revision_id, sealed.structure_fingerprint, list(sealed.source_scene_ids))
+    scene(session, project, 5, thread="b", location="b")
+    service.sync(session, project.id, config())
+    refreshed = session.get(Chapter, sealed.id)
+    assert (refreshed.id, refreshed.structure_revision_id, refreshed.structure_fingerprint, refreshed.source_scene_ids) == provenance
+    assert refreshed.structure_revision_id == first.id
+
+
+def test_superseded_tail_keeps_creation_revision_and_new_tail_uses_new_revision(session, project):
+    for sequence in range(1, 4): scene(session, project, sequence)
+    service = NarrativeStructureService(); first, _ = service.sync(session, project.id, config(chapter_boundary_threshold=99))
+    old_tail = session.scalar(select(Chapter).where(Chapter.active.is_(True)))
+    old_creation_revision = old_tail.structure_revision_id
+    scene(session, project, 4, thread="b", location="b", participants=["b"])
+    second, _ = service.sync(session, project.id, config(chapter_boundary_threshold=1))
+    replacement = session.scalar(select(Chapter).where(Chapter.active.is_(True), Chapter.supersedes_chapter_id == old_tail.id))
+    assert old_tail.active is False and old_tail.structure_revision_id == old_creation_revision == first.id
+    assert replacement is not None and replacement.structure_revision_id == second.id and replacement.structure_revision_id != old_tail.structure_revision_id
+
+
+def test_old_revision_semantic_metadata_is_immutable_after_sync(session, project):
+    scene(session, project, 1); service = NarrativeStructureService()
+    first, _ = service.sync(session, project.id, config())
+    before = (first.source_history_fingerprint, first.source_max_sequence, first.config, first.config_fingerprint, first.rebuild_from_sequence, first.structure_fingerprint, first.completed_at)
+    scene(session, project, 2)
+    service.sync(session, project.id, config())
+    session.refresh(first)
+    after = (first.source_history_fingerprint, first.source_max_sequence, first.config, first.config_fingerprint, first.rebuild_from_sequence, first.structure_fingerprint, first.completed_at)
+    assert first.active is False and after == before
+
+
+def test_audit_is_read_only_on_corrupt_structure(session, project):
+    scene(session, project, 1); service = NarrativeStructureService(); service.sync(session, project.id)
+    chapter = session.scalar(select(Chapter).where(Chapter.active.is_(True)))
+    chapter.source_scene_ids = ["corrupt"]; session.flush()
+    corrupted = list(chapter.source_scene_ids)
+    with pytest.raises(ValueError): NarrativeStructureAudit().audit(session, project.id)
+    assert chapter.source_scene_ids == corrupted
+
+
+def test_api_corrupt_derived_structure_returns_repaired_non_idempotent(session, project, monkeypatch):
+    scene(session, project, 1); session.commit()
+    service = NarrativeStructureService(); first, _ = service.sync(session, project.id)
+    chapter = session.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.active.is_(True)))
+    chapter.source_scene_ids = ["broken"]; session.commit()
+    monkeypatch.setattr(api, "SessionLocal", sessionmaker(bind=session.bind, expire_on_commit=False))
+    response = TestClient(app).post(f"/projects/{project.id}/narrative-structure/sync", json={})
+    assert response.status_code == 200 and response.json()["idempotent"] is False
+    assert response.json()["revision"]["id"] != first.id
+
+
+@pytest.mark.parametrize("model,attribute", [(NarrativeArc, "supersedes_arc_id"), (NarrativeVolume, "supersedes_volume_id")])
+def test_corrupt_arc_or_volume_supersession_forces_repair(session, project, model, attribute):
+    scene(session, project, 1); service = NarrativeStructureService(); service.sync(session, project.id, config())
+    scene(session, project, 2); first_revised, _ = service.sync(session, project.id, config())
+    current = session.scalar(select(model).where(model.project_id == project.id, model.active.is_(True)))
+    setattr(current, attribute, current.id); session.flush()
+    repaired, existing = service.sync(session, project.id, config())
+    assert not existing and repaired.id != first_revised.id
+    NarrativeStructureAudit().audit(session, project.id)

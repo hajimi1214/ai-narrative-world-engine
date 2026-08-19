@@ -280,6 +280,20 @@ class NarrativeVolumeFormationEngine:
 
 
 class NarrativeStructureService:
+    DERIVED_CORRUPTION_CODES = {
+        "NARRATIVE_STRUCTURE_REVISION_INVALID",
+        "NARRATIVE_STRUCTURE_FINGERPRINT_INVALID",
+        "NARRATIVE_STRUCTURE_NUMBERING_INVALID",
+        "NARRATIVE_STRUCTURE_CHAPTER_INVALID",
+        "NARRATIVE_STRUCTURE_SUPERSESSION_INVALID",
+        "NARRATIVE_STRUCTURE_BINDING_INVALID",
+        "NARRATIVE_STRUCTURE_SCENE_COVERAGE_INVALID",
+        "NARRATIVE_STRUCTURE_ARC_INVALID",
+        "NARRATIVE_STRUCTURE_ARC_COVERAGE_INVALID",
+        "NARRATIVE_STRUCTURE_VOLUME_INVALID",
+        "NARRATIVE_STRUCTURE_VOLUME_COVERAGE_INVALID",
+    }
+
     def preview(self, db: Session, project_id: str, config_data: dict[str, Any] | None = None) -> dict[str, Any]:
         project = db.get(Project, project_id)
         if not project: raise LookupError("PROJECT_NOT_FOUND")
@@ -300,8 +314,16 @@ class NarrativeStructureService:
         preview = self.preview(db, project_id, config_data)
         if expected_source_fingerprint and expected_source_fingerprint != preview["source_fingerprint"]: raise ValueError("NARRATIVE_STRUCTURE_SOURCE_CHANGED")
         current = db.scalar(select(NarrativeStructureRevision).where(NarrativeStructureRevision.project_id == project_id, NarrativeStructureRevision.active.is_(True)))
+        force_rebuild = False
         if current and current.source_history_fingerprint == preview["source_fingerprint"] and current.config_fingerprint == preview["config_fingerprint"]:
-            return current, True
+            try:
+                NarrativeStructureAudit().audit(db, project_id)
+            except ValueError as exc:
+                if str(exc) not in self.DERIVED_CORRUPTION_CODES:
+                    raise
+                force_rebuild = True
+            else:
+                return current, True
 
         _, rechecked_source_fingerprint = NarrativeStructureSourceFingerprintBuilder().build(db, project_id)
         if rechecked_source_fingerprint != preview["source_fingerprint"]:
@@ -312,13 +334,14 @@ class NarrativeStructureService:
         old_volumes = db.scalars(select(NarrativeVolume).where(NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True)).order_by(NarrativeVolume.number)).all()
         keep: dict[int, Chapter] = {}
         first_divergent_number = 1
-        for planned in preview["chapters"]:
-            prior = next((item for item in old_chapters if item.number == planned["number"]), None)
-            matches = bool(prior and prior.source_scene_ids == planned["scene_ids"] and prior.structure_fingerprint == planned["structure_fingerprint"])
-            if not matches or _value(prior.structure_status) != "SEALED":
-                first_divergent_number = planned["number"]
-                break
-            first_divergent_number = planned["number"] + 1
+        if not force_rebuild:
+            for planned in preview["chapters"]:
+                prior = next((item for item in old_chapters if item.number == planned["number"]), None)
+                matches = bool(prior and prior.source_scene_ids == planned["scene_ids"] and prior.structure_fingerprint == planned["structure_fingerprint"])
+                if not matches or _value(prior.structure_status) != "SEALED":
+                    first_divergent_number = planned["number"]
+                    break
+                first_divergent_number = planned["number"] + 1
         for planned in preview["chapters"]:
             prior = next((item for item in old_chapters if item.number == planned["number"]), None)
             if planned["number"] < first_divergent_number and prior and _value(prior.structure_status) == "SEALED" and prior.source_scene_ids == planned["scene_ids"] and prior.structure_fingerprint == planned["structure_fingerprint"]:
@@ -338,7 +361,9 @@ class NarrativeStructureService:
             prior = next((item for item in old_chapters if item.number == planned["number"]), None)
             chapter = keep.get(planned["number"])
             if chapter:
-                chapter.structure_revision_id = revision.id
+                # A retained sealed Chapter keeps the revision that created its row.
+                # The active structure revision owns the projection, not the row's provenance.
+                chapter.active = True
             else:
                 chapter = Chapter(project_id=project_id, number=planned["number"], title=None, source_scene_ids=planned["scene_ids"], content=None, word_count=0, quality_report={}, status="DRAFT", structure_revision_id=revision.id, active=True, structure_status=planned["status"], start_sequence=planned["start_sequence"], end_sequence=planned["end_sequence"], structure_fingerprint=planned["structure_fingerprint"], boundary_metadata=planned["boundary_metadata"], supersedes_chapter_id=prior.id if prior else None)
                 db.add(chapter); db.flush()
@@ -399,7 +424,8 @@ class NarrativeStructureAudit:
         bound = []
         expected_chapters = {item["number"]: item for item in expected["chapters"]}
         for chapter in chapters:
-            if chapter.structure_revision_id != revision.id or not chapter.structure_fingerprint:
+            creation_revision = db.get(NarrativeStructureRevision, chapter.structure_revision_id) if chapter.structure_revision_id else None
+            if not creation_revision or creation_revision.project_id != project_id or not chapter.structure_fingerprint:
                 raise ValueError("NARRATIVE_STRUCTURE_CHAPTER_INVALID")
             if chapter.structure_fingerprint != expected_chapters[chapter.number]["structure_fingerprint"]:
                 raise ValueError("NARRATIVE_STRUCTURE_FINGERPRINT_INVALID")
@@ -416,11 +442,21 @@ class NarrativeStructureAudit:
         expected_arcs = {item["number"]: item for item in expected["narrative_arcs"]}
         if any(item.structure_revision_id != revision.id or not item.structure_fingerprint or item.structure_fingerprint != expected_arcs[item.number]["structure_fingerprint"] for item in arcs):
             raise ValueError("NARRATIVE_STRUCTURE_ARC_INVALID")
+        for arc in arcs:
+            if arc.supersedes_arc_id:
+                superseded = db.get(NarrativeArc, arc.supersedes_arc_id)
+                if not superseded or superseded.project_id != project_id or superseded.active:
+                    raise ValueError("NARRATIVE_STRUCTURE_SUPERSESSION_INVALID")
         arc_bound = [item for arc in arcs for item in db.scalars(select(NarrativeArcChapterBinding.chapter_id).where(NarrativeArcChapterBinding.narrative_arc_id == arc.id).order_by(NarrativeArcChapterBinding.ordinal)).all()]
         if arc_bound != chapter_ids: raise ValueError("NARRATIVE_STRUCTURE_ARC_COVERAGE_INVALID")
         arc_ids = [item.id for item in arcs]
         expected_volumes = {item["number"]: item for item in expected["volumes"]}
         if any(item.structure_revision_id != revision.id or not item.structure_fingerprint or item.structure_fingerprint != expected_volumes[item.number]["structure_fingerprint"] for item in volumes):
             raise ValueError("NARRATIVE_STRUCTURE_VOLUME_INVALID")
+        for volume in volumes:
+            if volume.supersedes_volume_id:
+                superseded = db.get(NarrativeVolume, volume.supersedes_volume_id)
+                if not superseded or superseded.project_id != project_id or superseded.active:
+                    raise ValueError("NARRATIVE_STRUCTURE_SUPERSESSION_INVALID")
         volume_bound = [item for volume in volumes for item in db.scalars(select(NarrativeVolumeArcBinding.narrative_arc_id).where(NarrativeVolumeArcBinding.volume_id == volume.id).order_by(NarrativeVolumeArcBinding.ordinal)).all()]
         if volume_bound != arc_ids: raise ValueError("NARRATIVE_STRUCTURE_VOLUME_COVERAGE_INVALID")
