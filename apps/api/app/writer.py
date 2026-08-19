@@ -27,6 +27,7 @@ from .models import (
     SceneStateCheckpoint, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem,
     TimelineEvent, TimelineEventType, WorldResolution, ResolutionStatus,
     WritingBible, WriterDraftStatus, WriterPOVMode, ChapterWriterDraft,
+    WriterDraftOrigin, ChapterQualityAssessment, QualityAssessmentStatus,
     RevealConstraint, RevealStatus, WorldEntity,
 )
 from .narrative_structure import NarrativeStructureAudit
@@ -505,7 +506,7 @@ class WriterProjectionService:
         if prior and prior.chapter_source_fingerprint != source["source_fingerprint"] and _value(prior.status) not in {WriterDraftStatus.SUPERSEDED.value, WriterDraftStatus.STALE.value}:
             prior.status = WriterDraftStatus.STALE; prior.stale_at = datetime.utcnow()
         version = (db.scalar(select(func.max(ChapterWriterDraft.version)).where(ChapterWriterDraft.chapter_id == chapter.id)) or 0) + 1
-        draft = ChapterWriterDraft(project_id=chapter.project_id, chapter_id=chapter.id, version=version, status=WriterDraftStatus.GENERATING, client_request_id=client_request_id, request_fingerprint=request_fp, chapter_structure_fingerprint=source["structure_fingerprint"], chapter_source_fingerprint=source["source_fingerprint"], writer_context_fingerprint=context["writer_context_fingerprint"], source_structure_status=_value(chapter.structure_status), source_scene_ids=source["source_scene_ids"], source_manifest=context["source_manifest"], writing_bible_id=context["writing_bible"].id if context.get("writing_bible") else None, writing_bible_version=context["writing_bible"].version if context.get("writing_bible") else None, writing_bible_fingerprint=context["fingerprints"]["writing_bible"], pov_mode=context["pov_mode"], pov_character_id=context["pov_character_id"], parent_draft_id=prior.id if prior else None)
+        draft = ChapterWriterDraft(project_id=chapter.project_id, chapter_id=chapter.id, version=version, status=WriterDraftStatus.GENERATING, origin=WriterDraftOrigin.WRITER, client_request_id=client_request_id, request_fingerprint=request_fp, chapter_structure_fingerprint=source["structure_fingerprint"], chapter_source_fingerprint=source["source_fingerprint"], writer_context_fingerprint=context["writer_context_fingerprint"], source_structure_status=_value(chapter.structure_status), source_scene_ids=source["source_scene_ids"], source_manifest=context["source_manifest"], writing_bible_id=context["writing_bible"].id if context.get("writing_bible") else None, writing_bible_version=context["writing_bible"].version if context.get("writing_bible") else None, writing_bible_fingerprint=context["fingerprints"]["writing_bible"], pov_mode=context["pov_mode"], pov_character_id=context["pov_character_id"], parent_draft_id=prior.id if prior else None)
         db.add(draft); db.flush()
         try:
             route_provider, route_model = self._provider(db, chapter.project_id, provider, model, settings)
@@ -576,6 +577,18 @@ class WriterProjectionService:
         prior = db.get(ChapterWriterDraft, chapter.current_writer_draft_id) if chapter.current_writer_draft_id else None
         if prior and prior.id != draft.id and _value(prior.status) == WriterDraftStatus.ADOPTED.value:
             prior.status = WriterDraftStatus.SUPERSEDED
+        if chapter.current_quality_assessment_id:
+            quality = db.get(ChapterQualityAssessment, chapter.current_quality_assessment_id)
+            if quality:
+                quality.status = QualityAssessmentStatus.STALE
+                quality.active = False
+                quality.stale_at = datetime.utcnow()
+            chapter.current_quality_assessment_id = None
+            chapter.quality_status = "STALE"
+            chapter.quality_content_fingerprint = None
+            chapter.quality_approved_at = None
+            chapter.quality_report = {}
+        chapter.status = "DRAFT"
         chapter.content = draft.content
         if replace_title or chapter.title is None:
             chapter.title = draft.title_candidate or chapter.title

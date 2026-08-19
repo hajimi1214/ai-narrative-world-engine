@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, ChapterQualityAssessment, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -35,6 +35,7 @@ from .autonomy import AutonomousWorldLoopService
 from .narrative_structure import NarrativeStructureService
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
 from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionService
+from .quality import QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
 
 router = APIRouter()
 
@@ -512,7 +513,7 @@ def record_dict(record: Any) -> dict[str, Any]:
     return {column.name: serialize(getattr(record, column.name)) for column in record.__table__.columns}
 
 def writer_draft_payload(draft: ChapterWriterDraft, *, include_content: bool = False) -> dict[str, Any]:
-    value = {"id": draft.id, "project_id": draft.project_id, "chapter_id": draft.chapter_id, "version": draft.version, "status": serialize(draft.status), "client_request_id": draft.client_request_id, "request_fingerprint": draft.request_fingerprint, "chapter_structure_fingerprint": draft.chapter_structure_fingerprint, "chapter_source_fingerprint": draft.chapter_source_fingerprint, "writer_context_fingerprint": draft.writer_context_fingerprint, "source_structure_status": draft.source_structure_status, "source_scene_ids": draft.source_scene_ids, "writing_bible_id": draft.writing_bible_id, "writing_bible_version": draft.writing_bible_version, "writing_bible_fingerprint": draft.writing_bible_fingerprint, "pov_mode": serialize(draft.pov_mode), "pov_character_id": draft.pov_character_id, "provider": draft.provider, "model": draft.model, "model_request_id": draft.model_request_id, "prompt_fingerprint": draft.prompt_fingerprint, "title_candidate": draft.title_candidate, "content_fingerprint": draft.content_fingerprint, "word_count": draft.word_count, "scene_coverage": draft.scene_coverage, "source_refs": draft.source_refs, "validation_report": draft.validation_report, "parent_draft_id": draft.parent_draft_id, "supersedes_draft_id": draft.supersedes_draft_id, "created_at": serialize(draft.created_at), "completed_at": serialize(draft.completed_at), "adopted_at": serialize(draft.adopted_at), "stale_at": serialize(draft.stale_at)}
+    value = {"id": draft.id, "project_id": draft.project_id, "chapter_id": draft.chapter_id, "version": draft.version, "status": serialize(draft.status), "origin": serialize(draft.origin), "source_quality_assessment_id": draft.source_quality_assessment_id, "client_request_id": draft.client_request_id, "request_fingerprint": draft.request_fingerprint, "chapter_structure_fingerprint": draft.chapter_structure_fingerprint, "chapter_source_fingerprint": draft.chapter_source_fingerprint, "writer_context_fingerprint": draft.writer_context_fingerprint, "source_structure_status": draft.source_structure_status, "source_scene_ids": draft.source_scene_ids, "writing_bible_id": draft.writing_bible_id, "writing_bible_version": draft.writing_bible_version, "writing_bible_fingerprint": draft.writing_bible_fingerprint, "pov_mode": serialize(draft.pov_mode), "pov_character_id": draft.pov_character_id, "provider": draft.provider, "model": draft.model, "model_request_id": draft.model_request_id, "prompt_fingerprint": draft.prompt_fingerprint, "title_candidate": draft.title_candidate, "content_fingerprint": draft.content_fingerprint, "word_count": draft.word_count, "scene_coverage": draft.scene_coverage, "source_refs": draft.source_refs, "validation_report": draft.validation_report, "parent_draft_id": draft.parent_draft_id, "supersedes_draft_id": draft.supersedes_draft_id, "created_at": serialize(draft.created_at), "completed_at": serialize(draft.completed_at), "adopted_at": serialize(draft.adopted_at), "stale_at": serialize(draft.stale_at)}
     if include_content:
         value["content"] = draft.content
         value["prose"] = draft.content
@@ -641,6 +642,116 @@ def writer_adopt_nested(project_id: str, chapter_id: str, draft_id: str, payload
     if not draft or draft.project_id != project_id or draft.chapter_id != chapter_id:
         raise HTTPException(status_code=404, detail="Writer draft not found")
     return writer_adopt(project_id, draft_id, payload, db)
+
+
+def _quality_chapter(db: Session, project_id: str, chapter_id: str) -> Chapter:
+    require_project(db, project_id)
+    chapter = db.get(Chapter, chapter_id)
+    if not chapter or chapter.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    return chapter
+
+
+def _quality_provider(db: Session, project_id: str, role: str):
+    settings = get_settings()
+    route = ModelRouter().resolve(db, project_id, settings, role)
+    try:
+        provider = routed_provider(settings, route)
+    except ModelProviderError as provider_error:
+        deferred_error = provider_error
+        class DeferredQualityProvider:
+            name = route.provider
+            def generate(self, messages, model):
+                raise deferred_error
+        provider = DeferredQualityProvider()
+    return provider, route.model, settings
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/quality/preview")
+def quality_preview(project_id: str, chapter_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    _quality_chapter(db, project_id, chapter_id)
+    try:
+        return QualityGateService().preview(db, chapter_id, payload.model_dump() if payload else {})
+    except QualityDomainError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/quality/assess")
+def quality_assess(project_id: str, chapter_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    _quality_chapter(db, project_id, chapter_id)
+    values = payload.model_dump() if payload else {}
+    if values.get("idempotency_key") and not values.get("client_request_id"):
+        values["client_request_id"] = values["idempotency_key"]
+    provider, model, settings = _quality_provider(db, project_id, "CRITIC")
+    try:
+        assessment = QualityGateService().assess(db, chapter_id, values, provider=provider, model=model, settings=settings)
+        db.commit(); db.refresh(assessment)
+    except QualityDomainError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
+    if serialize(assessment.status) == "FAILED":
+        raise HTTPException(status_code=409, detail={"code": (assessment.decision_reason_codes or ["QUALITY_ASSESSMENT_FAILED"])[0], "assessment_id": assessment.id})
+    return assessment_payload(db, assessment, include_findings=True)
+
+
+@router.get("/projects/{project_id}/chapters/{chapter_id}/quality/assessments")
+def quality_assessments(project_id: str, chapter_id: str, db: Session = Depends(get_db)):
+    _quality_chapter(db, project_id, chapter_id)
+    rows = db.scalars(select(ChapterQualityAssessment).where(ChapterQualityAssessment.project_id == project_id, ChapterQualityAssessment.chapter_id == chapter_id).order_by(ChapterQualityAssessment.version.desc(), ChapterQualityAssessment.id.desc())).all()
+    return [assessment_payload(db, item) for item in rows]
+
+
+@router.get("/projects/{project_id}/chapters/{chapter_id}/quality/assessments/{assessment_id}")
+def quality_assessment_detail(project_id: str, chapter_id: str, assessment_id: str, db: Session = Depends(get_db)):
+    assessment = db.get(ChapterQualityAssessment, assessment_id)
+    if not assessment or assessment.project_id != project_id or assessment.chapter_id != chapter_id:
+        raise HTTPException(status_code=404, detail="Quality assessment not found")
+    return assessment_payload(db, assessment, include_findings=True)
+
+
+@router.get("/projects/{project_id}/chapters/{chapter_id}/quality")
+def quality_current(project_id: str, chapter_id: str, db: Session = Depends(get_db)):
+    chapter = _quality_chapter(db, project_id, chapter_id)
+    assessment = db.get(ChapterQualityAssessment, chapter.current_quality_assessment_id) if chapter.current_quality_assessment_id else db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True)).order_by(ChapterQualityAssessment.version.desc()))
+    return {"chapter_id": chapter.id, "chapter_status": chapter.status, "quality_status": chapter.quality_status, "quality_content_fingerprint": chapter.quality_content_fingerprint, "quality_approved_at": serialize(chapter.quality_approved_at), "current_assessment": assessment_payload(db, assessment) if assessment else None, "stale": bool(assessment and serialize(assessment.status) == "STALE"), "repair_available": bool(assessment and serialize(assessment.status) in {"REPAIR_REQUIRED", "BLOCKED"})}
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/quality/assessments/{assessment_id}/approve")
+def quality_approve(project_id: str, chapter_id: str, assessment_id: str, db: Session = Depends(get_db)):
+    assessment = db.get(ChapterQualityAssessment, assessment_id)
+    if not assessment or assessment.project_id != project_id or assessment.chapter_id != chapter_id:
+        raise HTTPException(status_code=404, detail="Quality assessment not found")
+    try:
+        chapter = QualityGateService().approve(db, assessment_id); db.commit(); db.refresh(chapter); return record_dict(chapter)
+    except QualityDomainError as exc:
+        if exc.code == "QUALITY_SOURCE_CHANGED": db.commit()
+        else: db.rollback()
+        raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/quality/assessments/{assessment_id}/repair")
+def quality_repair(project_id: str, chapter_id: str, assessment_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    assessment = db.get(ChapterQualityAssessment, assessment_id)
+    if not assessment or assessment.project_id != project_id or assessment.chapter_id != chapter_id:
+        raise HTTPException(status_code=404, detail="Quality assessment not found")
+    repair_provider, repair_model, settings = _quality_provider(db, project_id, "REPAIR")
+    critic_provider, critic_model, _ = _quality_provider(db, project_id, "CRITIC")
+    try:
+        draft, child = QualityRepairService().repair(db, assessment_id, payload.model_dump() if payload else {}, repair_provider=repair_provider, repair_model=repair_model, critic_provider=critic_provider, critic_model=critic_model, settings=settings)
+        db.commit(); db.refresh(draft)
+    except QualityDomainError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
+    return {"draft": writer_draft_payload(draft, include_content=True), "assessment": assessment_payload(db, child, include_findings=True) if child else None}
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/quality/repairs/{draft_id}/adopt")
+def quality_repair_adopt(project_id: str, chapter_id: str, draft_id: str, db: Session = Depends(get_db)):
+    draft = db.get(ChapterWriterDraft, draft_id)
+    if not draft or draft.project_id != project_id or draft.chapter_id != chapter_id:
+        raise HTTPException(status_code=404, detail="Quality repair draft not found")
+    try:
+        chapter = QualityRepairService().adopt(db, draft_id); db.commit(); db.refresh(chapter); return record_dict(chapter)
+    except QualityDomainError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
 
 @router.get("/projects")
 def list_projects(db: Session = Depends(get_db)):

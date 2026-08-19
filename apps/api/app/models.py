@@ -54,6 +54,10 @@ class ChapterStructureStatus(str, enum.Enum): LEGACY="LEGACY"; PROVISIONAL="PROV
 class NarrativeArcStatus(str, enum.Enum): OPEN="OPEN"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
 class NarrativeVolumeStatus(str, enum.Enum): OPEN="OPEN"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
 class WriterDraftStatus(str, enum.Enum): GENERATING="GENERATING"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; REJECTED="REJECTED"; FAILED="FAILED"; STALE="STALE"; SUPERSEDED="SUPERSEDED"
+class WriterDraftOrigin(str, enum.Enum): WRITER="WRITER"; QUALITY_REPAIR="QUALITY_REPAIR"
+class QualityAssessmentStatus(str, enum.Enum): RUNNING="RUNNING"; PASS="PASS"; REPAIR_REQUIRED="REPAIR_REQUIRED"; BLOCKED="BLOCKED"; FAILED="FAILED"; STALE="STALE"; SUPERSEDED="SUPERSEDED"
+class QualityFindingSeverity(str, enum.Enum): BLOCKING="BLOCKING"; MAJOR="MAJOR"; MINOR="MINOR"; INFO="INFO"
+class QualityFindingSource(str, enum.Enum): DETERMINISTIC="DETERMINISTIC"; CRITIC="CRITIC"
 class WriterPOVMode(str, enum.Enum): FIRST_PERSON="FIRST_PERSON"; THIRD_PERSON_LIMITED="THIRD_PERSON_LIMITED"; THIRD_PERSON_OMNISCIENT="THIRD_PERSON_OMNISCIENT"; OBJECTIVE="OBJECTIVE"
 class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; SCENE_COMMIT="SCENE_COMMIT"; AUTONOMOUS_LOOP="AUTONOMOUS_LOOP"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
@@ -241,6 +245,10 @@ class Chapter(Base):
     writer_content_fingerprint: Mapped[str | None] = mapped_column(String(120))
     writer_context_fingerprint: Mapped[str | None] = mapped_column(String(120))
     written_at: Mapped[datetime | None] = mapped_column(DateTime)
+    current_quality_assessment_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_quality_assessments.id"))
+    quality_status: Mapped[str | None] = mapped_column(String(30))
+    quality_content_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    quality_approved_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 class ChapterWriterDraft(Base):
     __tablename__ = "chapter_writer_drafts"
@@ -284,6 +292,65 @@ class ChapterWriterDraft(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
     adopted_at: Mapped[datetime | None] = mapped_column(DateTime)
     stale_at: Mapped[datetime | None] = mapped_column(DateTime)
+    origin: Mapped[WriterDraftOrigin] = mapped_column(Enum(WriterDraftOrigin, native_enum=False, length=30), default=WriterDraftOrigin.WRITER, nullable=False)
+    source_quality_assessment_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_quality_assessments.id"))
+
+class ChapterQualityAssessment(Base):
+    __tablename__ = "chapter_quality_assessments"
+    __table_args__ = (
+        UniqueConstraint("chapter_id", "version", name="uq_chapter_quality_assessment_version"),
+        UniqueConstraint("chapter_id", "client_request_id", name="uq_chapter_quality_assessment_request"),
+        Index("uq_chapter_quality_assessment_active", "chapter_id", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id"), nullable=False, index=True)
+    writer_draft_id: Mapped[str] = mapped_column(ForeignKey("chapter_writer_drafts.id"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[QualityAssessmentStatus] = mapped_column(Enum(QualityAssessmentStatus, native_enum=False, length=30), nullable=False, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    client_request_id: Mapped[str | None] = mapped_column(String(200))
+    request_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    content_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    writer_context_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    chapter_source_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    anti_ai_bible_id: Mapped[str | None] = mapped_column(ForeignKey("anti_ai_bibles.id"))
+    anti_ai_bible_version: Mapped[int | None] = mapped_column(Integer)
+    anti_ai_bible_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    writing_bible_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    quality_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    quality_config_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    quality_context_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    deterministic_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    critic_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    overall_score: Mapped[float | None] = mapped_column(Float)
+    decision_reason_codes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    critic_provider: Mapped[str | None] = mapped_column(String(100))
+    critic_model: Mapped[str | None] = mapped_column(String(200))
+    critic_request_id: Mapped[str | None] = mapped_column(String(200))
+    critic_prompt_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    stale_at: Mapped[datetime | None] = mapped_column(DateTime)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+class ChapterQualityFinding(Base):
+    __tablename__ = "chapter_quality_findings"
+    __table_args__ = (UniqueConstraint("assessment_id", "ordinal", name="uq_chapter_quality_finding_ordinal"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    assessment_id: Mapped[str] = mapped_column(ForeignKey("chapter_quality_assessments.id"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[QualityFindingSource] = mapped_column(Enum(QualityFindingSource, native_enum=False, length=20), nullable=False)
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    severity: Mapped[QualityFindingSeverity] = mapped_column(Enum(QualityFindingSeverity, native_enum=False, length=20), nullable=False)
+    rule_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    start_offset: Mapped[int | None] = mapped_column(Integer)
+    end_offset: Mapped[int | None] = mapped_column(Integer)
+    excerpt: Mapped[str | None] = mapped_column(Text)
+    source_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    finding_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)
+    finding_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
 
 class NarrativeStructureRevision(Base):
     __tablename__ = "narrative_structure_revisions"
