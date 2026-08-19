@@ -16,13 +16,13 @@ from app.main import app
 from app.models import (
     AntiAIBible, Chapter, ChapterQualityAssessment, ChapterQualityFinding,
     ChapterWriterDraft, Character, ExecutionTrace, Project, Scene,
-    WriterDraftOrigin, WriterDraftStatus,
+    ProjectModelConfig, WriterDraftOrigin, WriterDraftStatus,
 )
 from app.narrative_structure import NarrativeStructureService
 from app.quality import (
     AntiAIBibleResolver, AntiAIStyleRuleEngine, CriticOutputValidator,
     NarrativeRepetitionDetector, QualityAssessmentAudit, QualityContextBuilder,
-    QualityDomainError, QualityGateConfigResolver, QualityGateService,
+    QualityAssessmentFreshnessChecker, QualityDecisionEngine, QualityDomainError, QualityGateConfigResolver, QualityGateService,
     QualityRepairService, assessment_payload, finding_fingerprint,
 )
 from app.writer import WriterProjectionService
@@ -474,3 +474,150 @@ def test_assessment_payload_never_contains_prose_or_safe_context(quality_project
     assessment = assess_pass(session, quality_project[3])
     encoded = json.dumps(assessment_payload(session, assessment, include_findings=True))
     assert quality_project[3].content not in encoded and "writer_safe_context" not in encoded and "messages" not in encoded
+
+
+def test_decision_engine_is_single_authority_for_score_tamper(quality_project, session):
+    chapter = quality_project[3]
+    assessment = QualityGateService().assess(session, chapter.id, {}, provider=FakeModelProvider(critic_response(overall=20)), model="critic")
+    assert assessment.status.value == "REPAIR_REQUIRED"
+    assessment.status = "PASS"; assessment.decision_reason_codes = []
+    with pytest.raises(QualityDomainError, match="QUALITY_DECISION_INVALID"):
+        QualityAssessmentAudit().audit(session, assessment.id)
+    before = (chapter.status, chapter.current_quality_assessment_id, chapter.quality_report.copy())
+    with pytest.raises(QualityDomainError, match="QUALITY_DECISION_INVALID"):
+        QualityGateService().approve(session, assessment.id)
+    assert (chapter.status, chapter.current_quality_assessment_id, chapter.quality_report) == before
+    assert QualityDecisionEngine.decide([], "PASS", assessment.quality_config, 20)[0].value == "REPAIR_REQUIRED"
+
+
+def test_audit_rejects_major_minor_and_critic_policy_tamper(quality_project, session):
+    chapter = quality_project[3]
+    major = {"category": "CLARITY", "severity": "MAJOR", "message": "major", "start_offset": None, "end_offset": None, "excerpt": None, "source_refs": []}
+    assessment = QualityGateService().assess(session, chapter.id, {}, provider=FakeModelProvider(critic_response(findings=[major])), model="critic")
+    assessment.status = "PASS"; assessment.decision_reason_codes = []
+    with pytest.raises(QualityDomainError, match="QUALITY_DECISION_INVALID"):
+        QualityAssessmentAudit().audit(session, assessment.id)
+    session.rollback()
+    minor = {"category": "CLARITY", "severity": "MINOR", "message": "minor", "start_offset": None, "end_offset": None, "excerpt": None, "source_refs": []}
+    assessment = QualityGateService().assess(session, chapter.id, {"config": {"allow_minor_findings": False}}, provider=FakeModelProvider(critic_response(findings=[minor])), model="critic")
+    assessment.status = "PASS"; assessment.decision_reason_codes = []
+    with pytest.raises(QualityDomainError, match="QUALITY_DECISION_INVALID"):
+        QualityAssessmentAudit().audit(session, assessment.id)
+    session.rollback()
+    assessment = assess_pass(session, chapter)
+    assessment.critic_report = {**assessment.critic_report, "decision": "BLOCKED"}
+    with pytest.raises(QualityDomainError, match="QUALITY_DECISION_INVALID"):
+        QualityAssessmentAudit().audit(session, assessment.id)
+
+
+def test_current_quality_api_is_freshness_aware_and_excludes_candidate(quality_project, session, monkeypatch):
+    project, _, _, chapter, _ = quality_project
+    root = QualityGateService().assess(session, chapter.id, {}, provider=FakeModelProvider(critic_response(overall=1)), model="critic")
+    candidate, child = QualityRepairService().repair(session, root.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Fixed.")), repair_model="repair", critic_provider=FakeModelProvider(critic_response()), critic_model="critic")
+    assert child.status.value == "PASS" and candidate.id != chapter.current_writer_draft_id
+    monkeypatch.setattr(api, "SessionLocal", sessionmaker(bind=session.bind, expire_on_commit=False))
+    current = TestClient(app).get(f"/projects/{project.id}/chapters/{chapter.id}/quality").json()
+    assert current["current_assessment"]["writer_draft_id"] == chapter.current_writer_draft_id
+    assert current["current_assessment"]["id"] == root.id
+
+
+def test_approved_bible_version_change_is_effectively_stale(quality_project, session, monkeypatch):
+    project, _, _, chapter, _ = quality_project
+    first = AntiAIBible(project_id=project.id, version=1, active=True)
+    session.add(first); session.flush()
+    assessment = assess_pass(session, chapter); QualityGateService().approve(session, assessment.id); session.commit()
+    first.active = False; session.add(AntiAIBible(project_id=project.id, version=2, active=True)); session.commit()
+    monkeypatch.setattr(api, "SessionLocal", sessionmaker(bind=session.bind, expire_on_commit=False))
+    current = TestClient(app).get(f"/projects/{project.id}/chapters/{chapter.id}/quality").json()
+    assert current["stored_status"] == "PASS" and current["effective_status"] == "STALE" and current["stale"] is True
+    assert not QualityAssessmentFreshnessChecker().check(session, assessment, require_current=True)["fresh"]
+
+
+def test_failed_reassessment_keeps_prior_approved_state_consistent(quality_project, session):
+    project, _, _, chapter, _ = quality_project
+    first = AntiAIBible(project_id=project.id, version=1, active=True)
+    session.add(first); session.flush()
+    approved = assess_pass(session, chapter); QualityGateService().approve(session, approved.id); session.commit()
+    first.active = False; session.add(AntiAIBible(project_id=project.id, version=2, active=True)); session.flush()
+    failed = QualityGateService().assess(session, chapter.id, {"client_request_id": "reassess"}, provider=FakeModelProvider(error=ModelProviderError(MODEL_TIMEOUT)), model="critic")
+    assert failed.status.value == "FAILED" and not failed.active
+    assert approved.active and chapter.current_quality_assessment_id == approved.id and chapter.status == "QUALITY_APPROVED"
+
+
+def test_repair_chain_budget_and_lineage_are_root_bounded(quality_project, session):
+    chapter = quality_project[3]
+    project_config = session.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == chapter.project_id))
+    if project_config:
+        project_config.max_repair_attempts = 2
+    else:
+        session.add(ProjectModelConfig(project_id=chapter.project_id, max_repair_attempts=2))
+    session.flush()
+    first = QualityGateService().assess(session, chapter.id, {"config": {"max_repair_attempts": 2}}, provider=FakeModelProvider(critic_response(overall=1)), model="critic")
+    second_draft, second = QualityRepairService().repair(session, first.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "First repair.")), repair_model="repair", critic_provider=FakeModelProvider(critic_response(overall=1)), critic_model="critic")
+    third_draft, third = QualityRepairService().repair(session, second.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Second repair.")), repair_model="repair", critic_provider=FakeModelProvider(critic_response()), critic_model="critic")
+    assert second_draft.parent_draft_id == quality_project[4].id and second_draft.source_quality_assessment_id == first.id
+    assert third_draft.parent_draft_id == second_draft.id and third_draft.source_quality_assessment_id == second.id and third.status.value == "PASS"
+    with pytest.raises(QualityDomainError, match="QUALITY_REPAIR_LIMIT_REACHED"):
+        QualityRepairService().repair(session, third.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Third repair.")), repair_model="repair")
+
+
+def test_repair_provider_failure_is_counted_and_idempotent(quality_project, session):
+    chapter = quality_project[3]
+    assessment = QualityGateService().assess(session, chapter.id, {"config": {"max_repair_attempts": 1}}, provider=FakeModelProvider(critic_response(overall=1)), model="critic")
+    provider = FakeModelProvider(error=ModelProviderError(MODEL_TIMEOUT))
+    first, child = QualityRepairService().repair(session, assessment.id, {"client_request_id": "failed"}, repair_provider=provider, repair_model="repair")
+    same, same_child = QualityRepairService().repair(session, assessment.id, {"client_request_id": "failed"}, repair_provider=provider, repair_model="repair")
+    assert first.status.value == "FAILED" and child is None and same.id == first.id and same_child is None and provider.calls == 1
+    with pytest.raises(QualityDomainError, match="QUALITY_REPAIR_LIMIT_REACHED"):
+        QualityRepairService().repair(session, assessment.id, {"client_request_id": "new"}, repair_provider=provider, repair_model="repair")
+
+
+def test_repair_adopt_failure_rolls_back_in_fresh_session(quality_project, session):
+    chapter, original = quality_project[3], quality_project[4]
+    source = QualityGateService().assess(session, chapter.id, {}, provider=FakeModelProvider(critic_response(overall=1)), model="critic")
+    repair, child = QualityRepairService().repair(session, source.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Fixed.")), repair_model="repair", critic_provider=FakeModelProvider(critic_response()), critic_model="critic")
+    session.commit(); original_id, repair_id, child_id = original.id, repair.id, child.id
+    service = QualityRepairService(failure_injector=lambda stage: (_ for _ in ()).throw(RuntimeError(stage)))
+    with pytest.raises(RuntimeError, match="AFTER_CHAPTER_CONTENT_BEFORE_QUALITY_FINALIZATION"):
+        service.adopt(session, repair_id)
+    session.rollback()
+    with sessionmaker(bind=session.bind, expire_on_commit=False)() as fresh:
+        current = fresh.get(Chapter, chapter.id); old = fresh.get(ChapterWriterDraft, original_id); candidate = fresh.get(ChapterWriterDraft, repair_id); assessed = fresh.get(ChapterQualityAssessment, child_id)
+        assert current.content == old.content and current.current_writer_draft_id == old.id and old.status.value == "ADOPTED"
+        assert candidate.status.value == "VALIDATED" and current.current_quality_assessment_id is None and assessed.status.value == "PASS"
+
+
+def test_child_repair_retry_honors_root_budget(quality_project, session):
+    chapter = quality_project[3]
+    first = QualityGateService().assess(session, chapter.id, {"config": {"max_repair_attempts": 1}}, provider=FakeModelProvider(critic_response(overall=1)), model="critic")
+    _, child = QualityRepairService().repair(session, first.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Still weak.")), repair_model="repair", critic_provider=FakeModelProvider(critic_response(overall=1)), critic_model="critic")
+    with pytest.raises(QualityDomainError, match="QUALITY_REPAIR_LIMIT_REACHED"):
+        QualityRepairService().repair(session, child.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Never generated.")), repair_model="repair")
+
+
+def test_repair_idempotency_rejects_semantic_request_change(quality_project, session):
+    chapter = quality_project[3]
+    assessment = QualityGateService().assess(session, chapter.id, {}, provider=FakeModelProvider(critic_response(overall=1)), model="critic")
+    QualityRepairService().repair(session, assessment.id, {"client_request_id": "stable", "note": "first"}, repair_provider=FakeModelProvider(writer_response(chapter, "Fixed.")), repair_model="repair", critic_provider=FakeModelProvider(critic_response()), critic_model="critic")
+    with pytest.raises(QualityDomainError, match="QUALITY_REQUEST_MISMATCH"):
+        QualityRepairService().repair(session, assessment.id, {"client_request_id": "stable", "note": "changed"}, repair_provider=FakeModelProvider(writer_response(chapter, "Other.")), repair_model="repair")
+
+
+def test_deterministic_report_tamper_fails_read_only_audit(quality_project, session):
+    project, _, _, chapter, _ = quality_project
+    session.add(AntiAIBible(project_id=project.id, version=1, active=True, warning_expressions=["door"])); session.flush()
+    assessment = QualityGateService().assess(session, chapter.id, {}, provider=FakeModelProvider(critic_response()), model="critic")
+    assessment.deterministic_report = {**assessment.deterministic_report, "finding_count": 99}
+    with pytest.raises(QualityDomainError, match="QUALITY_DETERMINISTIC_REPORT_INVALID"):
+        QualityAssessmentAudit().audit(session, assessment.id)
+    assert assessment.deterministic_report["finding_count"] == 99
+
+
+def test_current_approval_audit_detects_bible_freshness_change(quality_project, session):
+    project, _, _, chapter, _ = quality_project
+    first = AntiAIBible(project_id=project.id, version=1, active=True)
+    session.add(first); session.flush()
+    assessment = assess_pass(session, chapter); QualityGateService().approve(session, assessment.id)
+    first.active = False; session.add(AntiAIBible(project_id=project.id, version=2, active=True)); session.flush()
+    with pytest.raises(QualityDomainError, match="QUALITY_APPROVAL_FRESHNESS_INVALID"):
+        QualityAssessmentAudit().audit(session, assessment.id)

@@ -349,6 +349,113 @@ class QualityContextBuilder:
         return {"chapter": chapter, "writer_draft": draft, "prose": draft.content, "writer_safe_context": safe_writer, "writing_rules": writer_context["writing_rules"], "anti_ai_rules": anti_ai["rules"], "anti_ai_bible": anti_ai, "quality_contract": {"prose_is_truth": False, "critic_may_rewrite": False, "formal_mutation": False}, "source_fingerprints": semantic, "quality_config": config_value, "quality_config_fingerprint": config_fp, "quality_context_fingerprint": _fp(semantic, self.protocol), "renderable_source_refs": writer_context["renderable_source_refs"]}
 
 
+class QualityDecisionEngine:
+    """The sole authority for persisted quality decisions.
+
+    Both creation and audit feed the same normalized inputs through this small
+    pure function.  Quality findings are evidence; neither prose nor a critic
+    decision is allowed to override the policy encoded here.
+    """
+
+    @staticmethod
+    def decide(findings: list[dict[str, Any]], critic_decision: str | None,
+               config: dict[str, Any], overall_score: float | None) -> tuple[QualityAssessmentStatus, list[str]]:
+        config_value = QualityGateConfig.model_validate(config).model_dump(mode="json")
+        severities = [_value(item.get("severity")) for item in findings]
+        reasons: list[str] = []
+        if critic_decision == "BLOCKED":
+            reasons.append("CRITIC_BLOCKED")
+        if "BLOCKING" in severities:
+            reasons.append("BLOCKING_FINDINGS")
+        if severities.count("MAJOR") > config_value["max_major_findings"]:
+            reasons.append("MAJOR_FINDING_LIMIT")
+        if "MINOR" in severities and not config_value["allow_minor_findings"]:
+            reasons.append("MINOR_FINDINGS_NOT_ALLOWED")
+        if float(overall_score if overall_score is not None else 100) < config_value["min_overall_score"]:
+            reasons.append("OVERALL_SCORE_BELOW_MINIMUM")
+        if critic_decision == "REPAIR_REQUIRED":
+            reasons.append("CRITIC_REPAIR_REQUIRED")
+        reasons = sorted(set(reasons))
+        if "CRITIC_BLOCKED" in reasons:
+            return QualityAssessmentStatus.BLOCKED, reasons
+        if reasons:
+            return QualityAssessmentStatus.REPAIR_REQUIRED, reasons
+        return QualityAssessmentStatus.PASS, []
+
+
+def _assessment_bible_rules(db: Session, assessment: ChapterQualityAssessment) -> dict[str, Any]:
+    if assessment.anti_ai_bible_id is None:
+        rules = AntiAIBibleResolver.DEFAULT.copy()
+        expected = _fp({"version": 1, **rules}, "anti-ai-default-v1")
+    else:
+        bible = db.get(AntiAIBible, assessment.anti_ai_bible_id)
+        if not bible or bible.project_id != assessment.project_id or bible.version != assessment.anti_ai_bible_version:
+            raise QualityDomainError("QUALITY_ASSESSMENT_INTEGRITY_INVALID")
+        rules = {
+            "disabled_expressions": list(bible.disabled_expressions or []),
+            "warning_expressions": list(bible.warning_expressions or []),
+            "frequency_limits": dict(bible.frequency_limits or {}),
+            "writing_principles": list(bible.writing_principles or []),
+            "future_risk_labels": list(bible.future_risk_labels or []),
+        }
+        expected = _fp({"version": bible.version, **rules}, "anti-ai-bible-v1")
+    AntiAIBibleResolver.validate(rules)
+    if assessment.anti_ai_bible_fingerprint != expected:
+        raise QualityDomainError("QUALITY_ASSESSMENT_INTEGRITY_INVALID")
+    return rules
+
+
+class QualityAssessmentFreshnessChecker:
+    """Read-only proof that an assessment still describes present semantics."""
+
+    def check(self, db: Session, assessment: ChapterQualityAssessment, *, require_current: bool = False) -> dict[str, Any]:
+        chapter = db.get(Chapter, assessment.chapter_id)
+        draft = db.get(ChapterWriterDraft, assessment.writer_draft_id)
+        reasons: list[str] = []
+        if not chapter or not draft or chapter.project_id != assessment.project_id or draft.project_id != assessment.project_id or draft.chapter_id != assessment.chapter_id:
+            return {"fresh": False, "current": False, "reasons": ["QUALITY_ASSESSMENT_INTEGRITY_INVALID"]}
+        try:
+            context = QualityContextBuilder().build(
+                db, chapter.id, {"config": assessment.quality_config}, draft=draft,
+                critic_provider=assessment.critic_provider, critic_model=assessment.critic_model,
+                require_current=False,
+            )
+        except QualityDomainError as exc:
+            return {"fresh": False, "current": False, "reasons": [exc.code]}
+        expected = {
+            "content_fingerprint": assessment.content_fingerprint,
+            "writer_context_fingerprint": assessment.writer_context_fingerprint,
+            "chapter_source_fingerprint": assessment.chapter_source_fingerprint,
+            "anti_ai_bible_fingerprint": assessment.anti_ai_bible_fingerprint,
+            "quality_config_fingerprint": assessment.quality_config_fingerprint,
+            "quality_context_fingerprint": assessment.quality_context_fingerprint,
+            "writing_bible_fingerprint": assessment.writing_bible_fingerprint,
+        }
+        actual = {
+            "content_fingerprint": draft.content_fingerprint,
+            "writer_context_fingerprint": draft.writer_context_fingerprint,
+            "chapter_source_fingerprint": draft.chapter_source_fingerprint,
+            "anti_ai_bible_fingerprint": context["anti_ai_bible"]["fingerprint"],
+            "quality_config_fingerprint": context["quality_config_fingerprint"],
+            "quality_context_fingerprint": context["quality_context_fingerprint"],
+            "writing_bible_fingerprint": draft.writing_bible_fingerprint,
+        }
+        if actual != expected:
+            reasons.append("QUALITY_SOURCE_CHANGED")
+        # Explicit project routes are current semantics. Test-only injected
+        # providers deliberately have no project route and remain reproducible.
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == chapter.project_id))
+        if config and (config.critic_model or config.provider):
+            settings = __import__("app.settings", fromlist=["get_settings"]).get_settings()
+            route = ModelRouter().resolve(db, chapter.project_id, settings, "CRITIC")
+            if assessment.critic_model != route.model or assessment.critic_provider != route.provider:
+                reasons.append("QUALITY_CRITIC_ROUTE_CHANGED")
+        current = chapter.current_writer_draft_id == draft.id and chapter.content == draft.content and chapter.writer_content_fingerprint == draft.content_fingerprint
+        if require_current and not current:
+            reasons.append("QUALITY_CURRENT_CONTENT_CHANGED")
+        return {"fresh": not reasons, "current": current, "reasons": sorted(set(reasons)), "context": context}
+
+
 class QualityAssessmentAudit:
     def audit(self, db: Session, assessment_id: str) -> dict[str, Any]:
         assessment = db.get(ChapterQualityAssessment, assessment_id)
@@ -356,23 +463,52 @@ class QualityAssessmentAudit:
             raise QualityDomainError("QUALITY_ASSESSMENT_NOT_FOUND")
         chapter = db.get(Chapter, assessment.chapter_id)
         draft = db.get(ChapterWriterDraft, assessment.writer_draft_id)
-        if not chapter or not draft or chapter.project_id != assessment.project_id or draft.project_id != assessment.project_id or draft.chapter_id != chapter.id or draft.content_fingerprint != assessment.content_fingerprint or draft.writer_context_fingerprint != assessment.writer_context_fingerprint:
+        if not chapter or not draft or chapter.project_id != assessment.project_id or draft.project_id != assessment.project_id or draft.chapter_id != chapter.id or draft.content_fingerprint != assessment.content_fingerprint or draft.writer_context_fingerprint != assessment.writer_context_fingerprint or draft.chapter_source_fingerprint != assessment.chapter_source_fingerprint or draft.writing_bible_fingerprint != assessment.writing_bible_fingerprint:
+            raise QualityDomainError("QUALITY_ASSESSMENT_INTEGRITY_INVALID")
+        try:
+            config = QualityGateConfig.model_validate(assessment.quality_config).model_dump(mode="json")
+        except ValidationError as exc:
+            raise QualityDomainError("QUALITY_ASSESSMENT_INTEGRITY_INVALID") from exc
+        if config != assessment.quality_config or _fp(config, "quality-config-v1") != assessment.quality_config_fingerprint:
             raise QualityDomainError("QUALITY_ASSESSMENT_INTEGRITY_INVALID")
         findings = db.scalars(select(ChapterQualityFinding).where(ChapterQualityFinding.assessment_id == assessment.id).order_by(ChapterQualityFinding.ordinal)).all()
         if [item.ordinal for item in findings] != list(range(1, len(findings) + 1)):
             raise QualityDomainError("QUALITY_FINDING_ORDER_INVALID")
+        values: list[dict[str, Any]] = []
         for item in findings:
             value = {"source": _value(item.source), "category": item.category, "severity": _value(item.severity), "rule_code": item.rule_code, "message": item.message, "start_offset": item.start_offset, "end_offset": item.end_offset, "excerpt": item.excerpt, "source_refs": item.source_refs, "metadata": item.finding_metadata}
             if finding_fingerprint(value) != item.finding_fingerprint:
                 raise QualityDomainError("QUALITY_FINDING_INTEGRITY_INVALID")
-        if _value(assessment.status) == "PASS" and any(_value(item.severity) == "BLOCKING" for item in findings):
-            raise QualityDomainError("QUALITY_DECISION_INVALID")
+            value["finding_fingerprint"] = item.finding_fingerprint
+            values.append(value)
+        rules = _assessment_bible_rules(db, assessment)
+        deterministic = AntiAIStyleRuleEngine().evaluate(draft.content or "", rules)
+        expected_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"])}
+        deterministic_rows = [item["finding_fingerprint"] for item in values if item["source"] == "DETERMINISTIC"]
+        if assessment.deterministic_report != expected_report or sorted(deterministic_rows) != sorted(item["finding_fingerprint"] for item in deterministic["findings"]):
+            raise QualityDomainError("QUALITY_DETERMINISTIC_REPORT_INVALID")
+        critic = assessment.critic_report or {}
+        if _value(assessment.status) in {"PASS", "REPAIR_REQUIRED", "BLOCKED"}:
+            try:
+                CriticOutputPayload.model_validate(critic)
+            except ValidationError as exc:
+                raise QualityDomainError("QUALITY_CRITIC_REPORT_INVALID") from exc
+            expected_critic = [_finding(source="CRITIC", category=item["category"], severity=item["severity"], rule_code=f"CRITIC_{item['category']}", message=item["message"], start_offset=item["start_offset"], end_offset=item["end_offset"], excerpt=item["excerpt"], source_refs=item["source_refs"]) for item in critic.get("findings", [])]
+            critic_rows = [item["finding_fingerprint"] for item in values if item["source"] == "CRITIC"]
+            if sorted(critic_rows) != sorted(item["finding_fingerprint"] for item in expected_critic) or assessment.overall_score != float(critic["scores"]["overall"]):
+                raise QualityDomainError("QUALITY_CRITIC_REPORT_INVALID")
+            expected_status, expected_reasons = QualityDecisionEngine.decide(values, critic.get("decision"), config, assessment.overall_score)
+            if _value(assessment.status) != _value(expected_status) or list(assessment.decision_reason_codes or []) != expected_reasons:
+                raise QualityDomainError("QUALITY_DECISION_INVALID")
         active_count = db.scalar(select(func.count(ChapterQualityAssessment.id)).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True))) or 0
         if assessment.active and active_count != 1:
             raise QualityDomainError("QUALITY_ACTIVE_ASSESSMENT_INVALID")
-        if chapter.status == "QUALITY_APPROVED":
-            if chapter.current_quality_assessment_id != assessment.id or _value(assessment.status) != "PASS" or chapter.quality_content_fingerprint != assessment.content_fingerprint or chapter.content != draft.content:
+        if chapter.status == "QUALITY_APPROVED" and chapter.current_quality_assessment_id == assessment.id:
+            if _value(assessment.status) != "PASS" or not assessment.active or chapter.quality_content_fingerprint != assessment.content_fingerprint or chapter.content != draft.content:
                 raise QualityDomainError("QUALITY_APPROVAL_INTEGRITY_INVALID")
+            freshness = QualityAssessmentFreshnessChecker().check(db, assessment, require_current=True)
+            if not freshness["fresh"]:
+                raise QualityDomainError("QUALITY_APPROVAL_FRESHNESS_INVALID", freshness)
             WriterProjectionAudit().audit(db, chapter.id)
         return {"valid": True, "assessment_id": assessment.id, "finding_count": len(findings)}
 
@@ -400,20 +536,16 @@ class QualityGateService:
                 if existing.request_fingerprint != request_fp:
                     raise QualityDomainError("QUALITY_REQUEST_MISMATCH")
                 return existing
-        existing = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True), ChapterQualityAssessment.quality_context_fingerprint == context["quality_context_fingerprint"]))
+        existing = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.writer_draft_id == context["writer_draft"].id, ChapterQualityAssessment.active.is_(True), ChapterQualityAssessment.quality_context_fingerprint == context["quality_context_fingerprint"]))
         if existing:
             QualityAssessmentAudit().audit(db, existing.id)
             return existing
-        prior = db.scalars(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True)).with_for_update()).all()
-        for item in prior:
-            item.active = False
-            if _value(item.status) not in {"STALE", "FAILED"}:
-                item.status = QualityAssessmentStatus.SUPERSEDED
-        if prior:
-            db.flush()
         version = (db.scalar(select(func.max(ChapterQualityAssessment.version)).where(ChapterQualityAssessment.chapter_id == chapter.id)) or 0) + 1
         anti_ai = context["anti_ai_bible"]
-        assessment = ChapterQualityAssessment(project_id=chapter.project_id, chapter_id=chapter.id, writer_draft_id=context["writer_draft"].id, version=version, status=QualityAssessmentStatus.RUNNING, active=True, client_request_id=key, request_fingerprint=request_fp, content_fingerprint=context["writer_draft"].content_fingerprint, writer_context_fingerprint=context["writer_draft"].writer_context_fingerprint, chapter_source_fingerprint=context["writer_draft"].chapter_source_fingerprint, anti_ai_bible_id=anti_ai["id"], anti_ai_bible_version=anti_ai["version"], anti_ai_bible_fingerprint=anti_ai["fingerprint"], writing_bible_fingerprint=context["writer_draft"].writing_bible_fingerprint, quality_config=context["quality_config"], quality_config_fingerprint=context["quality_config_fingerprint"], quality_context_fingerprint=context["quality_context_fingerprint"], deterministic_report={}, critic_report={}, decision_reason_codes=[], critic_provider=provider_name, critic_model=route_model)
+        current_draft = chapter.current_writer_draft_id == context["writer_draft"].id and chapter.content == context["writer_draft"].content
+        # A provider call must not invalidate the prior current assessment. A
+        # candidate draft is never an active Chapter assessment before adoption.
+        assessment = ChapterQualityAssessment(project_id=chapter.project_id, chapter_id=chapter.id, writer_draft_id=context["writer_draft"].id, version=version, status=QualityAssessmentStatus.RUNNING, active=False, client_request_id=key, request_fingerprint=request_fp, content_fingerprint=context["writer_draft"].content_fingerprint, writer_context_fingerprint=context["writer_draft"].writer_context_fingerprint, chapter_source_fingerprint=context["writer_draft"].chapter_source_fingerprint, anti_ai_bible_id=anti_ai["id"], anti_ai_bible_version=anti_ai["version"], anti_ai_bible_fingerprint=anti_ai["fingerprint"], writing_bible_fingerprint=context["writer_draft"].writing_bible_fingerprint, quality_config=context["quality_config"], quality_config_fingerprint=context["quality_config_fingerprint"], quality_context_fingerprint=context["quality_context_fingerprint"], deterministic_report={}, critic_report={}, decision_reason_codes=[], critic_provider=provider_name, critic_model=route_model)
         db.add(assessment); db.flush()
         deterministic = AntiAIStyleRuleEngine().evaluate(context["prose"], context["anti_ai_rules"])
         assessment.deterministic_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"])}
@@ -440,45 +572,43 @@ class QualityGateService:
         for ordinal, item in enumerate(findings, 1):
             db.add(ChapterQualityFinding(assessment_id=assessment.id, ordinal=ordinal, source=item["source"], category=item["category"], severity=item["severity"], rule_code=item["rule_code"], message=item["message"], start_offset=item["start_offset"], end_offset=item["end_offset"], excerpt=item["excerpt"], source_refs=item["source_refs"], finding_metadata=item["metadata"], finding_fingerprint=item["finding_fingerprint"]))
         assessment.overall_score = float(critic.get("scores", {}).get("overall", 100))
-        status, reasons = self._decision(findings, critic, context["quality_config"], assessment.overall_score)
-        assessment.status = status; assessment.decision_reason_codes = reasons; assessment.completed_at = datetime.utcnow(); db.flush()
+        status, reasons = QualityDecisionEngine.decide(findings, critic.get("decision"), context["quality_config"], assessment.overall_score)
+        assessment.status = status; assessment.decision_reason_codes = reasons; assessment.completed_at = datetime.utcnow()
+        if current_draft:
+            prior = db.scalars(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True)).with_for_update()).all()
+            for item in prior:
+                item.active = False
+                if _value(item.status) not in {"STALE", "FAILED"}:
+                    item.status = QualityAssessmentStatus.SUPERSEDED
+            if prior:
+                db.flush()
+            assessment.active = True
+            if chapter.current_quality_assessment_id in {item.id for item in prior}:
+                chapter.current_quality_assessment_id = None
+                chapter.quality_status = "STALE"
+                chapter.quality_content_fingerprint = None
+                chapter.quality_approved_at = None
+                chapter.quality_report = {}
+                chapter.status = "DRAFT"
+        db.flush()
         QualityAssessmentAudit().audit(db, assessment.id)
         return assessment
-
-    @staticmethod
-    def _decision(findings: list[dict[str, Any]], critic: dict[str, Any], config: dict[str, Any], score: float) -> tuple[QualityAssessmentStatus, list[str]]:
-        reasons = []
-        blocking = [item for item in findings if item["severity"] == "BLOCKING"]
-        major = [item for item in findings if item["severity"] == "MAJOR"]
-        minor = [item for item in findings if item["severity"] == "MINOR"]
-        if critic.get("decision") == "BLOCKED": reasons.append("CRITIC_BLOCKED")
-        if blocking: reasons.append("BLOCKING_FINDINGS")
-        if len(major) > config["max_major_findings"]: reasons.append("MAJOR_FINDING_LIMIT")
-        if minor and not config["allow_minor_findings"]: reasons.append("MINOR_FINDINGS_NOT_ALLOWED")
-        if score < config["min_overall_score"]: reasons.append("OVERALL_SCORE_BELOW_MINIMUM")
-        if critic.get("decision") == "REPAIR_REQUIRED": reasons.append("CRITIC_REPAIR_REQUIRED")
-        if "CRITIC_BLOCKED" in reasons:
-            return QualityAssessmentStatus.BLOCKED, sorted(set(reasons))
-        if reasons:
-            return QualityAssessmentStatus.REPAIR_REQUIRED, sorted(set(reasons))
-        return QualityAssessmentStatus.PASS, []
 
     def approve(self, db: Session, assessment_id: str) -> Chapter:
         assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.id == assessment_id).with_for_update())
         if not assessment:
             raise QualityDomainError("QUALITY_ASSESSMENT_NOT_FOUND")
         chapter = db.scalar(select(Chapter).where(Chapter.id == assessment.chapter_id).with_for_update())
+        # Audit first: a tampered PASS row must never touch Chapter state.
+        QualityAssessmentAudit().audit(db, assessment.id)
         if _value(assessment.status) != "PASS" or not assessment.active:
             raise QualityDomainError("QUALITY_ASSESSMENT_NOT_PASS")
-        try:
-            context = QualityContextBuilder().build(db, chapter.id, {"config": assessment.quality_config}, critic_provider=assessment.critic_provider, critic_model=assessment.critic_model)
-        except QualityDomainError as exc:
+        freshness = QualityAssessmentFreshnessChecker().check(db, assessment, require_current=True)
+        if not freshness["fresh"]:
             assessment.status = QualityAssessmentStatus.STALE; assessment.active = False; assessment.stale_at = datetime.utcnow()
             if chapter.current_quality_assessment_id == assessment.id:
                 chapter.current_quality_assessment_id = None; chapter.quality_status = "STALE"; chapter.quality_approved_at = None
-            db.flush(); raise QualityDomainError("QUALITY_SOURCE_CHANGED", {"cause": exc.code}) from exc
-        if context["quality_context_fingerprint"] != assessment.quality_context_fingerprint or context["writer_draft"].id != assessment.writer_draft_id:
-            assessment.status = QualityAssessmentStatus.STALE; assessment.active = False; assessment.stale_at = datetime.utcnow(); db.flush(); raise QualityDomainError("QUALITY_SOURCE_CHANGED")
+            db.flush(); raise QualityDomainError("QUALITY_SOURCE_CHANGED", freshness)
         counts = Counter(_value(item.severity) for item in db.scalars(select(ChapterQualityFinding).where(ChapterQualityFinding.assessment_id == assessment.id)).all())
         chapter.current_quality_assessment_id = assessment.id; chapter.quality_status = "PASS"; chapter.quality_content_fingerprint = assessment.content_fingerprint; chapter.quality_approved_at = datetime.utcnow(); chapter.status = "QUALITY_APPROVED"; assessment.approved_at = chapter.quality_approved_at
         chapter.quality_report = {"assessment_id": assessment.id, "status": "PASS", "overall_score": assessment.overall_score, "finding_counts": dict(sorted(counts.items())), "approved_at": chapter.quality_approved_at.isoformat()}
@@ -502,36 +632,105 @@ class QualityRepairPromptBuilder:
 
 
 class QualityRepairService:
+    failure_injector = None
+
+    def __init__(self, failure_injector=None):
+        self._instance_failure_injector = failure_injector
+
+    def _inject(self, stage: str) -> None:
+        injector = self._instance_failure_injector or type(self).failure_injector
+        if injector:
+            injector(stage)
+
+    @staticmethod
+    def _root_draft(db: Session, draft: ChapterWriterDraft) -> ChapterWriterDraft:
+        current = draft
+        seen: set[str] = set()
+        while current.parent_draft_id:
+            if current.id in seen:
+                raise QualityDomainError("QUALITY_REPAIR_LINEAGE_INVALID")
+            seen.add(current.id)
+            parent = db.get(ChapterWriterDraft, current.parent_draft_id)
+            if not parent or parent.chapter_id != draft.chapter_id or parent.project_id != draft.project_id:
+                raise QualityDomainError("QUALITY_REPAIR_LINEAGE_INVALID")
+            current = parent
+        return current
+
+    @classmethod
+    def _chain_attempt_count(cls, db: Session, source: ChapterWriterDraft) -> int:
+        root = cls._root_draft(db, source)
+        candidates = db.scalars(select(ChapterWriterDraft).where(ChapterWriterDraft.chapter_id == source.chapter_id, ChapterWriterDraft.origin == WriterDraftOrigin.QUALITY_REPAIR)).all()
+        return sum(1 for item in candidates if cls._root_draft(db, item).id == root.id)
+
+    @staticmethod
+    def _source_is_repairable(db: Session, chapter: Chapter, assessment: ChapterQualityAssessment, source: ChapterWriterDraft) -> bool:
+        if source.id == chapter.current_writer_draft_id:
+            return _value(source.status) == "ADOPTED" and chapter.content == source.content
+        if _value(source.origin) != "QUALITY_REPAIR" or _value(source.status) != "VALIDATED" or not source.parent_draft_id or not source.source_quality_assessment_id:
+            return False
+        parent = db.get(ChapterWriterDraft, source.parent_draft_id)
+        parent_assessment = db.get(ChapterQualityAssessment, source.source_quality_assessment_id)
+        return bool(parent and parent_assessment and parent.id == parent_assessment.writer_draft_id and parent.chapter_id == chapter.id)
+
+    @staticmethod
+    def _draft_attempt(chapter: Chapter, source: ChapterWriterDraft, assessment: ChapterQualityAssessment,
+                       stored_key: str | None, request_fp: str, prompt_fingerprint: str,
+                       provider: str | None, model: str | None) -> ChapterWriterDraft:
+        return ChapterWriterDraft(
+            project_id=chapter.project_id, chapter_id=chapter.id,
+            version=0, status=WriterDraftStatus.GENERATING,
+            origin=WriterDraftOrigin.QUALITY_REPAIR,
+            source_quality_assessment_id=assessment.id,
+            client_request_id=stored_key, request_fingerprint=request_fp,
+            chapter_structure_fingerprint=source.chapter_structure_fingerprint,
+            chapter_source_fingerprint=source.chapter_source_fingerprint,
+            writer_context_fingerprint=source.writer_context_fingerprint,
+            source_structure_status=source.source_structure_status,
+            source_scene_ids=source.source_scene_ids, source_manifest=source.source_manifest,
+            writing_bible_id=source.writing_bible_id, writing_bible_version=source.writing_bible_version,
+            writing_bible_fingerprint=source.writing_bible_fingerprint,
+            pov_mode=source.pov_mode, pov_character_id=source.pov_character_id,
+            provider=provider, model=model, prompt_fingerprint=prompt_fingerprint,
+            parent_draft_id=source.id,
+        )
+
     def repair(self, db: Session, assessment_id: str, request: dict[str, Any] | None = None, *, repair_provider=None, repair_model: str | None = None, critic_provider=None, critic_model: str | None = None, settings=None) -> tuple[ChapterWriterDraft, ChapterQualityAssessment | None]:
         request = dict(request or {})
         assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.id == assessment_id).with_for_update())
         if not assessment:
             raise QualityDomainError("QUALITY_REPAIR_NOT_ALLOWED")
         chapter = db.scalar(select(Chapter).where(Chapter.id == assessment.chapter_id).with_for_update())
+        source = db.get(ChapterWriterDraft, assessment.writer_draft_id)
+        if not chapter or not source or not self._source_is_repairable(db, chapter, assessment, source):
+            raise QualityDomainError("QUALITY_REPAIR_LINEAGE_INVALID")
+        QualityAssessmentAudit().audit(db, assessment.id)
+        context = QualityContextBuilder().build(db, chapter.id, {"config": assessment.quality_config}, draft=source, critic_provider=assessment.critic_provider, critic_model=assessment.critic_model, require_current=False)
+        if context["quality_context_fingerprint"] != assessment.quality_context_fingerprint:
+            raise QualityDomainError("QUALITY_SOURCE_CHANGED")
         key = request.get("client_request_id") or request.get("idempotency_key")
         stored_key = f"quality-repair:{key}" if key else None
+        request_fp = _fp({"assessment_id": assessment.id, "quality_context": assessment.quality_context_fingerprint, "request": {key: value for key, value in request.items() if key not in {"client_request_id", "idempotency_key"}}}, "quality-repair-request-v1")
         if stored_key:
             existing = db.scalar(select(ChapterWriterDraft).where(ChapterWriterDraft.chapter_id == chapter.id, ChapterWriterDraft.client_request_id == stored_key))
             if existing:
-                if existing.source_quality_assessment_id != assessment.id:
+                if existing.source_quality_assessment_id != assessment.id or existing.request_fingerprint != request_fp:
                     raise QualityDomainError("QUALITY_REQUEST_MISMATCH")
                 child = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.writer_draft_id == existing.id).order_by(ChapterQualityAssessment.version.desc()))
                 return existing, child
         project_config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == chapter.project_id))
         limit = min(assessment.quality_config.get("max_repair_attempts", 1), project_config.max_repair_attempts if project_config else 1)
-        attempts = db.scalar(select(func.count(ChapterWriterDraft.id)).where(ChapterWriterDraft.source_quality_assessment_id == assessment.id, ChapterWriterDraft.origin == WriterDraftOrigin.QUALITY_REPAIR)) or 0
-        if attempts >= limit:
+        if self._chain_attempt_count(db, source) >= limit:
             raise QualityDomainError("QUALITY_REPAIR_LIMIT_REACHED")
         if _value(assessment.status) not in {"REPAIR_REQUIRED", "BLOCKED"}:
             raise QualityDomainError("QUALITY_REPAIR_NOT_ALLOWED")
-        current = db.get(ChapterWriterDraft, chapter.current_writer_draft_id)
-        context = QualityContextBuilder().build(db, chapter.id, {"config": assessment.quality_config}, critic_provider=assessment.critic_provider, critic_model=assessment.critic_model)
-        if context["quality_context_fingerprint"] != assessment.quality_context_fingerprint:
-            raise QualityDomainError("QUALITY_SOURCE_CHANGED")
         provider, model, provider_name = self._provider(db, chapter.project_id, repair_provider, repair_model, settings)
         finding_rows = db.scalars(select(ChapterQualityFinding).where(ChapterQualityFinding.assessment_id == assessment.id).order_by(ChapterQualityFinding.ordinal)).all()
         findings = [{"category": item.category, "severity": _value(item.severity), "rule_code": item.rule_code, "message": item.message, "start_offset": item.start_offset, "end_offset": item.end_offset, "excerpt": item.excerpt, "source_refs": item.source_refs} for item in finding_rows]
         prompt = QualityRepairPromptBuilder().build(context, findings)
+        version = (db.scalar(select(func.max(ChapterWriterDraft.version)).where(ChapterWriterDraft.chapter_id == chapter.id)) or 0) + 1
+        draft = self._draft_attempt(chapter, source, assessment, stored_key, request_fp, _fp(prompt, "quality-repair-prompt-v1"), provider_name, model)
+        draft.version = version
+        db.add(draft); db.flush()
         trace = ExecutionTraceRecorder().start(db, project_id=chapter.project_id, stage="REPAIR", source_type="CHAPTER_QUALITY_ASSESSMENT", source_id=assessment.id, provider=provider_name, model=model, input_fingerprint=context["quality_context_fingerprint"])
         try:
             result = provider.generate(prompt, model)
@@ -540,34 +739,62 @@ class QualityRepairService:
             except ValidationError as exc:
                 raise QualityDomainError(MODEL_OUTPUT_INVALID) from exc
             report = WriterGroundingValidator().validate(parsed, context["writer_safe_context"])
-            version = (db.scalar(select(func.max(ChapterWriterDraft.version)).where(ChapterWriterDraft.chapter_id == chapter.id)) or 0) + 1
-            request_fp = _fp({"assessment_id": assessment.id, "quality_context": assessment.quality_context_fingerprint, "request": {key: value for key, value in request.items() if key not in {"client_request_id", "idempotency_key"}}}, "quality-repair-request-v1")
-            draft = ChapterWriterDraft(project_id=chapter.project_id, chapter_id=chapter.id, version=version, status=WriterDraftStatus.VALIDATED if report["valid"] else WriterDraftStatus.REJECTED, origin=WriterDraftOrigin.QUALITY_REPAIR, source_quality_assessment_id=assessment.id, client_request_id=stored_key, request_fingerprint=request_fp, chapter_structure_fingerprint=current.chapter_structure_fingerprint, chapter_source_fingerprint=current.chapter_source_fingerprint, writer_context_fingerprint=current.writer_context_fingerprint, source_structure_status=current.source_structure_status, source_scene_ids=current.source_scene_ids, source_manifest=current.source_manifest, writing_bible_id=current.writing_bible_id, writing_bible_version=current.writing_bible_version, writing_bible_fingerprint=current.writing_bible_fingerprint, pov_mode=current.pov_mode, pov_character_id=current.pov_character_id, provider=result.provider, model=result.model, model_request_id=result.request_id, prompt_fingerprint=_fp(prompt, "quality-repair-prompt-v1"), title_candidate=parsed["chapter_title"], content=parsed["prose"], content_fingerprint=_fp(parsed["prose"], "writer-content-v1"), word_count=WriterWordCounter().count(parsed["prose"]), scene_coverage=parsed["scene_coverage"], source_refs=parsed["source_refs"], validation_report=report, parent_draft_id=current.id, completed_at=datetime.utcnow())
-            db.add(draft); db.flush()
+            draft.provider = result.provider; draft.model = result.model; draft.model_request_id = result.request_id
+            draft.title_candidate = parsed["chapter_title"]; draft.content = parsed["prose"]
+            draft.content_fingerprint = _fp(parsed["prose"], "writer-content-v1")
+            draft.word_count = WriterWordCounter().count(parsed["prose"])
+            draft.scene_coverage = parsed["scene_coverage"]; draft.source_refs = parsed["source_refs"]
+            draft.validation_report = report; draft.completed_at = datetime.utcnow()
             if not report["valid"]:
-                ExecutionTraceRecorder().block(trace, report["issues"][0]["code"], validation_report=report, request_id=result.request_id); return draft, None
+                draft.status = WriterDraftStatus.REJECTED
+                ExecutionTraceRecorder().block(trace, report["issues"][0]["code"], validation_report=report, request_id=result.request_id)
+                db.flush(); return draft, None
+            draft.status = WriterDraftStatus.VALIDATED
             ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms, request_id=result.request_id, output_fingerprint=draft.content_fingerprint)
+            db.flush()
             child_request = {"client_request_id": f"repair-assessment:{draft.id}", "config": assessment.quality_config}
             child = QualityGateService().assess(db, chapter.id, child_request, provider=critic_provider, model=critic_model, settings=settings, draft=draft, require_current=False)
             return draft, child
         except ModelProviderError as exc:
-            ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status); raise QualityDomainError(exc.code) from exc
+            draft.status = WriterDraftStatus.FAILED; draft.validation_report = {"valid": False, "issues": [{"code": exc.code, "blocking": True}]}; draft.completed_at = datetime.utcnow()
+            ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status); db.flush(); return draft, None
+        except QualityDomainError as exc:
+            draft.status = WriterDraftStatus.FAILED; draft.validation_report = {"valid": False, "issues": [{"code": exc.code, "blocking": True}]}; draft.completed_at = datetime.utcnow()
+            ExecutionTraceRecorder().fail(trace, exc.code); db.flush(); return draft, None
 
     def adopt(self, db: Session, draft_id: str) -> Chapter:
         draft = db.scalar(select(ChapterWriterDraft).where(ChapterWriterDraft.id == draft_id).with_for_update())
-        if not draft or _value(draft.origin) != "QUALITY_REPAIR" or _value(draft.status) != "VALIDATED":
+        if not draft or _value(draft.origin) != "QUALITY_REPAIR":
             raise QualityDomainError("QUALITY_REPAIR_DRAFT_NOT_VALIDATED")
         chapter = db.scalar(select(Chapter).where(Chapter.id == draft.chapter_id).with_for_update())
-        assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.writer_draft_id == draft.id, ChapterQualityAssessment.status == QualityAssessmentStatus.PASS, ChapterQualityAssessment.active.is_(True)).order_by(ChapterQualityAssessment.version.desc()))
-        if not assessment:
+        if _value(draft.status) == "ADOPTED" and chapter.current_writer_draft_id == draft.id:
+            return chapter
+        if _value(draft.status) != "VALIDATED":
+            raise QualityDomainError("QUALITY_REPAIR_DRAFT_NOT_VALIDATED")
+        assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.writer_draft_id == draft.id, ChapterQualityAssessment.status == QualityAssessmentStatus.PASS).order_by(ChapterQualityAssessment.version.desc()))
+        if not assessment or not self._source_is_repairable(db, chapter, assessment, draft):
             raise QualityDomainError("QUALITY_REPAIR_ASSESSMENT_NOT_PASS")
-        context = QualityContextBuilder().build(db, chapter.id, {"config": assessment.quality_config}, draft=draft, critic_provider=assessment.critic_provider, critic_model=assessment.critic_model, require_current=False)
-        if context["quality_context_fingerprint"] != assessment.quality_context_fingerprint:
-            raise QualityDomainError("QUALITY_SOURCE_CHANGED")
+        QualityAssessmentAudit().audit(db, assessment.id)
+        freshness = QualityAssessmentFreshnessChecker().check(db, assessment, require_current=False)
+        if not freshness["fresh"]:
+            raise QualityDomainError("QUALITY_SOURCE_CHANGED", freshness)
         prior = db.get(ChapterWriterDraft, chapter.current_writer_draft_id)
+        # Deliberately inject while only the presentation row is dirty. The
+        # surrounding caller transaction must restore every lifecycle row.
+        chapter.content = draft.content; chapter.word_count = draft.word_count; chapter.writer_content_fingerprint = draft.content_fingerprint; chapter.writer_context_fingerprint = draft.writer_context_fingerprint; chapter.current_writer_draft_id = draft.id; chapter.written_at = datetime.utcnow()
+        self._inject("AFTER_CHAPTER_CONTENT_BEFORE_QUALITY_FINALIZATION")
         if prior and prior.id != draft.id:
             prior.status = WriterDraftStatus.SUPERSEDED
-        chapter.content = draft.content; chapter.word_count = draft.word_count; chapter.writer_content_fingerprint = draft.content_fingerprint; chapter.writer_context_fingerprint = draft.writer_context_fingerprint; chapter.current_writer_draft_id = draft.id; chapter.written_at = datetime.utcnow(); draft.status = WriterDraftStatus.ADOPTED; draft.adopted_at = datetime.utcnow()
+        old_assessments = db.scalars(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True)).with_for_update()).all()
+        for item in old_assessments:
+            if item.id != assessment.id:
+                item.active = False
+                if _value(item.status) not in {"STALE", "FAILED"}:
+                    item.status = QualityAssessmentStatus.SUPERSEDED
+        if old_assessments:
+            db.flush()
+        assessment.active = True
+        draft.status = WriterDraftStatus.ADOPTED; draft.adopted_at = datetime.utcnow()
         chapter.current_quality_assessment_id = assessment.id; chapter.quality_status = "PASS"; chapter.quality_content_fingerprint = assessment.content_fingerprint; chapter.quality_approved_at = datetime.utcnow(); chapter.status = "QUALITY_APPROVED"; assessment.approved_at = chapter.quality_approved_at
         counts = Counter(_value(item.severity) for item in db.scalars(select(ChapterQualityFinding).where(ChapterQualityFinding.assessment_id == assessment.id)).all())
         chapter.quality_report = {"assessment_id": assessment.id, "status": "PASS", "overall_score": assessment.overall_score, "finding_counts": dict(sorted(counts.items())), "approved_at": chapter.quality_approved_at.isoformat()}

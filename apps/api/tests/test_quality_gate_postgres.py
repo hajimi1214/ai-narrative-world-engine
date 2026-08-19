@@ -12,7 +12,8 @@ from app.models import (
     Chapter, ChapterQualityAssessment, ChapterQualityFinding, ChapterWriterDraft,
     ExecutionTrace, Project, WriterDraftOrigin, WriterDraftStatus, WriterPOVMode,
 )
-from app.quality import QualityContextBuilder, QualityGateService
+from app.quality import AntiAIBibleResolver, QualityAssessmentAudit, QualityContextBuilder, QualityGateService, QualityRepairService, _fp
+from app.writer import WriterProjectionAudit
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -21,6 +22,14 @@ pytestmark = pytest.mark.skipif(not DATABASE_URL.startswith("postgresql"), reaso
 
 def _critic():
     return '{"decision":"PASS","scores":{"factual_grounding":95,"pov_compliance":95,"reveal_safety":95,"style_naturalness":95,"repetition":95,"pacing":95,"voice_consistency":95,"overall":95},"findings":[]}'
+
+
+def _repair_required():
+    return '{"decision":"REPAIR_REQUIRED","scores":{"factual_grounding":95,"pov_compliance":95,"reveal_safety":95,"style_naturalness":95,"repetition":95,"pacing":95,"voice_consistency":95,"overall":1},"findings":[]}'
+
+
+def _writer_output(prose):
+    return '{"chapter_title":"Quality","prose":"%s","scene_coverage":[],"source_refs":[],"pov_character_id":null}' % prose
 
 
 def _fixture(db):
@@ -38,7 +47,8 @@ def _context(self, db, chapter_id, request=None, *, draft=None, critic_provider=
     chapter = db.get(Chapter, chapter_id)
     draft = draft or db.get(ChapterWriterDraft, chapter.current_writer_draft_id)
     config = {"require_critic": True, "min_overall_score": 70, "max_major_findings": 0, "allow_minor_findings": True, "auto_repair_enabled": False, "max_repair_attempts": 1}
-    return {"chapter": chapter, "writer_draft": draft, "prose": draft.content, "writer_safe_context": {"source_manifest": {"scenes": []}, "renderable_source_refs": []}, "writing_rules": {"protocol": "default"}, "anti_ai_rules": {"disabled_expressions": [], "warning_expressions": [], "frequency_limits": {}, "writing_principles": [], "future_risk_labels": []}, "anti_ai_bible": {"id": None, "version": None, "fingerprint": "anti-ai-default", "rules": {}}, "quality_contract": {"formal_mutation": False}, "source_fingerprints": {}, "quality_config": config, "quality_config_fingerprint": "quality-config", "quality_context_fingerprint": "quality-context", "renderable_source_refs": []}
+    rules = AntiAIBibleResolver.DEFAULT.copy()
+    return {"chapter": chapter, "writer_draft": draft, "prose": draft.content, "writer_safe_context": {"source_manifest": {"scenes": []}, "renderable_source_refs": []}, "writing_rules": {"protocol": "default"}, "anti_ai_rules": rules, "anti_ai_bible": {"id": None, "version": None, "fingerprint": _fp({"version": 1, **rules}, "anti-ai-default-v1"), "rules": rules}, "quality_contract": {"formal_mutation": False}, "source_fingerprints": {}, "quality_config": config, "quality_config_fingerprint": _fp(config, "quality-config-v1"), "quality_context_fingerprint": "quality-context", "renderable_source_refs": []}
 
 
 def _cleanup(Session, project_id, chapter_id):
@@ -136,5 +146,40 @@ def test_postgres_assessment_version_is_unique(monkeypatch):
             duplicate = ChapterQualityAssessment(project_id=first.project_id, chapter_id=first.chapter_id, writer_draft_id=first.writer_draft_id, version=first.version, status="PASS", active=False, request_fingerprint="other", content_fingerprint=first.content_fingerprint, writer_context_fingerprint=first.writer_context_fingerprint, chapter_source_fingerprint=first.chapter_source_fingerprint, anti_ai_bible_fingerprint=first.anti_ai_bible_fingerprint, writing_bible_fingerprint=first.writing_bible_fingerprint, quality_config=first.quality_config, quality_config_fingerprint=first.quality_config_fingerprint, quality_context_fingerprint="other-context", deterministic_report={}, critic_report={}, decision_reason_codes=[])
             db.add(duplicate)
             with pytest.raises(IntegrityError): db.flush()
+    finally:
+        _cleanup(Session, project_id, chapter_id); engine.dispose()
+
+
+def test_postgres_concurrent_repair_adopt_serializes_current(monkeypatch):
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project_id, chapter_id, _ = _fixture(db)
+    monkeypatch.setattr(QualityContextBuilder, "build", _context)
+    try:
+        with Session() as db:
+            source = QualityGateService().assess(db, chapter_id, {}, provider=FakeModelProvider(_repair_required()), model="critic")
+            repair, child = QualityRepairService().repair(db, source.id, {}, repair_provider=FakeModelProvider(_writer_output("Fixed.")), repair_model="repair", critic_provider=FakeModelProvider(_critic()), critic_model="critic")
+            db.commit(); repair_id = repair.id; child_id = child.id
+        barrier = threading.Barrier(2); outcomes = []; errors = []
+
+        def worker():
+            try:
+                with Session() as db:
+                    barrier.wait()
+                    chapter = QualityRepairService().adopt(db, repair_id)
+                    db.commit(); outcomes.append(chapter.current_writer_draft_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        assert not errors and outcomes == [repair_id, repair_id]
+        with Session() as db:
+            chapter = db.get(Chapter, chapter_id)
+            assert chapter.current_writer_draft_id == repair_id and chapter.current_quality_assessment_id == child_id
+            assert WriterProjectionAudit().audit(db, chapter_id)["valid"]
+            assert QualityAssessmentAudit().audit(db, child_id)["valid"]
     finally:
         _cleanup(Session, project_id, chapter_id); engine.dispose()

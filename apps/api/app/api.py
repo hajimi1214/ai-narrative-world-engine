@@ -35,7 +35,7 @@ from .autonomy import AutonomousWorldLoopService
 from .narrative_structure import NarrativeStructureService
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
 from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionService
-from .quality import QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
+from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
 
 router = APIRouter()
 
@@ -711,8 +711,15 @@ def quality_assessment_detail(project_id: str, chapter_id: str, assessment_id: s
 @router.get("/projects/{project_id}/chapters/{chapter_id}/quality")
 def quality_current(project_id: str, chapter_id: str, db: Session = Depends(get_db)):
     chapter = _quality_chapter(db, project_id, chapter_id)
-    assessment = db.get(ChapterQualityAssessment, chapter.current_quality_assessment_id) if chapter.current_quality_assessment_id else db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True)).order_by(ChapterQualityAssessment.version.desc()))
-    return {"chapter_id": chapter.id, "chapter_status": chapter.status, "quality_status": chapter.quality_status, "quality_content_fingerprint": chapter.quality_content_fingerprint, "quality_approved_at": serialize(chapter.quality_approved_at), "current_assessment": assessment_payload(db, assessment) if assessment else None, "stale": bool(assessment and serialize(assessment.status) == "STALE"), "repair_available": bool(assessment and serialize(assessment.status) in {"REPAIR_REQUIRED", "BLOCKED"})}
+    current_draft_id = chapter.current_writer_draft_id
+    current_content_fp = chapter.writer_content_fingerprint
+    assessment = db.get(ChapterQualityAssessment, chapter.current_quality_assessment_id) if chapter.current_quality_assessment_id else None
+    if not assessment or assessment.writer_draft_id != current_draft_id or assessment.content_fingerprint != current_content_fp:
+        assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.writer_draft_id == current_draft_id, ChapterQualityAssessment.content_fingerprint == current_content_fp).order_by(ChapterQualityAssessment.version.desc(), ChapterQualityAssessment.id.desc()))
+    freshness = QualityAssessmentFreshnessChecker().check(db, assessment, require_current=True) if assessment else {"fresh": False, "current": False, "reasons": ["QUALITY_NOT_ASSESSED"]}
+    stored_status = serialize(assessment.status) if assessment else (chapter.quality_status or "NOT_ASSESSED")
+    effective_status = stored_status if assessment and freshness["fresh"] else "STALE" if assessment else "NOT_ASSESSED"
+    return {"chapter_id": chapter.id, "chapter_status": chapter.status, "quality_status": chapter.quality_status, "stored_status": stored_status, "effective_status": effective_status, "quality_content_fingerprint": chapter.quality_content_fingerprint, "quality_approved_at": serialize(chapter.quality_approved_at), "current_assessment": assessment_payload(db, assessment) if assessment else None, "stale": bool(assessment and not freshness["fresh"]), "freshness_reasons": freshness["reasons"], "repair_available": bool(assessment and serialize(assessment.status) in {"REPAIR_REQUIRED", "BLOCKED"})}
 
 
 @router.post("/projects/{project_id}/chapters/{chapter_id}/quality/assessments/{assessment_id}/approve")
