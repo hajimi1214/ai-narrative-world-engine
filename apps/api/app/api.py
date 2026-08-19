@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, ChapterQualityAssessment, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, ChapterQualityAssessment, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision, ResearchDocument, ResearchDocumentRevision
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -36,6 +36,7 @@ from .narrative_structure import NarrativeStructureService
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
 from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionService
 from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
+from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
 
 router = APIRouter()
 
@@ -520,10 +521,101 @@ def writer_draft_payload(draft: ChapterWriterDraft, *, include_content: bool = F
         value["chapter_title"] = draft.title_candidate
     return value
 
+@router.post("/projects/{project_id}/research/documents", status_code=status.HTTP_201_CREATED)
+def create_research_document(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    values = payload.model_dump()
+    try:
+        result = ResearchIngestionService().ingest(db, project_id, title=values.get("title"), content=values.get("content"), source_tier=values.get("source_tier", "PROJECT_RESEARCH"), source_kind=values.get("source_kind", "MANUAL_TEXT"), source_uri=values.get("source_uri"), source_metadata=values.get("source_metadata"), client_request_id=values.get("client_request_id") or values.get("idempotency_key"), request=values)
+        db.commit(); db.refresh(result.document); db.refresh(result.revision)
+        return {"document": research_document_payload(db, result.document), "revision": research_revision_payload(result.revision, include_content=True), "chunk_count": len(result.chunks), "idempotent": result.idempotent}
+    except ResearchDomainError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409 if exc.code not in {"RESEARCH_CONFIG_INVALID", "RESEARCH_SOURCE_URI_INVALID", "RESEARCH_METADATA_INVALID", "RESEARCH_TITLE_REQUIRED", "RESEARCH_CONTENT_EMPTY"} else 400, detail={"code": exc.code, **(exc.detail or {})}) from exc
+
+@router.get("/projects/{project_id}/research/documents")
+def list_research_documents(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [research_document_payload(db, item) for item in db.scalars(select(ResearchDocument).where(ResearchDocument.project_id == project_id).order_by(ResearchDocument.created_at, ResearchDocument.id)).all()]
+
+@router.get("/projects/{project_id}/research/documents/{document_id}")
+def get_research_document(project_id: str, document_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    document = db.get(ResearchDocument, document_id)
+    if not document or document.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Research document not found")
+    return research_document_payload(db, document, include_revisions=True)
+
+@router.get("/projects/{project_id}/research/documents/{document_id}/revisions")
+def list_research_revisions(project_id: str, document_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    document = db.get(ResearchDocument, document_id)
+    if not document or document.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Research document not found")
+    return [research_revision_payload(item) for item in db.scalars(select(ResearchDocumentRevision).where(ResearchDocumentRevision.document_id == document.id).order_by(ResearchDocumentRevision.version.desc())).all()]
+
+@router.post("/projects/{project_id}/research/documents/{document_id}/revisions", status_code=status.HTTP_201_CREATED)
+def create_research_revision(project_id: str, document_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    document = db.get(ResearchDocument, document_id)
+    if not document or document.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Research document not found")
+    try:
+        result = ResearchIngestionService().add_revision(db, document_id, content=payload.model_dump().get("content"), request=payload.model_dump(), source_metadata=payload.model_dump().get("source_metadata"))
+        db.commit(); db.refresh(result.revision)
+        return {"document_id": document_id, "revision": research_revision_payload(result.revision, include_content=True), "chunk_count": len(result.chunks), "idempotent": result.idempotent}
+    except ResearchDomainError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": exc.code, **(exc.detail or {})}) from exc
+
+@router.post("/projects/{project_id}/research/documents/{document_id}/archive")
+def archive_research_document(project_id: str, document_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    document = db.get(ResearchDocument, document_id)
+    if not document or document.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Research document not found")
+    try:
+        document = ResearchIngestionService().archive(db, document_id)
+        db.commit(); db.refresh(document)
+        return research_document_payload(db, document)
+    except ResearchDomainError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+
+@router.post("/projects/{project_id}/research/search")
+def search_research(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    values = payload.model_dump()
+    try:
+        packet = KnowledgePacketBuilder().build(db, project_id, values.get("query", ""), mode="AUTHOR", filters=values.get("filters"), request=values)
+        return packet.as_dict() | {"total_chars": sum(len(item["content"]) for item in packet.hits)}
+    except ResearchDomainError as exc:
+        raise HTTPException(status_code=400 if exc.code in {"RESEARCH_QUERY_EMPTY", "RESEARCH_FILTER_INVALID", "RESEARCH_CONFIG_INVALID"} else 409, detail={"code": exc.code, **(exc.detail or {})}) from exc
+
+@router.post("/projects/{project_id}/knowledge/preview")
+def preview_knowledge(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    values = payload.model_dump()
+    try:
+        return KnowledgePacketBuilder().build(db, project_id, values.get("query", ""), mode=values.get("mode", "AUTHOR"), filters=values.get("filters"), request=values).as_dict()
+    except ResearchDomainError as exc:
+        raise HTTPException(status_code=400 if exc.code in {"RESEARCH_QUERY_EMPTY", "RESEARCH_FILTER_INVALID", "RESEARCH_CONFIG_INVALID"} else 409, detail={"code": exc.code, **(exc.detail or {})}) from exc
+
 def require_project(db: Session, project_id: str) -> Project:
     project = db.get(Project, project_id)
     if not project: raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+def research_document_payload(db: Session, document: ResearchDocument, *, include_revisions: bool = False) -> dict[str, Any]:
+    active = db.scalar(select(ResearchDocumentRevision).where(ResearchDocumentRevision.document_id == document.id, ResearchDocumentRevision.active.is_(True)))
+    value = {"id": document.id, "project_id": document.project_id, "title": document.title, "source_tier": serialize(document.source_tier), "source_kind": serialize(document.source_kind), "source_uri": document.source_uri, "source_metadata": document.source_metadata, "active": document.active, "archived_at": serialize(document.archived_at), "created_at": serialize(document.created_at), "updated_at": serialize(document.updated_at), "active_revision_id": active.id if active else None, "corpus_fingerprint": ResearchCorpusFingerprintBuilder().build(db, document.project_id)}
+    if include_revisions:
+        value["revisions"] = [research_revision_payload(item, include_content=False) for item in db.scalars(select(ResearchDocumentRevision).where(ResearchDocumentRevision.document_id == document.id).order_by(ResearchDocumentRevision.version.desc())).all()]
+    return value
+
+def research_revision_payload(revision: ResearchDocumentRevision, *, include_content: bool = False) -> dict[str, Any]:
+    value = {"id": revision.id, "project_id": revision.project_id, "document_id": revision.document_id, "version": revision.version, "active": revision.active, "content_fingerprint": revision.content_fingerprint, "normalized_fingerprint": revision.normalized_fingerprint, "ingestion_config": revision.ingestion_config, "ingestion_config_fingerprint": revision.ingestion_config_fingerprint, "supersedes_revision_id": revision.supersedes_revision_id, "created_at": serialize(revision.created_at)}
+    if include_content:
+        value["content"] = revision.content
+    return value
 
 def ensure_autonomous_run_idle(db: Session, project_id: str) -> None:
     if db.scalar(select(AutonomousWorldRun.id).where(AutonomousWorldRun.project_id == project_id, AutonomousWorldRun.active.is_(True))):

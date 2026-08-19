@@ -968,3 +968,75 @@ class RecoveryCandidateVersion(Base):
     validation_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     repair_trace_id: Mapped[str | None] = mapped_column(ForeignKey("execution_traces.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ResearchSourceTier(str, enum.Enum):
+    PROJECT_RESEARCH = "PROJECT_RESEARCH"
+    PUBLIC_KB = "PUBLIC_KB"
+    WEB = "WEB"
+
+
+class ResearchSourceKind(str, enum.Enum):
+    MANUAL_TEXT = "MANUAL_TEXT"
+    USER_DOCUMENT = "USER_DOCUMENT"
+    PUBLIC_KB_IMPORT = "PUBLIC_KB_IMPORT"
+    WEB_SNAPSHOT = "WEB_SNAPSHOT"
+
+
+class ResearchDocument(TimestampMixin, Base):
+    __tablename__ = "research_documents"
+    __table_args__ = (
+        UniqueConstraint("project_id", "client_request_id", name="uq_research_document_request"),
+        Index("ix_research_documents_project_active", "project_id", "active"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_tier: Mapped[ResearchSourceTier] = mapped_column(Enum(ResearchSourceTier, native_enum=False, length=30), nullable=False, index=True)
+    source_kind: Mapped[ResearchSourceKind] = mapped_column(Enum(ResearchSourceKind, native_enum=False, length=30), nullable=False, index=True)
+    source_uri: Mapped[str | None] = mapped_column(String(2048))
+    source_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    client_request_id: Mapped[str | None] = mapped_column(String(200))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class ResearchDocumentRevision(Base):
+    __tablename__ = "research_document_revisions"
+    __table_args__ = (
+        UniqueConstraint("document_id", "version", name="uq_research_revision_version"),
+        Index("uq_research_revision_active", "document_id", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("research_documents.id"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    normalized_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    ingestion_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    ingestion_config_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    supersedes_revision_id: Mapped[str | None] = mapped_column(ForeignKey("research_document_revisions.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ResearchChunk(Base):
+    __tablename__ = "research_chunks"
+    __table_args__ = (
+        UniqueConstraint("revision_id", "ordinal", name="uq_research_chunk_revision_ordinal"),
+        Index("ix_research_chunks_project_active", "project_id", "active"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("research_documents.id"), nullable=False, index=True)
+    revision_id: Mapped[str] = mapped_column(ForeignKey("research_document_revisions.id"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_offset: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_offset: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    char_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
