@@ -501,6 +501,21 @@ def test_public_resolution_does_not_require_recipient():
     assert rows[0]["resolutions"][0]["actor_observation"] is None
 
 
+def test_hidden_action_public_consequence_is_renderable_without_hidden_turn():
+    rows = WriterVisibilityProjector().project(visibility_scene(), WriterPOVMode.THIRD_PERSON_LIMITED, "B")
+    by_id = {item["id"]: item for item in rows[0]["resolutions"]}
+    assert "turn-4" not in {item["id"] for item in rows[0]["turns"]}
+    assert by_id["resolution-4"]["public_observation"] == "public-COVERT"
+    assert by_id["resolution-4"]["renderable"] is True
+
+
+def test_targeted_foreign_action_public_consequence_is_renderable():
+    rows = WriterVisibilityProjector().project(visibility_scene(), WriterPOVMode.THIRD_PERSON_LIMITED, "C")
+    by_id = {item["id"]: item for item in rows[0]["resolutions"]}
+    assert "turn-2" not in {item["id"] for item in rows[0]["turns"]}
+    assert by_id["resolution-2"]["public_observation"] == "public-TARGETED"
+
+
 def test_limited_projection_excludes_raw_world_truth_and_refs(writer_project, session):
     source = WriterChapterSourceBuilder().build(session, writer_project[3].id)
     source["scenes"][0]["state_delta_items"] = [{"id": "delta", "target_type": "CHARACTER", "target_id": "hidden", "after_value": "terrified"}]
@@ -509,6 +524,12 @@ def test_limited_projection_excludes_raw_world_truth_and_refs(writer_project, se
     encoded = json.dumps(context, default=str)
     assert "terrified" not in encoded and "Secret Vault" not in encoded
     assert not {"delta", "event"} & {item["source_id"] for item in context["renderable_source_refs"]}
+
+
+def test_omniscient_projection_also_excludes_raw_world_truth():
+    rows = WriterVisibilityProjector().project(visibility_scene(), WriterPOVMode.THIRD_PERSON_OMNISCIENT, None)
+    encoded = json.dumps(rows)
+    assert "terrified" not in encoded and "Secret Vault" not in encoded
 
 
 def test_writer_config_validation(writer_project):
@@ -537,11 +558,34 @@ def test_default_config_change_stales_but_explicit_override_does_not(writer_proj
     assert draft.status == WriterDraftStatus.ADOPTED
 
 
+def test_default_config_change_stales_default_draft(writer_project, session):
+    project, _, _, chapter = writer_project
+    draft = render(session, chapter)
+    project.target_chapter_words = 4000; session.flush()
+    with pytest.raises(WriterDomainError, match="WRITER_STYLE_SOURCE_CHANGED"):
+        WriterProjectionService().adopt(session, draft.id)
+    assert draft.status == WriterDraftStatus.STALE
+
+
 def test_preview_and_render_prompt_fingerprint_match(writer_project, session):
     chapter = writer_project[3]
     preview = WriterProjectionService().preview(session, chapter.id, {"pov_mode": "OBJECTIVE"})
     draft = render(session, chapter)
     assert preview["prompt_fingerprint"] == draft.prompt_fingerprint
+
+
+def test_subjective_memory_is_conservatively_redacted_when_secret_exists(writer_project, session):
+    project, actor, scene, chapter = writer_project
+    from app.models import CanonFact, CharacterMemory
+    secret = CanonFact(project_id=project.id, fact_type="SECRET_CANON", proposition="宁墨的父亲没有死")
+    memory = CharacterMemory(character_id=actor.id, content="那具尸体可能根本不是父亲", confidence=0.8, importance=0.7)
+    session.add_all([secret, memory]); session.flush()
+    source = WriterChapterSourceBuilder().build(session, chapter.id)
+    source["scenes"][0]["turns"] = [{"id": "memory-turn", "visibility": "PRIVATE", "actor_character_id": actor.id, "recipient_character_ids": [], "observable_action": None, "spoken_content": None, "decision": {"id": "missing-decision", "character_id": actor.id, "chosen_action": "remember", "memory_refs": [memory.id], "knowledge_used": []}}]
+    context = WriterContextBuilder().build(session, source, {"pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": actor.id})
+    encoded = json.dumps(context)
+    assert memory.content not in encoded
+    assert any(item["id"] == memory.id and item["content_redacted"] for row in context["pov_subjective_context"] for item in row["memories"])
 
 
 def test_adopt_title_policy(writer_project, session):
@@ -596,3 +640,20 @@ def test_formal_execution_lineage_is_writer_source(writer_project, session):
     assert row["legacy_source"] is False and row["binding_id"] and row["performance_id"]
     assert row["turns"][0]["spoken_content"] == "I look around."
     assert row["checkpoint_id"] and row["state_changes"][0]["path"] == "/profile/opened"
+
+
+def test_formal_render_e2e_and_hidden_source_ref_rejection(writer_project, session):
+    chapter = writer_project[3]
+    provider = FakeModelProvider(response(scene_ids=chapter.source_scene_ids, source_refs=[{"source_type": "TURN", "source_id": "hidden-turn"}]))
+    draft = WriterProjectionService().render(session, chapter.id, {"pov_mode": "OBJECTIVE"}, provider=provider, model="fake-writer")
+    assert draft.status == WriterDraftStatus.REJECTED
+    assert draft.validation_report["issues"][0]["code"] == "WRITER_SOURCE_REF_INVALID"
+
+
+def test_formal_render_prompt_contains_public_outcome_but_not_hidden_action(writer_project, session):
+    chapter = writer_project[3]
+    provider = FakeModelProvider(response(scene_ids=chapter.source_scene_ids))
+    draft = WriterProjectionService().render(session, chapter.id, {"pov_mode": "OBJECTIVE"}, provider=provider, model="fake-writer")
+    prompt = json.dumps(provider.messages)
+    assert draft.status == WriterDraftStatus.VALIDATED
+    assert "before_value" not in prompt and "after_value" not in prompt

@@ -112,9 +112,12 @@ class WriterVisibilityProjector:
         rows = json.loads(_canonical(scenes))
         omniscient = mode == WriterPOVMode.THIRD_PERSON_OMNISCIENT
         for scene in rows:
+            roster = set(scene.get("participants") or [])
+            observer = omniscient or mode == WriterPOVMode.OBJECTIVE or pov_character_id in roster
             visible_turns = []
             visible_ids: set[str] = set()
             visible_visibility: dict[str, str | None] = {}
+            safe_participants: set[str] = {pov_character_id} if pov_character_id in roster else set()
             for turn in scene.get("turns", []):
                 visibility = turn.get("visibility")
                 actor = turn.get("actor_character_id")
@@ -135,28 +138,56 @@ class WriterVisibilityProjector:
                     visible_turns.append(turn)
                     visible_ids.add(turn["id"])
                     visible_visibility[turn["id"]] = visibility
+                    if actor:
+                        safe_participants.add(actor)
+                    if visibility in {"PUBLIC", "TARGETED"}:
+                        safe_participants.update(recipients)
             scene["turns"] = visible_turns
             resolutions = []
             for resolution in scene.get("resolutions", []):
-                if resolution.get("turn_id") not in visible_ids:
+                source_visibility = visible_visibility.get(resolution.get("turn_id"))
+                public_observation = resolution.get("public_observation")
+                actor_observation = resolution.get("actor_observation") if resolution.get("actor_character_id") == pov_character_id else None
+                if not observer:
                     continue
-                if not omniscient:
-                    resolution["objective_facts"] = []
-                    if mode == WriterPOVMode.OBJECTIVE:
-                        resolution["actor_observation"] = None
-                    elif resolution.get("actor_character_id") != pov_character_id:
-                        resolution["actor_observation"] = None
-                if visible_visibility.get(resolution.get("turn_id")) != "PUBLIC":
+                resolution["actor_observation"] = None if mode == WriterPOVMode.OBJECTIVE else actor_observation
+                resolution["public_observation"] = public_observation
+                if source_visibility != "PUBLIC" and not public_observation:
                     resolution["public_observation"] = None
+                resolution["objective_facts"] = []
+                resolution["renderable"] = bool(resolution.get("public_observation") or resolution.get("actor_observation"))
+                if resolution["renderable"] and source_visibility == "PUBLIC":
+                    safe_participants.add(resolution.get("actor_character_id"))
+                    safe_participants.update(resolution.get("recipient_character_ids") or [])
                 resolutions.append(resolution)
             scene["resolutions"] = resolutions
-            if not omniscient:
-                # World truth remains in the full source fingerprint, but raw values are not prose authority.
-                scene["state_delta_items"] = []
-                scene["state_changes"] = []
-                scene.pop("legacy_facts", None)
-                scene.pop("legacy_result", None)
+            # Full source retains raw world state for freshness; no POV receives it as prose authority.
+            scene["state_delta_items"] = []
+            scene["state_changes"] = []
+            scene.pop("legacy_facts", None)
+            scene.pop("legacy_result", None)
+            scene["participants"] = sorted(item for item in safe_participants if item)
         return rows
+
+
+class WriterContextFingerprintBuilder:
+    """Hash the exact safe semantic context sent to the Writer prompt."""
+
+    protocol = "writer-context-fingerprint-v2"
+
+    def build(self, context: dict[str, Any]) -> str:
+        semantic = {
+            "writing_rules": context.get("writing_rules"),
+            "chapter": context.get("chapter"),
+            "formal_history": context.get("formal_history"),
+            "pov_subjective_context": context.get("pov_subjective_context"),
+            "entity_labels": context.get("entity_labels"),
+            "rendering_contract": context.get("rendering_contract"),
+            "source_manifest": context.get("source_manifest"),
+            "renderable_source_refs": context.get("renderable_source_refs"),
+            "fingerprints": context.get("fingerprints"),
+        }
+        return _fp(semantic, self.protocol)
 
 
 class WriterPOVResolver:
@@ -292,11 +323,11 @@ class WriterContextBuilder:
             "source_manifest": manifest,
             "fingerprints": {"chapter_structure": source["structure_fingerprint"], "chapter_source": source["source_fingerprint"], "writing_bible": bible_fp},
         }
-        context["writer_context_fingerprint"] = _fp({"chapter_source_fingerprint": source["source_fingerprint"], "chapter_structure_fingerprint": source["structure_fingerprint"], "writing_bible": bible_fp, "pov_mode": mode.value, "pov_character_id": pov_character_id, "rendering_config": config, "entity_labels": context["entity_labels"], "rendering_contract": context["rendering_contract"]}, self.protocol)
         context["writing_bible"] = bible
         context["pov_mode"] = mode
         context["pov_character_id"] = pov_character_id
         context["renderable_source_refs"] = sorted(self._source_refs(safe_scenes, context["pov_subjective_context"]), key=lambda item: (item["source_type"], item["source_id"]))
+        context["writer_context_fingerprint"] = WriterContextFingerprintBuilder().build(context)
         return context
 
     @staticmethod
@@ -306,7 +337,7 @@ class WriterContextBuilder:
             refs.add(("SCENE", scene["scene_id"]))
             refs.update(("TURN", item["id"]) for item in scene.get("turns", []))
             refs.update(("CHARACTER_DECISION", item["decision"]["id"]) for item in scene.get("turns", []) if item.get("decision"))
-            refs.update(("WORLD_RESOLUTION", item["id"]) for item in scene.get("resolutions", []))
+            refs.update(("WORLD_RESOLUTION", item["id"]) for item in scene.get("resolutions", []) if item.get("renderable", True))
             refs.update(("STATE_DELTA_ITEM", item["id"]) for item in scene.get("state_delta_items", []))
             refs.update(("TIMELINE_EVENT", item["id"]) for item in scene.get("state_changes", []))
         for row in subjective:
@@ -341,10 +372,12 @@ class WriterContextBuilder:
                     blocked_secret_propositions = set(db.scalars(select(CanonFact.proposition).where(CanonFact.project_id == project_id, CanonFact.fact_type == CanonType.SECRET_CANON, CanonFact.id.not_in(allowed_reveals))).all())
                     knowledge = [item for item in knowledge if item.proposition not in blocked_secret_propositions]
                     memories = db.scalars(select(CharacterMemory).where(CharacterMemory.id.in_(memory_ids), CharacterMemory.character_id == pov_character_id).order_by(CharacterMemory.id)).all() if memory_ids else []
+                    has_unresolved_secret = bool(db.scalar(select(CanonFact.id).where(CanonFact.project_id == project_id, CanonFact.fact_type == CanonType.SECRET_CANON).limit(1)))
                     visible_memories = []
                     for memory in memories:
-                        blocked = any(secret and secret in (memory.content or "") for secret in blocked_secret_propositions)
-                        visible_memories.append({"id": memory.id, "content": None if blocked else memory.content, "confidence": memory.confidence, "renderable": not blocked})
+                        # Without a structured proof, any secret canon makes raw memory unsafe.
+                        blocked = has_unresolved_secret
+                        visible_memories.append({"id": memory.id, "content": None if blocked else memory.content, "confidence": memory.confidence, "content_redacted": blocked, "renderable": not blocked})
                     rows.append({"scene_id": scene["scene_id"], "character_id": pov_character_id, "chosen_action": decision.get("chosen_action"), "motivation": formal.motivation if formal else None, "knowledge": [{"id": item.id, "proposition": item.proposition, "status": _value(item.status), "confidence": item.confidence} for item in knowledge], "memories": visible_memories})
         return rows
 
