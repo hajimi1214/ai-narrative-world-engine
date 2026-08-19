@@ -32,6 +32,7 @@ from .state_delta_validation import StateDeltaValidator
 from .scene_commit import SceneCommitService
 from .causal_ledger import CausalLedgerBackfillService, CausalProvenanceQuery
 from .autonomy import AutonomousWorldLoopService
+from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
 
 router = APIRouter()
 
@@ -1025,6 +1026,7 @@ def get_snapshot(project_id:str,snapshot_id:str,db:Session=Depends(get_db)):
     return record_dict(item)
 @router.post("/projects/{project_id}/revisions/{revision_id}/apply")
 def apply_revision(project_id:str,revision_id:str,payload:Payload,db:Session=Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
     ensure_replay_not_pending(db, project_id)
     revision=db.get(WorldRevision,revision_id)
     if not revision or revision.project_id!=project_id: raise HTTPException(status_code=404,detail="World Revision not found")
@@ -1275,6 +1277,23 @@ def get_performance(project_id: str, performance_id: str, db: Session = Depends(
 
 @router.post("/projects/{project_id}/performances/{performance_id}/step", status_code=status.HTTP_201_CREATED)
 def performance_step(project_id: str, performance_id: str, db: Session = Depends(get_db)):
+    # The same service is used by AutonomousWorldLoopService.  Keep HTTP
+    # concerns here while the persisted turn authority lives in one place.
+    ensure_autonomous_run_idle(db, project_id)
+    ensure_replay_not_pending(db, project_id)
+    performance = db.get(ScenePerformance, performance_id)
+    if not performance or performance.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Performance not found")
+    proposal = db.get(SceneProposal, performance.scene_proposal_id)
+    if not proposal: raise HTTPException(status_code=404, detail="Scene Proposal not found")
+    try:
+        result = PerformanceRuntimeService().step(db, project_id, performance, proposal, heuristic_performer=HeuristicCharacterPerformer, model_provider_factory=get_model_provider)
+    except RuntimeFailure as exc:
+        db.commit() if exc.code.startswith("MODEL_") or exc.code == "STALE_PERFORMANCE" else db.rollback()
+        raise HTTPException(status_code={"MODEL_TIMEOUT": 504, "MODEL_RATE_LIMITED": 429, "MODEL_AUTH_FAILED": 503}.get(exc.code, 409), detail={"code": exc.code, **(exc.detail or {})}) from exc
+    db.add(performance); db.commit(); db.refresh(performance)
+    turns = persisted_turns(db, performance.id)
+    return {"performance": _performance_payload(performance, turns, db), "turn": result.get("turn") and record_dict(result["turn"]), "decision": result.get("decision") and record_dict(result["decision"]), "validation_report": result.get("validation_report"), "model_metadata": None}
+    # Legacy implementation retained below only as an audit reference.
     ensure_autonomous_run_idle(db, project_id)
     ensure_replay_not_pending(db, project_id)
     performance = db.get(ScenePerformance, performance_id)
@@ -1341,6 +1360,21 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
 
 @router.post("/projects/{project_id}/performances/{performance_id}/world/resolve", status_code=status.HTTP_201_CREATED)
 def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Session = Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
+    ensure_replay_not_pending(db, project_id)
+    performance = db.get(ScenePerformance, performance_id)
+    if not performance or performance.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Performance not found")
+    proposal = db.get(SceneProposal, performance.scene_proposal_id)
+    if not proposal: raise HTTPException(status_code=404, detail="Scene Proposal not found")
+    try:
+        result = WorldResolutionRuntimeService().resolve(db, project_id, performance, proposal, payload.model_dump().get("mode"), heuristic_resolver=HeuristicWorldResolver, model_provider_factory=get_model_provider)
+    except RuntimeFailure as exc:
+        db.commit() if exc.code.startswith("MODEL_") else db.rollback()
+        raise HTTPException(status_code={"MODEL_TIMEOUT": 504, "MODEL_RATE_LIMITED": 429, "MODEL_AUTH_FAILED": 503}.get(exc.code, 409), detail={"code": exc.code, **(exc.detail or {})}) from exc
+    db.add(performance); db.commit(); db.refresh(performance); db.refresh(result["resolution"])
+    turns = list(reversed(persisted_turns(db, performance.id)))
+    return {"performance": _performance_payload(performance, turns, db), "resolution": record_dict(result["resolution"]), "validation_report": result.get("validation_report"), "model_metadata": None}
+    # Legacy implementation retained below only as an audit reference.
     ensure_autonomous_run_idle(db, project_id)
     ensure_replay_not_pending(db, project_id)
     performance = db.get(ScenePerformance, performance_id)

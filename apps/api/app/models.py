@@ -678,6 +678,9 @@ class AutonomousWorldRun(TimestampMixin, Base):
     last_committed_sequence: Mapped[int | None] = mapped_column(Integer)
     start_world_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
     current_world_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    # Structured current-history authority.  This deliberately excludes writer prose.
+    start_history_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    current_history_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
     autonomous_run_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     stop_reason: Mapped[str | None] = mapped_column(String(120))

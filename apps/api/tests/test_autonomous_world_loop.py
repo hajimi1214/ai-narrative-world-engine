@@ -12,6 +12,7 @@ from app.main import app
 import app.api as api
 from app.autonomy import AutonomousWorldLoopService
 from app.models import AutonomousRunStatus, AutonomousStepStatus, AutonomousWorldRun, AutonomousWorldStep, Character, Project, Scene, SceneCommit, ScenePerformance, StoryThread, WorldEntity
+from app.runtime import persisted_turns
 
 
 @pytest.fixture()
@@ -44,6 +45,21 @@ def test_run_schema_defaults_and_persistence(session, world):
     run = create_service_run(session, world)
     assert run.status == AutonomousRunStatus.CREATED and run.active is True and run.scene_budget == 1
     assert run.start_world_fingerprint == run.current_world_fingerprint
+    assert run.start_history_fingerprint == run.current_history_fingerprint
+
+
+def test_blocked_legacy_run_cancel_releases_active_lock(session, world):
+    run = create_service_run(session, world)
+    run.status, run.active = AutonomousRunStatus.BLOCKED, True
+    AutonomousWorldLoopService().cancel(session, run.id)
+    assert run.active is False
+
+
+def test_run_payload_redacts_history_payloads(session, world):
+    run = create_service_run(session, world)
+    payload = AutonomousWorldLoopService.run_payload(run)
+    assert "current_history_fingerprint" in payload
+    assert "payload" not in payload and "secret" not in payload
 
 
 def test_one_active_run_per_project(session, world):
@@ -104,6 +120,21 @@ def test_step_world_fingerprint_continuity(session, world):
     run = create_service_run(session, world, budget=2); AutonomousWorldLoopService().advance(session, run.id, max_scenes=2, request_key="continuity")
     steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal)).all()
     assert steps[0].world_fingerprint_after == steps[1].world_fingerprint_before
+
+
+def test_advance_commits_each_completed_scene(session, world):
+    run = create_service_run(session, world, budget=2)
+    AutonomousWorldLoopService().advance(session, run.id, max_scenes=2, request_key="durable")
+    steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal)).all()
+    assert [step.status for step in steps] == [AutonomousStepStatus.COMMITTED, AutonomousStepStatus.COMMITTED]
+
+
+def test_persisted_turn_reader_orders_by_sequence_and_id(session, world):
+    run = create_service_run(session, world)
+    AutonomousWorldLoopService().advance(session, run.id, request_key="turns")
+    performance = session.scalar(select(ScenePerformance))
+    turns = persisted_turns(session, performance.id)
+    assert [turn.sequence for turn in turns] == list(range(1, len(turns) + 1))
 
 
 def test_new_scene_rebuilds_context_and_sequence(session, world):
@@ -184,6 +215,99 @@ def test_run_status_contains_no_model_transcript(session, world):
 def test_formal_world_changes_only_after_scene_commit(session, world):
     run = create_service_run(session, world); before = run.current_world_fingerprint; AutonomousWorldLoopService().advance(session, run.id, request_key="formal")
     assert run.current_world_fingerprint != "" and before != run.current_world_fingerprint
+
+
+def test_step_finalization_failure_rolls_back_scene(session, world):
+    run = create_service_run(session, world)
+    service = AutonomousWorldLoopService()
+    def inject(stage, *_):
+        if stage == "AFTER_SCENE_COMMIT_BEFORE_STEP_FINALIZATION":
+            raise RuntimeError("inject")
+    service.failure_injector = inject
+    with pytest.raises(ValueError, match="AUTONOMY_SCENE_FAILED"):
+        service.advance(session, run.id, request_key="finalize-fail")
+    service.failure_injector = None
+    assert session.scalar(select(func.count(Scene.id))) == 0
+    assert session.get(AutonomousWorldRun, run.id).status == AutonomousRunStatus.PAUSED
+
+
+def test_later_failure_preserves_prior_durable_scenes(session, world):
+    run = create_service_run(session, world, budget=3)
+    service = AutonomousWorldLoopService(); calls = {"count": 0}
+    def inject(stage, *_):
+        if stage == "AFTER_SCENE_COMMIT_BEFORE_STEP_FINALIZATION":
+            calls["count"] += 1
+            if calls["count"] == 3:
+                raise RuntimeError("third")
+    service.failure_injector = inject
+    with pytest.raises(ValueError, match="AUTONOMY_SCENE_FAILED"):
+        service.advance(session, run.id, max_scenes=3, request_key="three")
+    service.failure_injector = None
+    assert session.scalar(select(func.count(Scene.id))) == 2
+
+
+def test_resume_checks_zero_commit_history_boundary(session, world):
+    run = create_service_run(session, world)
+    world.thread.weight = 9
+    with pytest.raises(ValueError, match="AUTONOMY_BASELINE_CHANGED"):
+        AutonomousWorldLoopService().resume(session, run.id)
+    assert run.status == AutonomousRunStatus.BLOCKED and run.active is False
+
+
+def test_state_delta_block_releases_active_run(session, world):
+    run = create_service_run(session, world)
+    step = AutonomousWorldStep(project_id=world.project.id, run_id=run.id, ordinal=1, status=AutonomousStepStatus.RUNNING, request_key="blocked", request_offset=0, stage="STATE_DELTA", scene_sequence_before=0, world_fingerprint_before=run.current_world_fingerprint)
+    session.add(step); session.flush()
+    AutonomousWorldLoopService()._blocked(step, run, "STATE_DELTA_REJECTED", stage="STATE_DELTA")
+    assert step.status == AutonomousStepStatus.BLOCKED and run.status == AutonomousRunStatus.BLOCKED and not run.active
+
+
+def test_history_fingerprint_is_part_of_run_fingerprint(session, world):
+    run = create_service_run(session, world)
+    before = run.autonomous_run_fingerprint
+    run.current_history_fingerprint = "history-changed"
+    AutonomousWorldLoopService()._refresh_run_fingerprint(session, run)
+    assert run.autonomous_run_fingerprint != before
+
+
+def test_step_payload_excludes_recovery_payload_content(session, world):
+    run = create_service_run(session, world)
+    step = AutonomousWorldStep(project_id=world.project.id, run_id=run.id, ordinal=1, status=AutonomousStepStatus.PAUSED, request_key="safe", request_offset=0, stage="PERFORMANCE", scene_sequence_before=0, world_fingerprint_before=run.current_world_fingerprint, recovery_candidate_ids=["candidate"])
+    payload = AutonomousWorldLoopService.step_payload(step)
+    assert "recovery_candidate_ids" not in payload and "error_detail" not in payload
+
+
+def test_scene_failure_does_not_create_committed_step(session, world):
+    run = create_service_run(session, world)
+    service = AutonomousWorldLoopService()
+    service.failure_injector = lambda stage, *_: (_ for _ in ()).throw(RuntimeError("fail")) if stage == "AFTER_SCENE_COMMIT_BEFORE_STEP_FINALIZATION" else None
+    with pytest.raises(ValueError):
+        service.advance(session, run.id, request_key="no-committed")
+    service.failure_injector = None
+    assert not session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id, AutonomousWorldStep.status == AutonomousStepStatus.COMMITTED)).all()
+
+
+def test_terminal_run_active_invariant_after_budget(session, world):
+    run = create_service_run(session, world)
+    AutonomousWorldLoopService().advance(session, run.id, request_key="terminal")
+    assert run.status == AutonomousRunStatus.COMPLETED and run.active is False
+
+
+def test_step_world_before_matches_run_start(session, world):
+    run = create_service_run(session, world)
+    AutonomousWorldLoopService().advance(session, run.id, request_key="boundary")
+    step = session.scalar(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id))
+    assert step.world_fingerprint_before == run.start_world_fingerprint
+
+
+@pytest.mark.parametrize("status", [AutonomousRunStatus.COMPLETED, AutonomousRunStatus.FAILED, AutonomousRunStatus.CANCELLED, AutonomousRunStatus.BLOCKED, AutonomousRunStatus.PAUSED])
+def test_run_status_active_contract(session, world, status):
+    run = create_service_run(session, world)
+    run.status = status
+    run.active = status == AutonomousRunStatus.PAUSED
+    if status == AutonomousRunStatus.BLOCKED:
+        AutonomousWorldLoopService().cancel(session, run.id)
+    assert run.active is (status == AutonomousRunStatus.PAUSED)
 
 
 def test_step_and_run_are_project_scoped(session, world):

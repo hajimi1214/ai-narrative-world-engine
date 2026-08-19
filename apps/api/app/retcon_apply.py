@@ -9,7 +9,7 @@ from .models import (
     CharacterKnowledge, CharacterMemory, RetconApplication, RetconApplicationStatus,
     RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconImpactItem,
     RetconImpactPlan, RetconRequest, RevisionStatus, RevisionApplication, WorldSnapshot,
-    CanonFact, CanonType,
+    CanonFact, CanonType, AutonomousWorldRun,
 )
 from .retcon import RetconPlanStalenessChecker, semantic_fingerprint
 from .revision import RevisionChangeNormalizer, RevisionStateFingerprintBuilder
@@ -31,6 +31,13 @@ class RetconPendingReplayGuard:
 
     def assert_formal_mutation_allowed(self, db: Session, project_id: str) -> None:
         self.assert_progression_allowed(db, project_id)
+
+    def assert_autonomy_idle(self, db: Session, project_id: str) -> None:
+        if db.scalar(select(AutonomousWorldRun.id).where(
+            AutonomousWorldRun.project_id == project_id,
+            AutonomousWorldRun.active.is_(True),
+        ).limit(1)):
+            raise ValueError("AUTONOMY_RUN_ACTIVE")
 
 
 class RetconAuthorOverrideResolver:
@@ -89,6 +96,7 @@ class RetconApplyService:
 
     def _prepare(self, db: Session, project_id: str, request: RetconRequest, plan: RetconImpactPlan,
                  revision, author_override: bool, author_override_reason: str | None):
+        RetconPendingReplayGuard().assert_autonomy_idle(db, project_id)
         if request.project_id != project_id or plan.project_id != project_id or revision.project_id != project_id:
             self._fail("CROSS_PROJECT_REFERENCE")
         existing = db.scalar(select(RetconApplication).where(RetconApplication.retcon_request_id == request.id))
