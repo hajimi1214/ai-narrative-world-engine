@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .db import SessionLocal
-from .director import DirectorConstraintChecker, DirectorContextBuilder, HeuristicDirector
+from .director import DirectorCandidateEngine, DirectorConstraintChecker, DirectorContextBuilder, DirectorModelContextSanitizer, DirectorProposalFactory, HeuristicDirector, LLMDirectorCandidateGenerator, StoryGravityContextBuilder, StoryGravityEngine
 from .character_mind import ActiveCharacterCognitionReader, ActorPerceptionSanitizer, CharacterContextBuilder, CharacterDecisionConstraintChecker, CharacterMindViewBuilder, HeuristicCharacterActor
 from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MODEL_OUTPUT_INVALID, ModelProviderError
 from .ai.factory import get_model_provider
@@ -683,20 +683,62 @@ def character_mind_view(project_id: str, character_id: str, proposal_id: str | N
     return CharacterMindViewBuilder().build(db, project_id, character_id, proposal)
 
 def context_summary(context: dict[str, Any]) -> dict[str, Any]:
-    return {"version": context["version"], "fingerprint": context["fingerprint"], "project": context["project"], "current_story_arc": context["current_story_arc"], "active_story_threads": context["active_story_threads"], "paused_story_threads": context["paused_story_threads"], "active_characters": context["active_characters"], "recent_scene_count": len(context["recent_scenes"]), "world_entity_count": len(context["world_entities"]), "canon_count": len(context["canon"])}
+    return {"version": context["version"], "fingerprint": context["fingerprint"], "project": context["project"], "current_sequence": context.get("current_sequence", 0), "current_history_fingerprint": context.get("current_history_fingerprint"), "current_story_arc": context["current_story_arc"], "active_story_threads": context["active_story_threads"], "paused_story_threads": context["paused_story_threads"], "active_characters": context["active_characters"], "recent_scene_count": len(context["recent_scenes"]), "world_entity_count": len(context["world_entities"]), "canon_count": len(context["canon"])}
 
 @router.post("/projects/{project_id}/director/dry-run", status_code=status.HTTP_201_CREATED)
 def director_dry_run(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
     ensure_replay_not_pending(db, project_id)
     context = DirectorContextBuilder().build(db, project_id)
-    proposal = SceneProposal(project_id=project_id, context_fingerprint=context["fingerprint"], **HeuristicDirector().propose(context))
+    gravity_context = StoryGravityContextBuilder().build(db, project_id)
+    gravity = StoryGravityEngine().build(gravity_context)
+    candidates = DirectorCandidateEngine().generate(gravity_context, gravity)
+    selected = DirectorCandidateEngine().select(candidates)
+    if not selected:
+        raise HTTPException(status_code=409, detail={"code": "NO_VALID_DIRECTOR_CANDIDATE"})
+    proposal = SceneProposal(project_id=project_id, context_fingerprint=context["fingerprint"], **DirectorProposalFactory().create(project_id, gravity_context, gravity, selected))
     report = DirectorConstraintChecker().validate(db, context, proposal)
     proposal.status = ProposalStatus.VALID if report.valid else ProposalStatus.REJECTED
-    db.add(proposal); db.commit(); db.refresh(proposal)
+    db.add(proposal)
     log = DirectorDecisionLog(project_id=project_id, context_version=context["version"], proposal_id=proposal.id, decision_type=DecisionType.DRY_RUN, brief_reason=proposal.director_reasoning_summary, validation_result=report.as_dict())
-    db.add(log); db.commit()
-    return {"context_summary": context_summary(context), "proposal": record_dict(proposal), "validation_report": report.as_dict()}
+    db.add(log); db.commit(); db.refresh(proposal)
+    return {"context_summary": context_summary(context), "gravity_summary": gravity.as_dict(), "selected_candidate": selected.as_dict(), "candidate_seeds": [candidate.as_dict() for candidate in candidates[:3]], "proposal": record_dict(proposal), "validation_report": report.as_dict()}
+
+@router.get("/projects/{project_id}/director/gravity")
+def director_gravity(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    gravity_context = StoryGravityContextBuilder().build(db, project_id)
+    gravity = StoryGravityEngine().build(gravity_context)
+    candidates = DirectorCandidateEngine().generate(gravity_context, gravity)
+    return {**gravity.as_dict(), "ranked_candidate_seeds": [candidate.as_dict() for candidate in candidates[:3]]}
+
+@router.post("/projects/{project_id}/director/ai-dry-run")
+def director_ai_dry_run(project_id: str, db: Session = Depends(get_db)):
+    """Ask an optional model for a candidate only; no proposal or world write occurs."""
+    require_project(db, project_id)
+    ensure_replay_not_pending(db, project_id)
+    context = DirectorContextBuilder().build(db, project_id)
+    gravity_context = StoryGravityContextBuilder().build(db, project_id)
+    gravity = StoryGravityEngine().build(gravity_context)
+    settings = get_settings(); route = ModelRouter().resolve(db, project_id, settings, "DIRECTOR")
+    trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.DIRECTOR, source_type="DIRECTOR", source_id=project_id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
+    try:
+        provider = get_model_provider(settings, route.provider, route.base_url)
+        candidate = LLMDirectorCandidateGenerator().generate(provider, route.model, gravity_context, gravity)
+        errors = LLMDirectorCandidateGenerator().validate_references(candidate, gravity_context)
+        if errors:
+            ExecutionTraceRecorder().block(trace, errors[0], validation_report={"issues": [{"code": error} for error in errors]}); db.commit()
+            raise HTTPException(status_code=409, detail={"code": errors[0]})
+        ExecutionTraceRecorder().succeed(trace, output_fingerprint=stable_fingerprint(candidate.model_dump(mode="json"))); db.commit()
+        return {"candidate": candidate.model_dump(mode="json"), "gravity_fingerprint": gravity.gravity_fingerprint, "context_fingerprint": context["fingerprint"], "authority": "CANDIDATE_ONLY"}
+    except HTTPException:
+        raise
+    except ModelProviderError as exc:
+        ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status); db.commit()
+        raise HTTPException(status_code={MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502), detail={"code": exc.code}) from exc
+    except ValueError as exc:
+        ExecutionTraceRecorder().block(trace, MODEL_OUTPUT_INVALID, validation_report={"code": str(exc)}); db.commit()
+        raise HTTPException(status_code=502, detail={"code": MODEL_OUTPUT_INVALID}) from exc
 
 @router.get("/projects/{project_id}/director/proposals")
 def list_director_proposals(project_id: str, db: Session = Depends(get_db)):
@@ -717,10 +759,13 @@ def approve_director_proposal(project_id: str, proposal_id: str, db: Session = D
     context = DirectorContextBuilder().build(db, project_id)
     if proposal.context_fingerprint != context["fingerprint"]:
         raise HTTPException(status_code=409, detail={"code": "STALE_PROPOSAL", "message": "World state changed after this proposal was generated. Run Director again."})
+    gravity = StoryGravityEngine().build(StoryGravityContextBuilder().build(db, project_id))
+    proposal_gravity = (proposal.entry_state or {}).get("director_meta", {}).get("gravity_fingerprint")
+    if proposal_gravity and proposal_gravity != gravity.gravity_fingerprint:
+        raise HTTPException(status_code=409, detail={"code": "STALE_STORY_GRAVITY", "message": "Story Gravity changed after this proposal was generated. Run Director again."})
     report = DirectorConstraintChecker().validate(db, context, proposal)
     if not report.valid: raise HTTPException(status_code=409, detail={"message": "Blocking validation issues prevent approval.", "validation_report": report.as_dict()})
-    proposal.status = ProposalStatus.APPROVED; db.add(proposal); db.commit(); db.refresh(proposal)
-    db.add(DirectorDecisionLog(project_id=project_id, context_version=context["version"], proposal_id=proposal.id, decision_type=DecisionType.APPROVE, brief_reason="Proposal approved after constraint validation.", validation_result=report.as_dict())); db.commit()
+    proposal.status = ProposalStatus.APPROVED; db.add(proposal); db.add(DirectorDecisionLog(project_id=project_id, context_version=context["version"], proposal_id=proposal.id, decision_type=DecisionType.APPROVE, brief_reason="Proposal approved after constraint validation.", validation_result=report.as_dict())); db.commit(); db.refresh(proposal)
     return {"proposal": record_dict(proposal), "validation_report": report.as_dict()}
 
 @router.post("/projects/{project_id}/director/proposals/{proposal_id}/reject")
