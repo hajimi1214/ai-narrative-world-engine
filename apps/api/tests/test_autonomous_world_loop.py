@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from dataclasses import replace
 
 import json
 import pytest
@@ -12,7 +13,7 @@ from app.db import Base
 from app.main import app
 import app.api as api
 from app.autonomy import AutonomousWorldLoopService
-from app.models import AutonomousRunStatus, AutonomousStepStatus, AutonomousWorldRun, AutonomousWorldStep, CausalLink, Character, CharacterKnowledge, CharacterMemory, Project, RecoveryCandidate, RetconApplication, RetconApplicationStatus, Scene, SceneCommit, ScenePerformance, ScenePerformanceTurn, SceneStateCheckpoint, StateDeltaBatch, StoryThread, TimelineEvent, WorldEntity, WorldResolution, WorldSnapshot
+from app.models import AutonomousRunStatus, AutonomousStepStatus, AutonomousWorldRun, AutonomousWorldStep, CausalLink, Character, CharacterDecision, CharacterKnowledge, CharacterMemory, Project, RecoveryCandidate, RetconApplication, RetconApplicationStatus, Scene, SceneCommit, ScenePerformance, ScenePerformanceTurn, SceneStateCheckpoint, StateDeltaBatch, StateDeltaItem, StoryThread, TimelineEvent, WorldEntity, WorldResolution, WorldSnapshot
 from app.runtime import persisted_turns
 
 
@@ -62,6 +63,29 @@ def world_action_payload(entity_id):
         "world_resolution_request": {"kind": "INSPECT", "description": "inspect", "target_entity_id": entity_id, "target_character_id": None},
     })
     return payload
+
+
+def quiet_performance_payload(observable=None, memory_refs=None):
+    payload = json.loads(valid_performance_payload())
+    payload["decision"].update({"decision_type": "WAIT", "chosen_action": "wait", "memory_refs": list(memory_refs or [])})
+    payload["action"].update({"observable_action": observable, "spoken_content": None})
+    return payload
+
+
+def fixed_candidate_generator(monkeypatch, keys):
+    from app.director import DirectorCandidateEngine
+    original = DirectorCandidateEngine.generate
+    state = {"template": None, "calls": 0}
+
+    def generate(self, context, gravity):
+        if state["template"] is None:
+            state["template"] = original(self, context, gravity)[0]
+        index = min(state["calls"], len(keys) - 1)
+        state["calls"] += 1
+        return [replace(state["template"], candidate_key=keys[index])]
+
+    monkeypatch.setattr(DirectorCandidateEngine, "generate", generate)
+    return state
 
 
 @pytest.fixture()
@@ -321,6 +345,60 @@ def test_partial_request_retry_continues_exact_paused_offset(session, world, mon
     assert session.scalar(select(func.count(Scene.id))) == 2
 
 
+def test_second_provider_failure_stops_request_without_next_offset(session, world, monkeypatch):
+    from app.ai.errors import MODEL_TIMEOUT, ModelProviderError
+    provider = SequencedProvider([valid_performance_payload(), ModelProviderError(MODEL_TIMEOUT), ModelProviderError(MODEL_TIMEOUT)])
+    monkeypatch.setattr("app.runtime.get_model_provider", lambda *args, **kwargs: provider)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=4, max_turns_per_scene=1, performance_mode="LLM")
+    session.commit(); service = AutonomousWorldLoopService()
+    first = service.advance(session, run.id, max_scenes=3, request_key="second-failure")
+    steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.request_offset)).all()
+    assert [step.status for step in steps] == [AutonomousStepStatus.COMMITTED, AutonomousStepStatus.PAUSED]
+    assert [item["id"] for item in first["steps"]] == [step.id for step in steps]
+    assert run.status == AutonomousRunStatus.PAUSED and run.last_error_code == MODEL_TIMEOUT
+    service.resume(session, run.id)
+    retry = service.advance(session, run.id, max_scenes=3, request_key="second-failure")
+    steps_after = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.request_offset)).all()
+    assert retry["existing"] is True and len(retry["steps"]) == 2
+    assert [step.id for step in steps_after] == [step.id for step in steps]
+    assert steps_after[1].status == AutonomousStepStatus.PAUSED
+    assert run.status == AutonomousRunStatus.PAUSED and run.last_error_code == MODEL_TIMEOUT
+    assert session.scalar(select(func.count(Scene.id))) == 1
+
+
+def test_resumed_third_stagnant_step_stops_before_next_offset(session, world, monkeypatch):
+    from app.ai.errors import MODEL_TIMEOUT, ModelProviderError
+    provider = SequencedProvider([
+        valid_performance_payload(),
+        valid_performance_payload(),
+        ModelProviderError(MODEL_TIMEOUT),
+        valid_performance_payload(),
+    ])
+    fixed_candidate_generator(monkeypatch, ["resumed-stagnation"])
+    monkeypatch.setattr("app.runtime.get_model_provider", lambda *args, **kwargs: provider)
+    run = AutonomousWorldLoopService().create_run(
+        session,
+        world.project.id,
+        scene_budget=4,
+        max_turns_per_scene=1,
+        performance_mode="LLM",
+    )
+    session.commit(); service = AutonomousWorldLoopService()
+    service.advance(session, run.id, max_scenes=4, request_key="resumed-stagnation")
+    paused = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.request_offset)).all()
+    assert [step.status for step in paused] == [AutonomousStepStatus.COMMITTED, AutonomousStepStatus.COMMITTED, AutonomousStepStatus.PAUSED]
+    paused_identity = (paused[2].id, paused[2].proposal_id, paused[2].performance_id)
+
+    service.resume(session, run.id)
+    result = service.advance(session, run.id, max_scenes=4, request_key="resumed-stagnation")
+    final = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.request_offset)).all()
+    assert len(result["steps"]) == 3 and len(final) == 3
+    assert (final[2].id, final[2].proposal_id, final[2].performance_id) == paused_identity
+    assert final[2].status == AutonomousStepStatus.COMMITTED
+    assert run.status == AutonomousRunStatus.PAUSED and run.stop_reason == "STAGNATION_GUARD"
+    assert session.scalar(select(func.count(Scene.id))) == 3
+
+
 def test_recovery_adoption_resumes_same_step_and_keeps_provenance(session, world, monkeypatch):
     class InvalidPerformer:
         def perform(self, context):
@@ -535,6 +613,118 @@ def test_three_scene_e2e_has_checkpoint_and_causal_continuity(session, world):
         assert session.scalar(select(func.count(TimelineEvent.id)).where(TimelineEvent.scene_id == scene.id, TimelineEvent.event_type == "SCENE_OCCURRED", TimelineEvent.active.is_(True))) == 1
 
 
+def test_real_stagnation_stops_after_third_committed_scene(session, world, monkeypatch):
+    class QuietPerformer:
+        def perform(self, context): return quiet_performance_payload(), None
+    fixed_candidate_generator(monkeypatch, ["same-candidate"])
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", QuietPerformer)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=4, max_turns_per_scene=2)
+    session.commit()
+    result = AutonomousWorldLoopService().advance(session, run.id, max_scenes=4, request_key="real-stagnation")
+    steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal)).all()
+    assert len(result["steps"]) == 3 and len(steps) == 3, [
+        (step.ordinal, step.candidate_key, step.delta_batch_ids, session.get(ScenePerformance, step.performance_id).stop_reason)
+        for step in steps
+    ]
+    assert all(step.status == AutonomousStepStatus.COMMITTED and step.candidate_key == "same-candidate" and not step.delta_batch_ids for step in steps)
+    assert all(step.stop_reason == "QUIESCENT" for step in steps)
+    assert all(session.get(ScenePerformance, step.performance_id).stop_reason == "SCENE_COMMITTED" for step in steps)
+    assert run.status == AutonomousRunStatus.PAUSED and run.stop_reason == "STAGNATION_GUARD"
+    assert session.scalar(select(func.count(Scene.id))) == 3
+
+
+def test_candidate_change_resets_real_stagnation(session, world, monkeypatch):
+    class QuietPerformer:
+        def perform(self, context): return quiet_performance_payload(), None
+    fixed_candidate_generator(monkeypatch, ["candidate-a", "candidate-a", "candidate-b"])
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", QuietPerformer)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=4, max_turns_per_scene=2)
+    session.commit()
+    AutonomousWorldLoopService().advance(session, run.id, max_scenes=3, request_key="candidate-reset")
+    steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal)).all()
+    assert [step.candidate_key for step in steps] == ["candidate-a", "candidate-a", "candidate-b"]
+    assert run.status == AutonomousRunStatus.RUNNING and run.stop_reason is None
+    assert session.scalar(select(func.count(Scene.id))) == 3
+
+
+def test_state_delta_progress_resets_real_stagnation(session, world, monkeypatch):
+    class Performer:
+        calls = 0
+        def perform(self, context):
+            Performer.calls += 1
+            return (world_action_payload(world.location.id) if Performer.calls == 2 else quiet_performance_payload()), None
+    class Resolver:
+        def resolve(self, context):
+            effect = {"effect_kind": "STATE_CHANGE", "target_type": "WORLD_ENTITY", "target_id": world.location.id, "domain": "WORLD_ENTITY_PROFILE", "operation": "SET", "path": "/profile/opened", "value": True, "reason": "structured progress", "evidence": {"kind": "INSPECT", "target_entity_id": world.location.id}}
+            return {"outcome": "SUCCESS", "outcome_summary": "Opened.", "objective_facts": [{"subject_type": "ENTITY", "subject_id": world.location.id, "predicate": "opened", "value": True}], "state_effects": [effect], "actor_observation": "The entity opens.", "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": [world.location.id], "resolution_basis_summary": "structured", "missing_information": []}, None
+    world.location.profile = {**(world.location.profile or {}), "opened": False}; session.commit()
+    fixed_candidate_generator(monkeypatch, ["same-progress-candidate"])
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", Performer)
+    monkeypatch.setattr("app.runtime.HeuristicWorldResolver", Resolver)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=4, max_turns_per_scene=1)
+    session.commit()
+    AutonomousWorldLoopService().advance(session, run.id, max_scenes=3, request_key="progress-reset")
+    steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal)).all()
+    assert len(steps) == 3 and len(steps[1].delta_batch_ids) == 1
+    assert session.scalar(select(func.count(StateDeltaItem.id)).where(StateDeltaItem.batch_id == steps[1].delta_batch_ids[0])) == 1
+    assert run.status == AutonomousRunStatus.RUNNING and run.stop_reason is None
+
+
+def test_scene_one_consequence_is_in_scene_two_autonomy_gravity(session, world, monkeypatch):
+    from app.director import DirectorCandidateEngine
+    original_generate = DirectorCandidateEngine.generate
+    generated_inputs = []
+    class Performer:
+        calls = 0
+        def perform(self, context):
+            Performer.calls += 1
+            return (world_action_payload(world.location.id) if Performer.calls == 1 else quiet_performance_payload()), None
+    class Resolver:
+        def resolve(self, context):
+            effect = {"effect_kind": "STATE_CHANGE", "target_type": "WORLD_ENTITY", "target_id": world.location.id, "domain": "WORLD_ENTITY_PROFILE", "operation": "SET", "path": "/profile/opened", "value": True, "reason": "structured consequence", "evidence": {"kind": "INSPECT", "target_entity_id": world.location.id}}
+            return {"outcome": "SUCCESS", "outcome_summary": "Opened.", "objective_facts": [{"subject_type": "ENTITY", "subject_id": world.location.id, "predicate": "opened", "value": True}], "state_effects": [effect], "actor_observation": "The entity opens.", "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": [world.location.id], "resolution_basis_summary": "structured", "missing_information": []}, None
+    def capture_generate(self, context, gravity):
+        generated_inputs.append((context, gravity))
+        return original_generate(self, context, gravity)
+    world.location.profile = {**(world.location.profile or {}), "opened": False}; session.commit()
+    monkeypatch.setattr(DirectorCandidateEngine, "generate", capture_generate)
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", Performer)
+    monkeypatch.setattr("app.runtime.HeuristicWorldResolver", Resolver)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=2, max_turns_per_scene=1)
+    session.commit(); AutonomousWorldLoopService().advance(session, run.id, max_scenes=2, request_key="story-feedback")
+    state_event = session.scalar(select(TimelineEvent).where(TimelineEvent.project_id == world.project.id, TimelineEvent.event_type == "STATE_CHANGE", TimelineEvent.active.is_(True)))
+    assert state_event and state_event.scene_id and state_event.target_id == world.location.id and state_event.path == "/profile/opened"
+    assert len(generated_inputs) == 2
+    second_context, second_gravity = generated_inputs[1]
+    assert any(row["id"] == state_event.id and row["target_id"] == world.location.id and row["path"] == "/profile/opened" for row in second_context["state_changes"])
+    assert any(row["id"] == state_event.id and row["pressure_score"] > 0 for row in second_gravity.consequence_pressure)
+
+
+def test_scene_one_memory_is_recalled_and_causes_scene_two_decision(session, world, monkeypatch):
+    recalled = []
+    class MemoryAwarePerformer:
+        calls = 0
+        def perform(self, context):
+            MemoryAwarePerformer.calls += 1
+            if MemoryAwarePerformer.calls == 1:
+                return quiet_performance_payload(observable="A brass bell rings once."), None
+            memory_ids = [item["memory_id"] for item in context.get("memories", [])]
+            recalled.extend(memory_ids)
+            return quiet_performance_payload(memory_refs=memory_ids[:1]), None
+    fixed_candidate_generator(monkeypatch, ["memory-feedback"])
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", MemoryAwarePerformer)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=2, max_turns_per_scene=1)
+    session.commit(); AutonomousWorldLoopService().advance(session, run.id, max_scenes=2, request_key="memory-feedback")
+    steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal)).all()
+    memory = session.scalar(select(CharacterMemory).where(CharacterMemory.source_scene == steps[0].scene_id, CharacterMemory.character_id == world.actor.id, CharacterMemory.content == "A brass bell rings once."))
+    assert memory and recalled == [memory.id]
+    scene_two_turn = session.scalar(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == steps[1].performance_id).order_by(ScenePerformanceTurn.sequence))
+    decision = session.get(CharacterDecision, scene_two_turn.character_decision_id)
+    assert decision.memory_refs == [memory.id]
+    edge = session.scalar(select(CausalLink).where(CausalLink.project_id == world.project.id, CausalLink.cause_id == memory.id, CausalLink.effect_id == decision.id, CausalLink.relation_type == "MEMORY_INFORMED_DECISION", CausalLink.active.is_(True)))
+    assert edge is not None
+
+
 def test_resume_checks_zero_commit_history_boundary(session, world):
     run = create_service_run(session, world)
     world.thread.weight = 9
@@ -683,8 +873,7 @@ def test_stagnation_guard_pauses_after_three_no_delta_steps(session, world):
         step.candidate_key = "same-semantic-candidate"
         step.delta_batch_ids = []
         step.resolution_count = 0
-        performance = session.get(ScenePerformance, step.performance_id)
-        performance.stop_reason = "TURN_LIMIT"
+        step.stop_reason = "TURN_LIMIT"
     service._apply_stagnation_guard(session, run)
     assert run.status == AutonomousRunStatus.PAUSED and run.stop_reason == "STAGNATION_GUARD"
 
