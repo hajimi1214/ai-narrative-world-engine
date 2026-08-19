@@ -13,6 +13,7 @@ from .models import (
     CharacterDecision, CharacterDecisionType, CharacterKnowledge, CharacterMemory,
     KnowledgeStatus, Project, RetconCognitionInvalidation,
     RetconCognitionInvalidationStatus, Scene, SceneProposal, WorldEntity,
+    MemoryRetrievalMode, ProjectModelConfig,
 )
 
 MAX_CHARACTER_KNOWLEDGE = 32
@@ -279,8 +280,9 @@ def memory_source_bucket(item: dict[str, Any]) -> str:
 
 
 class CharacterMindViewBuilder:
-    def __init__(self, reader: ActiveCharacterCognitionReader | None = None):
+    def __init__(self, reader: ActiveCharacterCognitionReader | None = None, embedding_provider_factory=None):
         self.reader = reader or ActiveCharacterCognitionReader(); self.cues = StructuredActorCueExtractor(); self.beliefs = CharacterBeliefViewBuilder(); self.knowledge = CharacterKnowledgeRetriever(); self.memories = CharacterMemoryRetriever()
+        self.embedding_provider_factory = embedding_provider_factory
 
     def build(self, session: Session, project_id: str, character_id: str, proposal: SceneProposal) -> dict[str, Any]:
         character = session.get(Character, character_id)
@@ -293,10 +295,32 @@ class CharacterMindViewBuilder:
         beliefs, conflicts = self.beliefs.build(active_knowledge)
         recalled_knowledge = self.knowledge.retrieve(session, project_id, active_knowledge, cues, beliefs)
         recalled_memories = self.memories.retrieve(session, project_id, self.reader.memories(session, project_id, character_id), cues)
+        recalled_memories = self._hybrid_memories(session, project_id, character_id, cues, recalled_memories)
         identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
         result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
         result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
         return result
+
+    def _hybrid_memories(self, session: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]], deterministic: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Optional derived ranking. Any embedding failure preserves Phase9 recall."""
+        config = session.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        if not config or not config.embedding_enabled or config.memory_retrieval_mode != MemoryRetrievalMode.HYBRID_RRF:
+            return deterministic
+        try:
+            from .embeddings import CharacterMemoryHybridRetriever, CharacterMemorySemanticRetriever, CharacterSemanticCueBuilder, EmbeddingRouter, OpenAICompatibleEmbeddingProvider
+            from .settings import get_settings
+            route = EmbeddingRouter().resolve(session, project_id, get_settings())
+            query = CharacterSemanticCueBuilder().build(cues)
+            if not route.enabled or not query:
+                return deterministic
+            provider = self.embedding_provider_factory(route) if self.embedding_provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
+            embedding = provider.embed([query], route.model)
+            if embedding.dimension != route.dimension:
+                return deterministic
+            semantic = CharacterMemorySemanticRetriever().retrieve(session, project_id, character_id, embedding.vectors[0], route.embedding_config_fingerprint, config.memory_vector_top_k, config.memory_semantic_min_similarity)
+            return CharacterMemoryHybridRetriever().merge(deterministic, semantic, MAX_CHARACTER_MEMORIES, config.memory_rrf_k)
+        except Exception:
+            return deterministic
 
 
 class ReplayCognitionUsageProvider:

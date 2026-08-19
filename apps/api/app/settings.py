@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     ai_repair_model: str = "deepseek-v4-pro"
     ai_writer_model: str = "deepseek-v4-pro"
     ai_critic_model: str = "deepseek-v4-pro"
+    ai_embedding_provider: str = "openai_compatible"
+    ai_embedding_base_url: str = ""
+    ai_embedding_api_key: SecretStr | None = None
+    ai_embedding_model: str = ""
+    ai_embedding_dimension: int | None = None
     ai_timeout_seconds: float = 120.0
     character_actor_mode: str = "heuristic"
 

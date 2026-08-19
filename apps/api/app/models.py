@@ -3,10 +3,23 @@ import uuid
 from datetime import datetime
 from typing import Any
 from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, JSON as SAJSON, String, Text, UniqueConstraint, Index, text, func
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
 JSON = SAJSON
+
+
+class MemoryEmbeddingVector(TypeDecorator):
+    """Uses pgvector in PostgreSQL and a JSON value in SQLite test databases."""
+    impl = SAJSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            from pgvector.sqlalchemy import Vector
+            return dialect.type_descriptor(Vector())
+        return dialect.type_descriptor(SAJSON())
 
 def new_id() -> str:
     return str(uuid.uuid4())
@@ -62,6 +75,9 @@ class WriterPOVMode(str, enum.Enum): FIRST_PERSON="FIRST_PERSON"; THIRD_PERSON_L
 class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; SCENE_COMMIT="SCENE_COMMIT"; AUTONOMOUS_LOOP="AUTONOMOUS_LOOP"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
+class EmbeddingStatus(str, enum.Enum): PENDING="PENDING"; READY="READY"; FAILED="FAILED"
+class ProviderCredentialPurpose(str, enum.Enum): GENERATION="GENERATION"; EMBEDDING="EMBEDDING"
+class MemoryRetrievalMode(str, enum.Enum): DETERMINISTIC="DETERMINISTIC"; HYBRID_RRF="HYBRID_RRF"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
 class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
 
@@ -866,6 +882,51 @@ class RevisionApplication(Base):
 class ProjectModelConfig(TimestampMixin, Base):
     __tablename__="project_model_configs"; __table_args__=(UniqueConstraint("project_id"),)
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); provider: Mapped[str|None]=mapped_column(String(100)); base_url: Mapped[str|None]=mapped_column(String(500)); character_model: Mapped[str|None]=mapped_column(String(200)); world_model: Mapped[str|None]=mapped_column(String(200)); director_model: Mapped[str|None]=mapped_column(String(200)); repair_model: Mapped[str|None]=mapped_column(String(200)); writer_model: Mapped[str|None]=mapped_column(String(200)); critic_model: Mapped[str|None]=mapped_column(String(200)); fallback_model: Mapped[str|None]=mapped_column(String(200)); auto_failover: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); max_repair_attempts: Mapped[int]=mapped_column(Integer,default=1,nullable=False)
+    embedding_enabled: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False)
+    embedding_use_main_connection: Mapped[bool]=mapped_column(Boolean,default=True,nullable=False)
+    embedding_provider: Mapped[str|None]=mapped_column(String(100))
+    embedding_base_url: Mapped[str|None]=mapped_column(String(500))
+    embedding_model: Mapped[str|None]=mapped_column(String(200))
+    embedding_dimension: Mapped[int|None]=mapped_column(Integer)
+    memory_retrieval_mode: Mapped[MemoryRetrievalMode]=mapped_column(Enum(MemoryRetrievalMode, native_enum=False, length=30),default=MemoryRetrievalMode.DETERMINISTIC,nullable=False)
+    memory_vector_top_k: Mapped[int]=mapped_column(Integer,default=12,nullable=False)
+    memory_rrf_k: Mapped[int]=mapped_column(Integer,default=60,nullable=False)
+    memory_semantic_min_similarity: Mapped[float|None]=mapped_column(Float)
+
+
+class ProjectProviderCredential(TimestampMixin, Base):
+    __tablename__ = "project_provider_credentials"
+    __table_args__ = (UniqueConstraint("project_id", "purpose", name="uq_project_provider_credential_purpose"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    purpose: Mapped[ProviderCredentialPurpose] = mapped_column(Enum(ProviderCredentialPurpose, native_enum=False, length=20), nullable=False)
+    secret_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    secret_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    secret_hint: Mapped[str] = mapped_column(String(20), nullable=False)
+
+
+class CharacterMemoryEmbedding(TimestampMixin, Base):
+    __tablename__ = "character_memory_embeddings"
+    __table_args__ = (
+        UniqueConstraint("memory_id", "embedding_config_fingerprint", name="uq_memory_embedding_config"),
+        Index("ix_memory_embedding_project_character_config_status", "project_id", "character_id", "embedding_config_fingerprint", "status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    character_id: Mapped[str] = mapped_column(ForeignKey("characters.id"), nullable=False, index=True)
+    memory_id: Mapped[str] = mapped_column(ForeignKey("character_memories.id"), nullable=False, index=True)
+    embedding_config_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    dimension: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[EmbeddingStatus] = mapped_column(Enum(EmbeddingStatus, native_enum=False, length=20), default=EmbeddingStatus.PENDING, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(MemoryEmbeddingVector())
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error_code: Mapped[str | None] = mapped_column(String(120))
+    request_id: Mapped[str | None] = mapped_column(String(200))
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 class AutonomousWorldRun(TimestampMixin, Base):
     __tablename__ = "autonomous_world_runs"

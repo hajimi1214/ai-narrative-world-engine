@@ -12,7 +12,7 @@ const groups = [
   { label: "剧情", items: [["剧情线程", "story-threads", Workflow], ["导演台", "director", Sparkles]] },
   { label: "写作", items: [["写作手册", "writing-bibles", FileText], ["反 AI 规则", "anti-ai-bibles", ShieldAlert]] },
   { label: "运行与调试", items: [["恢复中心", "recovery-candidates", Wrench], ["历史改写", "retcon", History]] },
-  { label: "设置", items: [["模型配置", "model-config", Settings, true]] },
+  { label: "设置", items: [["模型配置", "model-config", Settings, false]] },
 ] as const;
 
 export function ProjectShell({ projectId, children }: { projectId: string; children: ReactNode }) {

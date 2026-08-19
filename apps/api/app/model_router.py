@@ -20,6 +20,20 @@ class ProjectModelConfigPayload(BaseModel):
     fallback_model: str | None = None
     auto_failover: bool = False
     max_repair_attempts: int = Field(default=1, ge=0, le=3)
+    embedding_enabled: bool = False
+    embedding_use_main_connection: bool = True
+    embedding_provider: str | None = None
+    embedding_base_url: str | None = None
+    embedding_model: str | None = None
+    embedding_dimension: int | None = Field(default=None, gt=0)
+    memory_retrieval_mode: str = "DETERMINISTIC"
+    memory_vector_top_k: int = Field(default=12, gt=0, le=100)
+    memory_rrf_k: int = Field(default=60, gt=0, le=1000)
+    memory_semantic_min_similarity: float | None = Field(default=None, ge=-1, le=1)
+    api_key: str | None = None
+    embedding_api_key: str | None = None
+    clear_api_key: bool = False
+    clear_embedding_api_key: bool = False
 
     @field_validator("provider")
     @classmethod
@@ -28,7 +42,21 @@ class ProjectModelConfigPayload(BaseModel):
             raise ValueError("unsupported provider")
         return value
 
-    @field_validator("base_url")
+    @field_validator("embedding_provider")
+    @classmethod
+    def validate_embedding_provider(cls, value):
+        if value is not None and value not in {"disabled", "openai_compatible"}:
+            raise ValueError("unsupported embedding provider")
+        return value
+
+    @field_validator("memory_retrieval_mode")
+    @classmethod
+    def validate_memory_retrieval_mode(cls, value):
+        if value not in {"DETERMINISTIC", "HYBRID_RRF"}:
+            raise ValueError("unsupported memory retrieval mode")
+        return value
+
+    @field_validator("base_url", "embedding_base_url")
     @classmethod
     def validate_url(cls, value):
         if value is None:

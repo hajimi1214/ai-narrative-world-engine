@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, ChapterQualityAssessment, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision, ResearchDocument, ResearchDocumentRevision
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, ChapterQualityAssessment, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision, ResearchDocument, ResearchDocumentRevision, ProjectProviderCredential, ProviderCredentialPurpose, CharacterMemoryEmbedding
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -36,6 +36,7 @@ from .narrative_structure import NarrativeStructureService
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
 from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionService
 from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
+from .embeddings import CredentialVault, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
 
 router = APIRouter()
@@ -1433,15 +1434,95 @@ def rollback_revision(project_id:str,application_id:str,db:Session=Depends(get_d
         raise HTTPException(status_code=409,detail={"code":str(exc)}) from exc
 @router.get("/projects/{project_id}/model-config")
 def get_model_config(project_id:str,db:Session=Depends(get_db)):
-    require_project(db,project_id); item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id)); return record_dict(item) if item else None
+    require_project(db,project_id); item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id)); return _model_config_payload(db, item)
 @router.put("/projects/{project_id}/model-config")
 def put_model_config(project_id:str,payload:Payload,db:Session=Depends(get_db)):
     require_project(db,project_id)
     try: values=ProjectModelConfigPayload.model_validate(payload.model_dump()).model_dump()
     except Exception as exc: raise HTTPException(status_code=400,detail={"code":"INVALID_MODEL_CONFIG"}) from exc
     item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id))
-    if item: return record_dict(update_record(db,item,values))
-    return record_dict(create_record(db,ProjectModelConfig,values,project_id))
+    api_key, embedding_key = values.pop("api_key", None), values.pop("embedding_api_key", None)
+    clear_api, clear_embedding = values.pop("clear_api_key", False), values.pop("clear_embedding_api_key", False)
+    if item:
+        for key, value in values.items():
+            if key not in {"id", "project_id", "created_at", "updated_at"}: setattr(item, key, value)
+    else:
+        item = ProjectModelConfig(project_id=project_id, **values); db.add(item)
+    db.flush()
+    import os
+    vault_key = os.getenv("AI_CREDENTIAL_MASTER_KEY")
+    if api_key is not None or clear_api: _update_provider_credential(db, project_id, ProviderCredentialPurpose.GENERATION, api_key, clear_api, vault_key)
+    if embedding_key is not None or clear_embedding: _update_provider_credential(db, project_id, ProviderCredentialPurpose.EMBEDDING, embedding_key, clear_embedding, vault_key)
+    db.commit(); db.refresh(item); return _model_config_payload(db, item)
+
+
+def _model_config_payload(db, item):
+    if not item: return None
+    value = record_dict(item)
+    for secret in ("api_key", "embedding_api_key", "secret_ciphertext"):
+        value.pop(secret, None)
+    credentials = db.scalars(select(ProjectProviderCredential).where(ProjectProviderCredential.project_id == item.project_id)).all()
+    value["credentials"] = {
+        record.purpose.value: {"configured": True, "hint": record.secret_hint, "fingerprint": record.secret_fingerprint}
+        for record in credentials
+    }
+    return value
+
+
+def _update_provider_credential(db, project_id, purpose, secret, clear, master_key):
+    from .embeddings import credential_fingerprint
+    current = db.scalar(select(ProjectProviderCredential).where(ProjectProviderCredential.project_id == project_id, ProjectProviderCredential.purpose == purpose))
+    if clear:
+        if current: db.delete(current)
+        return
+    if secret is None: return
+    try: ciphertext = CredentialVault(master_key).encrypt(secret)
+    except ValueError as exc: raise HTTPException(status_code=400, detail={"code": str(exc)}) from exc
+    value = {"project_id": project_id, "purpose": purpose, "secret_ciphertext": ciphertext, "secret_fingerprint": credential_fingerprint(secret), "secret_hint": CredentialVault.hint(secret)}
+    if current:
+        for key, item in value.items():
+            if key not in {"id", "project_id", "created_at", "updated_at"}:
+                setattr(current, key, item)
+    else:
+        db.add(ProjectProviderCredential(**value))
+    db.flush()
+
+
+@router.post("/projects/{project_id}/model-config/test-embedding")
+def test_embedding_config(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    values = payload.model_dump(); settings = get_settings()
+    try:
+        route = EmbeddingRouter().resolve(db, project_id, settings)
+        if values.get("model"): route = route.__class__(route.enabled, route.provider, route.base_url, values["model"], route.dimension, values.get("api_key") or route.api_key, "REQUEST" if values.get("api_key") else route.credential_source, route.embedding_config_fingerprint)
+        provider = OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
+        result = provider.embed([values.get("text", "AI Narrative World Engine embedding test")], route.model)
+        return {"ok": True, "provider": result.provider, "model": result.model, "dimension": result.dimension, "latency_ms": result.latency_ms, "request_id": result.request_id}
+    except Exception as exc:
+        code = getattr(exc, "code", "EMBEDDING_TEST_FAILED")
+        safe_codes = {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_CONFIG_INCOMPLETE", "EMBEDDING_DIMENSION_MISMATCH", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID", "EMBEDDING_TEST_FAILED"}
+        if code not in safe_codes: code = "EMBEDDING_TEST_FAILED"
+        raise HTTPException(status_code=409, detail={"code": code}) from exc
+
+
+def _safe_embedding_error(exc: Exception) -> str:
+    code = getattr(exc, "code", "EMBEDDING_INDEX_FAILED")
+    allowed = {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_CONFIG_INCOMPLETE", "EMBEDDING_DIMENSION_MISMATCH", "MODEL_CREDENTIAL_INVALID", "EMBEDDING_INDEX_FAILED"}
+    return code if code in allowed else "EMBEDDING_INDEX_FAILED"
+
+
+@router.post("/projects/{project_id}/memory-embeddings/index-missing")
+def index_missing_memory_embeddings(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try: result = MemoryEmbeddingIndexService().index_memories(db, project_id); db.commit(); return result
+    except Exception as exc: db.rollback(); raise HTTPException(status_code=409, detail={"code": _safe_embedding_error(exc)}) from exc
+
+
+@router.post("/projects/{project_id}/memory-embeddings/rebuild")
+def rebuild_memory_embeddings(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try: result = MemoryEmbeddingIndexService().index_memories(db, project_id, rebuild=True); db.commit(); return result
+    except Exception as exc: db.rollback(); raise HTTPException(status_code=409, detail={"code": _safe_embedding_error(exc)}) from exc
 def _trace_payload(trace, db=None):
     value = record_dict(trace)
     candidate = db.scalar(select(RecoveryCandidate).where(RecoveryCandidate.source_trace_id == trace.id)) if db else None
