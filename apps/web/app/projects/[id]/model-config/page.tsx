@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { Check, Database, RotateCcw, Save, Zap } from "lucide-react";
 import { api } from "../../../lib";
 import { ErrorState, LoadingState, PageHeader, SectionCard } from "../../../../components/ui/primitives";
+import styles from "./model-config.module.css";
 
 type Config = Record<string, any>;
 const defaults: Config = {
@@ -15,8 +16,9 @@ const defaults: Config = {
 
 export default function ModelConfigPage({ params }: { params: { id: string } }) {
   const [config, setConfig] = useState<Config>(defaults); const [generationKey, setGenerationKey] = useState(""); const [embeddingKey, setEmbeddingKey] = useState("");
+  const [indexStatus, setIndexStatus] = useState<Config | null>(null);
   const [loading, setLoading] = useState(true); const [saving, setSaving] = useState(false); const [message, setMessage] = useState(""); const [error, setError] = useState("");
-  const load = () => { setLoading(true); setError(""); void api(`/projects/${params.id}/model-config`).then((value) => setConfig({ ...defaults, ...(value || {}) })).catch(() => setError("无法读取模型配置。" )).finally(() => setLoading(false)); };
+  const load = () => { setLoading(true); setError(""); void Promise.all([api(`/projects/${params.id}/model-config`), api(`/projects/${params.id}/memory-embeddings/status`).catch(() => null)]).then(([value, status]) => { setConfig({ ...defaults, ...(value || {}) }); setIndexStatus(status as Config | null); }).catch(() => setError("无法读取模型配置。" )).finally(() => setLoading(false)); };
   useEffect(load, [params.id]);
   const update = (name: string, value: unknown) => setConfig((current) => ({ ...current, [name]: value }));
   async function save(event: FormEvent) {
@@ -24,23 +26,23 @@ export default function ModelConfigPage({ params }: { params: { id: string } }) 
     try {
       const payload = { ...config, embedding_dimension: config.embedding_dimension === "" ? null : Number(config.embedding_dimension), memory_semantic_min_similarity: config.memory_semantic_min_similarity === "" ? null : Number(config.memory_semantic_min_similarity), ...(generationKey ? { api_key: generationKey } : {}), ...(embeddingKey ? { embedding_api_key: embeddingKey } : {}) };
       const result = await api(`/projects/${params.id}/model-config`, { method: "PUT", body: JSON.stringify(payload) }) as Config;
-      setConfig({ ...defaults, ...result }); setGenerationKey(""); setEmbeddingKey(""); setMessage("配置已保存。密钥不会再次显示。");
+      setConfig({ ...defaults, ...result }); setGenerationKey(""); setEmbeddingKey(""); setMessage("配置已保存。密钥不会再次显示。"); void api(`/projects/${params.id}/memory-embeddings/status`).then(setIndexStatus).catch(() => undefined);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败。"); } finally { setSaving(false); }
   }
   async function testEmbedding() {
     setSaving(true); setError(""); setMessage("");
-    try { const result = await api(`/projects/${params.id}/model-config/test-embedding`, { method: "POST", body: JSON.stringify({ model: config.embedding_model, api_key: embeddingKey || undefined }) }) as any; setMessage(`嵌入连接可用：${result.model}，${result.dimension} 维。`); }
+    try { const result = await api(`/projects/${params.id}/model-config/test-embedding`, { method: "POST", body: JSON.stringify({ embedding_use_main_connection: Boolean(config.embedding_use_main_connection), provider: config.embedding_use_main_connection ? config.provider : config.embedding_provider, base_url: config.embedding_use_main_connection ? config.base_url : config.embedding_base_url, model: config.embedding_model, dimension: config.embedding_dimension || undefined, api_key: (config.embedding_use_main_connection ? generationKey : embeddingKey) || undefined, test_text: "embedding connectivity test" }) }) as any; update("embedding_dimension", result.dimension); setMessage(`嵌入连接可用：${result.model}，${result.dimension} 维。`); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "嵌入连接测试失败。"); } finally { setSaving(false); }
   }
   async function indexMemories(rebuild = false) {
     setSaving(true); setError("");
-    try { const result = await api(`/projects/${params.id}/memory-embeddings/${rebuild ? "rebuild" : "index-missing"}`, { method: "POST" }) as any; setMessage(`索引完成：${result.indexed} 条更新，${result.skipped} 条跳过。`); }
+    try { const result = await api(`/projects/${params.id}/memory-embeddings/${rebuild ? "rebuild" : "index-missing"}`, { method: "POST" }) as any; setMessage(`索引完成：${result.indexed || 0} 条更新，${result.skipped || 0} 条跳过。`); setIndexStatus(await api(`/projects/${params.id}/memory-embeddings/status`) as Config); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "索引失败。"); } finally { setSaving(false); }
   }
   if (loading) return <LoadingState />;
   return <form className="form" onSubmit={save}><PageHeader title="模型与记忆检索" description="项目级模型连接与角色记忆召回策略。密钥仅作为写入值处理。" action={<button className="button" disabled={saving}><Save size={16} />保存</button>} />
     {error && <ErrorState message={error} retry={load} />}{message && <div className="success-state"><Check size={18} />{message}</div>}
-    <SectionCard title="生成模型" description="角色、世界裁定、导演与写作角色共享此连接配置。"><div className="form-grid">
+    <div className={styles.columns}><SectionCard title="生成模型" description="角色、世界裁定、导演与写作角色共享此连接配置。"><div className="form-grid">
       <label className="field"><span>提供方</span><select value={config.provider} onChange={(e) => update("provider", e.target.value)}><option value="disabled">禁用</option><option value="openai_compatible">OpenAI 兼容</option></select></label>
       <label className="field"><span>Base URL</span><input value={config.base_url || ""} onChange={(e) => update("base_url", e.target.value)} placeholder="https://provider.example/v1" /></label>
       <label className="field"><span>角色模型</span><input value={config.character_model || ""} onChange={(e) => update("character_model", e.target.value)} /></label>
@@ -59,6 +61,6 @@ export default function ModelConfigPage({ params }: { params: { id: string } }) 
       <label className="field"><span>新嵌入密钥</span><input type="password" autoComplete="new-password" value={embeddingKey} onChange={(e) => setEmbeddingKey(e.target.value)} placeholder={config.credentials?.EMBEDDING?.configured ? `已配置 ${config.credentials.EMBEDDING.hint}` : "仅写入，不会回显"} /></label>
       <label className="field"><span>向量候选数</span><input type="number" min="1" value={config.memory_vector_top_k} onChange={(e) => update("memory_vector_top_k", Number(e.target.value))} /></label>
       <label className="field"><span>RRF 常量</span><input type="number" min="1" value={config.memory_rrf_k} onChange={(e) => update("memory_rrf_k", Number(e.target.value))} /></label>
-    </div><div className="button-row"><button className="button secondary" type="button" disabled={saving} onClick={testEmbedding}><Zap size={16} />测试嵌入连接</button><button className="button secondary" type="button" disabled={saving} onClick={() => indexMemories(false)}><Database size={16} />索引缺失记忆</button><button className="button secondary" type="button" disabled={saving} onClick={() => indexMemories(true)}><RotateCcw size={16} />重建索引</button></div></SectionCard>
+    </div><div className="button-row"><button className="button secondary" type="button" disabled={saving} onClick={testEmbedding}><Zap size={16} />测试嵌入连接</button><button className="button secondary" type="button" disabled={saving} onClick={() => indexMemories(false)}><Database size={16} />索引缺失记忆</button><button className="button secondary" type="button" disabled={saving} onClick={() => indexMemories(true)}><RotateCcw size={16} />重建索引</button></div>{indexStatus && <div className="metric-grid"><div><strong>{indexStatus.current_valid_memory_count}</strong><span>当前有效记忆</span></div><div><strong>{indexStatus.ready_count}</strong><span>已建立</span></div><div><strong>{indexStatus.missing_count}</strong><span>缺失</span></div><div><strong>{indexStatus.failed_count}</strong><span>失败</span></div><div><strong>{Math.round((indexStatus.coverage_ratio || 0) * 100)}%</strong><span>覆盖率</span></div><div><strong>{indexStatus.dimension || "-"}</strong><span>向量维度</span></div></div>}</SectionCard></div>
   </form>;
 }

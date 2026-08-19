@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from app.embeddings import CharacterMemorySemanticRetriever, memory_content_fingerprint
+from app.embeddings import CharacterMemorySemanticRetriever, EmbeddingRoute, FakeEmbeddingProvider, MemoryEmbeddingIndexService, memory_content_fingerprint
 from app.models import Character, CharacterMemory, CharacterMemoryEmbedding, EmbeddingStatus, Project
 
 
@@ -42,7 +42,7 @@ def test_postgres_pgvector_extension_and_cosine_ordering():
     try:
         with Session() as db:
             assert db.execute(text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")).scalar()
-            ranked = CharacterMemorySemanticRetriever().retrieve(db, project_id, actor_id, [1.0, 0.0], "pg-cfg")
+            ranked = CharacterMemorySemanticRetriever().retrieve(db, project_id, actor_id, [1.0, 0.0], "pg-cfg", [first_id, second_id])
             assert [memory_id for memory_id, _ in ranked] == [first_id, second_id]
     finally:
         _cleanup(Session, project_id); engine.dispose()
@@ -67,5 +67,34 @@ def test_postgres_embedding_identity_prevents_duplicate_derived_rows():
         with Session() as db:
             rows = db.scalars(select(CharacterMemoryEmbedding).where(CharacterMemoryEmbedding.memory_id == first_id, CharacterMemoryEmbedding.embedding_config_fingerprint == "concurrent-cfg")).all()
             assert len(rows) == 1
+    finally:
+        _cleanup(Session, project_id); engine.dispose()
+
+
+def test_postgres_index_service_concurrent_same_memory_is_serialized(monkeypatch):
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    project_id, actor_id, first_id, _ = _seed(Session)
+    route = EmbeddingRoute(True, "openai_compatible", "https://example.test/v1", "fake", 2, "secret", "PROJECT", "service-concurrent-cfg")
+    monkeypatch.setattr("app.embeddings.EmbeddingRouter.resolve", lambda *_args, **_kwargs: route)
+    barrier = threading.Barrier(2); results, errors = [], []
+
+    def index_once():
+        try:
+            with Session() as db:
+                barrier.wait()
+                result = MemoryEmbeddingIndexService(provider_factory=lambda _route: FakeEmbeddingProvider({"north bell": [1.0, 0.0]})).index_memories(db, project_id, memory_ids=[first_id])
+                db.commit(); results.append(result)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=index_once) for _ in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    try:
+        assert not errors
+        with Session() as db:
+            rows = db.scalars(select(CharacterMemoryEmbedding).where(CharacterMemoryEmbedding.project_id == project_id, CharacterMemoryEmbedding.memory_id == first_id, CharacterMemoryEmbedding.embedding_config_fingerprint == route.embedding_config_fingerprint)).all()
+            assert len(rows) == 1 and rows[0].status == EmbeddingStatus.READY and rows[0].attempt_count == 1
+            assert sum(item.get("indexed", 0) for item in results) == 1
     finally:
         _cleanup(Session, project_id); engine.dispose()

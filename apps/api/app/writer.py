@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from .ai.errors import ModelProviderError, MODEL_OUTPUT_INVALID
 from .ai.factory import get_model_provider
 from .execution_trace import ExecutionTraceRecorder, TraceSanitizer, stable_fingerprint
-from .model_router import ModelRouter
+from .model_router import ModelRouter, ProviderCredentialResolver
 from .models import (
     CanonFact, CanonType, Chapter, ChapterSceneBinding, ChapterStructureStatus, Character,
     CharacterDecision, CharacterKnowledge, CharacterMemory, Scene,
@@ -606,7 +606,8 @@ class WriterProjectionService:
             return provider, model or "writer-test-model"
         settings = settings or __import__("app.settings", fromlist=["get_settings"]).get_settings()
         route = ModelRouter().resolve(db, project_id, settings, "WRITER")
-        return get_model_provider(settings, route.provider, route.base_url), model or route.model
+        key = ProviderCredentialResolver().generation_key(db, project_id, settings)
+        return get_model_provider(settings, route.provider, route.base_url, key), model or route.model
 
     @staticmethod
     def _parse(content: str) -> dict[str, Any]:

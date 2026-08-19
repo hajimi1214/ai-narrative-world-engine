@@ -2,6 +2,7 @@ import math
 
 import pytest
 from cryptography.fernet import Fernet
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -21,8 +22,11 @@ from app.embeddings import (
     FakeEmbeddingProvider,
     MemoryEmbeddingIndexService,
     memory_content_fingerprint,
+    OpenAICompatibleEmbeddingProvider,
 )
-from app.models import Character, CharacterMemory, CharacterMemoryEmbedding, EmbeddingStatus, Project, ProjectProviderCredential
+from app.model_router import ProviderCredentialResolver
+from app.settings import Settings
+from app.models import Character, CharacterMemory, CharacterMemoryEmbedding, EmbeddingStatus, Project, ProjectProviderCredential, ProviderCredentialPurpose
 
 
 @pytest.fixture()
@@ -58,9 +62,16 @@ def test_rrf_is_ordinal_deterministic_and_hybrid_keeps_authoritative_items():
     assert [row["memory_id"] for row in CharacterMemoryHybridRetriever().merge(items, [("c", .99), ("b", .8)])] == ["b", "a"]
 
 
+def test_semantic_candidate_outside_deterministic_top12_can_be_rescued():
+    items = {f"m{index}": {"memory_id": f"m{index}", "source_scene_id": f"scene-{index}"} for index in range(20)}
+    deterministic = [f"m{index}" for index in range(20)]
+    result = CharacterMemoryHybridRetriever().merge(items, deterministic, [("m19", 1.0)] + [(f"m{index}", 0.1) for index in range(12)], 12)
+    assert "m19" in {item["memory_id"] for item in result}
+
+
 def test_structured_semantic_cues_are_stable_and_do_not_use_prose():
     cues = {"thread_ids": ("thread-b", "thread-a"), "location_ids": ("tomb",), "entity_ids": (), "participant_ids": (), "item_ids": ()}
-    assert CharacterSemanticCueBuilder().build(cues) == "thread_ids=thread-a,thread-b|location_ids=tomb"
+    assert CharacterSemanticCueBuilder().build(cues) == '{"location_ids":["tomb"],"thread_ids":["thread-a","thread-b"]}'
 
 
 def test_index_is_derived_and_auditable_without_mutating_memory(session, monkeypatch):
@@ -77,15 +88,31 @@ def test_index_is_derived_and_auditable_without_mutating_memory(session, monkeyp
     assert CharacterMemoryEmbeddingAudit().audit(session, row.id)["valid"]
 
 
+def test_index_failure_is_persisted_and_retryable(session, monkeypatch):
+    project, actor, _, first, _, _ = seed(session)
+    route = EmbeddingRoute(True, "openai_compatible", "https://example.test/v1", "fake", 2, "secret", "PROJECT", "cfg-failure")
+    monkeypatch.setattr("app.embeddings.EmbeddingRouter.resolve", lambda *_args, **_kwargs: route)
+    failed = MemoryEmbeddingIndexService(provider_factory=lambda _route: FakeEmbeddingProvider(error=__import__("app.ai.errors", fromlist=["ModelProviderError"]).ModelProviderError("MODEL_TIMEOUT")))
+    result = failed.index_memories(session, project.id, memory_ids=[first.id])
+    session.commit()
+    row = session.scalar(select(CharacterMemoryEmbedding).where(CharacterMemoryEmbedding.memory_id == first.id))
+    assert result["failed"] == 1 and row.status == EmbeddingStatus.FAILED and row.attempt_count == 1
+    retried = MemoryEmbeddingIndexService(provider_factory=lambda _route: FakeEmbeddingProvider({first.content: [1.0, 0.0]}))
+    result = retried.index_memories(session, project.id, memory_ids=[first.id])
+    session.commit()
+    session.refresh(row)
+    assert result["indexed"] == 1 and row.status == EmbeddingStatus.READY and row.attempt_count == 2 and row.last_error_code is None
+
+
 def test_semantic_retrieval_enforces_project_character_and_content_eligibility(session):
     project, actor, other, first, second, foreign = seed(session)
     for memory, vector in ((first, [1.0, 0.0]), (second, [0.0, 1.0]), (foreign, [1.0, 0.0])):
         session.add(CharacterMemoryEmbedding(project_id=project.id, character_id=memory.character_id, memory_id=memory.id, embedding_config_fingerprint="cfg", provider="fake", model="fake", dimension=2, content_fingerprint=memory_content_fingerprint(memory.content), status=EmbeddingStatus.READY, embedding=vector))
     session.commit()
-    found = CharacterMemorySemanticRetriever().retrieve(session, project.id, actor.id, [1.0, 0.0], "cfg")
+    found = CharacterMemorySemanticRetriever().retrieve(session, project.id, actor.id, [1.0, 0.0], "cfg", [first.id, second.id])
     assert [memory_id for memory_id, _ in found] == [first.id, second.id]
     first.content = "changed"; session.commit()
-    found_after_change = CharacterMemorySemanticRetriever().retrieve(session, project.id, actor.id, [1.0, 0.0], "cfg")
+    found_after_change = CharacterMemorySemanticRetriever().retrieve(session, project.id, actor.id, [1.0, 0.0], "cfg", [first.id, second.id])
     assert first.id not in {memory_id for memory_id, _ in found_after_change}
 
 
@@ -101,3 +128,33 @@ def test_model_config_writes_encrypted_credentials_and_never_returns_them(sessio
     safe = client.get(f"/projects/{project.id}/model-config").json()
     assert "generation-secret" not in str(safe) and "embedding-secret" not in str(safe)
     assert safe["credentials"]["GENERATION"]["configured"] is True
+
+
+def test_generation_credential_precedes_environment_and_clear_falls_back(session, monkeypatch):
+    project, *_ = seed(session); monkeypatch.setenv("AI_CREDENTIAL_MASTER_KEY", Fernet.generate_key().decode())
+    from app.api import _update_provider_credential
+    _update_provider_credential(session, project.id, ProviderCredentialPurpose.GENERATION, "project-secret", False, __import__("os").environ["AI_CREDENTIAL_MASTER_KEY"]); session.commit()
+    settings = Settings(ai_api_key="env-secret")
+    assert ProviderCredentialResolver().generation_key(session, project.id, settings) == "project-secret"
+    _update_provider_credential(session, project.id, ProviderCredentialPurpose.GENERATION, None, True, __import__("os").environ["AI_CREDENTIAL_MASTER_KEY"]); session.commit()
+    assert ProviderCredentialResolver().generation_key(session, project.id, settings) == "env-secret"
+
+
+@pytest.mark.parametrize("status,code", [(401, "MODEL_AUTH_FAILED"), (403, "MODEL_AUTH_FAILED"), (429, "MODEL_RATE_LIMITED"), (500, "MODEL_UPSTREAM_ERROR")])
+def test_openai_embedding_provider_maps_safe_http_errors(status, code):
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(status, json={"error": "secret must not leak"})))
+    with pytest.raises(Exception) as error:
+        OpenAICompatibleEmbeddingProvider("https://example.test/v1", "secret", client=client).embed(["x"], "model")
+    assert getattr(error.value, "code", None) == code
+
+
+def test_openai_embedding_provider_reorders_batch_and_rejects_malformed_vectors():
+    def handler(request):
+        return httpx.Response(200, json={"data": [{"index": 1, "embedding": [0.0, 1.0]}, {"index": 0, "embedding": [1.0, 0.0]}]})
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = OpenAICompatibleEmbeddingProvider("https://example.test/v1", "secret", client=client).embed(["a", "b"], "model")
+    assert result.vectors == [[1.0, 0.0], [0.0, 1.0]]
+    malformed = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b'{"data":[{"index":0,"embedding":[NaN]}]}', headers={"content-type": "application/json"})))
+    with pytest.raises(Exception) as error:
+        OpenAICompatibleEmbeddingProvider("https://example.test/v1", "secret", client=malformed).embed(["a"], "model")
+    assert getattr(error.value, "code", None) == "EMBEDDING_OUTPUT_INVALID"

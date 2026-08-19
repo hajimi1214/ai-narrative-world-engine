@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from .ai.errors import MODEL_OUTPUT_INVALID, ModelProviderError
 from .ai.factory import get_model_provider
 from .execution_trace import ExecutionTraceRecorder
-from .model_router import ModelRouter
+from .model_router import ModelRouter, ProviderCredentialResolver
 from .models import (
     AntiAIBible, Chapter, ChapterQualityAssessment, ChapterQualityFinding,
     ChapterWriterDraft, Project, ProjectModelConfig, QualityAssessmentStatus,
@@ -698,7 +698,8 @@ class QualityGateService:
             return provider, model or "critic-test-model", getattr(provider, "name", "test")
         settings = settings or __import__("app.settings", fromlist=["get_settings"]).get_settings()
         route = ModelRouter().resolve(db, project_id, settings, "CRITIC")
-        return get_model_provider(settings, route.provider, route.base_url), model or route.model, route.provider
+        key = ProviderCredentialResolver().generation_key(db, project_id, settings)
+        return get_model_provider(settings, route.provider, route.base_url, key), model or route.model, route.provider
 
 
 class QualityRepairPromptBuilder:
@@ -885,7 +886,8 @@ class QualityRepairService:
             return provider, model or "repair-test-model", getattr(provider, "name", "test")
         settings = settings or __import__("app.settings", fromlist=["get_settings"]).get_settings()
         route = ModelRouter().resolve(db, project_id, settings, "REPAIR")
-        return get_model_provider(settings, route.provider, route.base_url), model or route.model, route.provider
+        key = ProviderCredentialResolver().generation_key(db, project_id, settings)
+        return get_model_provider(settings, route.provider, route.base_url, key), model or route.model, route.provider
 
 
 def assessment_payload(db: Session, assessment: ChapterQualityAssessment, *, include_findings: bool = False) -> dict[str, Any]:

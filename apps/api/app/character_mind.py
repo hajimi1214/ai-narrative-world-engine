@@ -204,6 +204,16 @@ class CharacterMemoryRetriever:
     MAX_PER_SOURCE_SCENE = 3
 
     def retrieve(self, session: Session, project_id: str, records: list[CharacterMemory], cues: dict[str, tuple[str, ...]], *, usage=None, usage_provider=None, current_sequence: int | None = None, scene_provider=None, scene_metadata_provider=None) -> list[dict[str, Any]]:
+        entries = self.rank_entries(session, project_id, records, cues, usage=usage, usage_provider=usage_provider, current_sequence=current_sequence, scene_provider=scene_provider, scene_metadata_provider=scene_metadata_provider)
+        return self.select_bounded([entry[6] for entry in entries], strong_memory_ids={entry[6]["memory_id"] for entry in entries if entry[5]})
+
+    def rank_all(self, session: Session, project_id: str, records: list[CharacterMemory], cues: dict[str, tuple[str, ...]], *, usage=None, usage_provider=None, current_sequence: int | None = None, scene_provider=None, scene_metadata_provider=None) -> list[dict[str, Any]]:
+        return [entry[6] for entry in self._rank_entries(session, project_id, records, cues, usage=usage, usage_provider=usage_provider, current_sequence=current_sequence, scene_provider=scene_provider, scene_metadata_provider=scene_metadata_provider)]
+
+    def rank_entries(self, session: Session, project_id: str, records: list[CharacterMemory], cues: dict[str, tuple[str, ...]], *, usage=None, usage_provider=None, current_sequence: int | None = None, scene_provider=None, scene_metadata_provider=None) -> list[tuple]:
+        return self._rank_entries(session, project_id, records, cues, usage=usage, usage_provider=usage_provider, current_sequence=current_sequence, scene_provider=scene_provider, scene_metadata_provider=scene_metadata_provider)
+
+    def _rank_entries(self, session: Session, project_id: str, records: list[CharacterMemory], cues: dict[str, tuple[str, ...]], *, usage=None, usage_provider=None, current_sequence: int | None = None, scene_provider=None, scene_metadata_provider=None) -> list[tuple]:
         usage = usage or usage_provider or _CognitionUsage(session, project_id, CausalResourceType.CHARACTER_MEMORY, CausalRelationType.MEMORY_INFORMED_DECISION)
         scene_provider = scene_provider or scene_metadata_provider
         project = session.get(Project, project_id)
@@ -223,14 +233,18 @@ class CharacterMemoryRetriever:
                 item["source_scene_sequence"] = memory.source_sequence
             ranked.append((score, cue, count, source_sequence, item["happened_at"] or "", strong, item))
         ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4], item[6]["memory_id"]))
+        return ranked
+
+    def select_bounded(self, ranked_items: list[dict[str, Any]], limit: int = MAX_CHARACTER_MEMORIES, *, strong_memory_ids: set[str] | None = None) -> list[dict[str, Any]]:
+        strong_memory_ids = strong_memory_ids or set()
         selected, by_scene = [], {}
-        for item in ranked:
-            source_bucket = memory_source_bucket(item[6])
-            if by_scene.get(source_bucket, 0) >= self.MAX_PER_SOURCE_SCENE and not item[5]:
+        for item in ranked_items:
+            source_bucket = memory_source_bucket(item)
+            if by_scene.get(source_bucket, 0) >= self.MAX_PER_SOURCE_SCENE and item.get("memory_id") not in strong_memory_ids:
                 continue
-            selected.append(item[6]); by_scene[source_bucket] = by_scene.get(source_bucket, 0) + 1
-            if len(selected) == MAX_CHARACTER_MEMORIES:
-                return selected
+            selected.append(item); by_scene[source_bucket] = by_scene.get(source_bucket, 0) + 1
+            if len(selected) == limit:
+                break
         return selected
 
     def _cue_score(self, memory: CharacterMemory, scene: Scene | None, cues: dict[str, tuple[str, ...]]) -> tuple[float, bool]:
@@ -294,14 +308,18 @@ class CharacterMindViewBuilder:
         active_knowledge = self.reader.knowledge(session, project_id, character_id)
         beliefs, conflicts = self.beliefs.build(active_knowledge)
         recalled_knowledge = self.knowledge.retrieve(session, project_id, active_knowledge, cues, beliefs)
-        recalled_memories = self.memories.retrieve(session, project_id, self.reader.memories(session, project_id, character_id), cues)
-        recalled_memories = self._hybrid_memories(session, project_id, character_id, cues, recalled_memories)
+        memory_records = self.reader.memories(session, project_id, character_id)
+        memory_entries = self.memories.rank_entries(session, project_id, memory_records, cues)
+        recalled_memories = self.memories.select_bounded([entry[6] for entry in memory_entries], strong_memory_ids={entry[6]["memory_id"] for entry in memory_entries if entry[5]})
+        location = session.get(WorldEntity, proposal.location_id) if proposal.location_id else None
+        participants = session.scalars(select(Character).where(Character.project_id == project_id, Character.id.in_(proposal.participants or [])).order_by(Character.id)).all() if proposal.participants else []
+        recalled_memories = self._hybrid_memories(session, project_id, character_id, cues, memory_records, memory_entries, recalled_memories, character, proposal, location, participants)
         identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
         result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
         result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
         return result
 
-    def _hybrid_memories(self, session: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]], deterministic: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _hybrid_memories(self, session: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]], records: list[CharacterMemory], entries: list[tuple], deterministic: list[dict[str, Any]], character: Any = None, scene: Any = None, location: Any = None, participants: list[Any] | None = None) -> list[dict[str, Any]]:
         """Optional derived ranking. Any embedding failure preserves Phase9 recall."""
         config = session.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
         if not config or not config.embedding_enabled or config.memory_retrieval_mode != MemoryRetrievalMode.HYBRID_RRF:
@@ -310,15 +328,20 @@ class CharacterMindViewBuilder:
             from .embeddings import CharacterMemoryHybridRetriever, CharacterMemorySemanticRetriever, CharacterSemanticCueBuilder, EmbeddingRouter, OpenAICompatibleEmbeddingProvider
             from .settings import get_settings
             route = EmbeddingRouter().resolve(session, project_id, get_settings())
-            query = CharacterSemanticCueBuilder().build(cues)
+            query = CharacterSemanticCueBuilder().build(cues, character=character, scene=scene, location=location, participants=participants)
             if not route.enabled or not query:
                 return deterministic
             provider = self.embedding_provider_factory(route) if self.embedding_provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
             embedding = provider.embed([query], route.model)
             if embedding.dimension != route.dimension:
                 return deterministic
-            semantic = CharacterMemorySemanticRetriever().retrieve(session, project_id, character_id, embedding.vectors[0], route.embedding_config_fingerprint, config.memory_vector_top_k, config.memory_semantic_min_similarity)
-            return CharacterMemoryHybridRetriever().merge(deterministic, semantic, MAX_CHARACTER_MEMORIES, config.memory_rrf_k)
+            semantic = CharacterMemorySemanticRetriever().retrieve(session, project_id, character_id, embedding.vectors[0], route.embedding_config_fingerprint, [memory.id for memory in records], config.memory_vector_top_k, config.memory_semantic_min_similarity)
+            if not semantic:
+                return deterministic
+            full_items = {entry[6]["memory_id"]: entry[6] for entry in entries}
+            deterministic_ids = [entry[6]["memory_id"] for entry in entries]
+            strong_ids = {entry[6]["memory_id"] for entry in entries if entry[5]}
+            return CharacterMemoryHybridRetriever().merge(full_items, deterministic_ids, semantic, MAX_CHARACTER_MEMORIES, config.memory_rrf_k, strong_ids)
         except Exception:
             return deterministic
 
@@ -431,7 +454,11 @@ class ReplayCharacterMindViewBuilder:
         knowledge = CharacterKnowledgeRetriever().retrieve(db, replay_session.project_id, cognition["knowledge"], cues, beliefs, usage_provider=usage, current_sequence=scene.sequence)
         def source_scene_provider(memory_source):
             return metadata.by_scene(memory_source) or metadata.by_sequence_value(memory_source if isinstance(memory_source, int) else None)
-        memories = CharacterMemoryRetriever().retrieve(db, replay_session.project_id, cognition["memories"], cues, usage_provider=usage, current_sequence=scene.sequence, scene_provider=source_scene_provider)
+        memory_retriever = CharacterMemoryRetriever()
+        memory_entries = memory_retriever.rank_entries(db, replay_session.project_id, cognition["memories"], cues, usage_provider=usage, current_sequence=scene.sequence, scene_provider=source_scene_provider)
+        memories = memory_retriever.select_bounded([entry[6] for entry in memory_entries], strong_memory_ids={entry[6]["memory_id"] for entry in memory_entries if entry[5]})
+        replay_character = {key: character.get(key) for key in ("id", "name", "goals", "current_state", "emotional_state")}
+        memories = CharacterMindViewBuilder()._hybrid_memories(db, replay_session.project_id, character_id, cues, cognition["memories"], memory_entries, memories, replay_character, proposal, None, None)
         for item in memories:
             if item.get("source_scene_id"):
                 source = metadata.by_scene(item["source_scene_id"])

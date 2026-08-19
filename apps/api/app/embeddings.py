@@ -6,11 +6,12 @@ and query failures deliberately degrade to deterministic Phase9 recall.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Iterable, Protocol
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
@@ -146,7 +147,11 @@ class MemoryEmbeddingIndexService:
         from .settings import get_settings
         route = EmbeddingRouter().resolve(db, project_id, settings or get_settings())
         if not route.enabled: raise ValueError("EMBEDDING_CONFIG_INCOMPLETE")
-        query = select(CharacterMemory).join(Character, Character.id == CharacterMemory.character_id).where(Character.project_id == project_id)
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            db.execute(select(func.pg_advisory_xact_lock(func.hashtext(project_id))))
+        from .character_mind import ActiveCharacterCognitionReader
+        eligible = {memory.id: memory for character in db.scalars(select(Character).where(Character.project_id == project_id).order_by(Character.id)).all() for memory in ActiveCharacterCognitionReader().memories(db, project_id, character.id)}
+        query = select(CharacterMemory).where(CharacterMemory.id.in_(sorted(eligible)))
         if memory_ids: query = query.where(CharacterMemory.id.in_(memory_ids))
         memories = db.scalars(query.order_by(CharacterMemory.id).with_for_update()).all()
         candidates = []
@@ -156,16 +161,42 @@ class MemoryEmbeddingIndexService:
             if existing and not rebuild and existing.status == EmbeddingStatus.READY and existing.content_fingerprint == fp: continue
             candidates.append((memory, existing, fp))
         if not candidates: return {"indexed": 0, "skipped": len(memories), "config_fingerprint": route.embedding_config_fingerprint}
-        try: result = self._provider(route).embed([memory.content for memory, _, _ in candidates], route.model)
-        except ModelProviderError: raise
-        if result.dimension != route.dimension: raise ValueError("EMBEDDING_DIMENSION_MISMATCH")
-        for (memory, existing, fp), vector in zip(candidates, result.vectors):
+        rows = []
+        for memory, existing, fp in candidates:
             row = existing or CharacterMemoryEmbedding(project_id=project_id, character_id=memory.character_id, memory_id=memory.id, embedding_config_fingerprint=route.embedding_config_fingerprint, provider=route.provider, model=route.model, dimension=route.dimension, content_fingerprint=fp)
+            row.status = EmbeddingStatus.PENDING; row.attempt_count = (row.attempt_count or 0) + 1; row.last_error_code = None; row.embedding = None
+            if not existing: db.add(row)
+            rows.append(row)
+        db.flush()
+        try:
+            result = self._provider(route).embed([memory.content for memory, _, _ in candidates], route.model)
+            if result.dimension != route.dimension: raise ValueError("EMBEDDING_DIMENSION_MISMATCH")
+        except Exception as exc:
+            safe_code = getattr(exc, "code", "EMBEDDING_OUTPUT_INVALID")
+            if safe_code not in {MODEL_TIMEOUT, MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_UPSTREAM_ERROR, "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_DIMENSION_MISMATCH"}: safe_code = "EMBEDDING_OUTPUT_INVALID"
+            for row in rows: row.status = EmbeddingStatus.FAILED; row.last_error_code = safe_code
+            db.flush()
+            return {"indexed": 0, "failed": len(rows), "skipped": len(memories) - len(candidates), "config_fingerprint": route.embedding_config_fingerprint, "error_code": safe_code}
+        for (memory, existing, fp), vector in zip(candidates, result.vectors):
+            row = next(item for item in rows if item.memory_id == memory.id)
             row.provider, row.model, row.dimension, row.content_fingerprint = route.provider, route.model, route.dimension, fp
-            row.embedding, row.status, row.attempt_count, row.last_error_code, row.request_id, row.latency_ms, row.indexed_at = vector, EmbeddingStatus.READY, (row.attempt_count or 0) + 1, None, result.request_id, result.latency_ms, datetime.now(UTC)
+            # ``attempt_count`` was incremented when the row entered PENDING;
+            # a successful provider response completes that same attempt.
+            row.embedding, row.status, row.last_error_code, row.request_id, row.latency_ms, row.indexed_at = vector, EmbeddingStatus.READY, None, result.request_id, result.latency_ms, datetime.now(UTC)
             if not existing: db.add(row)
         db.flush()
         return {"indexed": len(candidates), "skipped": len(memories) - len(candidates), "config_fingerprint": route.embedding_config_fingerprint}
+
+    def status(self, db: Session, project_id: str, settings=None) -> dict:
+        from .settings import get_settings
+        from .character_mind import ActiveCharacterCognitionReader
+        route = EmbeddingRouter().resolve(db, project_id, settings or get_settings())
+        current = [memory for character in db.scalars(select(Character).where(Character.project_id == project_id)).all() for memory in ActiveCharacterCognitionReader().memories(db, project_id, character.id)]
+        ids = {memory.id for memory in current}; rows = db.scalars(select(CharacterMemoryEmbedding).where(CharacterMemoryEmbedding.project_id == project_id)).all()
+        current_rows = [row for row in rows if row.memory_id in ids and row.embedding_config_fingerprint == route.embedding_config_fingerprint]
+        ready = sum(row.status == EmbeddingStatus.READY and row.content_fingerprint == memory_content_fingerprint(next(memory.content for memory in current if memory.id == row.memory_id)) for row in current_rows)
+        failed = sum(row.status == EmbeddingStatus.FAILED for row in current_rows)
+        return {"embedding_enabled": route.enabled, "memory_retrieval_mode": getattr(route, "mode", None), "provider": route.provider, "model": route.model, "dimension": route.dimension, "embedding_config_fingerprint": route.embedding_config_fingerprint, "current_valid_memory_count": len(current), "ready_count": ready, "missing_count": max(0, len(current) - len(current_rows)), "failed_count": failed, "stale_count": sum(row.status == EmbeddingStatus.READY and row.content_fingerprint != memory_content_fingerprint(next(memory.content for memory in current if memory.id == row.memory_id)) for row in current_rows), "coverage_ratio": ready / len(current) if current else 1.0}
 
 
 class CharacterMemoryEmbeddingAudit:
@@ -188,8 +219,12 @@ class CharacterMemoryRRFMerger:
 
 
 class CharacterMemorySemanticRetriever:
-    def retrieve(self, db: Session, project_id: str, character_id: str, query_vector: list[float], config_fingerprint: str, top_k: int = 12, min_similarity: float | None = None) -> list[tuple[str, float]]:
+    def retrieve(self, db: Session, project_id: str, character_id: str, query_vector: list[float], config_fingerprint: str, eligible_memory_ids: Iterable[str], top_k: int = 12, min_similarity: float | None = None) -> list[tuple[str, float]]:
+        eligible_memory_ids = tuple(sorted(set(eligible_memory_ids)))
+        if not eligible_memory_ids:
+            return []
         base = select(CharacterMemoryEmbedding).where(CharacterMemoryEmbedding.project_id == project_id, CharacterMemoryEmbedding.character_id == character_id, CharacterMemoryEmbedding.embedding_config_fingerprint == config_fingerprint, CharacterMemoryEmbedding.status == EmbeddingStatus.READY, CharacterMemoryEmbedding.dimension == len(query_vector))
+        base = base.where(CharacterMemoryEmbedding.memory_id.in_(eligible_memory_ids))
         # PostgreSQL does the ranked vector work in the database.  SQLite keeps
         # a deterministic cosine fallback for unit tests and local development.
         if db.bind is not None and db.bind.dialect.name == "postgresql":
@@ -218,16 +253,56 @@ class CharacterMemorySemanticRetriever:
 
 
 class CharacterSemanticCueBuilder:
-    """Build a provider query from structured cues only; prose is excluded."""
+    """Build a bounded, canonical semantic cue from visible structured data."""
 
-    def build(self, cues: dict[str, tuple[str, ...]] | None) -> str:
+    PROTOCOL = "character-memory-semantic-cue-v1"
+    MAX_CHARS = 1800
+    _PRIVATE_KEYS = {
+        "director_only", "director_reasoning", "secret", "hidden", "private",
+        "canon", "prose", "summary", "rationale", "reasoning", "gravity",
+        "story_gravity", "required_canon", "forbidden_reveals", "allowed_reveals",
+        "expected_progress",
+    }
+
+    def _safe(self, value: Any, depth: int = 0) -> Any:
+        if depth > 3:
+            return None
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, list):
+            return [item for item in (self._safe(item, depth + 1) for item in value[:32]) if item is not None]
+        if isinstance(value, dict):
+            return {str(key): safe for key, item in sorted(value.items(), key=lambda pair: str(pair[0])) if str(key).casefold() not in self._PRIVATE_KEYS and (safe := self._safe(item, depth + 1)) is not None}
+        return str(value)
+
+    def build(self, cues: dict[str, tuple[str, ...]] | None = None, *, character: Any = None, scene: Any = None, location: Any = None, participants: Iterable[Any] | None = None) -> str:
         cues = cues or {}
-        parts: list[str] = []
+        payload: dict[str, Any] = {}
         for key in ("entity_ids", "participant_ids", "thread_ids", "location_ids", "item_ids"):
             values = sorted({str(value) for value in cues.get(key, ()) if value is not None})
             if values:
-                parts.append(f"{key}=" + ",".join(values))
-        return "|".join(parts)
+                payload[key] = values
+
+        def attr(source: Any, key: str, default=None):
+            return source.get(key, default) if isinstance(source, dict) else getattr(source, key, default)
+
+        if character is not None:
+            payload["character"] = {key: self._safe(attr(character, key, {})) for key in ("goals", "current_state", "emotional_state")}
+        if scene is not None:
+            entry = attr(scene, "entry_state", {}) or {}
+            visible = entry.get("visible_context", {}) if isinstance(entry, dict) else {}
+            actor_id = attr(character, "id") if character is not None else None
+            actor_visible = (entry.get("actor_visible_context", {}) or {}).get(actor_id, {}) if isinstance(entry, dict) and actor_id else {}
+            payload["visible_context"] = self._safe(visible)
+            payload["actor_visible_context"] = self._safe(actor_visible)
+            payload["scene_location"] = self._safe(attr(scene, "location_id"))
+            payload["scene_participants"] = sorted(str(value) for value in (attr(scene, "participants", []) or []))
+        if location is not None:
+            payload["location"] = self._safe({"id": attr(location, "id"), "name": attr(location, "name")})
+        if participants is not None:
+            payload["participants"] = sorted(self._safe({"id": attr(item, "id"), "name": attr(item, "name")}) for item in participants)
+        rendered = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return rendered[: self.MAX_CHARS]
 
 
 class CharacterMemoryHybridRetriever:
@@ -237,18 +312,30 @@ class CharacterMemoryHybridRetriever:
         self.semantic = semantic or CharacterMemorySemanticRetriever()
         self.merger = merger or CharacterMemoryRRFMerger()
 
-    def merge(self, deterministic_items: list[dict], semantic_ids: list[tuple[str, float]], top_k: int = 12, rrf_k: int | None = None) -> list[dict]:
-        by_id = {item.get("memory_id"): item for item in deterministic_items if item.get("memory_id")}
-        deterministic_ids = list(by_id)
+    def merge(self, eligible_items: dict[str, dict] | list[dict], deterministic_ids: list[str] | list[tuple[str, Any]], semantic_ids: list[tuple[str, float]] | None = None, top_k: int = 12, rrf_k: int | None = None, strong_memory_ids: set[str] | None = None, max_per_source_scene: int = 3) -> list[dict]:
+        # The list form remains a small compatibility adapter for callers from
+        # the previous phase; production callers pass the full eligible map.
+        if semantic_ids is None:
+            semantic_ids = deterministic_ids  # type: ignore[assignment]
+            deterministic_ids = list(eligible_items) if isinstance(eligible_items, dict) else [item.get("memory_id") for item in eligible_items]
+        by_id = eligible_items if isinstance(eligible_items, dict) else {item.get("memory_id"): item for item in eligible_items if item.get("memory_id")}
+        deterministic_ids = [item[0] if isinstance(item, tuple) else item for item in deterministic_ids]
         merger = self.merger if rrf_k is None or rrf_k == self.merger.rrf_k else CharacterMemoryRRFMerger(rrf_k)
         fused = merger.merge(deterministic_ids, [memory_id for memory_id, _ in semantic_ids])
+        strong_memory_ids = strong_memory_ids or set()
+        selected: list[dict] = []; source_counts: dict[str, int] = {}
+        from .character_mind import memory_source_bucket
         for memory_id, _score in fused:
-            if memory_id not in by_id:
-                # A semantic candidate is only eligible when its deterministic
-                # authority has supplied the corresponding memory record.
+            item = by_id.get(memory_id)
+            if item is None:
                 continue
-            by_id[memory_id]["retrieval_mode"] = "HYBRID_RRF"
-        return [by_id[memory_id] for memory_id, _ in fused if memory_id in by_id][:top_k]
+            bucket = memory_source_bucket(item)
+            if source_counts.get(bucket, 0) >= max_per_source_scene and memory_id not in strong_memory_ids:
+                continue
+            selected.append(item); source_counts[bucket] = source_counts.get(bucket, 0) + 1
+            if len(selected) >= top_k:
+                break
+        return selected
 
     def retrieve(self, deterministic_items: list[dict], *, query_vector: list[float] | None = None, semantic_ids: list[tuple[str, float]] | None = None, top_k: int = 12) -> list[dict]:
-        return self.merge(deterministic_items, semantic_ids or [], top_k) if query_vector is not None or semantic_ids is not None else deterministic_items[:top_k]
+        return self.merge({item.get("memory_id"): item for item in deterministic_items}, [item.get("memory_id") for item in deterministic_items], semantic_ids or [], top_k) if query_vector is not None or semantic_ids is not None else deterministic_items[:top_k]

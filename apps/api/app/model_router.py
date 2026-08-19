@@ -4,7 +4,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
-from .models import ProjectModelConfig
+from .models import ProjectModelConfig, ProjectProviderCredential, ProviderCredentialPurpose
 
 
 class ProjectModelConfigPayload(BaseModel):
@@ -85,3 +85,15 @@ class ModelRouter:
         field = self.FIELDS[role]
         model = getattr(config, field) if config and getattr(config, field) else getattr(settings, self.DEFAULTS[role])
         return ModelRoute(config.provider if config and config.provider else settings.ai_provider, config.base_url if config and config.base_url else settings.ai_base_url, model)
+
+
+class ProviderCredentialResolver:
+    """Resolve a project credential without putting it into route metadata."""
+
+    def generation_key(self, db, project_id: str, settings) -> str | None:
+        import os
+        credential = db.scalar(select(ProjectProviderCredential).where(ProjectProviderCredential.project_id == project_id, ProjectProviderCredential.purpose == ProviderCredentialPurpose.GENERATION))
+        if credential:
+            from .embeddings import CredentialVault
+            return CredentialVault(os.getenv("AI_CREDENTIAL_MASTER_KEY")).decrypt(credential.secret_ciphertext)
+        return settings.ai_api_key.get_secret_value() if settings.ai_api_key else None

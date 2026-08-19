@@ -17,7 +17,7 @@ from .ai.factory import get_model_provider
 from .character_mind import ActorPerceptionSanitizer, CharacterDecisionConstraintChecker
 from .director import DirectorContextBuilder
 from .execution_trace import ExecutionTraceRecorder, stable_fingerprint
-from .model_router import ModelRouter
+from .model_router import ModelRouter, ProviderCredentialResolver
 from .models import (
     Character, CharacterDecision, CharacterDecisionStatus, ExecutionStage,
     PerformanceMode, PerformanceStatus, ResolverMode, ResolutionOutcome,
@@ -110,7 +110,8 @@ class PerformanceRuntimeService:
                 settings = get_settings()
                 route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
                 trace.provider, trace.model = route.provider, route.model
-                raw, model_result = LLMCharacterPerformer((model_provider_factory or get_model_provider)(settings, route.provider, route.base_url), route.model).perform(ActorPerceptionSanitizer().sanitize(context))
+                provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
+                raw, model_result = LLMCharacterPerformer(provider, route.model).perform(ActorPerceptionSanitizer().sanitize(context))
         except ModelProviderError as exc:
             ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status)
             performance.status, performance.stop_reason = initial_status, initial_stop_reason
@@ -205,7 +206,8 @@ class WorldResolutionRuntimeService:
                 settings = get_settings()
                 route = ModelRouter().resolve(db, project_id, settings, "WORLD")
                 trace.provider, trace.model = route.provider, route.model
-                raw, model_result = LLMWorldResolver((model_provider_factory or get_model_provider)(settings, route.provider, route.base_url), route.model).resolve(context)
+                provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
+                raw, model_result = LLMWorldResolver(provider, route.model).resolve(context)
             payload = WorldResolutionPayload.model_validate(raw)
         except ModelProviderError as exc:
             ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status)

@@ -19,7 +19,7 @@ from .performance import CharacterPerformancePayload, HeuristicCharacterPerforme
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
 from .versioning import WorldSnapshotBuilder, RevisionApplyService
-from .model_router import ModelRouter, ProjectModelConfigPayload
+from .model_router import ModelRouter, ProjectModelConfigPayload, ProviderCredentialResolver
 from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fingerprint
 from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryContextStaleError, RecoveryEditPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
@@ -36,7 +36,7 @@ from .narrative_structure import NarrativeStructureService
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
 from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionService
 from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
-from .embeddings import CredentialVault, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider
+from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
 
 router = APIRouter()
@@ -485,8 +485,16 @@ def abort_replay_session(project_id: str, session_id: str, db: Session = Depends
     session.status = ReplaySessionStatus.ABORTED; session.staged_world_state = {}; db.query(ReplaySceneRun).filter(ReplaySceneRun.replay_session_id == session.id).delete(synchronize_session=False); db.commit(); db.refresh(session)
     return replay_session_payload(db, session)
 
-def routed_provider(settings, route):
-    return get_model_provider(settings, route.provider, route.base_url)
+def routed_provider(settings, route, db=None, project_id=None):
+    key = ProviderCredentialResolver().generation_key(db, project_id, settings) if db is not None and project_id else None
+    try:
+        return get_model_provider(settings, route.provider, route.base_url, key)
+    except TypeError as exc:
+        # Preserve compatibility with injected test/fake factories from the
+        # frozen phases, whose contract has three positional arguments.
+        if "positional" not in str(exc) and "argument" not in str(exc):
+            raise
+        return get_model_provider(settings, route.provider, route.base_url)
 
 def ensure_replay_not_pending(db: Session, project_id: str) -> None:
     try:
@@ -667,7 +675,7 @@ def writer_render(project_id: str, chapter_id: str, payload: Payload | None = No
         settings = get_settings()
         route = ModelRouter().resolve(db, project_id, settings, "WRITER")
         try:
-            writer_provider = routed_provider(settings, route)
+            writer_provider = routed_provider(settings, route, db, project_id)
         except ModelProviderError as provider_error:
             deferred_error = provider_error
             class DeferredWriterProvider:
@@ -749,7 +757,7 @@ def _quality_provider(db: Session, project_id: str, role: str):
     settings = get_settings()
     route = ModelRouter().resolve(db, project_id, settings, role)
     try:
-        provider = routed_provider(settings, route)
+        provider = routed_provider(settings, route, db, project_id)
     except ModelProviderError as provider_error:
         deferred_error = provider_error
         class DeferredQualityProvider:
@@ -1192,7 +1200,7 @@ def director_ai_dry_run(project_id: str, db: Session = Depends(get_db)):
     settings = get_settings(); route = ModelRouter().resolve(db, project_id, settings, "DIRECTOR")
     trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.DIRECTOR, source_type="DIRECTOR", source_id=project_id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
     try:
-        provider = get_model_provider(settings, route.provider, route.base_url)
+        provider = routed_provider(settings, route, db, project_id)
         candidate = LLMDirectorCandidateGenerator().generate(provider, route.model, gravity_context, gravity)
         errors = LLMDirectorCandidateGenerator().validate_references(candidate, gravity_context)
         if errors:
@@ -1298,7 +1306,7 @@ def character_ai_dry_run(project_id: str, proposal_id: str, character_id: str, d
     try:
         route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
         trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="CHARACTER", source_id=character.id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
-        payload, model_result = LLMCharacterActor(routed_provider(settings, route), route.model).decide(actor_view)
+        payload, model_result = LLMCharacterActor(routed_provider(settings, route, db, project_id), route.model).decide(actor_view)
     except ModelProviderError as exc:
         if trace: (ExecutionTraceRecorder().block if exc.code == MODEL_OUTPUT_INVALID else ExecutionTraceRecorder().fail)(trace, exc.code, upstream_status=exc.upstream_status)
         db.commit()
@@ -1493,10 +1501,32 @@ def test_embedding_config(project_id: str, payload: Payload, db: Session = Depen
     require_project(db, project_id)
     values = payload.model_dump(); settings = get_settings()
     try:
-        route = EmbeddingRouter().resolve(db, project_id, settings)
+        draft_provider = values.get("provider") or values.get("embedding_provider")
+        draft_url = values.get("base_url") or values.get("embedding_base_url")
+        draft_model = values.get("model") or values.get("embedding_model")
+        draft_key = values.get("api_key") or values.get("embedding_api_key")
+        use_main_connection = values.get("embedding_use_main_connection", values.get("use_main_connection", True))
+        if not draft_key:
+            if use_main_connection:
+                draft_key = ProviderCredentialResolver().generation_key(db, project_id, settings)
+            else:
+                credential = db.scalar(select(ProjectProviderCredential).where(ProjectProviderCredential.project_id == project_id, ProjectProviderCredential.purpose == ProviderCredentialPurpose.EMBEDDING))
+                if credential:
+                    import os
+                    draft_key = CredentialVault(os.getenv("AI_CREDENTIAL_MASTER_KEY")).decrypt(credential.secret_ciphertext)
+                elif settings.ai_embedding_api_key:
+                    draft_key = settings.ai_embedding_api_key.get_secret_value()
+        if draft_provider and draft_url and draft_model:
+            from .embeddings import _fingerprint
+            expected_dimension = values.get("dimension") or values.get("embedding_dimension")
+            route = EmbeddingRoute(True, draft_provider, draft_url, draft_model, int(expected_dimension or 0), draft_key, "REQUEST" if draft_key else "ENV", _fingerprint((draft_provider, draft_url.rstrip("/").casefold(), draft_model, expected_dimension), "character-memory-embedding-config-v1"))
+        else:
+            route = EmbeddingRouter().resolve(db, project_id, settings)
         if values.get("model"): route = route.__class__(route.enabled, route.provider, route.base_url, values["model"], route.dimension, values.get("api_key") or route.api_key, "REQUEST" if values.get("api_key") else route.credential_source, route.embedding_config_fingerprint)
+        if not route.api_key: raise ValueError("EMBEDDING_CONFIG_INCOMPLETE")
         provider = OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
-        result = provider.embed([values.get("text", "AI Narrative World Engine embedding test")], route.model)
+        result = provider.embed([values.get("test_text") or values.get("text") or "AI Narrative World Engine embedding test"], route.model)
+        if route.dimension and result.dimension != route.dimension: raise ValueError("EMBEDDING_DIMENSION_MISMATCH")
         return {"ok": True, "provider": result.provider, "model": result.model, "dimension": result.dimension, "latency_ms": result.latency_ms, "request_id": result.request_id}
     except Exception as exc:
         code = getattr(exc, "code", "EMBEDDING_TEST_FAILED")
@@ -1523,6 +1553,19 @@ def rebuild_memory_embeddings(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
     try: result = MemoryEmbeddingIndexService().index_memories(db, project_id, rebuild=True); db.commit(); return result
     except Exception as exc: db.rollback(); raise HTTPException(status_code=409, detail={"code": _safe_embedding_error(exc)}) from exc
+
+
+@router.get("/projects/{project_id}/memory-embeddings/status")
+def memory_embedding_status(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    from .embeddings import MemoryEmbeddingIndexService
+    try:
+        result = MemoryEmbeddingIndexService().status(db, project_id)
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        result["memory_retrieval_mode"] = serialize(config.memory_retrieval_mode) if config else "DETERMINISTIC"
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail={"code": _safe_embedding_error(exc)}) from exc
 def _trace_payload(trace, db=None):
     value = record_dict(trace)
     candidate = db.scalar(select(RecoveryCandidate).where(RecoveryCandidate.source_trace_id == trace.id)) if db else None
@@ -1607,7 +1650,7 @@ def repair_recovery_candidate(project_id: str, candidate_id: str, db: Session = 
     settings = get_settings(); route = ModelRouter().resolve(db, project_id, settings, "REPAIR")
     trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.REPAIR, source_type="RECOVERY_CANDIDATE", source_id=candidate.id, provider=route.provider, model=route.model, input_fingerprint=candidate.context_fingerprint, attempt_number=previous_repairs + 1, parent_trace_id=(last_repair.id if last_repair else parent.id))
     try:
-        _, repaired, result = CandidateRepairAgent().repair(routed_provider(settings, route), route.model, candidate.candidate_type, sanitized, current.payload, current.validation_report)
+        _, repaired, result = CandidateRepairAgent().repair(routed_provider(settings, route, db, project_id), route.model, candidate.candidate_type, sanitized, current.payload, current.validation_report)
         safe_payload = service._payload(candidate.candidate_type, repaired)
     except ModelProviderError as exc:
         ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status); db.commit(); raise HTTPException(status_code={MODEL_AUTH_FAILED: 503, MODEL_RATE_LIMITED: 429, MODEL_TIMEOUT: 504}.get(exc.code, 502), detail={"code": exc.code, "upstream_status": exc.upstream_status}) from exc
@@ -1765,7 +1808,7 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
         else:
             settings = get_settings(); route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
             trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR, source_type="SCENE_PERFORMANCE", source_id=performance.id, provider=route.provider, model=route.model, input_fingerprint=context["fingerprint"])
-            raw_payload, result = LLMCharacterPerformer(routed_provider(settings, route), route.model).perform(actor_view)
+            raw_payload, result = LLMCharacterPerformer(routed_provider(settings, route, db, project_id), route.model).perform(actor_view)
     except ModelProviderError as exc:
         if trace: (ExecutionTraceRecorder().block if exc.code == MODEL_OUTPUT_INVALID else ExecutionTraceRecorder().fail)(trace, exc.code, upstream_status=exc.upstream_status)
         db.commit()
@@ -1859,7 +1902,7 @@ def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Se
             settings = get_settings()
             route = ModelRouter().resolve(db, project_id, settings, "WORLD")
             trace = ExecutionTraceRecorder().start(db, project_id=project_id, stage=ExecutionStage.WORLD_RESOLVER, source_type="SCENE_PERFORMANCE_TURN", source_id=turn.id, provider=route.provider, model=route.model, input_fingerprint=context_fingerprint)
-            raw, model_result = LLMWorldResolver(routed_provider(settings, route), route.model).resolve(context)
+            raw, model_result = LLMWorldResolver(routed_provider(settings, route, db, project_id), route.model).resolve(context)
         world_payload = WorldResolutionPayload.model_validate(raw)
     except ModelProviderError as exc:
         if trace: (ExecutionTraceRecorder().block if exc.code == MODEL_OUTPUT_INVALID else ExecutionTraceRecorder().fail)(trace, exc.code, upstream_status=exc.upstream_status)
