@@ -13,13 +13,17 @@ from .character_mind import CharacterDecisionConstraintChecker
 from .director import DirectorCandidateEngine, DirectorConstraintChecker, DirectorContextBuilder, DirectorProposalFactory, StoryGravityContextBuilder, StoryGravityEngine
 from .models import (AutonomousRunStatus, AutonomousStepStatus, AutonomousWorldRun, AutonomousWorldStep, CharacterDecision, CharacterDecisionStatus, DecisionType, DirectorDecisionLog, ExecutionStage, ExecutionStatus, PerformanceMode, PerformanceStatus, ProposalStatus, Project, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, ResolverMode, StateDeltaItem, WorldResolution)
 from .performance import HeuristicCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformancePostTurnStateResolver, TurnScheduler
+from .performance import LLMCharacterPerformer
 from .scene_commit import SceneCommitService
 from .versioning import WorldSnapshotBuilder
 from .retcon_apply import RetconPendingReplayGuard
-from .world_resolution import HeuristicWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
+from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .state_delta import StateDeltaCandidateBuilder
 from .state_delta_validation import StateDeltaValidator
 from .execution_trace import ExecutionTraceRecorder, stable_fingerprint
+from .model_router import ModelRouter
+from .settings import get_settings
+from .ai.factory import get_model_provider
 
 
 class AutonomousWorldLoopService:
@@ -208,7 +212,12 @@ class AutonomousWorldLoopService:
             actor_id = TurnScheduler().next_actor(performance, turns)
             if not actor_id: performance.status = PerformanceStatus.PAUSED; performance.stop_reason = "INSUFFICIENT_ACTIVE_PARTICIPANTS"; break
             context = PerformanceCharacterContextBuilder().build(db, run.project_id, actor_id, proposal, performance.id, turns)
-            raw, _ = HeuristicCharacterPerformer().perform(context)
+            if run.performance_mode == PerformanceMode.HEURISTIC:
+                raw, model_result = HeuristicCharacterPerformer().perform(context)
+            else:
+                settings = get_settings(); route = ModelRouter().resolve(db, run.project_id, settings, "CHARACTER")
+                actor_view = __import__("app.character_mind", fromlist=["ActorPerceptionSanitizer"]).ActorPerceptionSanitizer().sanitize(context)
+                raw, model_result = LLMCharacterPerformer(get_model_provider(settings, route.provider, route.base_url), route.model).perform(actor_view)
             decision = CharacterDecision(project_id=run.project_id, scene_proposal_id=proposal.id, character_id=actor_id, context_fingerprint=context["fingerprint"], **raw["decision"])
             decision_report = CharacterDecisionConstraintChecker().validate(db, context, decision)
             from .performance import PerformanceActionPayload
@@ -226,7 +235,11 @@ class AutonomousWorldLoopService:
             return False
         request = turn.world_resolution_request
         context = WorldResolutionContextBuilder().build(db, performance, turn, proposal, request)
-        raw, _ = HeuristicWorldResolver().resolve(context)
+        if run.resolver_mode == ResolverMode.HEURISTIC:
+            raw, model_result = HeuristicWorldResolver().resolve(context)
+        else:
+            settings = get_settings(); route = ModelRouter().resolve(db, run.project_id, settings, "WORLD")
+            raw, model_result = LLMWorldResolver(get_model_provider(settings, route.provider, route.base_url), route.model).resolve(context)
         payload = WorldResolutionPayload.model_validate(raw)
         report = WorldResolutionConstraintChecker().validate(db, context, payload, run.project_id)
         if not report.get("valid") or getattr(payload.outcome, "value", payload.outcome) == "UNRESOLVED":
