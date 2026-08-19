@@ -36,7 +36,7 @@ from .narrative_structure import NarrativeStructureService
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
 from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionService
 from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
-from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider
+from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider, embedding_error_code
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
 
 router = APIRouter()
@@ -1529,14 +1529,14 @@ def test_embedding_config(project_id: str, payload: Payload, db: Session = Depen
         if route.dimension and result.dimension != route.dimension: raise ValueError("EMBEDDING_DIMENSION_MISMATCH")
         return {"ok": True, "provider": result.provider, "model": result.model, "dimension": result.dimension, "latency_ms": result.latency_ms, "request_id": result.request_id}
     except Exception as exc:
-        code = getattr(exc, "code", "EMBEDDING_TEST_FAILED")
+        code = embedding_error_code(exc, "EMBEDDING_TEST_FAILED")
         safe_codes = {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_CONFIG_INCOMPLETE", "EMBEDDING_DIMENSION_MISMATCH", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID", "EMBEDDING_TEST_FAILED"}
         if code not in safe_codes: code = "EMBEDDING_TEST_FAILED"
         raise HTTPException(status_code=409, detail={"code": code}) from exc
 
 
 def _safe_embedding_error(exc: Exception) -> str:
-    code = getattr(exc, "code", "EMBEDDING_INDEX_FAILED")
+    code = embedding_error_code(exc, "EMBEDDING_INDEX_FAILED")
     allowed = {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_CONFIG_INCOMPLETE", "EMBEDDING_DIMENSION_MISMATCH", "MODEL_CREDENTIAL_INVALID", "EMBEDDING_INDEX_FAILED"}
     return code if code in allowed else "EMBEDDING_INDEX_FAILED"
 

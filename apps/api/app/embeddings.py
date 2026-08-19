@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Iterable, Protocol
@@ -33,6 +34,26 @@ def memory_content_fingerprint(content: str) -> str:
 
 def credential_fingerprint(secret: str) -> str:
     return _fingerprint(secret, "provider-credential-v1")
+
+
+_EMBEDDING_ERROR_CODES = {
+    MODEL_TIMEOUT, MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_UPSTREAM_ERROR,
+    "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_DIMENSION_MISMATCH",
+    "EMBEDDING_CONFIG_INCOMPLETE", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED",
+    "MODEL_CREDENTIAL_INVALID",
+}
+
+
+def embedding_error_code(exc: Exception, default: str = "EMBEDDING_INDEX_FAILED") -> str:
+    """Extract only a known embedding failure code; never expose provider text."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code in _EMBEDDING_ERROR_CODES:
+        return code
+    detail = str(exc)
+    for candidate in _EMBEDDING_ERROR_CODES:
+        if candidate in detail:
+            return candidate
+    return default
 
 
 @dataclass(frozen=True)
@@ -172,8 +193,7 @@ class MemoryEmbeddingIndexService:
             result = self._provider(route).embed([memory.content for memory, _, _ in candidates], route.model)
             if result.dimension != route.dimension: raise ValueError("EMBEDDING_DIMENSION_MISMATCH")
         except Exception as exc:
-            safe_code = getattr(exc, "code", "EMBEDDING_OUTPUT_INVALID")
-            if safe_code not in {MODEL_TIMEOUT, MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_UPSTREAM_ERROR, "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_DIMENSION_MISMATCH"}: safe_code = "EMBEDDING_OUTPUT_INVALID"
+            safe_code = embedding_error_code(exc, "EMBEDDING_OUTPUT_INVALID")
             for row in rows: row.status = EmbeddingStatus.FAILED; row.last_error_code = safe_code
             db.flush()
             return {"indexed": 0, "failed": len(rows), "skipped": len(memories) - len(candidates), "config_fingerprint": route.embedding_config_fingerprint, "error_code": safe_code}
@@ -267,7 +287,9 @@ class CharacterSemanticCueBuilder:
     def _safe(self, value: Any, depth: int = 0) -> Any:
         if depth > 3:
             return None
-        if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str):
+            return unicodedata.normalize("NFKC", value)
+        if isinstance(value, (int, float, bool)) or value is None:
             return value
         if isinstance(value, list):
             return [item for item in (self._safe(item, depth + 1) for item in value[:32]) if item is not None]
@@ -300,8 +322,9 @@ class CharacterSemanticCueBuilder:
         if location is not None:
             payload["location"] = self._safe({"id": attr(location, "id"), "name": attr(location, "name")})
         if participants is not None:
-            payload["participants"] = sorted(self._safe({"id": attr(item, "id"), "name": attr(item, "name")}) for item in participants)
-        rendered = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            participant_values = [self._safe({"id": attr(item, "id"), "name": attr(item, "name")}) for item in participants]
+            payload["participants"] = sorted(participant_values, key=lambda item: (str(item.get("id", "")), str(item.get("name", ""))) if isinstance(item, dict) else str(item))
+        rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return rendered[: self.MAX_CHARS]
 
 

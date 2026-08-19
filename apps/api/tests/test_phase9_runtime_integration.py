@@ -7,7 +7,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.character_mind import CharacterMemoryRetriever, ReplayCharacterMindViewBuilder, ReplayCognitionUsageProvider, ReplaySceneMetadataProvider, memory_source_bucket
-from app.models import ActionVisibility, CausalEdgeKind, CausalLink, CausalRelationType, CausalResourceType, CharacterDecision, CharacterKnowledge, CharacterMemory, RetconReplaySession, Scene
+from app.models import ActionVisibility, CausalEdgeKind, CausalLink, CausalRelationType, CausalResourceType, CharacterDecision, CharacterKnowledge, CharacterMemory, CharacterMemoryEmbedding, EmbeddingStatus, MemoryRetrievalMode, ProjectModelConfig, RetconReplaySession, Scene
+from app.embeddings import EmbeddingResult, EmbeddingRoute, memory_content_fingerprint
 from app.performance import PerformanceActionConstraintChecker, PerformanceActionPayload
 from test_character_mind import context, decision, seed, session
 
@@ -48,6 +49,28 @@ def test_replay_mind_is_temporal_bounded_and_excludes_future(session, monkeypatc
     assert all(item["content"] != "future memory" for item in view["memories"])
     assert all("knowledge_id" in item and "fact_identity" in item for item in view["knowledge"])
     assert all({"memory_id", "content", "source_scene_id", "happened_at"}.issubset(item) for item in view["memories"])
+
+
+def test_replay_hybrid_keeps_future_ready_vector_out_of_temporal_eligible_set(session, monkeypatch):
+    from app.models import CharacterMemoryEmbedding
+    from test_retcon_replay import historical_replay_world
+    project, scene, actor, proposal, client, application_id = historical_replay_world(session, monkeypatch)
+    created = client.post(f"/projects/{project.id}/retcon/applications/{application_id}/replay-sessions")
+    replay_session = session.get(RetconReplaySession, created.json()["id"])
+    future = session.scalar(select(CharacterMemory).where(CharacterMemory.character_id == actor.id, CharacterMemory.content == "future memory"))
+    config = ProjectModelConfig(project_id=project.id, provider="openai_compatible", base_url="https://example.test/v1", embedding_enabled=True, embedding_use_main_connection=True, embedding_model="fake", embedding_dimension=2, memory_retrieval_mode=MemoryRetrievalMode.HYBRID_RRF)
+    session.add(config); session.flush()
+    route = EmbeddingRoute(True, "openai_compatible", "https://example.test/v1", "fake", 2, "secret", "PROJECT", "replay-hybrid")
+    monkeypatch.setattr("app.embeddings.EmbeddingRouter.resolve", lambda *_args, **_kwargs: route)
+    session.add(CharacterMemoryEmbedding(project_id=project.id, character_id=actor.id, memory_id=future.id, embedding_config_fingerprint=route.embedding_config_fingerprint, provider="fake", model="fake", dimension=2, content_fingerprint=memory_content_fingerprint(future.content), status=EmbeddingStatus.READY, embedding=[1.0, 0.0])); session.commit()
+
+    class RecordingProvider:
+        def __init__(self): self.calls = 0
+        def embed(self, _inputs, _model): self.calls += 1; return EmbeddingResult([[1.0, 0.0]], "fake", "fake", 2, 0)
+
+    provider = RecordingProvider()
+    view = ReplayCharacterMindViewBuilder(embedding_provider_factory=lambda _route: provider).build(session, replay_session, scene, proposal, actor.id)
+    assert provider.calls == 1 and all(item["content"] != "future memory" for item in view["memories"])
 
 
 def test_replay_mind_build_is_read_only(session, monkeypatch):

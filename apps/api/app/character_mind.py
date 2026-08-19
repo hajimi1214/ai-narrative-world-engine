@@ -440,6 +440,9 @@ class ReplaySceneMetadataProvider:
 
 class ReplayCharacterMindViewBuilder:
     """Phase 9 retrieval over Temporal cognition and replay sandbox state."""
+    def __init__(self, embedding_provider_factory=None):
+        self.embedding_provider_factory = embedding_provider_factory
+
     def build(self, db, replay_session, scene, proposal, character_id: str) -> dict[str, Any]:
         from .historical import TemporalCharacterCognitionReader
         from .replay import ReplayWorldView
@@ -458,7 +461,7 @@ class ReplayCharacterMindViewBuilder:
         memory_entries = memory_retriever.rank_entries(db, replay_session.project_id, cognition["memories"], cues, usage_provider=usage, current_sequence=scene.sequence, scene_provider=source_scene_provider)
         memories = memory_retriever.select_bounded([entry[6] for entry in memory_entries], strong_memory_ids={entry[6]["memory_id"] for entry in memory_entries if entry[5]})
         replay_character = {key: character.get(key) for key in ("id", "name", "goals", "current_state", "emotional_state")}
-        memories = CharacterMindViewBuilder()._hybrid_memories(db, replay_session.project_id, character_id, cues, cognition["memories"], memory_entries, memories, replay_character, proposal, None, None)
+        memories = CharacterMindViewBuilder(embedding_provider_factory=self.embedding_provider_factory)._hybrid_memories(db, replay_session.project_id, character_id, cues, cognition["memories"], memory_entries, memories, replay_character, proposal, None, None)
         for item in memories:
             if item.get("source_scene_id"):
                 source = metadata.by_scene(item["source_scene_id"])
