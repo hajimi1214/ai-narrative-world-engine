@@ -6,7 +6,7 @@ from copy import deepcopy
 from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
-from app.character_mind import CharacterMemoryRetriever, ReplayCharacterMindViewBuilder, ReplayCognitionUsageProvider, ReplaySceneMetadataProvider
+from app.character_mind import CharacterMemoryRetriever, ReplayCharacterMindViewBuilder, ReplayCognitionUsageProvider, ReplaySceneMetadataProvider, memory_source_bucket
 from app.models import ActionVisibility, CausalEdgeKind, CausalLink, CausalRelationType, CausalResourceType, CharacterDecision, CharacterKnowledge, CharacterMemory, RetconReplaySession, Scene
 from app.performance import PerformanceActionConstraintChecker, PerformanceActionPayload
 from test_character_mind import context, decision, seed, session
@@ -82,12 +82,57 @@ def test_replay_usage_requires_prior_typed_sequence(session):
 
 def test_replay_staged_memory_uses_prior_source_sequence_metadata(session):
     project, _location, actor, other, _client, _proposal = seed(session)
-    replay = RetconReplaySession(project_id=project.id, queue=[], staged_world_state={"current_world": {"scenes": [{"id": "scene-2", "sequence": 2, "location": "tomb", "participants": [other.id], "story_threads": []}]}, "scene_results": {"scene-2": {"sequence": 2, "situation": {"location": "tomb", "participants": [other.id]}}}})
+    replay = RetconReplaySession(project_id=project.id, queue=[], staged_world_state={"current_world": {"scenes": [{"id": "scene-2", "sequence": 2, "location": "tomb", "participants": [other.id], "story_threads": ["thread-A"]}]}, "scene_results": {"scene-2": {"sequence": 2, "situation": {"location": "tomb", "participants": [other.id]}}}})
     metadata = ReplaySceneMetadataProvider(replay, 3)
     staged = SimpleNamespace(id="replay-memory:2", character_id=actor.id, content="tomb memory", importance=0, emotional_weight=0, confidence=0, distortion={}, happened_at=None, source_scene=None, source_sequence=2)
-    selected = CharacterMemoryRetriever().retrieve(session, project.id, [staged], {"entity_ids": (), "character_ids": (other.id,), "participant_ids": (other.id,), "thread_ids": (), "item_ids": (), "location_ids": ("tomb",)}, usage_provider=ReplayCognitionUsageProvider(session, replay, 3), current_sequence=3, scene_provider=lambda key: metadata.by_scene(key) or metadata.by_sequence_value(key if isinstance(key, int) else None))
+    selected = CharacterMemoryRetriever().retrieve(session, project.id, [staged], {"entity_ids": (), "character_ids": (other.id,), "participant_ids": (other.id,), "thread_ids": ("thread-A",), "item_ids": (), "location_ids": ("tomb",)}, usage_provider=ReplayCognitionUsageProvider(session, replay, 3), current_sequence=3, scene_provider=lambda key: metadata.by_scene(key) or metadata.by_sequence_value(key if isinstance(key, int) else None))
     assert selected and selected[0]["memory_id"] == staged.id and selected[0]["source_scene_sequence"] == 2
+    assert metadata.by_scene("scene-2")["story_threads"] == ["thread-A"]
     assert metadata.by_sequence_value(4) is None
+
+
+def test_replay_staged_same_source_sequence_obeys_diversity_cap(session):
+    project, _location, actor, _other, _client, _proposal = seed(session)
+    replay = SimpleNamespace(project_id=project.id, queue=[], staged_world_state={})
+    memories = [SimpleNamespace(id=f"replay-memory:{index}", character_id=actor.id, content=f"memory {index}", importance=0, emotional_weight=0, confidence=0, distortion={}, happened_at=None, source_scene=None, source_sequence=2) for index in range(8)]
+    selected = CharacterMemoryRetriever().retrieve(session, project.id, memories, {"entity_ids": (), "character_ids": (), "participant_ids": (), "thread_ids": (), "item_ids": (), "location_ids": ()}, usage_provider=ReplayCognitionUsageProvider(session, replay, 3), current_sequence=3)
+    assert sum(item.get("source_scene_sequence") == 2 for item in selected) == 3
+    assert all(memory_source_bucket(item) == "sequence:2" for item in selected)
+
+
+def test_replay_staged_strong_same_source_can_escape_diversity_cap(session):
+    project, _location, actor, other, _client, _proposal = seed(session)
+    replay = SimpleNamespace(project_id=project.id, queue=[], staged_world_state={})
+    memories = [SimpleNamespace(id=f"replay-memory:strong:{index}", character_id=actor.id, content=f"memory {index}", importance=0, emotional_weight=0, confidence=0, distortion={"location_id": "tomb", "participant_ids": [other.id]}, happened_at=None, source_scene=None, source_sequence=2) for index in range(4)]
+    cues = {"entity_ids": (), "character_ids": (), "participant_ids": (other.id,), "thread_ids": (), "item_ids": (), "location_ids": ("tomb",)}
+    selected = CharacterMemoryRetriever().retrieve(session, project.id, memories, cues, usage_provider=ReplayCognitionUsageProvider(session, replay, 3), current_sequence=3, scene_provider=lambda _source: {"sequence": 2, "location": "tomb", "participants": [other.id], "story_threads": []})
+    assert len(selected) == 4
+
+
+def test_replay_scene_metadata_inherits_missing_story_threads(session):
+    project, _location, actor, _other, _client, _proposal = seed(session)
+    replay = RetconReplaySession(project_id=project.id, queue=[], staged_world_state={"current_world": {"scenes": [{"id": "scene-2", "sequence": 2, "location": "tomb", "participants": [], "story_threads": ["thread-A"]}]}, "scene_results": {"scene-2": {"sequence": 2, "situation": {"location": "tomb", "participants": []}}}})
+    metadata = ReplaySceneMetadataProvider(replay, 3)
+    assert metadata.by_scene("scene-2")["story_threads"] == ["thread-A"]
+
+
+def test_replay_scene_metadata_explicit_empty_threads_and_future_isolation(session):
+    project, _location, actor, _other, _client, _proposal = seed(session)
+    replay = RetconReplaySession(project_id=project.id, queue=[], staged_world_state={"current_world": {"scenes": [{"id": "scene-2", "sequence": 2, "location": "tomb", "participants": [], "story_threads": ["thread-A"]}, {"id": "scene-4", "sequence": 4, "location": "future", "participants": [], "story_threads": ["future-thread"]}]}, "scene_results": {"scene-2": {"sequence": 2, "situation": {"story_threads": []}}}})
+    metadata = ReplaySceneMetadataProvider(replay, 3)
+    assert metadata.by_scene("scene-2")["story_threads"] == []
+    assert metadata.by_scene("scene-4") is None and metadata.by_sequence_value(4) is None
+
+
+def test_replay_scene_metadata_merge_is_order_independent(session):
+    project, _location, actor, _other, _client, _proposal = seed(session)
+    def build(scenes, results):
+        replay = RetconReplaySession(project_id=project.id, queue=[], staged_world_state={"current_world": {"scenes": scenes}, "scene_results": results})
+        return ReplaySceneMetadataProvider(replay, 3).by_scene("scene-2")
+    base = {"id": "scene-2", "sequence": 2, "location": "tomb", "participants": [actor.id], "story_threads": ["thread-A"]}
+    first = build([base], {"scene-2": {"sequence": 2, "situation": {"location": "tomb", "participants": [actor.id]}}})
+    second = build([{**base}], {"scene-2": {"situation": {"participants": [actor.id], "location": "tomb"}, "sequence": 2}})
+    assert first == second
 
 
 def test_replay_usage_replaces_old_replayed_link_without_double_count(session):

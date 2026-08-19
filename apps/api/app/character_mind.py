@@ -224,19 +224,12 @@ class CharacterMemoryRetriever:
         ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4], item[6]["memory_id"]))
         selected, by_scene = [], {}
         for item in ranked:
-            scene_id = item[6]["source_scene_id"] or f"memory:{item[6]['memory_id']}"
-            if by_scene.get(scene_id, 0) >= self.MAX_PER_SOURCE_SCENE and not item[5]:
+            source_bucket = memory_source_bucket(item[6])
+            if by_scene.get(source_bucket, 0) >= self.MAX_PER_SOURCE_SCENE and not item[5]:
                 continue
-            selected.append(item[6]); by_scene[scene_id] = by_scene.get(scene_id, 0) + 1
+            selected.append(item[6]); by_scene[source_bucket] = by_scene.get(source_bucket, 0) + 1
             if len(selected) == MAX_CHARACTER_MEMORIES:
                 return selected
-        if len(selected) < MAX_CHARACTER_MEMORIES:
-            seen = {item["memory_id"] for item in selected}
-            for item in ranked:
-                if item[6]["memory_id"] not in seen:
-                    selected.append(item[6]); seen.add(item[6]["memory_id"])
-                    if len(selected) == MAX_CHARACTER_MEMORIES:
-                        break
         return selected
 
     def _cue_score(self, memory: CharacterMemory, scene: Scene | None, cues: dict[str, tuple[str, ...]]) -> tuple[float, bool]:
@@ -259,7 +252,9 @@ class CharacterMemoryRetriever:
             ids["thread_ids"].update(str(value) for value in threads if isinstance(value, str))
         location = bool(ids["location_ids"].intersection(cues["location_ids"])); participants = len(ids["participant_ids"].intersection(cues["participant_ids"])); threads = bool(ids["thread_ids"].intersection(cues["thread_ids"])); other = len(ids["entity_ids"].intersection(cues["entity_ids"])) + len(ids["item_ids"].intersection(cues["item_ids"]))
         score = 4 * int(location) + 3 * participants + 3 * int(threads) + 2 * other
-        return float(score), score >= 6
+        # A direct structured location cue is already strong enough to
+        # reactivate a memory; stronger combinations remain strong as well.
+        return float(score), score >= 4
 
     def _recency(self, memory: CharacterMemory, scene: Scene | None, project: Project | None, max_sequence: int) -> float:
         if scene:
@@ -269,6 +264,18 @@ class CharacterMemoryRetriever:
         if happened_at and project and project.current_world_time:
             return 1.0 / (1 + abs((project.current_world_time - happened_at).total_seconds()) / 86400)
         return 0.0
+
+
+def memory_source_bucket(item: dict[str, Any]) -> str:
+    """Return the stable diversity identity shared by normal and replay memories."""
+    source_scene_id = item.get("source_scene_id") if isinstance(item, dict) else None
+    if isinstance(source_scene_id, str) and source_scene_id:
+        return f"scene:{source_scene_id}"
+    source_sequence = item.get("source_scene_sequence") if isinstance(item, dict) else None
+    if source_sequence is not None:
+        return f"sequence:{source_sequence}"
+    memory_id = item.get("memory_id") if isinstance(item, dict) else None
+    return f"memory:{memory_id}"
 
 
 class CharacterMindViewBuilder:
@@ -337,15 +344,42 @@ class ReplaySceneMetadataProvider:
             self._add(row)
         for scene_id, result in (state.get("scene_results", {}) or {}).items():
             situation = result.get("situation", {}) or {}
-            row = {"id": scene_id, "sequence": result.get("sequence"), "location": situation.get("location"), "participants": situation.get("participants", []), "story_threads": situation.get("story_threads", [])}
-            if row["sequence"] is not None:
-                self._add(row)
+            # Preserve the distinction between a missing structured field and
+            # an explicitly empty value.  Replay results may only contain the
+            # fields known at step time and must inherit the rest from the
+            # temporal baseline.
+            row = {"id": scene_id}
+            if "sequence" in result and result.get("sequence") is not None:
+                row["sequence"] = result["sequence"]
+            for field in ("location", "participants", "story_threads"):
+                if field in situation:
+                    row[field] = situation[field]
+            self._add(row)
 
     def _add(self, row: dict[str, Any]) -> None:
         sequence = row.get("sequence")
+        scene_id = row.get("id")
+        existing = self.by_id.get(scene_id) if scene_id else None
+        if sequence is None and existing is not None:
+            sequence = existing.get("sequence")
         if not isinstance(sequence, int) or sequence >= self.current_sequence:
             return
-        normalized = {"id": row.get("id"), "sequence": sequence, "location": row.get("location"), "participants": list(row.get("participants") or []), "story_threads": list(row.get("story_threads") or [])}
+        by_sequence = self.by_sequence.get(sequence)
+        if existing is None and by_sequence is not None:
+            existing = by_sequence
+        if existing is not None and scene_id and existing.get("id") not in (None, scene_id):
+            raise ValueError("REPLAY_SCENE_METADATA_AMBIGUOUS")
+        normalized = {
+            "id": scene_id if scene_id is not None else (existing or {}).get("id"),
+            "sequence": sequence,
+            "location": (existing or {}).get("location"),
+            "participants": list((existing or {}).get("participants") or []),
+            "story_threads": list((existing or {}).get("story_threads") or []),
+        }
+        for field in ("location", "participants", "story_threads"):
+            if field in row:
+                value = row[field]
+                normalized[field] = list(value or []) if field != "location" else value
         if normalized["id"]:
             self.by_id[normalized["id"]] = normalized
         self.by_sequence[sequence] = normalized

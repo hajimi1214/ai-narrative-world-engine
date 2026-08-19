@@ -428,7 +428,7 @@ class ReplayService:
             run.status = ReplaySceneRunStatus.VALIDATED; run.validation_report = report
         else:
             queue_item = session.queue[session.cursor]
-            situation = {"sequence": scene.sequence, "location": scene.location, "participants": list(scene.participants or []), "intent": scene.intent}
+            situation = {"sequence": scene.sequence, "location": scene.location, "participants": list(scene.participants or []), "story_threads": list(scene.story_threads or []), "intent": scene.intent}
             staged_decisions = []
             staged_turns = []
             staged_resolutions, knowledge, memories = [], [], []
