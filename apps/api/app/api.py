@@ -809,7 +809,13 @@ def resume_autonomous_run(project_id: str, run_id: str, db: Session = Depends(ge
     try:
         result = AutonomousWorldLoopService().resume(db, run_id); db.commit(); return AutonomousWorldLoopService.run_payload(result)
     except ValueError as exc:
-        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+        if str(exc) == "AUTONOMY_BASELINE_CHANGED":
+            # The service has intentionally persisted a terminal baseline
+            # transition; do not erase it while mapping to HTTP 409.
+            db.commit()
+        else:
+            db.rollback()
+        raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 
 
 @router.post("/projects/{project_id}/autonomous-runs/{run_id}/cancel")

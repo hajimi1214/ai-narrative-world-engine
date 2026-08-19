@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import json
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, inspect, select
@@ -11,8 +12,56 @@ from app.db import Base
 from app.main import app
 import app.api as api
 from app.autonomy import AutonomousWorldLoopService
-from app.models import AutonomousRunStatus, AutonomousStepStatus, AutonomousWorldRun, AutonomousWorldStep, Character, Project, Scene, SceneCommit, ScenePerformance, StoryThread, WorldEntity
+from app.models import AutonomousRunStatus, AutonomousStepStatus, AutonomousWorldRun, AutonomousWorldStep, CausalLink, Character, CharacterKnowledge, CharacterMemory, Project, RecoveryCandidate, RetconApplication, RetconApplicationStatus, Scene, SceneCommit, ScenePerformance, ScenePerformanceTurn, SceneStateCheckpoint, StateDeltaBatch, StoryThread, TimelineEvent, WorldEntity, WorldResolution, WorldSnapshot
 from app.runtime import persisted_turns
+
+
+def valid_performance_payload():
+    return json.dumps({
+        "decision": {
+            "decision_type": "WAIT", "intent": "wait", "chosen_action": "wait",
+            "motivation": "The character is cautious.", "target_character_id": None,
+            "target_entity_id": None, "goal_refs": [], "knowledge_used": [],
+            "memory_refs": [], "ability_refs": [], "inventory_refs": [],
+            "relationship_factors": {}, "perceived_risk": None, "accepted_cost": None,
+            "expected_personal_result": None, "uncertainties": [], "refused_options": [],
+            "boundary_override_reason": None, "decision_summary": "Wait.",
+        },
+        "action": {
+            "visibility": "PUBLIC", "observable_action": "wait", "spoken_content": None,
+            "requires_world_resolution": False, "world_resolution_request": None,
+            "disclosure_knowledge_ids": [], "target_character_id": None,
+        },
+    })
+
+
+class SequencedProvider:
+    name = "fake"
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = 0
+
+    def generate(self, messages, model):
+        from app.ai.provider import ModelResult
+        item = self.results[min(self.calls, len(self.results) - 1)]
+        self.calls += 1
+        if isinstance(item, Exception):
+            raise item
+        return ModelResult(content=item, latency_ms=0, request_id=f"fake-{self.calls}", provider="fake", model=model)
+
+
+def world_action_payload(entity_id):
+    payload = json.loads(valid_performance_payload())
+    payload["decision"].update({
+        "decision_type": "INVESTIGATE", "intent": "inspect", "chosen_action": "inspect",
+        "target_entity_id": entity_id, "decision_summary": "Inspect the entity.",
+    })
+    payload["action"].update({
+        "observable_action": "inspect the entity", "requires_world_resolution": True,
+        "world_resolution_request": {"kind": "INSPECT", "description": "inspect", "target_entity_id": entity_id, "target_character_id": None},
+    })
+    return payload
 
 
 @pytest.fixture()
@@ -185,9 +234,22 @@ def test_run_cancel_api(session, world, monkeypatch):
 
 
 def test_retcon_pending_blocks_advance(session, world):
+    # Use the persisted application state, rather than a no-op normal project.
+    application = RetconApplication(project_id=world.project.id, retcon_request_id="pending-request", retcon_plan_id="pending-plan", source_revision_id="pending-revision", status=RetconApplicationStatus.APPLIED_PENDING_REPLAY, plan_basis_fingerprint="basis", pre_apply_world_fingerprint="pre")
+    session.add(application); session.commit()
+    service = AutonomousWorldLoopService()
+    with pytest.raises(ValueError, match="RETCON_REPLAY_REQUIRED"):
+        service.create_run(session, world.project.id, scene_budget=1)
+
+
+def test_pending_replay_blocks_existing_run_progression(session, world):
     run = create_service_run(session, world)
-    # The frozen guard is the authority; a normal project has no pending replay.
-    assert run.status == AutonomousRunStatus.CREATED
+    session.add(RetconApplication(project_id=world.project.id, retcon_request_id="pending-request-2", retcon_plan_id="pending-plan-2", source_revision_id="pending-revision-2", status=RetconApplicationStatus.APPLIED_PENDING_REPLAY, plan_basis_fingerprint="basis", pre_apply_world_fingerprint="pre")); session.commit()
+    service = AutonomousWorldLoopService()
+    with pytest.raises(ValueError, match="RETCON_REPLAY_REQUIRED"):
+        service.advance(session, run.id, request_key="pending")
+    with pytest.raises(ValueError, match="RETCON_REPLAY_REQUIRED"):
+        service.resume(session, run.id)
 
 
 def test_new_thread_candidate_is_not_materialized(session, world):
@@ -200,6 +262,187 @@ def test_new_thread_candidate_is_not_materialized(session, world):
 def test_run_budget_is_hard_bound(session, world):
     run = create_service_run(session, world, budget=1); AutonomousWorldLoopService().advance(session, run.id, max_scenes=5, request_key="bound")
     assert session.scalar(select(func.count(Scene.id))) == 1
+
+
+def test_budget_clipped_request_retry_is_idempotent(session, world):
+    run = create_service_run(session, world, budget=1); service = AutonomousWorldLoopService()
+    first = service.advance(session, run.id, max_scenes=5, request_key="budget-retry")
+    step_id = first["steps"][0]["id"]
+    second = service.advance(session, run.id, max_scenes=5, request_key="budget-retry")
+    assert second["existing"] is True and [item["id"] for item in second["steps"]] == [step_id]
+    assert session.scalar(select(func.count(AutonomousWorldStep.id))) == 1
+
+
+def test_committed_request_retry_does_not_extend_window(session, world):
+    run = create_service_run(session, world, budget=5); service = AutonomousWorldLoopService()
+    first = service.advance(session, run.id, max_scenes=2, request_key="two-retry")
+    assert len(first["steps"]) == 2
+    second = service.advance(session, run.id, max_scenes=2, request_key="two-retry")
+    assert second["existing"] is True and len(second["steps"]) == 2
+    assert session.scalar(select(func.count(AutonomousWorldStep.id))) == 2
+
+
+def test_provider_retry_continues_same_step_proposal_and_performance(session, world, monkeypatch):
+    from app.ai.errors import MODEL_TIMEOUT, ModelProviderError
+    provider = SequencedProvider([ModelProviderError(MODEL_TIMEOUT), valid_performance_payload()])
+    monkeypatch.setattr("app.runtime.get_model_provider", lambda *args, **kwargs: provider)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=1, max_turns_per_scene=1, performance_mode="LLM")
+    session.commit(); service = AutonomousWorldLoopService()
+    first = service.advance(session, run.id, max_scenes=1, request_key="provider-retry")
+    paused = session.get(AutonomousWorldStep, first["steps"][0]["id"])
+    identity = (paused.id, paused.ordinal, paused.proposal_id, paused.performance_id)
+    assert paused.status == AutonomousStepStatus.PAUSED and run.status == AutonomousRunStatus.PAUSED
+    assert paused.error_code == MODEL_TIMEOUT and run.last_error_code == MODEL_TIMEOUT
+    assert session.scalar(select(func.count(Scene.id))) == 0
+    service.resume(session, run.id)
+    second = service.advance(session, run.id, max_scenes=1, request_key="provider-retry")
+    committed = session.get(AutonomousWorldStep, second["steps"][0]["id"])
+    assert (committed.id, committed.ordinal, committed.proposal_id, committed.performance_id) == identity
+    assert committed.status == AutonomousStepStatus.COMMITTED
+    assert session.scalar(select(func.count(Scene.id))) == 1
+
+
+def test_partial_request_retry_continues_exact_paused_offset(session, world, monkeypatch):
+    from app.ai.errors import MODEL_TIMEOUT, ModelProviderError
+    provider = SequencedProvider([valid_performance_payload(), ModelProviderError(MODEL_TIMEOUT), valid_performance_payload()])
+    monkeypatch.setattr("app.runtime.get_model_provider", lambda *args, **kwargs: provider)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=2, max_turns_per_scene=1, performance_mode="LLM")
+    session.commit(); service = AutonomousWorldLoopService()
+    first = service.advance(session, run.id, max_scenes=2, request_key="partial-retry")
+    steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.request_offset)).all()
+    assert [step.status for step in steps] == [AutonomousStepStatus.COMMITTED, AutonomousStepStatus.PAUSED]
+    paused_identity = (steps[1].id, steps[1].proposal_id, steps[1].performance_id)
+    service.resume(session, run.id)
+    second = service.advance(session, run.id, max_scenes=2, request_key="partial-retry")
+    final = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.request_offset)).all()
+    assert second["existing"] is True and len(final) == 2
+    assert (final[1].id, final[1].proposal_id, final[1].performance_id) == paused_identity
+    assert [step.status for step in final] == [AutonomousStepStatus.COMMITTED, AutonomousStepStatus.COMMITTED]
+    assert session.scalar(select(func.count(Scene.id))) == 2
+
+
+def test_recovery_adoption_resumes_same_step_and_keeps_provenance(session, world, monkeypatch):
+    class InvalidPerformer:
+        def perform(self, context):
+            payload = json.loads(valid_performance_payload())
+            payload["action"].update({"visibility": "TARGETED", "target_character_id": "missing-character"})
+            return payload, None
+
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", InvalidPerformer)
+    monkeypatch.setattr(api, "SessionLocal", sessionmaker(bind=session.bind, expire_on_commit=False))
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=1, max_turns_per_scene=1)
+    session.commit(); service = AutonomousWorldLoopService()
+    first = service.advance(session, run.id, request_key="recover-adopt")
+    step = session.get(AutonomousWorldStep, first["steps"][0]["id"])
+    identity = (step.id, step.ordinal, step.proposal_id, step.performance_id)
+    assert step.status == AutonomousStepStatus.PAUSED and len(step.recovery_candidate_ids) == 1
+    candidate_id = step.recovery_candidate_ids[0]
+    assert session.get(RecoveryCandidate, candidate_id).status == "OPEN"
+
+    client = TestClient(app)
+    edited = client.post(f"/projects/{world.project.id}/recovery-candidates/{candidate_id}/edit", json={
+        "base_version": 1,
+        "changes": [
+            {"operation": "SET", "path": "/action/visibility", "value": "PUBLIC"},
+            {"operation": "SET", "path": "/action/target_character_id", "value": None},
+        ],
+    })
+    assert edited.status_code == 200 and edited.json()["candidate"]["status"] == "VALIDATED"
+    adopted = client.post(f"/projects/{world.project.id}/recovery-candidates/{candidate_id}/adopt")
+    assert adopted.status_code == 200 and adopted.json()["candidate"]["status"] == "ADOPTED"
+
+    session.expire_all()
+    service.resume(session, run.id)
+    second = service.advance(session, run.id, request_key="recover-adopt")
+    committed = session.get(AutonomousWorldStep, second["steps"][0]["id"])
+    assert (committed.id, committed.ordinal, committed.proposal_id, committed.performance_id) == identity
+    assert committed.status == AutonomousStepStatus.COMMITTED
+    assert committed.recovery_candidate_ids == [candidate_id]
+    assert session.scalar(select(func.count(Scene.id))) == 1
+
+
+@pytest.mark.parametrize(
+    ("resolver_payload", "expected_status", "expected_reason"),
+    [
+        ({"outcome": "UNRESOLVED", "outcome_summary": "Unknown.", "objective_facts": [], "state_effects": [], "actor_observation": None, "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": [], "resolution_basis_summary": None, "missing_information": ["A formal fact is required."]}, "UNRESOLVED", "WORLD_INFORMATION_MISSING"),
+        ({"outcome": "SUCCESS", "outcome_summary": "Invalid scope.", "objective_facts": [{"subject_type": "ENTITY", "subject_id": "outside-scope", "predicate": "opened", "value": True}], "state_effects": [], "actor_observation": None, "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": [], "resolution_basis_summary": "structured", "missing_information": []}, "REJECTED", "WORLD_RESOLUTION_REJECTED"),
+    ],
+)
+def test_world_resolution_nonvalid_outcomes_are_durable(session, world, monkeypatch, resolver_payload, expected_status, expected_reason):
+    class Performer:
+        def perform(self, context): return world_action_payload(world.location.id), None
+    class Resolver:
+        def resolve(self, context): return resolver_payload, None
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", Performer)
+    monkeypatch.setattr("app.runtime.HeuristicWorldResolver", Resolver)
+    before = dict(world.location.profile or {})
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=1, max_turns_per_scene=1)
+    session.commit()
+    result = AutonomousWorldLoopService().advance(session, run.id, request_key=f"world-{expected_status.lower()}")
+    resolution = session.scalar(select(WorldResolution).where(WorldResolution.project_id == world.project.id))
+    step = session.get(AutonomousWorldStep, result["steps"][0]["id"])
+    assert getattr(resolution.status, "value", resolution.status) == expected_status
+    assert step.status == AutonomousStepStatus.PAUSED and step.stop_reason == expected_reason
+    assert len(step.recovery_candidate_ids) == 1 and session.get(RecoveryCandidate, step.recovery_candidate_ids[0])
+    assert session.scalar(select(func.count(Scene.id))) == 0
+    session.refresh(world.location); assert world.location.profile == before
+
+
+def test_real_state_delta_rejection_blocks_run_without_scene(session, world, monkeypatch):
+    class Performer:
+        def perform(self, context): return world_action_payload(world.location.id), None
+    class Resolver:
+        def resolve(self, context):
+            effect = lambda operation: {"effect_kind": "STATE_CHANGE", "target_type": "WORLD_ENTITY", "target_id": world.location.id, "domain": "WORLD_ENTITY_PROFILE", "operation": operation, "path": "/profile/opened", "value": True, "reason": "structured test", "evidence": {"kind": "INSPECT", "target_entity_id": world.location.id}}
+            return {"outcome": "SUCCESS", "outcome_summary": "Conflicting effects.", "objective_facts": [{"subject_type": "ENTITY", "subject_id": world.location.id, "predicate": "opened", "value": True}], "state_effects": [effect("SET"), effect("UPSERT")], "actor_observation": "Observed.", "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": [world.location.id], "resolution_basis_summary": "structured", "missing_information": []}, None
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", Performer)
+    monkeypatch.setattr("app.runtime.HeuristicWorldResolver", Resolver)
+    world.location.profile = {**(world.location.profile or {}), "opened": False}; session.commit()
+    before = dict(world.location.profile or {})
+    run = create_service_run(session, world)
+    result = AutonomousWorldLoopService().advance(session, run.id, request_key="delta-reject")
+    step = session.get(AutonomousWorldStep, result["steps"][0]["id"])
+    batch = session.scalar(select(StateDeltaBatch).where(StateDeltaBatch.source_resolution_id.is_not(None)))
+    assert getattr(batch.status, "value", batch.status) == "REJECTED"
+    assert step.status == AutonomousStepStatus.BLOCKED and run.status == AutonomousRunStatus.BLOCKED and run.active is False
+    assert session.scalar(select(func.count(Scene.id))) == 0
+    session.refresh(world.location); assert world.location.profile == before
+
+
+def test_two_world_resolutions_keep_turn_sequence_continuous(session, world, monkeypatch):
+    class Performer:
+        def perform(self, context): return world_action_payload(world.location.id), None
+    class Resolver:
+        calls = 0
+        def resolve(self, context):
+            Resolver.calls += 1
+            predicate = f"observed_{Resolver.calls}"
+            effect = {"effect_kind": "STATE_CHANGE", "target_type": "WORLD_ENTITY", "target_id": world.location.id, "domain": "WORLD_ENTITY_PROFILE", "operation": "SET", "path": f"/profile/{predicate}", "value": True, "reason": "structured test", "evidence": {"kind": "INSPECT", "target_entity_id": world.location.id}}
+            return {"outcome": "SUCCESS", "outcome_summary": "Observed.", "objective_facts": [{"subject_type": "ENTITY", "subject_id": world.location.id, "predicate": predicate, "value": True}], "state_effects": [effect], "actor_observation": "Observed.", "public_observation": None, "canon_fact_ids_used": [], "world_entity_ids_used": [world.location.id], "resolution_basis_summary": "structured", "missing_information": []}, None
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", Performer)
+    monkeypatch.setattr("app.runtime.HeuristicWorldResolver", Resolver)
+    world.location.profile = {**(world.location.profile or {}), "observed_1": False, "observed_2": False}; session.commit()
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=1, max_turns_per_scene=2)
+    session.commit()
+    result = AutonomousWorldLoopService().advance(session, run.id, request_key="two-resolutions")
+    step = session.get(AutonomousWorldStep, result["steps"][0]["id"])
+    turns = session.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == step.performance_id).order_by(ScenePerformanceTurn.sequence)).all()
+    resolutions = session.scalars(select(WorldResolution).where(WorldResolution.performance_id == step.performance_id).order_by(WorldResolution.created_at, WorldResolution.id)).all()
+    assert [turn.sequence for turn in turns] == [1, 2]
+    assert len(resolutions) == 2 and all(getattr(item.status, "value", item.status) == "VALID" for item in resolutions)
+    assert session.get(ScenePerformance, step.performance_id).turn_count == 2
+    assert step.status == AutonomousStepStatus.COMMITTED and step.resolution_count == 2
+
+
+def test_api_baseline_block_is_durable_in_fresh_session(session, world, monkeypatch):
+    monkeypatch.setattr(api, "SessionLocal", sessionmaker(bind=session.bind, expire_on_commit=False))
+    run = create_service_run(session, world)
+    world.thread.weight = 11; session.commit()
+    response = TestClient(app).post(f"/projects/{world.project.id}/autonomy/runs/{run.id}/resume")
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "AUTONOMY_BASELINE_CHANGED"
+    with sessionmaker(bind=session.bind, expire_on_commit=False)() as fresh:
+        persisted = fresh.get(AutonomousWorldRun, run.id)
+        assert persisted.status == AutonomousRunStatus.BLOCKED and persisted.active is False and persisted.stop_reason == "AUTONOMY_BASELINE_CHANGED"
 
 
 def test_step_request_offset_distinguishes_requests(session, world):
@@ -227,8 +470,28 @@ def test_step_finalization_failure_rolls_back_scene(session, world):
     with pytest.raises(ValueError, match="AUTONOMY_SCENE_FAILED"):
         service.advance(session, run.id, request_key="finalize-fail")
     service.failure_injector = None
-    assert session.scalar(select(func.count(Scene.id))) == 0
-    assert session.get(AutonomousWorldRun, run.id).status == AutonomousRunStatus.PAUSED
+    with sessionmaker(bind=session.bind, expire_on_commit=False)() as fresh:
+        assert fresh.scalar(select(func.count(Scene.id))) == 0
+        assert fresh.scalar(select(func.count(SceneCommit.id))) == 0
+        assert fresh.scalar(select(func.count(SceneStateCheckpoint.id))) == 0
+        assert fresh.scalar(select(func.count(CharacterKnowledge.id))) == 0
+        assert fresh.scalar(select(func.count(CharacterMemory.id))) == 0
+        assert fresh.scalar(select(func.count(TimelineEvent.id))) == 0
+        assert fresh.scalar(select(func.count(CausalLink.id))) == 0
+        assert fresh.get(AutonomousWorldRun, run.id).status == AutonomousRunStatus.PAUSED
+
+
+def test_scene_commit_materialization_failure_is_atomic_in_fresh_session(session, world, monkeypatch):
+    from app.scene_commit import SceneCommitService
+    monkeypatch.setattr(SceneCommitService, "failure_injector", staticmethod(lambda stage: (_ for _ in ()).throw(RuntimeError("injected")) if stage == "AFTER_SCENE_COMMIT_MATERIALIZATION" else None))
+    run = create_service_run(session, world)
+    with pytest.raises(ValueError, match="AUTONOMY_SCENE_FAILED"):
+        AutonomousWorldLoopService().advance(session, run.id, request_key="scene-commit-fail")
+    with sessionmaker(bind=session.bind, expire_on_commit=False)() as fresh:
+        for model in (Scene, SceneCommit, SceneStateCheckpoint, CharacterKnowledge, CharacterMemory, TimelineEvent, CausalLink):
+            assert fresh.scalar(select(func.count(model.id))) == 0
+        persisted = fresh.get(AutonomousWorldRun, run.id)
+        assert persisted.status == AutonomousRunStatus.PAUSED and persisted.committed_scene_count == 0
 
 
 def test_later_failure_preserves_prior_durable_scenes(session, world):
@@ -243,7 +506,33 @@ def test_later_failure_preserves_prior_durable_scenes(session, world):
     with pytest.raises(ValueError, match="AUTONOMY_SCENE_FAILED"):
         service.advance(session, run.id, max_scenes=3, request_key="three")
     service.failure_injector = None
-    assert session.scalar(select(func.count(Scene.id))) == 2
+    with sessionmaker(bind=session.bind, expire_on_commit=False)() as fresh:
+        assert fresh.scalar(select(func.count(Scene.id))) == 2
+        steps = fresh.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal)).all()
+        assert [step.status for step in steps] == [AutonomousStepStatus.COMMITTED, AutonomousStepStatus.COMMITTED]
+        persisted = fresh.get(AutonomousWorldRun, run.id)
+        assert persisted.committed_scene_count == 2 and persisted.status == AutonomousRunStatus.PAUSED
+
+
+def test_three_scene_e2e_has_checkpoint_and_causal_continuity(session, world):
+    from app.causal_ledger import CurrentCausalLedgerAudit
+    from app.historical import CurrentHistoryCheckpointAudit
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=3, config={"stagnation_limit": 0})
+    session.commit()
+    result = AutonomousWorldLoopService().advance(session, run.id, max_scenes=3, request_key="three-success")
+    assert [item["status"] for item in result["steps"]] == ["COMMITTED", "COMMITTED", "COMMITTED"]
+    scenes = session.scalars(select(Scene).where(Scene.project_id == world.project.id, Scene.history_status == "ACTIVE").order_by(Scene.sequence)).all()
+    assert [scene.sequence for scene in scenes] == [1, 2, 3]
+    checkpoints = [session.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.scene_id == scene.id, SceneStateCheckpoint.active.is_(True))) for scene in scenes]
+    snapshots = [(session.get(WorldSnapshot, item.pre_snapshot_id), session.get(WorldSnapshot, item.post_snapshot_id)) for item in checkpoints]
+    assert snapshots[0][1].state_fingerprint == snapshots[1][0].state_fingerprint
+    assert snapshots[1][1].state_fingerprint == snapshots[2][0].state_fingerprint
+    assert snapshots[0][1].payload == snapshots[1][0].payload
+    assert snapshots[1][1].payload == snapshots[2][0].payload
+    CurrentHistoryCheckpointAudit().audit(session, world.project.id)
+    CurrentCausalLedgerAudit().audit(session, world.project.id)
+    for scene in scenes:
+        assert session.scalar(select(func.count(TimelineEvent.id)).where(TimelineEvent.scene_id == scene.id, TimelineEvent.event_type == "SCENE_OCCURRED", TimelineEvent.active.is_(True))) == 1
 
 
 def test_resume_checks_zero_commit_history_boundary(session, world):

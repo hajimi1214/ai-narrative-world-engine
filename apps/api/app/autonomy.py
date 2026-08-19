@@ -137,30 +137,63 @@ class AutonomousWorldLoopService:
         if not run: raise LookupError("AUTONOMY_RUN_NOT_FOUND")
         if max_scenes < 1 or max_scenes > 20: raise ValueError("INVALID_ADVANCE_LIMIT")
         RetconPendingReplayGuard().assert_progression_allowed(db, run.project_id)
-        existing_steps = {
-            step.request_offset: step
-            for step in db.scalars(select(AutonomousWorldStep).where(
-                AutonomousWorldStep.run_id == run.id,
-                AutonomousWorldStep.request_key == request_key,
-                AutonomousWorldStep.request_offset >= request_offset,
-                AutonomousWorldStep.request_offset < request_offset + max_scenes,
-            )).all()
-        }
-        if len(existing_steps) == max_scenes:
-            return {"run": self.run_payload(run), "steps": [self.step_payload(existing_steps[offset]) for offset in sorted(existing_steps)], "existing": bool(existing_steps)}
-        if run.status in self.terminal:
-            raise ValueError(run.stop_reason or "AUTONOMY_RUN_NOT_RUNNING")
-        if run.status == AutonomousRunStatus.CREATED:
-            run.status = AutonomousRunStatus.RUNNING; run.started_at = run.started_at or datetime.utcnow(); db.flush()
-        if run.status != AutonomousRunStatus.RUNNING: raise ValueError(run.stop_reason or "AUTONOMY_RUN_NOT_RUNNING")
         steps: list[AutonomousWorldStep] = []
-        for offset in range(request_offset, request_offset + min(max_scenes, run.scene_budget - run.committed_scene_count)):
+        any_existing = False
+        for offset in range(request_offset, request_offset + max_scenes):
+            # The previous scene transaction commits and releases its lock.
+            # Re-read all request state for every offset, including retries.
+            run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run_id).with_for_update())
+            if not run:
+                raise LookupError("AUTONOMY_RUN_NOT_FOUND")
+            db.scalar(select(Project).where(Project.id == run.project_id).with_for_update())
+            step = db.scalar(select(AutonomousWorldStep).where(
+                AutonomousWorldStep.run_id == run_id,
+                AutonomousWorldStep.request_key == request_key,
+                AutonomousWorldStep.request_offset == offset,
+            ).with_for_update())
+            if step is not None:
+                any_existing = True
+                if step.status in {AutonomousStepStatus.COMMITTED, AutonomousStepStatus.BLOCKED, AutonomousStepStatus.FAILED, AutonomousStepStatus.CANCELLED}:
+                    steps.append(step)
+                    if step.status != AutonomousStepStatus.COMMITTED:
+                        break
+                    db.commit()
+                    continue
+                if step.status == AutonomousStepStatus.PAUSED:
+                    if run.status != AutonomousRunStatus.RUNNING:
+                        steps.append(step)
+                        break
+                    try:
+                        step = self.continue_step(db, run, step)
+                    except Exception as exc:
+                        db.rollback()
+                        failed_run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run_id).with_for_update())
+                        if failed_run:
+                            failed_run.status = AutonomousRunStatus.PAUSED
+                            failed_run.active = True
+                            failed_run.stop_reason = "AUTONOMY_SCENE_FAILED"
+                            failed_run.last_error_code = str(exc)
+                            failed_run.last_error_detail = {"message": str(exc)}
+                            self._refresh_run_fingerprint(db, failed_run)
+                            db.commit()
+                        raise ValueError("AUTONOMY_SCENE_FAILED") from exc
+                    steps.append(step)
+                    db.flush(); db.commit()
+                    continue
+            if run.status in self.terminal:
+                # A clipped retry of a completed request returns its existing
+                # offsets and stops at the first offset that never existed.
+                if not steps:
+                    raise ValueError(run.stop_reason or "AUTONOMY_RUN_NOT_RUNNING")
+                break
+            if run.status == AutonomousRunStatus.CREATED:
+                run.status = AutonomousRunStatus.RUNNING; run.started_at = run.started_at or datetime.utcnow(); db.flush()
+            if run.status != AutonomousRunStatus.RUNNING:
+                raise ValueError(run.stop_reason or "AUTONOMY_RUN_NOT_RUNNING")
+            if run.committed_scene_count >= run.scene_budget:
+                break
             try:
-                step = existing_steps.get(offset)
-                if step is None:
-                    step = self.advance_one_scene(db, run, request_key, offset)
-                elif step.status != AutonomousStepStatus.COMMITTED:
-                    step = self.continue_step(db, run, step)
+                step = self.advance_one_scene(db, run, request_key, offset)
             except Exception as exc:
                 # Earlier offsets were committed already.  Roll back only this
                 # Scene's transaction, then durably record a resumable pause.
@@ -187,7 +220,7 @@ class AutonomousWorldLoopService:
         db.flush()
         if run.status in self.terminal:
             db.commit()
-        return {"run": self.run_payload(run), "steps": [self.step_payload(step) for step in steps], "existing": bool(existing_steps) and not any(offset not in existing_steps for offset in range(request_offset, request_offset + len(steps)))}
+        return {"run": self.run_payload(run), "steps": [self.step_payload(step) for step in steps], "existing": any_existing}
 
     def continue_step(self, db: Session, run: AutonomousWorldRun, step: AutonomousWorldStep) -> AutonomousWorldStep:
         """Resume a paused step without regenerating proposal/performance."""
@@ -202,6 +235,14 @@ class AutonomousWorldLoopService:
             raise ValueError("AUTONOMY_STEP_ARTIFACT_MISSING")
         if self._fingerprint(db, run.project_id)[1] != step.world_fingerprint_before and not step.scene_id:
             raise ValueError("AUTONOMY_BASELINE_CHANGED")
+        current = DirectorContextBuilder().build(db, run.project_id)
+        if current["current_history_fingerprint"] != run.current_history_fingerprint:
+            raise ValueError("AUTONOMY_BASELINE_CHANGED")
+        # Recovery adoption appends runtime audit rows while preserving the
+        # formal world/current history.  Keep the same proposal/performance,
+        # but align their derived context token with that recovered runtime.
+        proposal.context_fingerprint = current["fingerprint"]
+        performance.proposal_context_fingerprint = current["fingerprint"]
         if not self._drive_performance(db, run, step, performance, proposal):
             return step
         result = SceneCommitService().commit(db, run.project_id, performance.id)
@@ -291,7 +332,10 @@ class AutonomousWorldLoopService:
                     result = turn_runtime.step(db, run.project_id, performance, proposal)
                 except RuntimeFailure as exc:
                     step.error_code = exc.code; step.error_detail = exc.detail or {}; step.stage = "PERFORMANCE"
-                    return self._blocked(step, run, exc.code, stage="PERFORMANCE") is None
+                    run.last_error_code = exc.code
+                    run.last_error_detail = exc.detail or {}
+                    self._blocked(step, run, exc.code, stage="PERFORMANCE")
+                    return False
                 self._record_recovery(step, result.get("recovery_candidate_id"))
                 if performance.status == PerformanceStatus.RUNNING:
                     continue
@@ -300,7 +344,10 @@ class AutonomousWorldLoopService:
                     result = world_runtime.resolve(db, run.project_id, performance, proposal, run.resolver_mode)
                 except RuntimeFailure as exc:
                     step.error_code = exc.code; step.error_detail = exc.detail or {}; step.stage = "WORLD_RESOLUTION"
-                    return self._blocked(step, run, exc.code, stage="WORLD_RESOLUTION") is None
+                    run.last_error_code = exc.code
+                    run.last_error_detail = exc.detail or {}
+                    self._blocked(step, run, exc.code, stage="WORLD_RESOLUTION")
+                    return False
                 resolution = result["resolution"]
                 self._record_recovery(step, result.get("recovery_candidate_id"))
                 if resolution.status == "UNRESOLVED" or getattr(resolution.status, "value", resolution.status) == "UNRESOLVED":
