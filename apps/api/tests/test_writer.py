@@ -51,6 +51,39 @@ def writer_project(session):
     return project, actor, scene, chapter
 
 
+@pytest.fixture()
+def formal_writer_project(writer_project, session):
+    project, actor, scene, chapter = writer_project
+    hidden_actor = Character(project_id=project.id, name="Hidden Actor")
+    hidden_target = Character(project_id=project.id, name="Hidden Target")
+    session.add_all([hidden_actor, hidden_target]); session.flush()
+    scene.participants = [actor.id, hidden_actor.id, hidden_target.id]
+    proposal = SceneProposal(project_id=project.id, context_fingerprint="formal", proposal_type="CONTINUE_THREAD", participants=scene.participants, scene_goal="formal", character_motivations={}, entry_state={}, expected_progress={}, allowed_reveals=[], forbidden_reveals=[], required_canon=[], possible_outcomes=[], new_entity_requests=[], risk_flags=[], director_reasoning_summary="formal", status="EXECUTED")
+    session.add(proposal); session.flush()
+    decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=actor.id, context_fingerprint="formal", decision_type="OBSERVE", intent="observe", chosen_action="observe", motivation="observe", goal_refs=[], knowledge_used=[], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, uncertainties=[], refused_options=[], decision_summary="observe", status="VALID")
+    hidden_decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=hidden_actor.id, context_fingerprint="formal-hidden", decision_type="ACT", intent="act unseen", chosen_action="strike the glass unseen", motivation="concealed", goal_refs=[], knowledge_used=[], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, uncertainties=[], refused_options=[], decision_summary="hidden", status="VALID")
+    session.add_all([decision, hidden_decision]); session.flush()
+    performance = ScenePerformance(project_id=project.id, scene_proposal_id=proposal.id, take_number=1, proposal_context_fingerprint="formal", mode="HEURISTIC", status="COMPLETED", participant_order=scene.participants, active_participant_ids=scene.participants, max_turns=2, turn_count=2)
+    session.add(performance); session.flush()
+    turn = ScenePerformanceTurn(project_id=project.id, performance_id=performance.id, sequence=1, actor_character_id=actor.id, actor_context_fingerprint="formal", character_decision_id=decision.id, action_visibility="PUBLIC", observable_action="observe", spoken_content="I look around.", recipient_character_ids=[], requires_world_resolution=False, world_resolution_request=None, validation_result={})
+    session.add(turn); session.flush()
+    resolution = WorldResolution(project_id=project.id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode="HEURISTIC", world_context_fingerprint="formal", status="VALID", outcome="SUCCESS", outcome_summary="door opened", objective_facts=[], state_effects=[], actor_observation="I see the door open.", public_observation="The door opens.", recipient_character_ids=[], canon_fact_ids_used=[], world_entity_ids_used=[], resolution_basis_summary="formal", missing_information=[])
+    session.add(resolution); session.flush()
+    hidden_turn = ScenePerformanceTurn(project_id=project.id, performance_id=performance.id, sequence=2, actor_character_id=hidden_actor.id, actor_context_fingerprint="formal-hidden", character_decision_id=hidden_decision.id, action_visibility="COVERT", observable_action="strike the glass unseen", spoken_content=None, recipient_character_ids=[hidden_target.id], requires_world_resolution=True, world_resolution_request={"target_id": hidden_target.id}, validation_result={})
+    session.add(hidden_turn); session.flush()
+    hidden_resolution = WorldResolution(project_id=project.id, performance_id=performance.id, performance_turn_id=hidden_turn.id, resolver_mode="HEURISTIC", world_context_fingerprint="formal-hidden", status="VALID", outcome="SUCCESS", outcome_summary="glass shattered", objective_facts=[{"actor_id": hidden_actor.id, "target_id": hidden_target.id}], state_effects=[], actor_observation="I shatter the glass.", public_observation="The glass shatters.", recipient_character_ids=[hidden_target.id], canon_fact_ids_used=[], world_entity_ids_used=[], resolution_basis_summary="hidden", missing_information=[])
+    session.add(hidden_resolution); session.flush()
+    batch = StateDeltaBatch(project_id=project.id, source_type="WORLD_RESOLUTION", source_id=resolution.id, source_performance_id=performance.id, source_turn_id=turn.id, source_resolution_id=resolution.id, base_world_fingerprint="before", input_fingerprint="formal-input", status="APPLIED", derivation_version="formal", derivation_report={}, applied_scene_id=scene.id)
+    session.add(batch); session.flush()
+    delta = StateDeltaItem(project_id=project.id, batch_id=batch.id, ordinal=1, target_type="WORLD_ENTITY", target_id="door", domain="WORLD_ENTITY_PROFILE", operation="SET", path="/profile/opened", before_value=False, after_value=True, causal_reason="formal", source_turn_id=turn.id, source_resolution_id=resolution.id, evidence={}, semantic_fingerprint="formal-delta-fp")
+    session.add(delta)
+    binding = SceneExecutionBinding(project_id=project.id, scene_id=scene.id, performance_id=performance.id, active=True)
+    checkpoint = SceneStateCheckpoint(project_id=project.id, scene_id=scene.id, sequence=scene.sequence, pre_snapshot_id="formal-pre", post_snapshot_id="formal-post", current_scene_id=scene.id, capture_protocol_version=3, version=1, active=True, checkpoint_fingerprint="formal-checkpoint")
+    event = TimelineEvent(project_id=project.id, event_type="STATE_CHANGE", source_type="STATE_DELTA_ITEM", source_id="formal-delta", source_key="formal-event", scene_id=scene.id, sequence=scene.sequence, ordinal=1, origin="NORMAL_COMMIT", active=True, target_type="WORLD_ENTITY", target_id="door", path="/profile/opened", before_value=False, after_value=True, structured_payload={}, event_fingerprint="formal-event-fp")
+    session.add_all([binding, checkpoint, event]); session.flush()
+    return {"project": project, "actor": actor, "hidden_actor": hidden_actor, "hidden_target": hidden_target, "scene": scene, "chapter": chapter, "proposal": proposal, "decision": decision, "hidden_decision": hidden_decision, "performance": performance, "turn": turn, "hidden_turn": hidden_turn, "resolution": resolution, "hidden_resolution": hidden_resolution, "batch": batch, "delta": delta, "binding": binding, "checkpoint": checkpoint, "event": event}
+
+
 def response(content="The hall remains quiet.", scene_ids=None, pov_character_id=None, **extra):
     return json.dumps({"prose": content, "chapter_title": "Quiet", "scene_coverage": scene_ids or [], "source_refs": [], "pov_character_id": pov_character_id, **extra})
 
@@ -502,18 +535,41 @@ def test_public_resolution_does_not_require_recipient():
 
 
 def test_hidden_action_public_consequence_is_renderable_without_hidden_turn():
-    rows = WriterVisibilityProjector().project(visibility_scene(), WriterPOVMode.THIRD_PERSON_LIMITED, "B")
+    source = visibility_scene()[0]
+    source["participants"] = ["A", "B"]
+    source["turns"] = [source["turns"][3]]
+    source["resolutions"] = [source["resolutions"][3]]
+    rows = WriterVisibilityProjector().project([source], WriterPOVMode.THIRD_PERSON_LIMITED, "B")
     by_id = {item["id"]: item for item in rows[0]["resolutions"]}
     assert "turn-4" not in {item["id"] for item in rows[0]["turns"]}
     assert by_id["resolution-4"]["public_observation"] == "public-COVERT"
     assert by_id["resolution-4"]["renderable"] is True
+    assert "turn_id" not in by_id["resolution-4"] and "actor_character_id" not in by_id["resolution-4"]
+    assert "A" not in rows[0]["participants"]
 
 
 def test_targeted_foreign_action_public_consequence_is_renderable():
-    rows = WriterVisibilityProjector().project(visibility_scene(), WriterPOVMode.THIRD_PERSON_LIMITED, "C")
+    source = visibility_scene()[0]
+    source["participants"] = ["A", "B", "C"]
+    source["turns"] = [source["turns"][1]]
+    source["resolutions"] = [source["resolutions"][1]]
+    rows = WriterVisibilityProjector().project([source], WriterPOVMode.THIRD_PERSON_LIMITED, "C")
     by_id = {item["id"]: item for item in rows[0]["resolutions"]}
     assert "turn-2" not in {item["id"] for item in rows[0]["turns"]}
     assert by_id["resolution-2"]["public_observation"] == "public-TARGETED"
+    assert "turn_id" not in by_id["resolution-2"] and "actor_character_id" not in by_id["resolution-2"]
+
+
+def test_hidden_turn_ref_blocked_but_public_resolution_ref_allowed():
+    source = visibility_scene()[0]
+    source["participants"] = ["A", "B"]
+    source["turns"] = [source["turns"][3]]
+    source["resolutions"] = [source["resolutions"][3]]
+    rows = WriterVisibilityProjector().project([source], WriterPOVMode.THIRD_PERSON_LIMITED, "B")
+    refs = WriterContextBuilder._source_refs(rows, [])
+    ref_set = {(item["source_type"], item["source_id"]) for item in refs}
+    assert ("WORLD_RESOLUTION", "resolution-4") in ref_set
+    assert ("TURN", "turn-4") not in ref_set
 
 
 def test_limited_projection_excludes_raw_world_truth_and_refs(writer_project, session):
@@ -616,25 +672,8 @@ def test_adopt_failure_rolls_back_in_fresh_session(writer_project, session):
         assert saved_draft.status == WriterDraftStatus.VALIDATED
 
 
-def test_formal_execution_lineage_is_writer_source(writer_project, session):
-    project, actor, scene, chapter = writer_project
-    proposal = SceneProposal(project_id=project.id, context_fingerprint="formal", proposal_type="CONTINUE_THREAD", participants=[actor.id], scene_goal="formal", character_motivations={}, entry_state={}, expected_progress={}, allowed_reveals=[], forbidden_reveals=[], required_canon=[], possible_outcomes=[], new_entity_requests=[], risk_flags=[], director_reasoning_summary="formal", status="EXECUTED")
-    session.add(proposal); session.flush()
-    decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=actor.id, context_fingerprint="formal", decision_type="OBSERVE", intent="observe", chosen_action="observe", motivation="observe", goal_refs=[], knowledge_used=[], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, uncertainties=[], refused_options=[], decision_summary="observe", status="VALID")
-    session.add(decision); session.flush()
-    performance = ScenePerformance(project_id=project.id, scene_proposal_id=proposal.id, take_number=1, proposal_context_fingerprint="formal", mode="HEURISTIC", status="COMPLETED", participant_order=[actor.id], active_participant_ids=[actor.id], max_turns=1, turn_count=1)
-    session.add(performance); session.flush()
-    turn = ScenePerformanceTurn(project_id=project.id, performance_id=performance.id, sequence=1, actor_character_id=actor.id, actor_context_fingerprint="formal", character_decision_id=decision.id, action_visibility="PUBLIC", observable_action="observe", spoken_content="I look around.", recipient_character_ids=[], requires_world_resolution=False, world_resolution_request=None, validation_result={})
-    session.add(turn); session.flush()
-    resolution = WorldResolution(project_id=project.id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode="HEURISTIC", world_context_fingerprint="formal", status="VALID", outcome="SUCCESS", outcome_summary="door opened", objective_facts=[], state_effects=[], actor_observation="I see the door open.", public_observation="The door opens.", recipient_character_ids=[], canon_fact_ids_used=[], world_entity_ids_used=[], resolution_basis_summary="formal", missing_information=[])
-    session.add(resolution); session.flush()
-    batch = StateDeltaBatch(project_id=project.id, source_type="WORLD_RESOLUTION", source_id=resolution.id, source_performance_id=performance.id, source_turn_id=turn.id, source_resolution_id=resolution.id, base_world_fingerprint="before", input_fingerprint="formal-input", status="APPLIED", derivation_version="formal", derivation_report={}, applied_scene_id=scene.id)
-    session.add(batch); session.flush()
-    session.add(StateDeltaItem(project_id=project.id, batch_id=batch.id, ordinal=1, target_type="WORLD_ENTITY", target_id="door", domain="WORLD_ENTITY_PROFILE", operation="SET", path="/profile/opened", before_value=False, after_value=True, causal_reason="formal", source_turn_id=turn.id, source_resolution_id=resolution.id, evidence={}, semantic_fingerprint="formal-delta-fp"))
-    session.add(SceneExecutionBinding(project_id=project.id, scene_id=scene.id, performance_id=performance.id, active=True))
-    session.add(SceneStateCheckpoint(project_id=project.id, scene_id=scene.id, sequence=scene.sequence, pre_snapshot_id="formal-pre", post_snapshot_id="formal-post", current_scene_id=scene.id, capture_protocol_version=3, version=1, active=True, checkpoint_fingerprint="formal-checkpoint"))
-    session.add(TimelineEvent(project_id=project.id, event_type="STATE_CHANGE", source_type="STATE_DELTA_ITEM", source_id="formal-delta", source_key="formal-event", scene_id=scene.id, sequence=scene.sequence, ordinal=1, origin="NORMAL_COMMIT", active=True, target_type="WORLD_ENTITY", target_id="door", path="/profile/opened", before_value=False, after_value=True, structured_payload={}, event_fingerprint="formal-event-fp"))
-    session.flush()
+def test_formal_execution_lineage_is_writer_source(formal_writer_project, session):
+    chapter = formal_writer_project["chapter"]
     source = WriterChapterSourceBuilder().build(session, chapter.id, run_audit=False)
     row = source["scenes"][0]
     assert row["legacy_source"] is False and row["binding_id"] and row["performance_id"]
@@ -642,18 +681,27 @@ def test_formal_execution_lineage_is_writer_source(writer_project, session):
     assert row["checkpoint_id"] and row["state_changes"][0]["path"] == "/profile/opened"
 
 
-def test_formal_render_e2e_and_hidden_source_ref_rejection(writer_project, session):
-    chapter = writer_project[3]
-    provider = FakeModelProvider(response(scene_ids=chapter.source_scene_ids, source_refs=[{"source_type": "TURN", "source_id": "hidden-turn"}]))
+def test_formal_render_e2e_and_hidden_source_ref_rejection(formal_writer_project, session, monkeypatch):
+    chapter = formal_writer_project["chapter"]
+    monkeypatch.setattr("app.writer.NarrativeStructureAudit.audit", lambda *args: None)
+    provider = FakeModelProvider(response(scene_ids=[formal_writer_project["scene"].id], source_refs=[{"source_type": "TURN", "source_id": formal_writer_project["hidden_turn"].id}]))
     draft = WriterProjectionService().render(session, chapter.id, {"pov_mode": "OBJECTIVE"}, provider=provider, model="fake-writer")
     assert draft.status == WriterDraftStatus.REJECTED
     assert draft.validation_report["issues"][0]["code"] == "WRITER_SOURCE_REF_INVALID"
 
 
-def test_formal_render_prompt_contains_public_outcome_but_not_hidden_action(writer_project, session):
-    chapter = writer_project[3]
-    provider = FakeModelProvider(response(scene_ids=chapter.source_scene_ids))
+def test_formal_render_prompt_contains_public_outcome_but_not_hidden_action(formal_writer_project, session, monkeypatch):
+    chapter = formal_writer_project["chapter"]
+    monkeypatch.setattr("app.writer.NarrativeStructureAudit.audit", lambda *args: None)
+    provider = FakeModelProvider(response(scene_ids=[formal_writer_project["scene"].id], source_refs=[{"source_type": "WORLD_RESOLUTION", "source_id": formal_writer_project["hidden_resolution"].id}]))
     draft = WriterProjectionService().render(session, chapter.id, {"pov_mode": "OBJECTIVE"}, provider=provider, model="fake-writer")
     prompt = json.dumps(provider.messages)
     assert draft.status == WriterDraftStatus.VALIDATED
+    assert "The glass shatters." in prompt
     assert "before_value" not in prompt and "after_value" not in prompt
+    assert formal_writer_project["hidden_resolution"].id in prompt
+    assert formal_writer_project["hidden_turn"].id not in prompt
+    assert formal_writer_project["hidden_actor"].id not in prompt
+    assert formal_writer_project["hidden_target"].id not in prompt
+    assert formal_writer_project["hidden_actor"].name not in prompt
+    assert formal_writer_project["hidden_target"].name not in prompt

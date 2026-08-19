@@ -150,16 +150,26 @@ class WriterVisibilityProjector:
                 actor_observation = resolution.get("actor_observation") if resolution.get("actor_character_id") == pov_character_id else None
                 if not observer:
                     continue
-                resolution["actor_observation"] = None if mode == WriterPOVMode.OBJECTIVE else actor_observation
-                resolution["public_observation"] = public_observation
-                if source_visibility != "PUBLIC" and not public_observation:
-                    resolution["public_observation"] = None
-                resolution["objective_facts"] = []
-                resolution["renderable"] = bool(resolution.get("public_observation") or resolution.get("actor_observation"))
-                if resolution["renderable"] and source_visibility == "PUBLIC":
-                    safe_participants.add(resolution.get("actor_character_id"))
-                    safe_participants.update(resolution.get("recipient_character_ids") or [])
-                resolutions.append(resolution)
+                if resolution.get("turn_id") in visible_ids:
+                    safe_resolution = {
+                        "id": resolution["id"],
+                        "turn_id": resolution.get("turn_id"),
+                        "actor_character_id": resolution.get("actor_character_id"),
+                        "recipient_character_ids": sorted(resolution.get("recipient_character_ids") or []),
+                        "public_observation": public_observation,
+                        "actor_observation": None if mode == WriterPOVMode.OBJECTIVE else actor_observation,
+                        "objective_facts": [],
+                        "renderable": bool(public_observation or actor_observation),
+                    }
+                    if safe_resolution["renderable"] and source_visibility == "PUBLIC":
+                        safe_participants.add(resolution.get("actor_character_id"))
+                        safe_participants.update(resolution.get("recipient_character_ids") or [])
+                elif public_observation:
+                    # A public consequence from hidden work carries no hidden causal provenance.
+                    safe_resolution = {"id": resolution["id"], "public_observation": public_observation, "renderable": True}
+                else:
+                    safe_resolution = {"id": resolution["id"], "renderable": False}
+                resolutions.append(safe_resolution)
             scene["resolutions"] = resolutions
             # Full source retains raw world state for freshness; no POV receives it as prose authority.
             scene["state_delta_items"] = []
