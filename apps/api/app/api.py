@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -34,6 +34,7 @@ from .causal_ledger import CausalLedgerBackfillService, CausalProvenanceQuery
 from .autonomy import AutonomousWorldLoopService
 from .narrative_structure import NarrativeStructureService
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
+from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionService
 
 router = APIRouter()
 
@@ -510,6 +511,14 @@ def serialize(value: Any) -> Any:
 def record_dict(record: Any) -> dict[str, Any]:
     return {column.name: serialize(getattr(record, column.name)) for column in record.__table__.columns}
 
+def writer_draft_payload(draft: ChapterWriterDraft, *, include_content: bool = False) -> dict[str, Any]:
+    value = {"id": draft.id, "project_id": draft.project_id, "chapter_id": draft.chapter_id, "version": draft.version, "status": serialize(draft.status), "client_request_id": draft.client_request_id, "request_fingerprint": draft.request_fingerprint, "chapter_structure_fingerprint": draft.chapter_structure_fingerprint, "chapter_source_fingerprint": draft.chapter_source_fingerprint, "writer_context_fingerprint": draft.writer_context_fingerprint, "source_structure_status": draft.source_structure_status, "source_scene_ids": draft.source_scene_ids, "writing_bible_id": draft.writing_bible_id, "writing_bible_version": draft.writing_bible_version, "writing_bible_fingerprint": draft.writing_bible_fingerprint, "pov_mode": serialize(draft.pov_mode), "pov_character_id": draft.pov_character_id, "provider": draft.provider, "model": draft.model, "model_request_id": draft.model_request_id, "prompt_fingerprint": draft.prompt_fingerprint, "title_candidate": draft.title_candidate, "content_fingerprint": draft.content_fingerprint, "word_count": draft.word_count, "scene_coverage": draft.scene_coverage, "source_refs": draft.source_refs, "validation_report": draft.validation_report, "parent_draft_id": draft.parent_draft_id, "supersedes_draft_id": draft.supersedes_draft_id, "created_at": serialize(draft.created_at), "completed_at": serialize(draft.completed_at), "adopted_at": serialize(draft.adopted_at), "stale_at": serialize(draft.stale_at)}
+    if include_content:
+        value["content"] = draft.content
+        value["prose"] = draft.content
+        value["chapter_title"] = draft.title_candidate
+    return value
+
 def require_project(db: Session, project_id: str) -> Project:
     project = db.get(Project, project_id)
     if not project: raise HTTPException(status_code=404, detail="Project not found")
@@ -536,6 +545,102 @@ FORMAL_MUTATION_MODELS = {Character, WorldEntity, CanonFact, StoryThread, StoryA
 def guard_formal_mutation(db: Session, project_id: str, model: Type) -> None:
     if model in FORMAL_MUTATION_MODELS:
         ensure_replay_not_pending(db, project_id)
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/writer/preview")
+def writer_preview(project_id: str, chapter_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    chapter = db.get(Chapter, chapter_id)
+    if not chapter or chapter.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    try:
+        return WriterProjectionService().preview(db, chapter_id, (payload.model_dump() if payload else {}))
+    except WriterDomainError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/writer/render")
+def writer_render(project_id: str, chapter_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    chapter = db.get(Chapter, chapter_id)
+    if not chapter or chapter.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    values = payload.model_dump() if payload else {}
+    if values.get("idempotency_key") and not values.get("client_request_id"):
+        values["client_request_id"] = values["idempotency_key"]
+    try:
+        service = WriterProjectionService()
+        settings = get_settings()
+        route = ModelRouter().resolve(db, project_id, settings, "WRITER")
+        try:
+            writer_provider = routed_provider(settings, route)
+        except ModelProviderError as provider_error:
+            deferred_error = provider_error
+            class DeferredWriterProvider:
+                name = route.provider
+                def generate(self, messages, model):
+                    raise deferred_error
+            writer_provider = DeferredWriterProvider()
+        draft = service.render(db, chapter_id, values, provider=writer_provider, model=route.model, settings=settings)
+        db.commit(); db.refresh(draft)
+    except WriterDomainError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
+    if draft.status in {WriterDraftStatus.FAILED, WriterDraftStatus.REJECTED}:
+        raise HTTPException(status_code=409, detail={"code": (draft.validation_report or {}).get("issues", [{}])[0].get("code", "WRITER_RENDER_FAILED"), "draft_id": draft.id})
+    return writer_draft_payload(draft, include_content=True)
+
+
+@router.get("/projects/{project_id}/chapters/{chapter_id}/writer/drafts")
+def writer_drafts(project_id: str, chapter_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    chapter = db.get(Chapter, chapter_id)
+    if not chapter or chapter.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    return [writer_draft_payload(item) for item in db.scalars(select(ChapterWriterDraft).where(ChapterWriterDraft.project_id == project_id, ChapterWriterDraft.chapter_id == chapter_id).order_by(ChapterWriterDraft.version.desc(), ChapterWriterDraft.id.desc())).all()]
+
+
+@router.get("/projects/{project_id}/writer-drafts/{draft_id}")
+def writer_draft(project_id: str, draft_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    draft = db.get(ChapterWriterDraft, draft_id)
+    if not draft or draft.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Writer draft not found")
+    return writer_draft_payload(draft, include_content=True)
+
+
+@router.get("/projects/{project_id}/chapters/{chapter_id}/writer/drafts/{draft_id}")
+def writer_draft_nested(project_id: str, chapter_id: str, draft_id: str, db: Session = Depends(get_db)):
+    draft = db.get(ChapterWriterDraft, draft_id)
+    if not draft or draft.project_id != project_id or draft.chapter_id != chapter_id:
+        raise HTTPException(status_code=404, detail="Writer draft not found")
+    return writer_draft_payload(draft, include_content=True)
+
+
+@router.post("/projects/{project_id}/writer-drafts/{draft_id}/adopt")
+def writer_adopt(project_id: str, draft_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    draft = db.get(ChapterWriterDraft, draft_id)
+    if not draft or draft.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Writer draft not found")
+    values = payload.model_dump() if payload else {}
+    try:
+        chapter = WriterProjectionService().adopt(db, draft_id, force_replace_untracked=bool(values.get("force_replace_untracked", False)))
+        db.commit(); db.refresh(chapter)
+        return record_dict(chapter)
+    except WriterDomainError as exc:
+        if exc.code in {"WRITER_DRAFT_STALE", "WRITER_SOURCE_CHANGED", "WRITER_STYLE_SOURCE_CHANGED"}:
+            db.commit()
+        else:
+            db.rollback()
+        raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/writer/drafts/{draft_id}/adopt")
+def writer_adopt_nested(project_id: str, chapter_id: str, draft_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    draft = db.get(ChapterWriterDraft, draft_id)
+    if not draft or draft.project_id != project_id or draft.chapter_id != chapter_id:
+        raise HTTPException(status_code=404, detail="Writer draft not found")
+    return writer_adopt(project_id, draft_id, payload, db)
 
 @router.get("/projects")
 def list_projects(db: Session = Depends(get_db)):

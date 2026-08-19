@@ -53,6 +53,8 @@ class AutonomousStepStatus(str, enum.Enum): PENDING="PENDING"; RUNNING="RUNNING"
 class ChapterStructureStatus(str, enum.Enum): LEGACY="LEGACY"; PROVISIONAL="PROVISIONAL"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
 class NarrativeArcStatus(str, enum.Enum): OPEN="OPEN"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
 class NarrativeVolumeStatus(str, enum.Enum): OPEN="OPEN"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
+class WriterDraftStatus(str, enum.Enum): GENERATING="GENERATING"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; REJECTED="REJECTED"; FAILED="FAILED"; STALE="STALE"; SUPERSEDED="SUPERSEDED"
+class WriterPOVMode(str, enum.Enum): FIRST_PERSON="FIRST_PERSON"; THIRD_PERSON_LIMITED="THIRD_PERSON_LIMITED"; THIRD_PERSON_OMNISCIENT="THIRD_PERSON_OMNISCIENT"; OBJECTIVE="OBJECTIVE"
 class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; SCENE_COMMIT="SCENE_COMMIT"; AUTONOMOUS_LOOP="AUTONOMOUS_LOOP"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
@@ -235,6 +237,53 @@ class Chapter(Base):
     structure_fingerprint: Mapped[str | None] = mapped_column(String(120))
     boundary_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     supersedes_chapter_id: Mapped[str | None] = mapped_column(ForeignKey("chapters.id"))
+    current_writer_draft_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_writer_drafts.id"))
+    writer_content_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    writer_context_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    written_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+class ChapterWriterDraft(Base):
+    __tablename__ = "chapter_writer_drafts"
+    __table_args__ = (
+        UniqueConstraint("chapter_id", "version", name="uq_chapter_writer_draft_version"),
+        UniqueConstraint("chapter_id", "client_request_id", name="uq_chapter_writer_draft_request"),
+        Index("ix_chapter_writer_drafts_chapter_status", "chapter_id", "status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[WriterDraftStatus] = mapped_column(Enum(WriterDraftStatus, native_enum=False, length=20), default=WriterDraftStatus.GENERATING, nullable=False, index=True)
+    client_request_id: Mapped[str | None] = mapped_column(String(200))
+    request_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    chapter_structure_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    chapter_source_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    writer_context_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_structure_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    source_scene_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    source_manifest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    writing_bible_id: Mapped[str | None] = mapped_column(ForeignKey("writing_bibles.id"))
+    writing_bible_version: Mapped[int | None] = mapped_column(Integer)
+    writing_bible_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    pov_mode: Mapped[WriterPOVMode] = mapped_column(Enum(WriterPOVMode, native_enum=False, length=30), nullable=False)
+    pov_character_id: Mapped[str | None] = mapped_column(ForeignKey("characters.id"))
+    provider: Mapped[str | None] = mapped_column(String(100))
+    model: Mapped[str | None] = mapped_column(String(200))
+    model_request_id: Mapped[str | None] = mapped_column(String(200))
+    prompt_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    title_candidate: Mapped[str | None] = mapped_column(String(300))
+    content: Mapped[str | None] = mapped_column(Text)
+    content_fingerprint: Mapped[str | None] = mapped_column(String(120), index=True)
+    word_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    scene_coverage: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    source_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    validation_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    parent_draft_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_writer_drafts.id"))
+    supersedes_draft_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_writer_drafts.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    adopted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    stale_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 class NarrativeStructureRevision(Base):
     __tablename__ = "narrative_structure_revisions"
