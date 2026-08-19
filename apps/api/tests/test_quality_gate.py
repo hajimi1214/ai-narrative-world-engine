@@ -557,6 +557,7 @@ def test_repair_chain_budget_and_lineage_are_root_bounded(quality_project, sessi
     third_draft, third = QualityRepairService().repair(session, second.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Second repair.")), repair_model="repair", critic_provider=FakeModelProvider(critic_response()), critic_model="critic")
     assert second_draft.parent_draft_id == quality_project[4].id and second_draft.source_quality_assessment_id == first.id
     assert third_draft.parent_draft_id == second_draft.id and third_draft.source_quality_assessment_id == second.id and third.status.value == "PASS"
+    assert first.quality_config["resolved"]["max_repair_attempts"] == 2 and second.quality_config["resolved"]["max_repair_attempts"] == 2
     with pytest.raises(QualityDomainError, match="QUALITY_REPAIR_LIMIT_REACHED"):
         QualityRepairService().repair(session, third.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Third repair.")), repair_model="repair")
 
@@ -621,3 +622,68 @@ def test_current_approval_audit_detects_bible_freshness_change(quality_project, 
     first.active = False; session.add(AntiAIBible(project_id=project.id, version=2, active=True)); session.flush()
     with pytest.raises(QualityDomainError, match="QUALITY_APPROVAL_FRESHNESS_INVALID"):
         QualityAssessmentAudit().audit(session, assessment.id)
+
+
+def test_deterministic_only_assessment_skips_critic_and_audits(quality_project, session):
+    chapter = quality_project[3]
+    critic = FakeModelProvider(critic_response())
+    assessment = QualityGateService().assess(session, chapter.id, {"config": {"require_critic": False}}, provider=critic, model="must-not-run")
+    traces = session.scalars(select(ExecutionTrace).where(ExecutionTrace.source_id == assessment.id, ExecutionTrace.stage == "CRITIC")).all()
+    assert assessment.status.value == "PASS" and assessment.critic_report == {"skipped": True, "reason": "CRITIC_DISABLED"}
+    assert assessment.overall_score is None and assessment.critic_provider is None and assessment.critic_model is None
+    assert critic.calls == 0 and not traces and assessment.quality_config["resolved"]["require_critic"] is False
+    assert QualityAssessmentAudit().audit(session, assessment.id)["valid"]
+
+
+def test_deterministic_only_disabled_expression_requires_repair_and_never_calls_critic(quality_project, session):
+    project, _, _, chapter, _ = quality_project
+    session.add(AntiAIBible(project_id=project.id, version=1, active=True, disabled_expressions=["opens"])); session.flush()
+    critic = FakeModelProvider(critic_response())
+    assessment = QualityGateService().assess(session, chapter.id, {"config": {"require_critic": False}}, provider=critic)
+    assert assessment.status.value == "REPAIR_REQUIRED" and assessment.overall_score is None and critic.calls == 0
+    assert QualityAssessmentAudit().audit(session, assessment.id)["valid"]
+
+
+def test_deterministic_only_pass_can_be_explicitly_approved(quality_project, session):
+    chapter = quality_project[3]
+    assessment = QualityGateService().assess(session, chapter.id, {"config": {"require_critic": False}})
+    result = QualityGateService().approve(session, assessment.id)
+    assert result.status == "QUALITY_APPROVED" and result.current_quality_assessment_id == assessment.id
+
+
+def test_project_inherited_quality_config_change_marks_assessment_stale(quality_project, session, monkeypatch):
+    project, _, _, chapter, _ = quality_project
+    project.autonomy_settings = {"quality_gate": {"min_overall_score": 70}}
+    assessment = assess_pass(session, chapter)
+    assert assessment.quality_config["explicit_overrides"] == {}
+    project.autonomy_settings = {"quality_gate": {"min_overall_score": 90}}
+    freshness = QualityAssessmentFreshnessChecker().check(session, assessment, require_current=True)
+    assert not freshness["fresh"] and "QUALITY_SOURCE_CHANGED" in freshness["reasons"]
+    monkeypatch.setattr(api, "SessionLocal", sessionmaker(bind=session.bind, expire_on_commit=False))
+    current = TestClient(app).get(f"/projects/{project.id}/chapters/{chapter.id}/quality").json()
+    assert current["effective_status"] == "STALE" and current["stale"] is True
+
+
+def test_explicit_quality_override_remains_fresh_across_project_default_change(quality_project, session):
+    project, _, _, chapter, _ = quality_project
+    project.autonomy_settings = {"quality_gate": {"min_overall_score": 70}}
+    assessment = QualityGateService().assess(session, chapter.id, {"config": {"min_overall_score": 70}}, provider=FakeModelProvider(critic_response()), model="critic")
+    project.autonomy_settings = {"quality_gate": {"min_overall_score": 90}}
+    freshness = QualityAssessmentFreshnessChecker().check(session, assessment, require_current=True)
+    assert freshness["fresh"] and assessment.quality_config["explicit_overrides"] == {"min_overall_score": 70}
+
+
+def test_partial_quality_override_stales_when_other_project_setting_changes(quality_project, session):
+    project, _, _, chapter, _ = quality_project
+    project.autonomy_settings = {"quality_gate": {"min_overall_score": 70, "max_major_findings": 0}}
+    assessment = QualityGateService().assess(session, chapter.id, {"config": {"min_overall_score": 80}}, provider=FakeModelProvider(critic_response()), model="critic")
+    project.autonomy_settings = {"quality_gate": {"min_overall_score": 70, "max_major_findings": 2}}
+    assert not QualityAssessmentFreshnessChecker().check(session, assessment, require_current=True)["fresh"]
+
+
+def test_inherited_require_critic_change_stales_assessment(quality_project, session):
+    project, _, _, chapter, _ = quality_project
+    project.autonomy_settings = {"quality_gate": {"require_critic": True}}
+    assessment = assess_pass(session, chapter)
+    project.autonomy_settings = {"quality_gate": {"require_critic": False}}
+    assert not QualityAssessmentFreshnessChecker().check(session, assessment, require_current=True)["fresh"]

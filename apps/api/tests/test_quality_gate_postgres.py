@@ -47,8 +47,9 @@ def _context(self, db, chapter_id, request=None, *, draft=None, critic_provider=
     chapter = db.get(Chapter, chapter_id)
     draft = draft or db.get(ChapterWriterDraft, chapter.current_writer_draft_id)
     config = {"require_critic": True, "min_overall_score": 70, "max_major_findings": 0, "allow_minor_findings": True, "auto_repair_enabled": False, "max_repair_attempts": 1}
+    envelope = {"resolved": config, "explicit_overrides": {}, "source": {"project_quality_gate_fingerprint": _fp({"require_critic": True}, "quality-project-config-v1"), "explicit_overrides_fingerprint": _fp({}, "quality-explicit-config-v1")}}
     rules = AntiAIBibleResolver.DEFAULT.copy()
-    return {"chapter": chapter, "writer_draft": draft, "prose": draft.content, "writer_safe_context": {"source_manifest": {"scenes": []}, "renderable_source_refs": []}, "writing_rules": {"protocol": "default"}, "anti_ai_rules": rules, "anti_ai_bible": {"id": None, "version": None, "fingerprint": _fp({"version": 1, **rules}, "anti-ai-default-v1"), "rules": rules}, "quality_contract": {"formal_mutation": False}, "source_fingerprints": {}, "quality_config": config, "quality_config_fingerprint": _fp(config, "quality-config-v1"), "quality_context_fingerprint": "quality-context", "renderable_source_refs": []}
+    return {"chapter": chapter, "writer_draft": draft, "prose": draft.content, "writer_safe_context": {"source_manifest": {"scenes": []}, "renderable_source_refs": []}, "writing_rules": {"protocol": "default"}, "anti_ai_rules": rules, "anti_ai_bible": {"id": None, "version": None, "fingerprint": _fp({"version": 1, **rules}, "anti-ai-default-v1"), "rules": rules}, "quality_contract": {"formal_mutation": False}, "source_fingerprints": {}, "quality_config": envelope, "resolved_quality_config": config, "quality_config_fingerprint": _fp(config, "quality-config-v1"), "quality_context_fingerprint": "quality-context", "renderable_source_refs": []}
 
 
 def _cleanup(Session, project_id, chapter_id):
