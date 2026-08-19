@@ -348,7 +348,7 @@ def test_archive_retains_historical_rows(session, project):
 def test_revision_config_is_frozen(session, project):
     first = ingest(session, project, request={"config": {"chunk_size_chars": 42, "chunk_overlap_chars": 2}})
     project.research_settings = {"chunk_size_chars": 80, "chunk_overlap_chars": 4}
-    assert first.revision.ingestion_config["chunk_size_chars"] == 42
+    assert first.revision.ingestion_config["resolved"]["chunk_size_chars"] == 42
 
 
 def test_project_config_change_changes_search_not_old_revision(session, project):
@@ -356,7 +356,7 @@ def test_project_config_change_changes_search_not_old_revision(session, project)
     before = ResearchConfigResolver().resolve(project).model_dump()
     project.research_settings = {"top_k": 2}
     after = ResearchConfigResolver().resolve(project).model_dump()
-    assert before != after and result.revision.ingestion_config["top_k"] != after["top_k"]
+    assert before != after and "top_k" not in result.revision.ingestion_config["resolved"]
 
 
 def test_corpus_audit_rejects_document_without_active_revision(session, project):
@@ -448,3 +448,76 @@ def test_api_empty_search_returns_safe_validation_error(session, project, monkey
     monkeypatch.setattr(api, "SessionLocal", sessionmaker(bind=session.bind, expire_on_commit=False))
     response = TestClient(app).post(f"/projects/{project.id}/research/search", json={"query": ""})
     assert response.status_code == 400 and response.json()["detail"]["code"] == "RESEARCH_QUERY_EMPTY"
+
+
+@pytest.mark.parametrize("tier,kind", [("PROJECT_RESEARCH", "WEB_SNAPSHOT"), ("PROJECT_RESEARCH", "PUBLIC_KB_IMPORT")])
+def test_external_source_authority_elevation_is_rejected(session, project, tier, kind):
+    with pytest.raises(ResearchDomainError, match="RESEARCH_SOURCE_CLASSIFICATION_INVALID"):
+        ingest(session, project, source_tier=tier, source_kind=kind)
+
+
+@pytest.mark.parametrize("uri", ["https://example.test/x?token=abc", "https://example.test/x?API_KEY=abc", "source:book?access_token=abc"])
+def test_source_uri_secrets_are_rejected_without_echo(session, project, uri):
+    with pytest.raises(ResearchDomainError) as error:
+        ingest(session, project, source_uri=uri)
+    assert error.value.code in {"RESEARCH_SOURCE_URI_INVALID", "RESEARCH_SOURCE_URI_SECRET"}
+    assert "abc" not in str(error.value.detail)
+
+
+def test_invalid_tag_shape_is_rejected_at_ingest(session, project):
+    with pytest.raises(ResearchDomainError, match="RESEARCH_METADATA_INVALID"):
+        ingest(session, project, source_metadata={"tags": [{"x": 1}]})
+
+
+@pytest.mark.parametrize("filters", [{"document_ids": "not-a-list"}, {"source_tiers": ["BOGUS"]}, {"tags": [{"x": 1}]}])
+def test_invalid_filters_fail_closed(session, project, filters):
+    ingest(session, project)
+    with pytest.raises(ResearchDomainError, match="RESEARCH_FILTER_INVALID"):
+        ResearchBM25Retriever().search(session, project.id, "steam", filters=filters)
+
+
+def test_unknown_knowledge_mode_fails_closed(session, project):
+    ingest(session, project)
+    with pytest.raises(ResearchDomainError, match="RESEARCH_MODE_INVALID"):
+        KnowledgePacketBuilder().build(session, project.id, "steam", mode="WRITER")
+
+
+@pytest.mark.parametrize("setting,value", [("top_k", 20), ("bm25_k1", 2.0)])
+def test_retrieval_config_change_does_not_create_revision(session, project, setting, value):
+    first = ingest(session, project)
+    project.research_settings = {setting: value}
+    second = ResearchIngestionService().add_revision(session, first.document.id, content=first.revision.content)
+    assert second.idempotent and second.revision.id == first.revision.id
+
+
+def test_chunk_config_change_creates_revision_and_provenance(session, project):
+    first = ingest(session, project, content="steam engine " * 100)
+    project.research_settings = {"chunk_size_chars": 600, "chunk_overlap_chars": 60}
+    second = ResearchIngestionService().add_revision(session, first.document.id, content=first.revision.content)
+    assert not second.idempotent and second.revision.version == 2
+    assert second.revision.ingestion_config["resolved"]["chunk_size_chars"] == 600
+    assert second.revision.ingestion_config["source"]["project_research_settings_fingerprint"].startswith("research-project-config-v1:")
+
+
+def test_retrieval_config_changes_packet_not_corpus_fingerprint(session, project):
+    ingest(session, project)
+    corpus = ResearchCorpusFingerprintBuilder().build(session, project.id)
+    first = KnowledgePacketBuilder().build(session, project.id, "steam")
+    project.research_settings = {"top_k": 2}
+    second = KnowledgePacketBuilder().build(session, project.id, "steam")
+    assert corpus == ResearchCorpusFingerprintBuilder().build(session, project.id)
+    assert first.config_fingerprint != second.config_fingerprint
+
+
+def test_global_research_authority_rank_matches_manifest(session, project):
+    web = ingest(session, project, source_tier="WEB", source_kind="WEB_SNAPSHOT")
+    hit = ResearchBM25Retriever().search(session, project.id, "steam")[0]
+    ranks = {item["authority"]: item["rank"] for item in KnowledgeAuthorityResolver().manifest()}
+    assert hit.document_id == web.document.id and hit.authority_rank == ranks["WEB"] == 6
+
+
+def test_corpus_audit_detects_tampered_source_classification(session, project):
+    result = ingest(session, project, source_tier="WEB", source_kind="WEB_SNAPSHOT")
+    result.document.source_tier = "PROJECT_RESEARCH"
+    with pytest.raises(ResearchDomainError, match="RESEARCH_SOURCE_CLASSIFICATION_INVALID"):
+        ResearchCorpusAudit().audit(session, project.id)

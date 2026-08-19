@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, select
@@ -65,6 +65,67 @@ class ResearchConfig(BaseModel):
             raise ValueError("chunk_overlap_chars must be smaller than chunk_size_chars")
 
 
+class ResearchIngestionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chunk_size_chars: int = Field(default=1200, gt=0, le=100000)
+    chunk_overlap_chars: int = Field(default=120, ge=0)
+    tokenizer_protocol: str = "knowledge-tokenizer-v1"
+    chunker_protocol: str = "research-chunker-v1"
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.chunk_overlap_chars >= self.chunk_size_chars:
+            raise ValueError("chunk_overlap_chars must be smaller than chunk_size_chars")
+
+
+class ResearchRetrievalConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    top_k: int = Field(default=8, gt=0, le=100)
+    max_context_chars: int = Field(default=8000, gt=0, le=1000000)
+    per_document_limit: int = Field(default=3, gt=0, le=100)
+    bm25_k1: float = Field(default=1.2, gt=0, le=3)
+    bm25_b: float = Field(default=0.75, ge=0, le=1)
+    diversity_lambda: float = Field(default=0.75, ge=0, le=1)
+    deduplicate_exact: bool = True
+
+
+class ResearchFilters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    document_ids: list[str] | None = None
+    source_tiers: list[ResearchSourceTier] | None = None
+    source_kinds: list[ResearchSourceKind] | None = None
+    tags: list[str] | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        for values in (self.document_ids, self.tags):
+            if values is not None and any(not value.strip() for value in values):
+                raise ValueError("filter value is empty")
+
+
+class KnowledgeConsumerMode(str, Enum):
+    AUTHOR = "AUTHOR"
+    CHARACTER = "CHARACTER"
+    DIRECTOR = "DIRECTOR"
+    WORLD = "WORLD"
+
+
+class ResearchSourcePolicy:
+    pairs = {
+        ResearchSourceKind.MANUAL_TEXT.value: ResearchSourceTier.PROJECT_RESEARCH.value,
+        ResearchSourceKind.USER_DOCUMENT.value: ResearchSourceTier.PROJECT_RESEARCH.value,
+        ResearchSourceKind.PUBLIC_KB_IMPORT.value: ResearchSourceTier.PUBLIC_KB.value,
+        ResearchSourceKind.WEB_SNAPSHOT.value: ResearchSourceTier.WEB.value,
+    }
+
+    def validate(self, source_tier: str | ResearchSourceTier, source_kind: str | ResearchSourceKind) -> tuple[str, str]:
+        try:
+            tier, kind = ResearchSourceTier(source_tier).value, ResearchSourceKind(source_kind).value
+        except (TypeError, ValueError) as exc:
+            raise ResearchDomainError("RESEARCH_SOURCE_CLASSIFICATION_INVALID") from exc
+        if self.pairs.get(kind) != tier:
+            raise ResearchDomainError("RESEARCH_SOURCE_CLASSIFICATION_INVALID")
+        return tier, kind
+
+
 class ResearchConfigResolver:
     defaults = ResearchConfig().model_dump(mode="json")
 
@@ -106,6 +167,14 @@ class ResearchConfigResolver:
                 "explicit_overrides_fingerprint": research_fingerprint(explicit, "research-explicit-config-v1"),
             },
         }
+
+    def ingestion_envelope(self, project: Project, request: dict[str, Any] | None = None) -> dict[str, Any]:
+        full = self.envelope(project, request)
+        semantics = ResearchIngestionConfig.model_validate({key: full["resolved"][key] for key in ("chunk_size_chars", "chunk_overlap_chars")}).model_dump(mode="json")
+        return {"resolved": semantics, "explicit_overrides": {key: value for key, value in full["explicit_overrides"].items() if key in {"chunk_size_chars", "chunk_overlap_chars"}}, "source": full["source"]}
+
+    def retrieval_config(self, project: Project, request: dict[str, Any] | None = None) -> ResearchRetrievalConfig:
+        return ResearchRetrievalConfig.model_validate(self.resolve(project, request).model_dump(mode="json"))
 
 
 def resolved_research_config(value: dict[str, Any] | ResearchConfig) -> dict[str, Any]:
@@ -190,8 +259,10 @@ def _safe_source_uri(value: str | None) -> str | None:
     if parsed.scheme in {"http", "https"}:
         if not parsed.hostname or parsed.username or parsed.password:
             raise ResearchDomainError("RESEARCH_SOURCE_URI_INVALID")
+        if any(key.casefold() in _SECRET_KEYS for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
+            raise ResearchDomainError("RESEARCH_SOURCE_URI_SECRET")
         return value
-    if "://" in value or not re.fullmatch(r"[A-Za-z0-9._:/#?=&%+\-]+", value):
+    if "://" in value or not re.fullmatch(r"[A-Za-z0-9._:/#?=&%+\-]+", value) or any(key.casefold() in _SECRET_KEYS for key, _ in parse_qsl(urlparse(value).query, keep_blank_values=True)):
         raise ResearchDomainError("RESEARCH_SOURCE_URI_INVALID")
     return value
 
@@ -211,6 +282,11 @@ def _safe_metadata(value: dict[str, Any] | None, *, reject: bool = True) -> dict
                 if str(key).casefold() in _SECRET_KEYS:
                     if reject:
                         raise ResearchDomainError("RESEARCH_METADATA_SECRET")
+                    continue
+                if str(key) == "tags":
+                    if not isinstance(child, list) or any(not isinstance(tag, str) or not tag.strip() or len(tag) > 120 for tag in child):
+                        raise ResearchDomainError("RESEARCH_METADATA_INVALID")
+                    output["tags"] = sorted(set(tag.strip() for tag in child))
                     continue
                 output[str(key)] = visit(child)
             return output
@@ -271,12 +347,12 @@ class ResearchIngestionService:
             raise ResearchDomainError("RESEARCH_TITLE_REQUIRED")
         if not isinstance(content, str) or not content:
             raise ResearchDomainError("RESEARCH_CONTENT_EMPTY")
-        tier = self._enum(source_tier, ResearchSourceTier, "RESEARCH_SOURCE_TIER_INVALID")
-        kind = self._enum(source_kind, ResearchSourceKind, "RESEARCH_SOURCE_KIND_INVALID")
+        tier, kind = ResearchSourcePolicy().validate(source_tier, source_kind)
         uri = _safe_source_uri(source_uri)
         metadata = _safe_metadata(source_metadata)
-        config = ResearchConfigResolver().resolve(project, request).model_dump(mode="json")
-        config_fp = research_fingerprint(config, "research-config-v1")
+        full_config = ResearchConfigResolver().resolve(project, request).model_dump(mode="json")
+        config = ResearchConfigResolver().ingestion_envelope(project, request)
+        config_fp = research_fingerprint(config["resolved"], "research-ingestion-config-v1")
         content_fp = research_fingerprint(content, "research-document-content-v1")
         request_semantics = {"title": title, "content_fingerprint": content_fp, "source_tier": tier, "source_kind": kind, "source_uri": uri, "source_metadata": metadata, "config_fingerprint": config_fp}
         existing = db.scalar(select(ResearchDocument).where(ResearchDocument.project_id == project_id, ResearchDocument.client_request_id == client_request_id)) if client_request_id else None
@@ -292,7 +368,7 @@ class ResearchIngestionService:
         revision = ResearchDocumentRevision(project_id=project_id, document_id=document.id, version=1, active=False, content=content, content_fingerprint=content_fp, normalized_fingerprint=research_fingerprint(unicodedata.normalize("NFKC", content).strip(), "research-normalized-content-v1"), ingestion_config=config, ingestion_config_fingerprint=config_fp, supersedes_revision_id=None)
         db.add(revision)
         db.flush()
-        chunks = self._chunks(db, project_id, document.id, revision, config, metadata)
+        chunks = self._chunks(db, project_id, document.id, revision, full_config, metadata)
         self._inject("AFTER_REVISION_BEFORE_ACTIVE_SWITCH")
         revision.active = True
         db.flush()
@@ -307,8 +383,9 @@ class ResearchIngestionService:
         if not isinstance(content, str) or not content:
             raise ResearchDomainError("RESEARCH_CONTENT_EMPTY")
         project = db.get(Project, document.project_id)
-        config = ResearchConfigResolver().resolve(project, request).model_dump(mode="json")
-        config_fp = research_fingerprint(config, "research-config-v1")
+        full_config = ResearchConfigResolver().resolve(project, request).model_dump(mode="json")
+        config = ResearchConfigResolver().ingestion_envelope(project, request)
+        config_fp = research_fingerprint(config["resolved"], "research-ingestion-config-v1")
         content_fp = research_fingerprint(content, "research-document-content-v1")
         old = db.scalar(select(ResearchDocumentRevision).where(ResearchDocumentRevision.document_id == document.id, ResearchDocumentRevision.active.is_(True)).with_for_update())
         if old and old.content_fingerprint == content_fp and old.ingestion_config_fingerprint == config_fp:
@@ -319,7 +396,7 @@ class ResearchIngestionService:
         revision = ResearchDocumentRevision(project_id=document.project_id, document_id=document.id, version=version, active=False, content=content, content_fingerprint=content_fp, normalized_fingerprint=research_fingerprint(unicodedata.normalize("NFKC", content).strip(), "research-normalized-content-v1"), ingestion_config=config, ingestion_config_fingerprint=config_fp, supersedes_revision_id=old.id if old else None)
         db.add(revision)
         db.flush()
-        chunks = self._chunks(db, document.project_id, document.id, revision, config, metadata)
+        chunks = self._chunks(db, document.project_id, document.id, revision, full_config, metadata)
         self._inject("AFTER_REVISION_BEFORE_ACTIVE_SWITCH")
         if old:
             old.active = False
@@ -363,7 +440,10 @@ class ResearchRevisionAudit:
         active_count = db.scalar(select(func.count(ResearchDocumentRevision.id)).where(ResearchDocumentRevision.document_id == document.id, ResearchDocumentRevision.active.is_(True))) or 0
         if active_count > 1:
             raise ResearchDomainError("RESEARCH_ACTIVE_REVISION_INVALID")
-        if revision.version < 1 or research_fingerprint(revision.content, "research-document-content-v1") != revision.content_fingerprint or research_fingerprint(unicodedata.normalize("NFKC", revision.content).strip(), "research-normalized-content-v1") != revision.normalized_fingerprint or research_fingerprint(revision.ingestion_config, "research-config-v1") != revision.ingestion_config_fingerprint:
+        legacy = not isinstance(revision.ingestion_config, dict) or "resolved" not in revision.ingestion_config
+        config_value = resolved_research_config(revision.ingestion_config) if legacy else ResearchIngestionConfig.model_validate(revision.ingestion_config["resolved"]).model_dump(mode="json")
+        config_protocol = "research-config-v1" if legacy else "research-ingestion-config-v1"
+        if revision.version < 1 or research_fingerprint(revision.content, "research-document-content-v1") != revision.content_fingerprint or research_fingerprint(unicodedata.normalize("NFKC", revision.content).strip(), "research-normalized-content-v1") != revision.normalized_fingerprint or research_fingerprint(config_value, config_protocol) != revision.ingestion_config_fingerprint:
             raise ResearchDomainError("RESEARCH_REVISION_INTEGRITY_INVALID")
         chunks = db.scalars(select(ResearchChunk).where(ResearchChunk.revision_id == revision.id).order_by(ResearchChunk.ordinal)).all()
         if not chunks:
@@ -375,7 +455,7 @@ class ResearchRevisionAudit:
         if [item.ordinal for item in chunks] != list(range(1, len(chunks) + 1)):
             raise ResearchDomainError("RESEARCH_CHUNK_ORDER_INVALID")
         for chunk in chunks:
-            if chunk.project_id != revision.project_id or chunk.document_id != document.id or chunk.start_offset < 0 or chunk.end_offset <= chunk.start_offset or revision.content[chunk.start_offset:chunk.end_offset] != chunk.content or research_fingerprint(chunk.content, "research-chunk-content-v1") != chunk.content_fingerprint or chunk.char_count != len(chunk.content):
+            if chunk.project_id != revision.project_id or chunk.document_id != document.id or chunk.start_offset < 0 or chunk.end_offset <= chunk.start_offset or revision.content[chunk.start_offset:chunk.end_offset] != chunk.content or research_fingerprint(chunk.content, "research-chunk-content-v1") != chunk.content_fingerprint or chunk.char_count != len(chunk.content) or chunk.token_count != len(KnowledgeTokenizer().tokenize(chunk.content)):
                 raise ResearchDomainError("RESEARCH_CHUNK_INTEGRITY_INVALID")
         return {"valid": True, "revision_id": revision.id, "chunk_count": len(chunks)}
 
@@ -384,6 +464,9 @@ class ResearchCorpusAudit:
     def audit(self, db: Session, project_id: str) -> dict[str, Any]:
         documents = db.scalars(select(ResearchDocument).where(ResearchDocument.project_id == project_id, ResearchDocument.active.is_(True)).order_by(ResearchDocument.id)).all()
         for document in documents:
+            ResearchSourcePolicy().validate(document.source_tier, document.source_kind)
+            _safe_source_uri(document.source_uri)
+            _safe_metadata(document.source_metadata)
             active = db.scalar(select(ResearchDocumentRevision).where(ResearchDocumentRevision.document_id == document.id, ResearchDocumentRevision.active.is_(True)))
             if not active:
                 raise ResearchDomainError("RESEARCH_ACTIVE_REVISION_MISSING")
@@ -409,7 +492,7 @@ class ResearchHit:
     truncated: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        return {"chunk_id": self.chunk_id, "document_id": self.document_id, "revision_id": self.revision_id, "title": self.title, "source_tier": self.source_tier, "source_kind": self.source_kind, "score": self.score, "rank": self.rank, "content": self.content, "content_fingerprint": self.content_fingerprint, "source_uri": self.source_uri, "source_metadata": _safe_metadata(self.source_metadata, reject=False), "authority_rank": self.authority_rank, "untrusted_external": self.source_tier in {ResearchSourceTier.PUBLIC_KB.value, ResearchSourceTier.WEB.value}, "truncated": self.truncated}
+        return {"chunk_id": self.chunk_id, "document_id": self.document_id, "revision_id": self.revision_id, "title": self.title, "source_tier": self.source_tier, "source_kind": self.source_kind, "score": self.score, "rank": self.rank, "content": self.content, "content_fingerprint": self.content_fingerprint, "source_uri": self.source_uri, "source_metadata": _safe_metadata(self.source_metadata, reject=False), "authority_rank": self.authority_rank, "untrusted_external": self.source_kind in {ResearchSourceKind.PUBLIC_KB_IMPORT.value, ResearchSourceKind.WEB_SNAPSHOT.value}, "truncated": self.truncated}
 
 
 class ResearchDiversifier:
@@ -448,29 +531,34 @@ class ResearchDiversifier:
 
 
 class ResearchBM25Retriever:
-    authority_order = {ResearchSourceTier.PROJECT_RESEARCH.value: 0, ResearchSourceTier.PUBLIC_KB.value: 1, ResearchSourceTier.WEB.value: 2}
 
     def __init__(self, tokenizer: KnowledgeTokenizer | None = None, diversifier: ResearchDiversifier | None = None):
         self.tokenizer = tokenizer or KnowledgeTokenizer()
         self.diversifier = diversifier or ResearchDiversifier(self.tokenizer)
 
     def search(self, db: Session, project_id: str, query_text: str, *, filters: dict[str, Any] | None = None, config: ResearchConfig | dict[str, Any] | None = None, browse_mode: bool = False) -> list[ResearchHit]:
-        cfg = ResearchConfig.model_validate(config or {}) if not isinstance(config, ResearchConfig) else config
+        try:
+            cfg = ResearchConfig.model_validate(config or {}) if not isinstance(config, ResearchConfig) else config
+        except (ValidationError, ValueError, TypeError) as exc:
+            raise ResearchDomainError("RESEARCH_CONFIG_INVALID") from exc
         query_tokens = self.tokenizer.tokenize(query_text or "")
         if not query_tokens and not browse_mode:
             raise ResearchDomainError("RESEARCH_QUERY_EMPTY")
-        filters = filters or {}
-        allowed = {"document_ids", "source_tiers", "source_kinds", "tags"}
-        if set(filters) - allowed:
-            raise ResearchDomainError("RESEARCH_FILTER_INVALID")
+        try:
+            filters = ResearchFilters.model_validate(filters or {}).model_dump(mode="json", exclude_none=True)
+        except (ValidationError, ValueError, TypeError) as exc:
+            raise ResearchDomainError("RESEARCH_FILTER_INVALID") from exc
         docs = db.scalars(select(ResearchDocument).where(ResearchDocument.project_id == project_id, ResearchDocument.active.is_(True)).order_by(ResearchDocument.id)).all()
         rows: list[tuple[ResearchDocument, ResearchDocumentRevision, ResearchChunk]] = []
         for document in docs:
+            ResearchSourcePolicy().validate(document.source_tier, document.source_kind)
+            _safe_source_uri(document.source_uri)
+            _safe_metadata(document.source_metadata)
             if filters.get("document_ids") and document.id not in set(filters["document_ids"]):
                 continue
-            if filters.get("source_tiers") and _value(document.source_tier) not in {_value(item) for item in filters["source_tiers"]}:
+            if filters.get("source_tiers") and _value(document.source_tier) not in set(filters["source_tiers"]):
                 continue
-            if filters.get("source_kinds") and _value(document.source_kind) not in {_value(item) for item in filters["source_kinds"]}:
+            if filters.get("source_kinds") and _value(document.source_kind) not in set(filters["source_kinds"]):
                 continue
             revision = db.scalar(select(ResearchDocumentRevision).where(ResearchDocumentRevision.document_id == document.id, ResearchDocumentRevision.active.is_(True)))
             if not revision:
@@ -502,7 +590,7 @@ class ResearchBM25Retriever:
             if not query_tokens:
                 score = 0.0
             if score > 0 or browse_mode:
-                candidates.append({"document": document, "revision": revision, "chunk": chunk, "document_id": document.id, "ordinal": chunk.ordinal, "content": chunk.content, "content_fingerprint": chunk.content_fingerprint, "score": score, "authority_rank": self.authority_order.get(_value(document.source_tier), 99)})
+                candidates.append({"document": document, "revision": revision, "chunk": chunk, "document_id": document.id, "ordinal": chunk.ordinal, "content": chunk.content, "content_fingerprint": chunk.content_fingerprint, "score": score, "authority_rank": KnowledgeAuthorityResolver().rank(KnowledgeAuthorityResolver().for_research(document.source_tier))})
         candidates.sort(key=lambda item: (-item["score"], item["authority_rank"], item["content_fingerprint"], item["document_id"], item["ordinal"]))
         if cfg.deduplicate_exact:
             seen: set[str] = set()
@@ -580,6 +668,9 @@ class KnowledgeAuthorityResolver:
             for index, tier in enumerate(self.ordered_tiers)
         )
 
+    def rank(self, tier: KnowledgeAuthorityTier) -> int:
+        return self.ordered_tiers.index(tier)
+
 
 @dataclass(frozen=True)
 class KnowledgePacket:
@@ -606,7 +697,10 @@ class KnowledgePacketBuilder:
             raise ResearchDomainError("PROJECT_NOT_FOUND")
         envelope = ResearchConfigResolver().envelope(project, request)
         config = envelope["resolved"]
-        normalized_mode = mode.upper()
+        try:
+            normalized_mode = KnowledgeConsumerMode(mode.upper()).value
+        except (AttributeError, ValueError) as exc:
+            raise ResearchDomainError("RESEARCH_MODE_INVALID") from exc
         if normalized_mode == "CHARACTER":
             hits: list[ResearchHit] = []
             canon_refs: tuple[dict[str, Any], ...] = ()
