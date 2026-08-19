@@ -50,6 +50,9 @@ class CausalEdgeKind(str, enum.Enum): CAUSAL="CAUSAL"; TEMPORAL="TEMPORAL"; PROV
 class CausalRelationType(str, enum.Enum): KNOWLEDGE_INFORMED_DECISION="KNOWLEDGE_INFORMED_DECISION"; MEMORY_INFORMED_DECISION="MEMORY_INFORMED_DECISION"; DECISION_PRODUCED_TURN="DECISION_PRODUCED_TURN"; TURN_RESOLVED_BY="TURN_RESOLVED_BY"; RESOLUTION_PRODUCED_STATE_CHANGE="RESOLUTION_PRODUCED_STATE_CHANGE"; STATE_CHANGE_COMMITTED_IN_SCENE="STATE_CHANGE_COMMITTED_IN_SCENE"; SCENE_PRODUCED_KNOWLEDGE="SCENE_PRODUCED_KNOWLEDGE"; SCENE_PRODUCED_MEMORY="SCENE_PRODUCED_MEMORY"; CANON_CONSTRAINED_RESOLUTION="CANON_CONSTRAINED_RESOLUTION"; WORLD_ENTITY_CONTEXT_FOR_RESOLUTION="WORLD_ENTITY_CONTEXT_FOR_RESOLUTION"; SCENE_PRECEDES_SCENE="SCENE_PRECEDES_SCENE"; RETCON_TRIGGERED_REPLAY="RETCON_TRIGGERED_REPLAY"; REPLAY_REPLACED_SCENE="REPLAY_REPLACED_SCENE"
 class AutonomousRunStatus(str, enum.Enum): CREATED="CREATED"; RUNNING="RUNNING"; PAUSED="PAUSED"; BLOCKED="BLOCKED"; COMPLETED="COMPLETED"; FAILED="FAILED"; CANCELLED="CANCELLED"
 class AutonomousStepStatus(str, enum.Enum): PENDING="PENDING"; RUNNING="RUNNING"; PAUSED="PAUSED"; COMMITTED="COMMITTED"; BLOCKED="BLOCKED"; FAILED="FAILED"; CANCELLED="CANCELLED"
+class ChapterStructureStatus(str, enum.Enum): LEGACY="LEGACY"; PROVISIONAL="PROVISIONAL"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
+class NarrativeArcStatus(str, enum.Enum): OPEN="OPEN"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
+class NarrativeVolumeStatus(str, enum.Enum): OPEN="OPEN"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
 class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; SCENE_COMMIT="SCENE_COMMIT"; AUTONOMOUS_LOOP="AUTONOMOUS_LOOP"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
@@ -214,6 +217,7 @@ class Scene(Base):
 
 class Chapter(Base):
     __tablename__ = "chapters"
+    __table_args__ = (Index("uq_chapter_project_active_number", "project_id", "number", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
     number: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -223,6 +227,91 @@ class Chapter(Base):
     word_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     quality_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="DRAFT", nullable=False)
+    structure_revision_id: Mapped[str | None] = mapped_column(ForeignKey("narrative_structure_revisions.id"))
+    active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    structure_status: Mapped[ChapterStructureStatus] = mapped_column(Enum(ChapterStructureStatus, native_enum=False, length=20), default=ChapterStructureStatus.LEGACY, nullable=False)
+    start_sequence: Mapped[int | None] = mapped_column(Integer)
+    end_sequence: Mapped[int | None] = mapped_column(Integer)
+    structure_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    boundary_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    supersedes_chapter_id: Mapped[str | None] = mapped_column(ForeignKey("chapters.id"))
+
+class NarrativeStructureRevision(Base):
+    __tablename__ = "narrative_structure_revisions"
+    __table_args__ = (Index("uq_narrative_structure_revision_project_active", "project_id", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    protocol_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    source_history_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_max_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    config_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    rebuild_from_sequence: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    structure_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+class ChapterSceneBinding(Base):
+    __tablename__ = "chapter_scene_bindings"
+    __table_args__ = (UniqueConstraint("chapter_id", "ordinal", name="uq_chapter_scene_binding_ordinal"), UniqueConstraint("chapter_id", "scene_id", name="uq_chapter_scene_binding_scene"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id"), nullable=False, index=True)
+    scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    scene_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+
+class NarrativeArc(Base):
+    __tablename__ = "narrative_arcs"
+    __table_args__ = (Index("uq_narrative_arc_project_active_number", "project_id", "number", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    structure_revision_id: Mapped[str] = mapped_column(ForeignKey("narrative_structure_revisions.id"), nullable=False, index=True)
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    status: Mapped[NarrativeArcStatus] = mapped_column(Enum(NarrativeArcStatus, native_enum=False, length=20), default=NarrativeArcStatus.OPEN, nullable=False)
+    start_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    dominant_thread_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    supporting_thread_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    structure_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    structure_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    supersedes_arc_id: Mapped[str | None] = mapped_column(ForeignKey("narrative_arcs.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class NarrativeArcChapterBinding(Base):
+    __tablename__ = "narrative_arc_chapter_bindings"
+    __table_args__ = (UniqueConstraint("narrative_arc_id", "ordinal", name="uq_narrative_arc_chapter_ordinal"), UniqueConstraint("narrative_arc_id", "chapter_id", name="uq_narrative_arc_chapter_chapter"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    narrative_arc_id: Mapped[str] = mapped_column(ForeignKey("narrative_arcs.id"), nullable=False, index=True)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+
+class NarrativeVolume(Base):
+    __tablename__ = "narrative_volumes"
+    __table_args__ = (Index("uq_narrative_volume_project_active_number", "project_id", "number", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    structure_revision_id: Mapped[str] = mapped_column(ForeignKey("narrative_structure_revisions.id"), nullable=False, index=True)
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(200))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    status: Mapped[NarrativeVolumeStatus] = mapped_column(Enum(NarrativeVolumeStatus, native_enum=False, length=20), default=NarrativeVolumeStatus.OPEN, nullable=False)
+    start_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    dominant_thread_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    structure_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    structure_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    supersedes_volume_id: Mapped[str | None] = mapped_column(ForeignKey("narrative_volumes.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class NarrativeVolumeArcBinding(Base):
+    __tablename__ = "narrative_volume_arc_bindings"
+    __table_args__ = (UniqueConstraint("volume_id", "ordinal", name="uq_narrative_volume_arc_ordinal"), UniqueConstraint("volume_id", "narrative_arc_id", name="uq_narrative_volume_arc_arc"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    volume_id: Mapped[str] = mapped_column(ForeignKey("narrative_volumes.id"), nullable=False, index=True)
+    narrative_arc_id: Mapped[str] = mapped_column(ForeignKey("narrative_arcs.id"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
 
 class RevealConstraint(TimestampMixin, Base):
     __tablename__ = "reveal_constraints"

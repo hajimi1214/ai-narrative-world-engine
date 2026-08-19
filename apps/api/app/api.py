@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -32,6 +32,7 @@ from .state_delta_validation import StateDeltaValidator
 from .scene_commit import SceneCommitService
 from .causal_ledger import CausalLedgerBackfillService, CausalProvenanceQuery
 from .autonomy import AutonomousWorldLoopService
+from .narrative_structure import NarrativeStructureService
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
 
 router = APIRouter()
@@ -740,6 +741,45 @@ def director_gravity(project_id: str, db: Session = Depends(get_db)):
     gravity = StoryGravityEngine().build(gravity_context)
     candidates = DirectorCandidateEngine().generate(gravity_context, gravity)
     return {**gravity.as_dict(), "ranked_candidate_seeds": [candidate.as_dict() for candidate in DirectorCandidateEngine().top_diverse(candidates)]}
+
+
+@router.post("/projects/{project_id}/narrative-structure/preview")
+def preview_narrative_structure(project_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    data = payload.model_dump(exclude_unset=True) if payload else {}
+    try:
+        result = NarrativeStructureService().preview(db, project_id, data.get("config"))
+    except ValueError as exc:
+        code = str(exc)
+        raise HTTPException(status_code=422 if code == "INVALID_NARRATIVE_STRUCTURE_CONFIG" else 409, detail={"code": code}) from exc
+    pending = has_pending_replay(db, project_id)
+    return result | {"pending_replay": pending, "warning": "RETCON_REPLAY_REQUIRED" if pending else None}
+
+
+@router.post("/projects/{project_id}/narrative-structure/sync")
+def sync_narrative_structure(project_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    data = payload.model_dump(exclude_unset=True) if payload else {}
+    try:
+        revision, idempotent = NarrativeStructureService().sync(db, project_id, data.get("config"), data.get("expected_source_fingerprint"))
+        db.commit(); db.refresh(revision)
+        return NarrativeStructureService().payload(db, revision) | {"idempotent": idempotent, "stale": False, "source_fingerprint": revision.source_history_fingerprint}
+    except ValueError as exc:
+        db.rollback(); code = str(exc)
+        raise HTTPException(status_code=422 if code == "INVALID_NARRATIVE_STRUCTURE_CONFIG" else 409, detail={"code": code}) from exc
+
+
+@router.get("/projects/{project_id}/narrative-structure")
+def get_narrative_structure(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return NarrativeStructureService().current(db, project_id)
+
+
+@router.get("/projects/{project_id}/narrative-structure/revisions")
+def list_narrative_structure_revisions(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    rows = db.scalars(select(NarrativeStructureRevision).where(NarrativeStructureRevision.project_id == project_id).order_by(NarrativeStructureRevision.created_at.desc(), NarrativeStructureRevision.id.desc())).all()
+    return [NarrativeStructureService.revision_metadata(item) for item in rows]
 
 
 @router.post("/projects/{project_id}/autonomous-runs", status_code=status.HTTP_201_CREATED)
