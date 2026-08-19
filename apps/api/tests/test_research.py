@@ -521,3 +521,47 @@ def test_corpus_audit_detects_tampered_source_classification(session, project):
     result.document.source_tier = "PROJECT_RESEARCH"
     with pytest.raises(ResearchDomainError, match="RESEARCH_SOURCE_CLASSIFICATION_INVALID"):
         ResearchCorpusAudit().audit(session, project.id)
+
+
+def test_retrieval_config_projects_only_retrieval_fields(project):
+    project.research_settings = {"top_k": 3, "bm25_k1": 1.8, "chunk_size_chars": 600}
+    config = ResearchConfigResolver().retrieval_config(project)
+    assert config.top_k == 3 and config.bm25_k1 == 1.8
+    assert "chunk_size_chars" not in config.model_dump()
+
+
+def test_ingestion_envelope_excludes_retrieval_fields(project):
+    project.research_settings = {"top_k": 3, "bm25_k1": 1.8, "chunk_size_chars": 600}
+    resolved = ResearchConfigResolver().ingestion_envelope(project)["resolved"]
+    assert set(resolved) == {"chunk_size_chars", "chunk_overlap_chars", "tokenizer_protocol", "chunker_protocol"}
+
+
+def test_retriever_accepts_first_class_retrieval_config(session, project):
+    ingest(session, project)
+    config = ResearchConfigResolver().retrieval_config(project)
+    assert ResearchBM25Retriever().search(session, project.id, "steam", config=config)
+
+
+def test_chunk_only_project_setting_does_not_change_retrieval_fingerprint(session, project):
+    ingest(session, project)
+    before = KnowledgePacketBuilder().build(session, project.id, "steam").config_fingerprint
+    project.research_settings = {"chunk_size_chars": 600}
+    after = KnowledgePacketBuilder().build(session, project.id, "steam").config_fingerprint
+    assert before == after
+
+
+@pytest.mark.parametrize("key", ["auth_token", "credential", "signature", "sig", "X-Amz-Signature", "X-Goog-Signature", "API-Key", "access.token"])
+def test_uri_secret_key_canonicalization_rejects_variants(session, project, key):
+    with pytest.raises(ResearchDomainError, match="RESEARCH_SOURCE_URI_SECRET"):
+        ingest(session, project, source_uri=f"https://example.test/a?{key}=hidden-value")
+
+
+def test_safe_uri_query_params_remain_allowed(session, project):
+    result = ingest(session, project, source_uri="https://example.test/a?page=2&lang=zh&version=1&id=abc")
+    assert result.document.source_uri.endswith("id=abc")
+
+
+@pytest.mark.parametrize("key", ["auth_token", "credential", "signature", "x_amz_signature"])
+def test_metadata_secret_key_canonicalization_rejects_variants(session, project, key):
+    with pytest.raises(ResearchDomainError, match="RESEARCH_METADATA_SECRET"):
+        ingest(session, project, source_metadata={key: "hidden-value"})

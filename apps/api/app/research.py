@@ -65,6 +65,12 @@ class ResearchConfig(BaseModel):
             raise ValueError("chunk_overlap_chars must be smaller than chunk_size_chars")
 
 
+RETRIEVAL_CONFIG_FIELDS = (
+    "top_k", "max_context_chars", "per_document_limit", "bm25_k1", "bm25_b",
+    "diversity_lambda", "deduplicate_exact",
+)
+
+
 class ResearchIngestionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     chunk_size_chars: int = Field(default=1200, gt=0, le=100000)
@@ -174,7 +180,8 @@ class ResearchConfigResolver:
         return {"resolved": semantics, "explicit_overrides": {key: value for key, value in full["explicit_overrides"].items() if key in {"chunk_size_chars", "chunk_overlap_chars"}}, "source": full["source"]}
 
     def retrieval_config(self, project: Project, request: dict[str, Any] | None = None) -> ResearchRetrievalConfig:
-        return ResearchRetrievalConfig.model_validate(self.resolve(project, request).model_dump(mode="json"))
+        resolved = self.resolve(project, request).model_dump(mode="json")
+        return ResearchRetrievalConfig.model_validate({key: resolved[key] for key in RETRIEVAL_CONFIG_FIELDS})
 
 
 def resolved_research_config(value: dict[str, Any] | ResearchConfig) -> dict[str, Any]:
@@ -184,6 +191,18 @@ def resolved_research_config(value: dict[str, Any] | ResearchConfig) -> dict[str
         raw = value.get("resolved") if isinstance(value, dict) and "resolved" in value else value
         return ResearchConfig.model_validate(raw).model_dump(mode="json")
     except (AttributeError, ValidationError) as exc:
+        raise ResearchDomainError("RESEARCH_CONFIG_INVALID") from exc
+
+
+def normalize_retrieval_config(value: ResearchRetrievalConfig | ResearchConfig | dict[str, Any] | None = None) -> ResearchRetrievalConfig:
+    if isinstance(value, ResearchRetrievalConfig):
+        return value
+    if isinstance(value, ResearchConfig):
+        value = value.model_dump(mode="json")
+    try:
+        raw = value.get("resolved") if isinstance(value, dict) and "resolved" in value else (value or {})
+        return ResearchRetrievalConfig.model_validate({key: raw[key] for key in RETRIEVAL_CONFIG_FIELDS if key in raw})
+    except (AttributeError, ValidationError, ValueError, TypeError) as exc:
         raise ResearchDomainError("RESEARCH_CONFIG_INVALID") from exc
 
 
@@ -259,15 +278,23 @@ def _safe_source_uri(value: str | None) -> str | None:
     if parsed.scheme in {"http", "https"}:
         if not parsed.hostname or parsed.username or parsed.password:
             raise ResearchDomainError("RESEARCH_SOURCE_URI_INVALID")
-        if any(key.casefold() in _SECRET_KEYS for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
+        if any(normalize_secret_key(key) in _SECRET_KEYS for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
             raise ResearchDomainError("RESEARCH_SOURCE_URI_SECRET")
         return value
-    if "://" in value or not re.fullmatch(r"[A-Za-z0-9._:/#?=&%+\-]+", value) or any(key.casefold() in _SECRET_KEYS for key, _ in parse_qsl(urlparse(value).query, keep_blank_values=True)):
+    if "://" in value or not re.fullmatch(r"[A-Za-z0-9._:/#?=&%+\-]+", value) or any(normalize_secret_key(key) in _SECRET_KEYS for key, _ in parse_qsl(urlparse(value).query, keep_blank_values=True)):
         raise ResearchDomainError("RESEARCH_SOURCE_URI_INVALID")
     return value
 
 
-_SECRET_KEYS = {"password", "passwd", "token", "api_key", "apikey", "authorization", "secret", "access_token"}
+_SECRET_KEYS = {
+    "password", "passwd", "token", "apikey", "accesstoken", "authorization",
+    "authtoken", "secret", "credential", "credentials", "signature", "sig",
+    "xamzsignature", "xgoogsignature",
+}
+
+
+def normalize_secret_key(value: Any) -> str:
+    return re.sub(r"[-_.\s]", "", str(value).strip().casefold())
 
 
 def _safe_metadata(value: dict[str, Any] | None, *, reject: bool = True) -> dict[str, Any]:
@@ -279,7 +306,7 @@ def _safe_metadata(value: dict[str, Any] | None, *, reject: bool = True) -> dict
         if isinstance(item, dict):
             output: dict[str, Any] = {}
             for key, child in item.items():
-                if str(key).casefold() in _SECRET_KEYS:
+                if normalize_secret_key(key) in _SECRET_KEYS:
                     if reject:
                         raise ResearchDomainError("RESEARCH_METADATA_SECRET")
                     continue
@@ -504,7 +531,7 @@ class ResearchDiversifier:
         return len(a & b) / len(a | b) if a | b else 0.0
 
     def select(self, candidates: list[dict[str, Any]], config: ResearchConfig | dict[str, Any]) -> list[dict[str, Any]]:
-        cfg = ResearchConfig.model_validate(config) if not isinstance(config, ResearchConfig) else config
+        cfg = normalize_retrieval_config(config)
         remaining = list(candidates)
         selected: list[dict[str, Any]] = []
         counts: dict[str, int] = {}
@@ -538,9 +565,9 @@ class ResearchBM25Retriever:
 
     def search(self, db: Session, project_id: str, query_text: str, *, filters: dict[str, Any] | None = None, config: ResearchConfig | dict[str, Any] | None = None, browse_mode: bool = False) -> list[ResearchHit]:
         try:
-            cfg = ResearchConfig.model_validate(config or {}) if not isinstance(config, ResearchConfig) else config
-        except (ValidationError, ValueError, TypeError) as exc:
-            raise ResearchDomainError("RESEARCH_CONFIG_INVALID") from exc
+            cfg = normalize_retrieval_config(config)
+        except ResearchDomainError:
+            raise
         query_tokens = self.tokenizer.tokenize(query_text or "")
         if not query_tokens and not browse_mode:
             raise ResearchDomainError("RESEARCH_QUERY_EMPTY")
@@ -695,8 +722,9 @@ class KnowledgePacketBuilder:
         project = db.get(Project, project_id)
         if not project:
             raise ResearchDomainError("PROJECT_NOT_FOUND")
-        envelope = ResearchConfigResolver().envelope(project, request)
-        config = envelope["resolved"]
+        resolver_config = ResearchConfigResolver()
+        envelope = resolver_config.envelope(project, request)
+        config = resolver_config.retrieval_config(project, request)
         try:
             normalized_mode = KnowledgeConsumerMode(mode.upper()).value
         except (AttributeError, ValueError) as exc:
@@ -748,7 +776,7 @@ class KnowledgePacketBuilder:
             for hit in hits
         )
         corpus_fingerprint = ResearchCorpusFingerprintBuilder().build(db, project_id)
-        config_fingerprint = research_fingerprint(config, "research-config-v1")
+        config_fingerprint = research_fingerprint(config.model_dump(mode="json"), "research-retrieval-config-v1")
         query_fingerprint = research_fingerprint(query_text, "knowledge-query-v1")
         hit_values = tuple(hit.as_dict() for hit in hits)
         packet_fingerprint = research_fingerprint(
