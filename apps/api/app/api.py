@@ -692,17 +692,25 @@ def director_dry_run(project_id: str, db: Session = Depends(get_db)):
     context = DirectorContextBuilder().build(db, project_id)
     gravity_context = StoryGravityContextBuilder().build(db, project_id)
     gravity = StoryGravityEngine().build(gravity_context)
-    candidates = DirectorCandidateEngine().generate(gravity_context, gravity)
-    selected = DirectorCandidateEngine().select(candidates)
-    if not selected:
+    engine = DirectorCandidateEngine()
+    candidates = engine.generate(gravity_context, gravity)
+    checker = DirectorConstraintChecker()
+    selected = None
+    report = None
+    for candidate in candidates:
+        transient = SceneProposal(project_id=project_id, context_fingerprint=context["fingerprint"], **DirectorProposalFactory().create(project_id, gravity_context, gravity, candidate))
+        candidate_report = checker.validate(db, context, transient)
+        if candidate_report.valid:
+            selected, report = candidate, candidate_report
+            break
+    if not selected or not report:
         raise HTTPException(status_code=409, detail={"code": "NO_VALID_DIRECTOR_CANDIDATE"})
     proposal = SceneProposal(project_id=project_id, context_fingerprint=context["fingerprint"], **DirectorProposalFactory().create(project_id, gravity_context, gravity, selected))
-    report = DirectorConstraintChecker().validate(db, context, proposal)
-    proposal.status = ProposalStatus.VALID if report.valid else ProposalStatus.REJECTED
+    proposal.status = ProposalStatus.VALID
     db.add(proposal)
     log = DirectorDecisionLog(project_id=project_id, context_version=context["version"], proposal_id=proposal.id, decision_type=DecisionType.DRY_RUN, brief_reason=proposal.director_reasoning_summary, validation_result=report.as_dict())
     db.add(log); db.commit(); db.refresh(proposal)
-    return {"context_summary": context_summary(context), "gravity_summary": gravity.as_dict(), "selected_candidate": selected.as_dict(), "candidate_seeds": [candidate.as_dict() for candidate in candidates[:3]], "proposal": record_dict(proposal), "validation_report": report.as_dict()}
+    return {"context_summary": context_summary(context), "gravity_summary": gravity.as_dict(), "selected_candidate": selected.as_dict(), "candidate_seeds": [candidate.as_dict() for candidate in engine.top_diverse(candidates)], "proposal": record_dict(proposal), "validation_report": report.as_dict()}
 
 @router.get("/projects/{project_id}/director/gravity")
 def director_gravity(project_id: str, db: Session = Depends(get_db)):
@@ -710,7 +718,7 @@ def director_gravity(project_id: str, db: Session = Depends(get_db)):
     gravity_context = StoryGravityContextBuilder().build(db, project_id)
     gravity = StoryGravityEngine().build(gravity_context)
     candidates = DirectorCandidateEngine().generate(gravity_context, gravity)
-    return {**gravity.as_dict(), "ranked_candidate_seeds": [candidate.as_dict() for candidate in candidates[:3]]}
+    return {**gravity.as_dict(), "ranked_candidate_seeds": [candidate.as_dict() for candidate in DirectorCandidateEngine().top_diverse(candidates)]}
 
 @router.post("/projects/{project_id}/director/ai-dry-run")
 def director_ai_dry_run(project_id: str, db: Session = Depends(get_db)):

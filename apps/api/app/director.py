@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .models import AntiAIBible, CanonFact, CanonType, Character, CharacterKnowledge, CharacterMemory, EntityType, KnowledgeStatus, Project, ProposalStatus, ProposalType, RevealConstraint, RevealStatus, Scene, SceneProposal, SceneStatus, SceneExecutionBinding, ScenePerformance, StoryArc, StoryThread, ThreadStatus, TimelineEvent, TimelineEventType, CausalLink, CausalResourceType, CausalRelationType, WorldEntity, WritingBible
-from .character_mind import ActiveCharacterCognitionReader
+from .character_mind import ActiveCharacterCognitionReader, CharacterBeliefViewBuilder
 
 RECENT_SCENE_LIMIT = 10
 
@@ -51,6 +51,10 @@ class StoryGravityWeights:
     overuse: float = 0.45
     belief_conflict: float = 0.5
     freshness: float = 0.4
+    proposal_type_repetition: float = 0.6
+    thread_candidate_repetition: float = 0.6
+    participant_repetition: float = 0.35
+    location_repetition: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,7 @@ class StoryGravityCandidate:
     reason_codes: tuple[str, ...] = ()
     expected_progress: dict[str, Any] = field(default_factory=dict)
     reveal_ids: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {"candidate_key": self.candidate_key, "proposal_type": self.proposal_type,
@@ -75,7 +80,7 @@ class StoryGravityCandidate:
                 "location_id": self.location_id, "focus_type": self.focus_type, "focus_ids": list(self.focus_ids),
                 "pressure_kind": self.pressure_kind, "score_components": self.score_components,
                 "score": self.score, "reason_codes": list(self.reason_codes),
-                "expected_progress": self.expected_progress, "reveal_ids": list(self.reveal_ids)}
+                "expected_progress": self.expected_progress, "reveal_ids": list(self.reveal_ids), "evidence": self.evidence}
 
 
 @dataclass
@@ -118,10 +123,12 @@ class StoryGravityContextBuilder:
         locations = session.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True), WorldEntity.entity_type == EntityType.LOCATION).order_by(WorldEntity.id)).all()
         signatures = [self._signature(session, scene) for scene in scenes[-RECENT_SCENE_LIMIT:]]
         knowledge = []
+        knowledge_rows_by_character = {}
         memories = []
         for character in characters:
             rows = ActiveCharacterCognitionReader().knowledge(session, project_id, character.id)
-            knowledge.extend({"knowledge_id": row.id, "character_id": character.id, "status": getattr(row.status, "value", row.status), "confidence": row.confidence, "fact_identity": row.proposition} for row in rows)
+            knowledge_rows_by_character[character.id] = rows
+            knowledge.extend({"knowledge_id": row.id, "character_id": character.id, "status": getattr(row.status, "value", row.status), "confidence": row.confidence, "proposition": row.proposition, "fact_identity": row.proposition} for row in rows)
             memories.extend({"memory_id": row.id, "character_id": character.id, "importance": row.importance, "emotional_weight": row.emotional_weight} for row in ActiveCharacterCognitionReader().memories(session, project_id, character.id))
         reveal = []
         for constraint in session.scalars(select(RevealConstraint).where(RevealConstraint.project_id == project_id).order_by(RevealConstraint.id)).all():
@@ -133,7 +140,7 @@ class StoryGravityContextBuilder:
             key = (event.target_type, event.target_id, event.path)
             if key not in current_events or (event.sequence or -1, event.ordinal or -1, event.id) > (current_events[key].sequence or -1, current_events[key].ordinal or -1, current_events[key].id):
                 current_events[key] = event
-        state_changes = [{"id": event.id, "sequence": event.sequence, "ordinal": event.ordinal, "target_type": event.target_type, "target_id": event.target_id, "path": event.path, "event_fingerprint": event.event_fingerprint} for event in current_events.values()]
+        state_changes = [{"id": event.id, "sequence": event.sequence, "ordinal": event.ordinal, "scene_id": event.scene_id, "target_type": event.target_type, "target_id": event.target_id, "path": event.path, "before_value": event.before_value, "after_value": event.after_value, "event_fingerprint": event.event_fingerprint} for event in current_events.values()]
         state_changes.sort(key=lambda item: (item["sequence"] or -1, item["ordinal"] or -1, item["target_type"] or "", item["target_id"] or "", item["path"] or ""))
         links = session.scalars(select(CausalLink).where(CausalLink.project_id == project_id, CausalLink.active.is_(True)).order_by(CausalLink.link_fingerprint, CausalLink.id)).all()
         valid_links = []
@@ -146,7 +153,7 @@ class StoryGravityContextBuilder:
                         endpoints_valid = False
             if endpoints_valid:
                 valid_links.append(link)
-        return StoryGravityContext({"protocol_version": "story-gravity-context-v1", "project": {"id": project.id, "story_seed": project.story_seed, "autonomy_settings": project.autonomy_settings}, "current_sequence": current_sequence, "scenes": [self._scene(scene) for scene in scenes], "recent_scene_signatures": signatures, "characters": [self._character(character, knowledge) for character in characters], "story_threads": [self._thread(thread) for thread in threads], "story_arc": self._arc(arc), "locations": [{"id": row.id, "name": row.name} for row in locations], "knowledge": sorted(knowledge, key=lambda item: (item["character_id"], item["knowledge_id"])), "memories": sorted(memories, key=lambda item: (item["character_id"], item["memory_id"])), "state_changes": state_changes, "causal_links": [{"id": link.id, "fingerprint": link.link_fingerprint, "scene_id": link.scene_id, "sequence": link.sequence} for link in valid_links], "reveals": reveal})
+        return StoryGravityContext({"protocol_version": "story-gravity-context-v1", "project": {"id": project.id, "story_seed": project.story_seed, "autonomy_settings": project.autonomy_settings}, "current_sequence": current_sequence, "scenes": [self._scene(scene) for scene in scenes], "recent_scene_signatures": signatures, "characters": [self._character(character, knowledge_rows_by_character.get(character.id, [])) for character in characters], "story_threads": [self._thread(thread) for thread in threads], "story_arc": self._arc(arc), "locations": [{"id": row.id, "name": row.name} for row in locations], "knowledge": sorted(knowledge, key=lambda item: (item["character_id"], item["knowledge_id"])), "memories": sorted(memories, key=lambda item: (item["character_id"], item["memory_id"])), "state_changes": state_changes, "causal_links": [{"id": link.id, "fingerprint": link.link_fingerprint, "scene_id": link.scene_id, "sequence": link.sequence} for link in valid_links], "reveals": reveal})
 
     def _signature(self, session, scene):
         binding = session.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
@@ -155,12 +162,9 @@ class StoryGravityContextBuilder:
         return {"scene_id": scene.id, "sequence": scene.sequence, "proposal_type": getattr(proposal.proposal_type, "value", proposal.proposal_type) if proposal else None, "primary_thread_id": proposal.primary_thread_id if proposal else None, "participants": sorted(str(value) for value in (proposal.participants if proposal else scene.participants or [])), "location_id": proposal.location_id if proposal else scene.location}
     def _scene(self, scene): return {"id": scene.id, "sequence": scene.sequence, "location_id": scene.location, "participants": sorted(str(value) for value in scene.participants or []), "story_threads": sorted(str(value) for value in scene.story_threads or [])}
     def _character(self, character, knowledge=None):
-        rows = [row for row in (knowledge or []) if row["character_id"] == character.id]
-        grouped = {}
-        for row in rows:
-            grouped.setdefault((row["fact_identity"].split(":", 1)[0], row["fact_identity"]), []).append(row["knowledge_id"])
-        conflicts = [sorted(ids) for ids in grouped.values() if len(ids) > 1]
-        return {"id": character.id, "narrative_relevance": (character.narrative_relevance or {}).get("score", 0), "location_id": (character.current_state or {}).get("location_id", (character.current_state or {}).get("location")), "has_goal": bool(character.goals), "goal_refs": sorted(str(key) for key in (character.goals or {}).keys()), "goals": character.goals or {}, "current_state": character.current_state or {}, "physical_state": character.physical_state or {}, "emotional_state": character.emotional_state or {}, "relationships": character.relationships or {}, "belief_conflict_count": len(conflicts), "belief_conflicts": [{"knowledge_ids": ids} for ids in conflicts]}
+        rows = list(knowledge or [])
+        _, conflicts = CharacterBeliefViewBuilder().build(rows)
+        return {"id": character.id, "narrative_relevance": (character.narrative_relevance or {}).get("score", 0), "location_id": (character.current_state or {}).get("location_id", (character.current_state or {}).get("location")), "has_goal": bool(character.goals), "goal_refs": sorted(str(key) for key in (character.goals or {}).keys()), "goals": character.goals or {}, "current_state": character.current_state or {}, "physical_state": character.physical_state or {}, "emotional_state": character.emotional_state or {}, "relationships": character.relationships or {}, "belief_conflict_count": len(conflicts), "belief_conflicts": conflicts}
     def _thread(self, thread): return {"id": thread.id, "title": thread.title, "type": thread.type, "goal": thread.goal, "weight": max(0.0, min(float(thread.weight or 0), 100.0)), "progress": max(0.0, min(float(thread.progress or 0), 1.0)), "status": getattr(thread.status, "value", thread.status), "state": thread.state or {}}
     def _arc(self, arc): return None if not arc else {"id": arc.id, "status": arc.status, "progress": arc.progress}
 
@@ -173,6 +177,27 @@ class StoryGravityEngine:
         current = context["current_sequence"]
         scenes = context["scenes"]
         recent = scenes[-2:]
+        consequence = sorted(context["state_changes"], key=lambda row: (-(row["sequence"] or -1), -(row["ordinal"] or -1), row["target_type"] or "", row["target_id"] or "", row["path"] or ""))
+        for row in consequence:
+            row["freshness"] = round(1.0 / (1.0 + max(0, current - (row.get("sequence") or current))) * self.weights.freshness, 8)
+            row["pressure_score"] = row["freshness"]
+        relationship = []
+        for row in consequence:
+            path = row.get("path") or ""
+            if row.get("target_type") == "CHARACTER" and path.startswith("/relationships/"):
+                parts = path.split("/")
+                other_id = parts[2] if len(parts) > 2 and parts[2] else None
+                ids = tuple(sorted(value for value in (row.get("target_id"), other_id) if value))
+                if len(ids) == 2:
+                    relationship.append({**row, "character_ids": ids})
+        character_consequence = {}
+        character_relationship = {}
+        for row in consequence:
+            if row.get("target_type") == "CHARACTER" and row.get("target_id"):
+                character_consequence[row["target_id"]] = character_consequence.get(row["target_id"], 0.0) + row["pressure_score"]
+        for row in relationship:
+            for character_id in row["character_ids"]:
+                character_relationship[character_id] = character_relationship.get(character_id, 0.0) + row["pressure_score"]
         thread_rows = []
         for thread in context["story_threads"]:
             if thread["status"] != ThreadStatus.OPEN.value:
@@ -182,7 +207,12 @@ class StoryGravityEngine:
             stale = current - last if last is not None else current + 1
             repetition = sum(thread["id"] in scene.get("story_threads", []) for scene in recent)
             progress_signal = 1.0 - abs(thread["progress"] - 0.5)
-            components = {"base_weight": thread["weight"] * self.weights.thread_weight, "staleness": min(stale, 20) * self.weights.staleness, "progress_pressure": progress_signal * self.weights.progress, "recent_repetition_penalty": -repetition * self.weights.repetition, "character_alignment": 0.0, "consequence_alignment": 0.0, "arc_alignment": self.weights.arc_alignment if context.get("story_arc") and (thread["state"].get("arc_id") == context["story_arc"].get("id") or context["story_arc"].get("id") in (thread["state"].get("arc_ids") or [])) else 0.0}
+            explicit_ids = self._thread_character_ids(thread)
+            scene_alignment = sum(1 for scene in scenes if thread["id"] in scene.get("story_threads", []) and set(scene.get("participants", [])).intersection({row["id"] for row in context["characters"]}))
+            character_alignment = (len(explicit_ids) + scene_alignment) * self.weights.character_alignment
+            consequence_alignment = sum(row["pressure_score"] for row in consequence if row.get("target_type") == "STORY_THREAD" and row.get("target_id") == thread["id"])
+            consequence_alignment += sum(row["pressure_score"] for row in consequence if row.get("scene_id") and any(scene["id"] == row["scene_id"] and thread["id"] in scene.get("story_threads", []) for scene in scenes))
+            components = {"base_weight": thread["weight"] * self.weights.thread_weight, "staleness": min(stale, 20) * self.weights.staleness, "progress_pressure": progress_signal * self.weights.progress, "recent_repetition_penalty": -repetition * self.weights.repetition, "character_alignment": character_alignment, "consequence_alignment": consequence_alignment * self.weights.consequence_alignment, "arc_alignment": self.weights.arc_alignment if context.get("story_arc") and (thread["state"].get("arc_id") == context["story_arc"].get("id") or context["story_arc"].get("id") in (thread["state"].get("arc_ids") or [])) else 0.0}
             thread_rows.append({"thread_id": thread["id"], "status": thread["status"], "last_touched_sequence": last, "staleness": stale, "score_components": components, "thread_gravity_score": round(sum(components.values()), 8)})
         thread_rows.sort(key=lambda row: (-row["thread_gravity_score"], row["thread_id"]))
         char_rows = []
@@ -190,19 +220,9 @@ class StoryGravityEngine:
             sequences = [scene["sequence"] for scene in scenes if character["id"] in scene.get("participants", [])]
             recent_count = sum(character["id"] in scene.get("participants", []) for scene in recent)
             absence = current - max(sequences) if sequences else current + 1
-            components = {"narrative_relevance": float(character["narrative_relevance"] or 0), "goal_pressure": self.weights.goal if character["has_goal"] else 0.0, "absence": min(absence, 20) * self.weights.absence, "overuse_penalty": -recent_count * self.weights.overuse, "belief_conflict_signal": float(character.get("belief_conflict_count", 0)) * self.weights.belief_conflict, "consequence_pressure": 0.0, "relationship_pressure": 0.0}
+            components = {"narrative_relevance": float(character["narrative_relevance"] or 0), "goal_pressure": self.weights.goal if character["has_goal"] else 0.0, "absence": min(absence, 20) * self.weights.absence, "overuse_penalty": -recent_count * self.weights.overuse, "belief_conflict_signal": float(character.get("belief_conflict_count", 0)) * self.weights.belief_conflict, "consequence_pressure": character_consequence.get(character["id"], 0.0), "relationship_pressure": character_relationship.get(character["id"], 0.0)}
             char_rows.append({"character_id": character["id"], "last_participation_sequence": max(sequences) if sequences else None, "score_components": components, "character_gravity_score": round(sum(components.values()), 8)})
         char_rows.sort(key=lambda row: (-row["character_gravity_score"], row["character_id"]))
-        consequence = sorted(context["state_changes"], key=lambda row: (-(row["sequence"] or -1), -(row["ordinal"] or -1), row["target_type"] or "", row["target_id"] or "", row["path"] or ""))
-        for row in consequence:
-            row["freshness"] = round(1.0 / (1.0 + max(0, current - (row.get("sequence") or current))) * self.weights.freshness, 8)
-            row["pressure_score"] = row["freshness"]
-        relationship = []
-        for row in consequence:
-            path = row.get("path") or ""
-            if path.startswith("/relationships/"):
-                other_id = path.split("/", 3)[2] if len(path.split("/", 3)) > 2 else None
-                relationship.append({**row, "character_ids": tuple(sorted(value for value in (row.get("target_id"), other_id) if value))})
         repetition = {"proposal_types": {}, "threads": {}, "participants": {}, "locations": {}}
         for signature in context["recent_scene_signatures"]:
             for key, value in (("proposal_types", signature.get("proposal_type")), ("threads", signature.get("primary_thread_id")), ("locations", signature.get("location_id"))):
@@ -214,51 +234,100 @@ class StoryGravityEngine:
         fingerprint = "story-gravity-v1:" + hashlib.sha256(json.dumps(semantic, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return StoryGravityReport("story-gravity-v1", current, thread_rows, char_rows, consequence, relationship, context["reveals"], repetition, seeds, fingerprint, paused)
 
+    @staticmethod
+    def _thread_character_ids(thread: dict[str, Any]) -> set[str]:
+        state = thread.get("state") or {}
+        values = []
+        for field in ("character_id", "character_ids", "participant_ids"):
+            value = state.get(field)
+            values.extend(value if isinstance(value, list) else [value])
+        return {value for value in values if isinstance(value, str) and value}
+
 
 class DirectorCandidateEngine:
+    MAX_THREAD_CANDIDATES = 3
+    def __init__(self, weights: StoryGravityWeights | None = None):
+        self.weights = weights or StoryGravityWeights()
+
     def generate(self, context: dict[str, Any], gravity: StoryGravityReport) -> list[StoryGravityCandidate]:
         candidates = []
         top_character = gravity.character_gravity[0] if gravity.character_gravity else None
         character = next((row for row in context["characters"] if row["id"] == top_character["character_id"]), None) if top_character else None
-        top_thread = gravity.thread_gravity[0] if gravity.thread_gravity and gravity.thread_gravity[0]["status"] == ThreadStatus.OPEN.value else None
-        if top_thread:
+        for top_thread in gravity.thread_gravity[:self.MAX_THREAD_CANDIDATES]:
             thread = next(row for row in context["story_threads"] if row["id"] == top_thread["thread_id"])
-            participants = (character["id"],) if character else ()
-            location = character.get("location_id") if character else None
-            candidates.append(self._candidate(ProposalType.CONTINUE_THREAD.value, thread["id"], participants, location, "THREAD", (thread["id"],), "thread", {"thread_gravity": top_thread["thread_gravity_score"]}, ("STALE_THREAD",) if top_thread["staleness"] > 3 else ()))
+            aligned_ids = StoryGravityEngine._thread_character_ids(thread)
+            aligned_ids.update(participant for scene in context["scenes"] if thread["id"] in scene.get("story_threads", []) for participant in scene.get("participants", []))
+            aligned = [row for row in context["characters"] if row["id"] in aligned_ids]
+            aligned.sort(key=lambda row: (-(next((item["character_gravity_score"] for item in gravity.character_gravity if item["character_id"] == row["id"]), 0.0)), row["id"]))
+            thread_character = aligned[0] if aligned else character
+            participants = (thread_character["id"],) if thread_character else ()
+            location = thread_character.get("location_id") if thread_character else None
+            candidates.append(self._candidate(ProposalType.CONTINUE_THREAD.value, thread["id"], participants, location, "THREAD", (thread["id"],), "thread", {"thread_gravity": top_thread["thread_gravity_score"]}, ("STALE_THREAD",) if top_thread["staleness"] > 3 else (), gravity=gravity, expected_progress={"thread": thread["id"]}, evidence={"thread_id": thread["id"]}))
+            fresh = [row for row in gravity.consequence_pressure if (row.get("target_type") == "STORY_THREAD" and row.get("target_id") == thread["id"]) or any(scene.get("id") == row.get("scene_id") and thread["id"] in scene.get("story_threads", []) for scene in context["scenes"])]
+            if fresh and gravity.repetition_pressure["threads"].get(thread["id"], 0) < 2:
+                candidates.append(self._candidate(ProposalType.ESCALATION.value, thread["id"], participants, location, "THREAD", (thread["id"],), "escalation", {"thread_gravity": top_thread["thread_gravity_score"], "fresh_consequence": fresh[0]["pressure_score"]}, ("THREAD_ESCALATION",), gravity=gravity, expected_progress={"thread": thread["id"], "escalation": True}, evidence={"timeline_event_ids": sorted(row["id"] for row in fresh), "thread_id": thread["id"]}))
         if character:
-            candidates.append(self._candidate(ProposalType.CHARACTER_DRIVEN.value, None, (character["id"],), character.get("location_id"), "CHARACTER", (character["id"],), "goal", top_character["score_components"], ("CHARACTER_GOAL",) if character["has_goal"] else ()))
-        if gravity.consequence_pressure:
-            event = gravity.consequence_pressure[0]
-            candidates.append(self._candidate(ProposalType.CONSEQUENCE.value, None, (character["id"],) if character else (), character.get("location_id") if character else None, event.get("target_type") or "STATE", (event.get("target_id"),) if event.get("target_id") else (), "consequence", {"freshness": event.get("pressure_score", 0.0)}, ("RECENT_STATE_CHANGE",)))
+            candidates.append(self._candidate(ProposalType.CHARACTER_DRIVEN.value, None, (character["id"],), character.get("location_id"), "CHARACTER", (character["id"],), "goal", top_character["score_components"], ("CHARACTER_GOAL",) if character["has_goal"] else (), gravity=gravity, expected_progress={"character_arc": True}, evidence={"character_id": character["id"]}))
+        for event in gravity.consequence_pressure[:3]:
+            target_character = next((row for row in context["characters"] if event.get("target_type") == "CHARACTER" and row["id"] == event.get("target_id")), None)
+            participants = (target_character["id"],) if target_character else ((character["id"],) if character else ())
+            location = target_character.get("location_id") if target_character else (character.get("location_id") if character else None)
+            evidence = {"timeline_event_ids": [event["id"]], "target_type": event.get("target_type"), "target_id": event.get("target_id"), "path": event.get("path")}
+            candidates.append(self._candidate(ProposalType.CONSEQUENCE.value, None, participants, location, event.get("target_type") or "STATE", (event.get("target_id"),) if event.get("target_id") else (), "consequence", {"freshness": event.get("pressure_score", 0.0)}, ("RECENT_STATE_CHANGE",), gravity=gravity, expected_progress={"consequence": {key: evidence[key] for key in ("target_type", "target_id", "path")}}, evidence=evidence))
         for reveal in gravity.reveal_opportunities:
             allowed = tuple(sorted(reveal.get("allowed_character_ids") or []))
             if allowed:
-                candidates.append(self._candidate(ProposalType.REVEAL.value, None, allowed, character.get("location_id") if character else None, "REVEAL", (reveal["canon_fact_id"],), "reveal", {"availability": 1.0}, ("AVAILABLE_REVEAL",), reveal_ids=(reveal["canon_fact_id"],)))
+                authorized = [row for row in context["characters"] if row["id"] in allowed]
+                ranked = sorted(authorized, key=lambda row: (-(next((item["character_gravity_score"] for item in gravity.character_gravity if item["character_id"] == row["id"]), 0.0)), row["id"]))
+                anchor = ranked[0] if ranked else None
+                if anchor:
+                    location = anchor.get("location_id")
+                    participants = tuple(sorted(row["id"] for row in authorized if row.get("location_id") == location))
+                    candidates.append(self._candidate(ProposalType.REVEAL.value, None, participants, location, "REVEAL", (reveal["canon_fact_id"],), "reveal", {"availability": 1.0}, ("AVAILABLE_REVEAL",), reveal_ids=(reveal["canon_fact_id"],), gravity=gravity, expected_progress={"reveal": {"canon_fact_ids": [reveal["canon_fact_id"]]}}, evidence={"canon_fact_ids": [reveal["canon_fact_id"]], "allowed_character_ids": list(allowed)}))
         if gravity.relationship_pressure and len(context["characters"]) >= 2:
             participants = tuple(gravity.relationship_pressure[0].get("character_ids", ())) or tuple(sorted(row["id"] for row in context["characters"][:2]))
-            locations = {row.get("location_id") for row in context["characters"] if row["id"] in participants and row.get("location_id")}
-            location = next(iter(locations), None)
+            locations = sorted({row.get("location_id") for row in context["characters"] if row["id"] in participants and row.get("location_id")})
+            ranked_participants = sorted((row for row in context["characters"] if row["id"] in participants), key=lambda row: (-(next((item["character_gravity_score"] for item in gravity.character_gravity if item["character_id"] == row["id"]), 0.0)), row["id"]))
+            location = next((row.get("location_id") for row in ranked_participants if row.get("location_id")), locations[0] if locations else None)
             relationship_type = ProposalType.TRANSITION.value if len(locations) > 1 else ProposalType.RELATIONSHIP.value
-            candidates.append(self._candidate(relationship_type, None, participants, location, "RELATIONSHIP", participants, "relationship", {"relationship_pressure": 1.0}, ("STRUCTURED_RELATIONSHIP", "LOCATION_TRANSITION") if relationship_type == ProposalType.TRANSITION.value else ("STRUCTURED_RELATIONSHIP",)))
+            relationship_evidence = gravity.relationship_pressure[0]
+            progress = {"transition": {"participant_ids": list(participants), "destination_location_id": location}} if relationship_type == ProposalType.TRANSITION.value else {"relationship": {"character_ids": list(participants)}}
+            candidates.append(self._candidate(relationship_type, None, participants, location, "RELATIONSHIP", participants, "relationship", {"relationship_pressure": relationship_evidence.get("pressure_score", 1.0)}, ("STRUCTURED_RELATIONSHIP", "LOCATION_TRANSITION") if relationship_type == ProposalType.TRANSITION.value else ("STRUCTURED_RELATIONSHIP",), gravity=gravity, expected_progress=progress, evidence={"timeline_event_ids": [relationship_evidence["id"]] if relationship_evidence.get("id") else [], "target_type": relationship_evidence.get("target_type"), "target_id": relationship_evidence.get("target_id"), "path": relationship_evidence.get("path")}))
         if not candidates:
-            candidates.append(self._candidate(ProposalType.NEW_THREAD.value, None, (), None, "PROJECT", (), "new_thread", {"fallback": 0.1}, ("NO_OPEN_THREAD",)))
+            candidates.append(self._candidate(ProposalType.NEW_THREAD.value, None, (), None, "PROJECT", (), "new_thread", {"fallback": 0.1}, ("NO_OPEN_THREAD",), gravity=gravity, expected_progress={"character_arc": False}, evidence={}))
         return self.rank(candidates)
 
-    def _candidate(self, proposal_type, thread_id, participants, location, focus_type, focus_ids, pressure, components, reasons, reveal_ids=()):
+    def _candidate(self, proposal_type, thread_id, participants, location, focus_type, focus_ids, pressure, components, reasons, *, gravity, expected_progress, evidence, reveal_ids=()):
+        repetition = gravity.repetition_pressure
+        components = dict(components)
+        components.update({
+            "proposal_type_repetition_penalty": -repetition["proposal_types"].get(proposal_type, 0) * self.weights.proposal_type_repetition,
+            "thread_repetition_penalty": -repetition["threads"].get(thread_id, 0) * self.weights.thread_candidate_repetition if thread_id else 0.0,
+            "participant_repetition_penalty": -sum(repetition["participants"].get(value, 0) for value in participants) * self.weights.participant_repetition,
+            "location_repetition_penalty": -repetition["locations"].get(location, 0) * self.weights.location_repetition if location else 0.0,
+        })
         key = "|".join([proposal_type, thread_id or "", ",".join(sorted(participants)), location or "", focus_type, ",".join(sorted(str(value) for value in focus_ids)), ",".join(sorted(reveal_ids))])
         score = round(sum(float(value) for value in components.values()), 8)
-        return StoryGravityCandidate(key, proposal_type, thread_id, tuple(sorted(participants)), location, focus_type, tuple(sorted(str(value) for value in focus_ids)), pressure, {key: round(float(value), 8) for key, value in components.items()}, score, tuple(reasons), {"thread": thread_id} if thread_id else {"character_arc": bool(participants)}, tuple(sorted(reveal_ids)))
+        return StoryGravityCandidate(key, proposal_type, thread_id, tuple(sorted(participants)), location, focus_type, tuple(sorted(str(value) for value in focus_ids)), pressure, {key: round(float(value), 8) for key, value in components.items()}, score, tuple(reasons), expected_progress, tuple(sorted(reveal_ids)), evidence)
     def rank(self, candidates):
         return sorted(candidates, key=lambda item: (-item.score, item.proposal_type, item.primary_thread_id or "", item.candidate_key))
     def select(self, candidates):
         return self.rank(candidates)[0] if candidates else None
+    def top_diverse(self, candidates, k=3):
+        result = []
+        seen = set()
+        for candidate in self.rank(candidates):
+            identity = (candidate.proposal_type, candidate.primary_thread_id, candidate.participant_ids, candidate.location_id)
+            if identity not in seen or len(result) + 1 >= k:
+                result.append(candidate); seen.add(identity)
+            if len(result) == k: break
+        return result
 
 
 class DirectorProposalFactory:
     def create(self, project_id: str, context: dict[str, Any], gravity: StoryGravityReport, candidate: StoryGravityCandidate) -> dict[str, Any]:
         participant_ids = list(candidate.participant_ids)
-        meta = {"protocol": "story-gravity-v1", "gravity_fingerprint": gravity.gravity_fingerprint, "candidate_key": candidate.candidate_key, "reason_codes": list(candidate.reason_codes), "score_components": candidate.score_components}
+        meta = {"protocol": "story-gravity-v1", "gravity_fingerprint": gravity.gravity_fingerprint, "candidate_key": candidate.candidate_key, "reason_codes": list(candidate.reason_codes), "score_components": candidate.score_components, "focus_type": candidate.focus_type, "focus_ids": list(candidate.focus_ids), "pressure_kind": candidate.pressure_kind, "evidence": candidate.evidence}
         motivations = {character_id: {"reason": "The current situation creates a structured opportunity for an autonomous choice."} for character_id in participant_ids}
         return {"proposal_type": candidate.proposal_type, "primary_thread_id": candidate.primary_thread_id, "location_id": candidate.location_id, "proposed_location": None, "participants": participant_ids, "scene_goal": "Create an opportunity to respond to the current pressure.", "character_motivations": motivations, "entry_state": {"director_meta": meta}, "planned_pressure": "A structured external pressure creates multiple plausible responses.", "expected_progress": candidate.expected_progress, "allowed_reveals": list(candidate.reveal_ids), "forbidden_reveals": [], "required_canon": [], "possible_outcomes": ["The pressure is refused, delayed, or investigated.", "The situation changes through an autonomous character choice."], "new_entity_requests": [], "risk_flags": list(candidate.reason_codes), "director_reasoning_summary": "Selected a structured situation; character decisions remain autonomous."}
 
@@ -300,19 +369,32 @@ class LLMDirectorCandidateGenerator:
 
     def validate_references(self, candidate: DirectorCandidatePayload, context: dict[str, Any]) -> list[str]:
         character_ids = {row.get("id") for row in context.get("characters", context.get("active_characters", []))}
-        thread_ids = {row.get("id") for row in context.get("story_threads", context.get("active_story_threads", []))}
+        threads = {row.get("id"): row for row in context.get("story_threads", context.get("active_story_threads", []))}
+        thread_ids = {thread_id for thread_id, row in threads.items() if row.get("status", ThreadStatus.OPEN.value) == ThreadStatus.OPEN.value}
         errors = ["INVALID_GRAVITY_REFERENCE"] if candidate.primary_thread_id and candidate.primary_thread_id not in thread_ids else []
         if any(value not in character_ids for value in candidate.participants): errors.append("INVALID_GRAVITY_REFERENCE")
         location_ids = {row.get("id") for row in context.get("locations", [])}
         if candidate.location_id and candidate.location_id not in location_ids: errors.append("INVALID_GRAVITY_REFERENCE")
-        reveal_ids = {row.get("canon_fact_id") for row in context.get("reveals", [])}
+        reveal_rows = {row.get("canon_fact_id"): row for row in context.get("reveals", [])}
+        reveal_ids = set(reveal_rows)
         if any(value not in reveal_ids for value in candidate.allowed_reveals): errors.append("INVALID_GRAVITY_REFERENCE")
+        for reveal_id in candidate.allowed_reveals:
+            allowed = set(reveal_rows.get(reveal_id, {}).get("allowed_character_ids") or [])
+            if not set(candidate.participants).issubset(allowed): errors.append("UNAUTHORIZED_REVEAL_PARTICIPANT")
         knowledge = {row.get("knowledge_id"): row for row in context.get("knowledge", [])}
         references = candidate.required_knowledge.items() if isinstance(candidate.required_knowledge, dict) else ((ref.get("character_id"), [ref]) for ref in candidate.required_knowledge)
         for character_id, refs in references:
-            if character_id not in character_ids or any(ref.get("knowledge_id") not in knowledge or knowledge[ref.get("knowledge_id")].get("character_id") != character_id for ref in refs): errors.append("INVALID_GRAVITY_REFERENCE")
+            for ref in refs:
+                row = knowledge.get(ref.get("knowledge_id")) if isinstance(ref, dict) else None
+                statuses = ref.get("accepted_statuses") if isinstance(ref, dict) else None
+                if character_id not in character_ids or not row or row.get("character_id") != character_id or ("proposition" in ref and ref.get("proposition") != row.get("proposition")) or (statuses is not None and row.get("status") not in {getattr(value, "value", value) for value in statuses}):
+                    errors.append("INVALID_GRAVITY_REFERENCE")
         forbidden = {"required_action", "forced_action", "must_accept", "must_succeed", "forced_outcome"}
-        if forbidden.intersection(candidate.expected_progress): errors.append("DIRECTOR_CHARACTER_PUPPETEERING")
+        def contains(value):
+            if isinstance(value, dict): return bool(forbidden.intersection(value)) or any(contains(item) for item in value.values())
+            if isinstance(value, list): return any(contains(item) for item in value)
+            return False
+        if contains(candidate.model_dump(mode="json")): errors.append("DIRECTOR_CHARACTER_PUPPETEERING")
         return sorted(set(errors))
 
 @dataclass
@@ -433,9 +515,9 @@ class DirectorConstraintChecker:
             if not location or location.project_id != proposal.project_id or getattr(location.entity_type, "value", location.entity_type) != EntityType.LOCATION.value or not location.active:
                 self._add(issues, "INVALID_ENTITY_REFERENCE", "BLOCKING", "location_id must reference an active LOCATION in this project.", [proposal.location_id], "Use an existing project LOCATION ID or a proposed new location.")
     def _canon_conflict(self, proposal, canon, issues):
-        for fact_id in proposal.required_canon:
+        for fact_id in proposal.required_canon or []:
             if fact_id not in canon: self._add(issues, "INVALID_ENTITY_REFERENCE", "BLOCKING", "Required Canon is unavailable to Director Context.", [fact_id], "Reference a project Canon fact.")
-        contradictions = proposal.entry_state.get("contradicts_canon_ids", [])
+        contradictions = (proposal.entry_state or {}).get("contradicts_canon_ids", [])
         locked = [fact_id for fact_id in contradictions if canon.get(fact_id, {}).get("locked") and canon[fact_id]["type"] == "CORE_CANON"]
         if locked: self._add(issues, "CANON_CONFLICT", "BLOCKING", "Proposal contradicts locked CORE_CANON.", locked, "Revise entry state to preserve locked facts.")
     def _knowledge(self, proposal, knowledge, issues):
@@ -444,9 +526,18 @@ class DirectorConstraintChecker:
             available = {status: {item["proposition"] for item in knowledge.get(character_id, {}).get(status, [])} for status in ("KNOWN", "SUSPECTED", "FALSE_BELIEF")}
             missing = []
             for requirement in required:
-                if isinstance(requirement, str): proposition, accepted = requirement, ["KNOWN"]
-                else: proposition, accepted = requirement.get("proposition"), requirement.get("accepted_statuses", ["KNOWN"])
-                if not proposition or not any(proposition in available.get(status, set()) for status in accepted): missing.append(proposition or "unspecified proposition")
+                if isinstance(requirement, str):
+                    proposition, accepted = requirement, ["KNOWN"]
+                    valid = bool(proposition) and any(proposition in available.get(status, set()) for status in accepted)
+                else:
+                    proposition, accepted = requirement.get("proposition"), requirement.get("accepted_statuses", ["KNOWN"])
+                    knowledge_id = requirement.get("knowledge_id")
+                    if knowledge_id:
+                        row = next((item for values in knowledge.get(character_id, {}).values() for item in values if item.get("knowledge_id", item.get("id")) == knowledge_id), None)
+                        valid = bool(row) and ("proposition" not in requirement or proposition == row.get("proposition")) and row.get("status") in {getattr(value, "value", value) for value in accepted}
+                    else:
+                        valid = bool(proposition) and any(proposition in available.get(status, set()) for status in accepted)
+                if not valid: missing.append(proposition or "unspecified proposition")
             if missing: self._add(issues, "KNOWLEDGE_LEAK", "BLOCKING", "Character motivation relies on information this character has not acquired.", [character_id], "Use known clues, suspicion, or add a prior discovery Scene.")
     def _motivation_and_boundaries(self, proposal, characters, issues):
         for character_id in proposal.participants:
@@ -454,27 +545,33 @@ class DirectorConstraintChecker:
             conflicts = proposal.entry_state.get("boundary_conflicts", {}).get(character_id, [])
             if conflicts: self._add(issues, "CHARACTER_BOUNDARY_CONFLICT", "ERROR", "Proposal may cross a declared character boundary.", [character_id], "Change pressure or justify a deliberate exception.")
     def _story_value(self, proposal, recent, issues):
-        if not proposal.primary_thread_id and not proposal.expected_progress.get("character_arc") and not proposal.expected_progress.get("relationship") and not proposal.expected_progress.get("consequence"):
+        progress = proposal.expected_progress or {}
+        if not proposal.primary_thread_id and not progress.get("character_arc") and not progress.get("relationship") and not progress.get("consequence"):
             self._add(issues, "THREADLESS_SCENE", "ERROR", "Scene does not advance a Story Thread, arc, relationship, or consequence.", [], "Add a concrete narrative progression.")
         goal = proposal.scene_goal.strip().lower()
         if goal and any(goal == (scene.get("intent") or "").strip().lower() for scene in recent): self._add(issues, "DUPLICATE_NARRATIVE_FUNCTION", "WARNING", "Recent Scene already used the same narrative intent.", [], "Change the pressure or advance the thread in a new way.")
     def _reveals(self, session, proposal, issues):
         if not proposal.allowed_reveals: return
-        locks = session.scalars(select(RevealConstraint).where(RevealConstraint.project_id == proposal.project_id, RevealConstraint.canon_fact_id.in_(proposal.allowed_reveals), RevealConstraint.status == RevealStatus.LOCKED)).all()
+        locks = session.scalars(select(RevealConstraint).where(RevealConstraint.project_id == proposal.project_id, RevealConstraint.canon_fact_id.in_(proposal.allowed_reveals))).all()
+        constraints = {lock.canon_fact_id: lock for lock in locks}
+        missing = set(proposal.allowed_reveals) - set(constraints)
+        if missing: self._add(issues, "INVALID_ENTITY_REFERENCE", "BLOCKING", "Reveal is not available through a project Reveal Constraint.", sorted(missing), "Use only available authorized Reveal Constraints.")
         for lock in locks:
             fact = session.get(CanonFact, lock.canon_fact_id)
             invalid_allowed = [character_id for character_id in lock.allowed_character_ids if not session.get(Character, character_id) or session.get(Character, character_id).project_id != proposal.project_id]
             if not fact or fact.project_id != proposal.project_id or invalid_allowed: self._add(issues, "INVALID_ENTITY_REFERENCE", "BLOCKING", "Reveal Constraint crosses project boundaries.", [lock.id], "Repair the Reveal Constraint references.")
             unauthorized = [character_id for character_id in proposal.participants if character_id not in lock.allowed_character_ids]
+            if getattr(lock.status, "value", lock.status) == RevealStatus.LOCKED.value:
+                self._add(issues, "PREMATURE_REVEAL", "BLOCKING", "Proposal reveals a locked Canon fact before its condition is met.", [lock.canon_fact_id], "Remove this reveal or update its Reveal Constraint through the appropriate workflow.")
             if unauthorized: self._add(issues, "PREMATURE_REVEAL", "BLOCKING", "Proposal reveals a locked Canon fact before its condition is met.", [lock.canon_fact_id] + unauthorized, "Remove this reveal or update its Reveal Constraint through the appropriate workflow.")
-        forbidden = set(proposal.forbidden_reveals).intersection(proposal.allowed_reveals)
+        forbidden = set(proposal.forbidden_reveals or []).intersection(proposal.allowed_reveals or [])
         if forbidden: self._add(issues, "PREMATURE_REVEAL", "BLOCKING", "Proposal both allows and forbids the same reveal.", list(forbidden), "Remove the forbidden reveal from allowed_reveals.")
     def _world_state(self, proposal, characters, issues):
         if proposal.proposal_type == ProposalType.TRANSITION or not proposal.location_id: return
         elsewhere = [character_id for character_id in proposal.participants if characters.get(character_id, {}).get("current_location") and characters[character_id]["current_location"] != proposal.location_id]
-        if elsewhere: self._add(issues, "WORLD_STATE_CONFLICT", "ERROR", "Participants are not currently at the proposed location and no Transition is planned.", elsewhere, "Use a TRANSITION proposal or select their current location.")
+        if elsewhere: self._add(issues, "WORLD_STATE_CONFLICT", "BLOCKING", "Participants are not currently at the proposed location and no Transition is planned.", elsewhere, "Use a TRANSITION proposal or select their current location.")
     def _overcasting(self, proposal, issues):
-        missing_reason = [str(item.get("name", "new entity")) for item in proposal.new_entity_requests if item.get("entity_type") == "CHARACTER" and not item.get("existing_character_gap")]
+        missing_reason = [str(item.get("name", "new entity")) for item in (proposal.new_entity_requests or []) if item.get("entity_type") == "CHARACTER" and not item.get("existing_character_gap")]
         if missing_reason: self._add(issues, "OVERCASTING", "WARNING", "New character requests do not explain why existing characters cannot serve the function.", missing_reason, "Provide existing_character_gap for each new character request.")
 
     def _puppeteering(self, proposal, issues):
