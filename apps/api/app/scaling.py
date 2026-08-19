@@ -378,10 +378,12 @@ class ProjectHistoryProjectionService:
             CurrentStateChangeHead.sequence, CurrentStateChangeHead.ordinal, CurrentStateChangeHead.target_type,
             CurrentStateChangeHead.target_id, CurrentStateChangeHead.path)).all()
         head_scene_ids = sorted({head.scene_id for head in heads if head.scene_id})
-        feature_by_scene = {row.scene_id: row for row in db.scalars(select(SceneHistoryFeature).where(
-            SceneHistoryFeature.project_id == project_id, SceneHistoryFeature.active.is_(True),
-            SceneHistoryFeature.scene_id.in_(head_scene_ids) if head_scene_ids else False,
-        )).all()}
+        feature_by_scene = {}
+        if head_scene_ids:
+            feature_by_scene = {row.scene_id: row for row in db.scalars(select(SceneHistoryFeature).where(
+                SceneHistoryFeature.project_id == project_id, SceneHistoryFeature.active.is_(True),
+                SceneHistoryFeature.scene_id.in_(head_scene_ids),
+            )).all()}
         events = {}
         if heads:
             events = {row.id: row for row in db.scalars(select(TimelineEvent).where(
