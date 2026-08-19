@@ -620,7 +620,8 @@ def test_real_stagnation_stops_after_third_committed_scene(session, world, monke
     monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", QuietPerformer)
     run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=4, max_turns_per_scene=2)
     session.commit()
-    result = AutonomousWorldLoopService().advance(session, run.id, max_scenes=4, request_key="real-stagnation")
+    service = AutonomousWorldLoopService()
+    result = service.advance(session, run.id, max_scenes=4, request_key="real-stagnation")
     steps = session.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal)).all()
     assert len(result["steps"]) == 3 and len(steps) == 3, [
         (step.ordinal, step.candidate_key, step.delta_batch_ids, session.get(ScenePerformance, step.performance_id).stop_reason)
@@ -630,6 +631,22 @@ def test_real_stagnation_stops_after_third_committed_scene(session, world, monke
     assert all(step.stop_reason == "QUIESCENT" for step in steps)
     assert all(session.get(ScenePerformance, step.performance_id).stop_reason == "SCENE_COMMITTED" for step in steps)
     assert run.status == AutonomousRunStatus.PAUSED and run.stop_reason == "STAGNATION_GUARD"
+    assert session.scalar(select(func.count(Scene.id))) == 3
+    retry = service.advance(session, run.id, max_scenes=4, request_key="real-stagnation")
+    assert retry["existing"] is True and [item["id"] for item in retry["steps"]] == [step.id for step in steps]
+    assert session.scalar(select(func.count(Scene.id))) == 3
+
+
+def test_new_request_while_stagnated_is_rejected(session, world, monkeypatch):
+    class QuietPerformer:
+        def perform(self, context): return quiet_performance_payload(), None
+    fixed_candidate_generator(monkeypatch, ["same-candidate"])
+    monkeypatch.setattr("app.runtime.HeuristicCharacterPerformer", QuietPerformer)
+    run = AutonomousWorldLoopService().create_run(session, world.project.id, scene_budget=4, max_turns_per_scene=2)
+    session.commit(); service = AutonomousWorldLoopService()
+    service.advance(session, run.id, max_scenes=4, request_key="stagnated")
+    with pytest.raises(ValueError, match="STAGNATION_GUARD"):
+        service.advance(session, run.id, max_scenes=1, request_key="brand-new")
     assert session.scalar(select(func.count(Scene.id))) == 3
 
 

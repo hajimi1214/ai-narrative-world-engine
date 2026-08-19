@@ -183,6 +183,12 @@ class AutonomousWorldLoopService:
                     if step.status != AutonomousStepStatus.COMMITTED or run.status != AutonomousRunStatus.RUNNING:
                         break
                     continue
+            if step is None and any_existing and run.status != AutonomousRunStatus.RUNNING:
+                # The original request already ended at a durable run boundary
+                # (for example STAGNATION_GUARD). A retry returns its existing
+                # prefix instead of treating the missing next offset as a new
+                # progression error.
+                break
             if run.status in self.terminal:
                 # A clipped retry of a completed request returns its existing
                 # offsets and stops at the first offset that never existed.
