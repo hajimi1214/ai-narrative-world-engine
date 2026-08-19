@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -31,11 +31,22 @@ from .state_delta import StateDeltaCandidateBuilder
 from .state_delta_validation import StateDeltaValidator
 from .scene_commit import SceneCommitService
 from .causal_ledger import CausalLedgerBackfillService, CausalProvenanceQuery
+from .autonomy import AutonomousWorldLoopService
 
 router = APIRouter()
 
 class Payload(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+class AutonomousRunCreatePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scene_budget: int = Field(gt=0, le=100)
+    max_turns_per_scene: int = Field(default=6, gt=0, le=100)
+    performance_mode: PerformanceMode = PerformanceMode.HEURISTIC
+    resolver_mode: ResolverMode = ResolverMode.HEURISTIC
+    config: dict[str, Any] = Field(default_factory=dict)
+    client_request_id: str | None = None
+    idempotency_key: str | None = None
 
 class RetconRequestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -121,6 +132,7 @@ def scene_checkpoint_payload(checkpoint: SceneStateCheckpoint) -> dict[str, Any]
 
 @router.post("/projects/{project_id}/state-delta-batches/derive", status_code=status.HTTP_201_CREATED)
 def derive_state_delta_batch(project_id: str, payload: StateDeltaDerivePayload, db: Session = Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
     require_project(db, project_id)
     try:
         batch, _items, existing = StateDeltaCandidateBuilder().derive(db, project_id, payload.source_resolution_id)
@@ -151,6 +163,7 @@ def get_state_delta_batch(project_id: str, batch_id: str, db: Session = Depends(
 
 @router.post("/projects/{project_id}/state-delta-batches/{batch_id}/validate")
 def validate_state_delta_batch(project_id: str, batch_id: str, db: Session = Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
     require_project(db, project_id)
     batch = db.get(StateDeltaBatch, batch_id)
     if not batch or batch.project_id != project_id:
@@ -170,6 +183,7 @@ def validate_state_delta_batch(project_id: str, batch_id: str, db: Session = Dep
 
 @router.post("/projects/{project_id}/performances/{performance_id}/commit-scene")
 def commit_scene(project_id: str, performance_id: str, db: Session = Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
     try:
         result = SceneCommitService().commit(db, project_id, performance_id)
         if not result.idempotent:
@@ -499,6 +513,10 @@ def require_project(db: Session, project_id: str) -> Project:
     if not project: raise HTTPException(status_code=404, detail="Project not found")
     return project
 
+def ensure_autonomous_run_idle(db: Session, project_id: str) -> None:
+    if db.scalar(select(AutonomousWorldRun.id).where(AutonomousWorldRun.project_id == project_id, AutonomousWorldRun.active.is_(True))):
+        raise HTTPException(status_code=409, detail={"code": "AUTONOMY_RUN_ACTIVE"})
+
 def create_record(db: Session, model: Type, values: dict[str, Any], project_id: str | None = None):
     if project_id: values["project_id"] = project_id
     record = model(**values)
@@ -689,6 +707,8 @@ def context_summary(context: dict[str, Any]) -> dict[str, Any]:
 def director_dry_run(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
     ensure_replay_not_pending(db, project_id)
+    if db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.project_id == project_id, AutonomousWorldRun.active.is_(True))):
+        raise HTTPException(status_code=409, detail={"code": "AUTONOMY_RUN_ACTIVE"})
     context = DirectorContextBuilder().build(db, project_id)
     gravity_context = StoryGravityContextBuilder().build(db, project_id)
     gravity = StoryGravityEngine().build(gravity_context)
@@ -719,6 +739,84 @@ def director_gravity(project_id: str, db: Session = Depends(get_db)):
     gravity = StoryGravityEngine().build(gravity_context)
     candidates = DirectorCandidateEngine().generate(gravity_context, gravity)
     return {**gravity.as_dict(), "ranked_candidate_seeds": [candidate.as_dict() for candidate in DirectorCandidateEngine().top_diverse(candidates)]}
+
+
+@router.post("/projects/{project_id}/autonomous-runs", status_code=status.HTTP_201_CREATED)
+@router.post("/projects/{project_id}/autonomy/runs", status_code=status.HTTP_201_CREATED)
+def create_autonomous_run(project_id: str, payload: AutonomousRunCreatePayload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        run = AutonomousWorldLoopService().create_run(db, project_id, scene_budget=payload.scene_budget, max_turns_per_scene=payload.max_turns_per_scene, performance_mode=payload.performance_mode.value, resolver_mode=payload.resolver_mode.value, config=payload.config, client_request_id=payload.client_request_id or payload.idempotency_key)
+        db.commit(); db.refresh(run)
+        return AutonomousWorldLoopService.run_payload(run)
+    except LookupError as exc:
+        db.rollback(); raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+    except (ValueError, IntegrityError) as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+
+@router.get("/projects/{project_id}/autonomous-runs")
+@router.get("/projects/{project_id}/autonomy/runs")
+def list_autonomous_runs(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [AutonomousWorldLoopService.run_payload(run) for run in db.scalars(select(AutonomousWorldRun).where(AutonomousWorldRun.project_id == project_id).order_by(AutonomousWorldRun.created_at.desc(), AutonomousWorldRun.id.desc())).all()]
+
+
+@router.get("/projects/{project_id}/autonomous-runs/{run_id}")
+@router.get("/projects/{project_id}/autonomy/runs/{run_id}")
+def get_autonomous_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
+    run = db.get(AutonomousWorldRun, run_id)
+    if not run or run.project_id != project_id: raise HTTPException(status_code=404, detail="Autonomous run not found")
+    return AutonomousWorldLoopService().get_status(db, run_id)
+
+
+@router.get("/projects/{project_id}/autonomous-runs/{run_id}/steps")
+@router.get("/projects/{project_id}/autonomy/runs/{run_id}/steps")
+def list_autonomous_steps(project_id: str, run_id: str, db: Session = Depends(get_db)):
+    run = db.get(AutonomousWorldRun, run_id)
+    if not run or run.project_id != project_id: raise HTTPException(status_code=404, detail="Autonomous run not found")
+    return [AutonomousWorldLoopService.step_payload(step) for step in db.scalars(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run_id).order_by(AutonomousWorldStep.ordinal)).all()]
+
+
+@router.post("/projects/{project_id}/autonomous-runs/{run_id}/advance")
+@router.post("/projects/{project_id}/autonomy/runs/{run_id}/advance")
+def advance_autonomous_run(project_id: str, run_id: str, payload: Payload, db: Session = Depends(get_db)):
+    run = db.get(AutonomousWorldRun, run_id)
+    if not run or run.project_id != project_id: raise HTTPException(status_code=404, detail="Autonomous run not found")
+    try:
+        values = payload.model_dump(); limit = int(values.get("max_scenes", 1)); request_key = str(values.get("idempotency_key", values.get("request_key", "default"))); offset = int(values.get("request_offset", 0))
+        result = AutonomousWorldLoopService().advance(db, run_id, max_scenes=limit, request_key=request_key, request_offset=offset); db.commit(); return result
+    except LookupError as exc:
+        db.rollback(); raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+    except ValueError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+
+@router.post("/projects/{project_id}/autonomous-runs/{run_id}/pause")
+@router.post("/projects/{project_id}/autonomy/runs/{run_id}/pause")
+def pause_autonomous_run(project_id: str, run_id: str, payload: Payload | None = None, db: Session = Depends(get_db)):
+    run = db.get(AutonomousWorldRun, run_id)
+    if not run or run.project_id != project_id: raise HTTPException(status_code=404, detail="Autonomous run not found")
+    result = AutonomousWorldLoopService().pause(db, run_id, str((payload.model_dump() if payload else {}).get("reason", "USER_PAUSED"))); db.commit(); return AutonomousWorldLoopService.run_payload(result)
+
+
+@router.post("/projects/{project_id}/autonomous-runs/{run_id}/resume")
+@router.post("/projects/{project_id}/autonomy/runs/{run_id}/resume")
+def resume_autonomous_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
+    run = db.get(AutonomousWorldRun, run_id)
+    if not run or run.project_id != project_id: raise HTTPException(status_code=404, detail="Autonomous run not found")
+    try:
+        result = AutonomousWorldLoopService().resume(db, run_id); db.commit(); return AutonomousWorldLoopService.run_payload(result)
+    except ValueError as exc:
+        db.rollback(); raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+
+@router.post("/projects/{project_id}/autonomous-runs/{run_id}/cancel")
+@router.post("/projects/{project_id}/autonomy/runs/{run_id}/cancel")
+def cancel_autonomous_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
+    run = db.get(AutonomousWorldRun, run_id)
+    if not run or run.project_id != project_id: raise HTTPException(status_code=404, detail="Autonomous run not found")
+    result = AutonomousWorldLoopService().cancel(db, run_id); db.commit(); return AutonomousWorldLoopService.run_payload(result)
 
 @router.post("/projects/{project_id}/director/ai-dry-run")
 def director_ai_dry_run(project_id: str, db: Session = Depends(get_db)):
@@ -761,6 +859,7 @@ def get_director_proposal(project_id: str, proposal_id: str, db: Session = Depen
 
 @router.post("/projects/{project_id}/director/proposals/{proposal_id}/approve")
 def approve_director_proposal(project_id: str, proposal_id: str, db: Session = Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
     ensure_replay_not_pending(db, project_id)
     proposal = db.get(SceneProposal, proposal_id)
     if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
@@ -1145,6 +1244,7 @@ def _performance_payload(performance: ScenePerformance, turns: list[ScenePerform
 
 @router.post("/projects/{project_id}/director/proposals/{proposal_id}/performances", status_code=status.HTTP_201_CREATED)
 def create_performance(project_id: str, proposal_id: str, payload: Payload, db: Session = Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
     ensure_replay_not_pending(db, project_id)
     require_project(db, project_id)
     proposal = db.get(SceneProposal, proposal_id)
@@ -1175,6 +1275,7 @@ def get_performance(project_id: str, performance_id: str, db: Session = Depends(
 
 @router.post("/projects/{project_id}/performances/{performance_id}/step", status_code=status.HTTP_201_CREATED)
 def performance_step(project_id: str, performance_id: str, db: Session = Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
     ensure_replay_not_pending(db, project_id)
     performance = db.get(ScenePerformance, performance_id)
     if not performance or performance.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Performance not found")
@@ -1240,6 +1341,7 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
 
 @router.post("/projects/{project_id}/performances/{performance_id}/world/resolve", status_code=status.HTTP_201_CREATED)
 def resolve_world(project_id: str, performance_id: str, payload: Payload, db: Session = Depends(get_db)):
+    ensure_autonomous_run_idle(db, project_id)
     ensure_replay_not_pending(db, project_id)
     performance = db.get(ScenePerformance, performance_id)
     if not performance or performance.project_id != project_id:

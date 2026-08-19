@@ -48,7 +48,9 @@ class TimelineOrigin(str, enum.Enum): NORMAL_COMMIT="NORMAL_COMMIT"; REPLAY_COMM
 class CausalResourceType(str, enum.Enum): CANON_FACT="CANON_FACT"; WORLD_ENTITY="WORLD_ENTITY"; CHARACTER_KNOWLEDGE="CHARACTER_KNOWLEDGE"; CHARACTER_MEMORY="CHARACTER_MEMORY"; CHARACTER_DECISION="CHARACTER_DECISION"; SCENE_PERFORMANCE_TURN="SCENE_PERFORMANCE_TURN"; WORLD_RESOLUTION="WORLD_RESOLUTION"; STATE_DELTA_ITEM="STATE_DELTA_ITEM"; TIMELINE_EVENT="TIMELINE_EVENT"; SCENE="SCENE"; RETCON_APPLICATION="RETCON_APPLICATION"; REPLAY_SESSION="REPLAY_SESSION"
 class CausalEdgeKind(str, enum.Enum): CAUSAL="CAUSAL"; TEMPORAL="TEMPORAL"; PROVENANCE="PROVENANCE"; STRUCTURAL="STRUCTURAL"
 class CausalRelationType(str, enum.Enum): KNOWLEDGE_INFORMED_DECISION="KNOWLEDGE_INFORMED_DECISION"; MEMORY_INFORMED_DECISION="MEMORY_INFORMED_DECISION"; DECISION_PRODUCED_TURN="DECISION_PRODUCED_TURN"; TURN_RESOLVED_BY="TURN_RESOLVED_BY"; RESOLUTION_PRODUCED_STATE_CHANGE="RESOLUTION_PRODUCED_STATE_CHANGE"; STATE_CHANGE_COMMITTED_IN_SCENE="STATE_CHANGE_COMMITTED_IN_SCENE"; SCENE_PRODUCED_KNOWLEDGE="SCENE_PRODUCED_KNOWLEDGE"; SCENE_PRODUCED_MEMORY="SCENE_PRODUCED_MEMORY"; CANON_CONSTRAINED_RESOLUTION="CANON_CONSTRAINED_RESOLUTION"; WORLD_ENTITY_CONTEXT_FOR_RESOLUTION="WORLD_ENTITY_CONTEXT_FOR_RESOLUTION"; SCENE_PRECEDES_SCENE="SCENE_PRECEDES_SCENE"; RETCON_TRIGGERED_REPLAY="RETCON_TRIGGERED_REPLAY"; REPLAY_REPLACED_SCENE="REPLAY_REPLACED_SCENE"
-class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; SCENE_COMMIT="SCENE_COMMIT"; WRITER="WRITER"; CRITIC="CRITIC"
+class AutonomousRunStatus(str, enum.Enum): CREATED="CREATED"; RUNNING="RUNNING"; PAUSED="PAUSED"; BLOCKED="BLOCKED"; COMPLETED="COMPLETED"; FAILED="FAILED"; CANCELLED="CANCELLED"
+class AutonomousStepStatus(str, enum.Enum): PENDING="PENDING"; RUNNING="RUNNING"; PAUSED="PAUSED"; COMMITTED="COMMITTED"; BLOCKED="BLOCKED"; FAILED="FAILED"; CANCELLED="CANCELLED"
+class ExecutionStage(str, enum.Enum): CHARACTER_ACTOR="CHARACTER_ACTOR"; WORLD_RESOLVER="WORLD_RESOLVER"; DIRECTOR="DIRECTOR"; REPAIR="REPAIR"; REVISION_APPLY="REVISION_APPLY"; REVISION_ROLLBACK="REVISION_ROLLBACK"; SCENE_COMMIT="SCENE_COMMIT"; AUTONOMOUS_LOOP="AUTONOMOUS_LOOP"; WRITER="WRITER"; CRITIC="CRITIC"
 class ExecutionStatus(str, enum.Enum): STARTED="STARTED"; SUCCEEDED="SUCCEEDED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
@@ -659,6 +661,68 @@ class RevisionApplication(Base):
 class ProjectModelConfig(TimestampMixin, Base):
     __tablename__="project_model_configs"; __table_args__=(UniqueConstraint("project_id"),)
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); provider: Mapped[str|None]=mapped_column(String(100)); base_url: Mapped[str|None]=mapped_column(String(500)); character_model: Mapped[str|None]=mapped_column(String(200)); world_model: Mapped[str|None]=mapped_column(String(200)); director_model: Mapped[str|None]=mapped_column(String(200)); repair_model: Mapped[str|None]=mapped_column(String(200)); writer_model: Mapped[str|None]=mapped_column(String(200)); critic_model: Mapped[str|None]=mapped_column(String(200)); fallback_model: Mapped[str|None]=mapped_column(String(200)); auto_failover: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); max_repair_attempts: Mapped[int]=mapped_column(Integer,default=1,nullable=False)
+
+class AutonomousWorldRun(TimestampMixin, Base):
+    __tablename__ = "autonomous_world_runs"
+    __table_args__ = (Index("uq_autonomous_run_project_active", "project_id", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    status: Mapped[AutonomousRunStatus] = mapped_column(Enum(AutonomousRunStatus, native_enum=False, length=20), default=AutonomousRunStatus.CREATED, nullable=False, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    scene_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    committed_scene_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_turns_per_scene: Mapped[int] = mapped_column(Integer, default=6, nullable=False)
+    performance_mode: Mapped[PerformanceMode] = mapped_column(Enum(PerformanceMode, native_enum=False, length=20), default=PerformanceMode.HEURISTIC, nullable=False)
+    resolver_mode: Mapped[ResolverMode] = mapped_column(Enum(ResolverMode, native_enum=False, length=20), default=ResolverMode.HEURISTIC, nullable=False)
+    start_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_committed_sequence: Mapped[int | None] = mapped_column(Integer)
+    start_world_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    current_world_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    autonomous_run_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    stop_reason: Mapped[str | None] = mapped_column(String(120))
+    last_error_code: Mapped[str | None] = mapped_column(String(120))
+    last_error_detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    client_request_id: Mapped[str | None] = mapped_column(String(200))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    lock_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+class AutonomousWorldStep(Base):
+    __tablename__ = "autonomous_world_steps"
+    __table_args__ = (UniqueConstraint("run_id", "ordinal", name="uq_autonomous_step_run_ordinal"), UniqueConstraint("run_id", "request_key", "request_offset", name="uq_autonomous_step_request"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("autonomous_world_runs.id"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[AutonomousStepStatus] = mapped_column(Enum(AutonomousStepStatus, native_enum=False, length=20), default=AutonomousStepStatus.PENDING, nullable=False, index=True)
+    request_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    request_offset: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stage: Mapped[str] = mapped_column(String(80), nullable=False)
+    scene_sequence_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    scene_sequence_after: Mapped[int | None] = mapped_column(Integer)
+    world_fingerprint_before: Mapped[str] = mapped_column(String(120), nullable=False)
+    world_fingerprint_after: Mapped[str | None] = mapped_column(String(120))
+    step_input_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    step_output_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    director_context_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    gravity_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    candidate_key: Mapped[str | None] = mapped_column(String(500))
+    proposal_id: Mapped[str | None] = mapped_column(ForeignKey("scene_proposals.id"))
+    performance_id: Mapped[str | None] = mapped_column(ForeignKey("scene_performances.id"))
+    scene_commit_id: Mapped[str | None] = mapped_column(ForeignKey("scene_commits.id"))
+    scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id"))
+    checkpoint_id: Mapped[str | None] = mapped_column(ForeignKey("scene_state_checkpoints.id"))
+    turn_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    resolution_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    delta_batch_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    recovery_candidate_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    stop_reason: Mapped[str | None] = mapped_column(String(120))
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    error_detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
 class ExecutionTrace(Base):
     __tablename__="execution_traces"
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); stage: Mapped[ExecutionStage]=mapped_column(String(50),nullable=False); source_type: Mapped[str|None]=mapped_column(String(100)); source_id: Mapped[str|None]=mapped_column(String(36)); status: Mapped[ExecutionStatus]=mapped_column(String(30),nullable=False); provider: Mapped[str|None]=mapped_column(String(100)); model: Mapped[str|None]=mapped_column(String(200)); input_fingerprint: Mapped[str|None]=mapped_column(String(100)); output_fingerprint: Mapped[str|None]=mapped_column(String(100)); latency_ms: Mapped[int|None]=mapped_column(Integer); request_id: Mapped[str|None]=mapped_column(String(200)); error_type: Mapped[str|None]=mapped_column(String(100)); error_code: Mapped[str|None]=mapped_column(String(100)); upstream_status: Mapped[int|None]=mapped_column(Integer); validation_report: Mapped[dict[str,Any]]=mapped_column(JSON,default=dict,nullable=False); repairable: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); retryable: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); attempt_number: Mapped[int]=mapped_column(Integer,default=1,nullable=False); parent_trace_id: Mapped[str|None]=mapped_column(ForeignKey("execution_traces.id")); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False)
