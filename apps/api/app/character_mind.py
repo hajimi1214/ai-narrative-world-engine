@@ -190,7 +190,7 @@ class CharacterKnowledgeRetriever:
             current_sequence = session.scalar(select(Scene.sequence).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc()).limit(1)) or 0
         ranked = []
         for row in records:
-            item = beliefs[row.id]; count, latest = usage.get(row.id); cue = _cue_hits(item["fact_identity"], cues)
+            item = beliefs[row.id]; count, latest = usage.get(CausalResourceType.CHARACTER_KNOWLEDGE, row.id) if usage_provider else usage.get(row.id); cue = _cue_hits(item["fact_identity"], cues)
             recency = max(0, latest) / max(1, current_sequence) if latest >= 0 else 0
             score = cue * 8 + self.STATUS_WEIGHT.get(item["status"], 0) * 2 + float(row.confidence) + min(count, 4) + recency
             ranked.append((score, cue, count, latest, item))
@@ -210,13 +210,16 @@ class CharacterMemoryRetriever:
         ranked = []
         for memory in records:
             source_scene = getattr(memory, "source_scene", None) or getattr(memory, "source_scene_id", None)
-            scene = scene_provider(source_scene) if scene_provider else _scene_metadata(session, project_id, source_scene)
-            cue, strong = self._cue_score(memory, scene, cues); count, latest = usage.get(memory.id)
+            source_lookup = source_scene if source_scene is not None else getattr(memory, "source_sequence", None)
+            scene = scene_provider(source_lookup) if scene_provider else _scene_metadata(session, project_id, source_scene)
+            cue, strong = self._cue_score(memory, scene, cues); count, latest = usage.get(CausalResourceType.CHARACTER_MEMORY, memory.id) if usage_provider else usage.get(memory.id)
             source_sequence = (scene.get("sequence", -1) if isinstance(scene, dict) else scene.sequence) if scene else -1
             recency = self._recency(memory, scene, project, max_sequence)
             score = cue + 2 * max(0.0, float(memory.importance)) + abs(float(memory.emotional_weight)) + max(0.0, float(memory.confidence)) + min(count, 4) + recency
             happened_at = getattr(memory, "happened_at", None)
             item = {"memory_id": memory.id, "content": memory.content, "importance": getattr(memory, "importance", 0.5), "emotional_weight": getattr(memory, "emotional_weight", 0.0), "confidence": getattr(memory, "confidence", 1.0), "distortion": getattr(memory, "distortion", {}) or {}, "happened_at": happened_at.isoformat() if hasattr(happened_at, "isoformat") else happened_at, "source_scene_id": getattr(memory, "source_scene", None)}
+            if getattr(memory, "source_sequence", None) is not None:
+                item["source_scene_sequence"] = memory.source_sequence
             ranked.append((score, cue, count, source_sequence, item["happened_at"] or "", strong, item))
         ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4], item[6]["memory_id"]))
         selected, by_scene = [], {}
@@ -292,17 +295,18 @@ class CharacterMindViewBuilder:
 class ReplayCognitionUsageProvider:
     """Current-history usage view for a replay sequence, including staged refs."""
     def __init__(self, db, replay_session, sequence: int):
-        self.data: dict[str, tuple[int, int]] = {}
-        excluded = {item.get("scene_id") for item in (replay_session.queue or []) if item.get("mode") == "REPLAY" and item.get("sequence", 0) <= sequence}
+        self.data: dict[tuple[CausalResourceType, str], tuple[int, int]] = {}
+        replayed_scene_ids = {item.get("scene_id") for item in (replay_session.queue or []) if item.get("mode") == "REPLAY" and item.get("sequence", 0) < sequence}
         links = db.scalars(select(CausalLink).where(CausalLink.project_id == replay_session.project_id, CausalLink.active.is_(True))).all()
         for link in links:
-            if getattr(link, "scene_id", None) in excluded:
+            link_sequence = getattr(link, "sequence", None)
+            if link_sequence is None or link_sequence >= sequence or getattr(link, "scene_id", None) in replayed_scene_ids:
                 continue
-            if getattr(link, "relation_type", None) not in {CausalRelationType.KNOWLEDGE_INFORMED_DECISION, CausalRelationType.MEMORY_INFORMED_DECISION}:
+            resource_type = getattr(link, "cause_type", None)
+            expected_relation = {CausalResourceType.CHARACTER_KNOWLEDGE: CausalRelationType.KNOWLEDGE_INFORMED_DECISION, CausalResourceType.CHARACTER_MEMORY: CausalRelationType.MEMORY_INFORMED_DECISION}.get(resource_type)
+            if expected_relation is None or getattr(link, "relation_type", None) != expected_relation:
                 continue
-            if getattr(link, "cause_type", None) not in {CausalResourceType.CHARACTER_KNOWLEDGE, CausalResourceType.CHARACTER_MEMORY}:
-                continue
-            count, latest = self.data.get(link.cause_id, (0, -1)); self.data[link.cause_id] = (count + 1, max(latest, getattr(link, "sequence", -1) or -1))
+            key = (resource_type, link.cause_id); count, latest = self.data.get(key, (0, -1)); self.data[key] = (count + 1, max(latest, link_sequence))
         state = replay_session.staged_world_state or {}
         for scene_result in (state.get("scene_results", {}) or {}).values():
             scene_sequence = scene_result.get("sequence", -1)
@@ -312,14 +316,45 @@ class ReplayCognitionUsageProvider:
                 for reference in decision.get("decision", {}).get("knowledge_used", []) or []:
                     ident = context_knowledge_id(reference)
                     if ident:
-                        count, latest = self.data.get(ident, (0, -1)); self.data[ident] = (count + 1, max(latest, scene_sequence))
+                        key = (CausalResourceType.CHARACTER_KNOWLEDGE, ident); count, latest = self.data.get(key, (0, -1)); self.data[key] = (count + 1, max(latest, scene_sequence))
                 for reference in decision.get("decision", {}).get("memory_refs", []) or []:
                     ident = reference if isinstance(reference, str) else reference.get("memory_id") if isinstance(reference, dict) else None
                     if ident:
-                        count, latest = self.data.get(ident, (0, -1)); self.data[ident] = (count + 1, max(latest, scene_sequence))
+                        key = (CausalResourceType.CHARACTER_MEMORY, ident); count, latest = self.data.get(key, (0, -1)); self.data[key] = (count + 1, max(latest, scene_sequence))
 
-    def get(self, resource_id: str) -> tuple[int, int]:
-        return self.data.get(resource_id, (0, -1))
+    def get(self, resource_type: CausalResourceType, resource_id: str) -> tuple[int, int]:
+        return self.data.get((resource_type, resource_id), (0, -1))
+
+
+class ReplaySceneMetadataProvider:
+    """Structured scene metadata for temporal memory ranking; never creates Scene rows."""
+    def __init__(self, replay_session, current_sequence: int):
+        self.current_sequence = current_sequence
+        state = replay_session.staged_world_state or {}
+        self.by_id: dict[str, dict[str, Any]] = {}
+        self.by_sequence: dict[int, dict[str, Any]] = {}
+        for row in state.get("current_world", {}).get("scenes", []) or []:
+            self._add(row)
+        for scene_id, result in (state.get("scene_results", {}) or {}).items():
+            situation = result.get("situation", {}) or {}
+            row = {"id": scene_id, "sequence": result.get("sequence"), "location": situation.get("location"), "participants": situation.get("participants", []), "story_threads": situation.get("story_threads", [])}
+            if row["sequence"] is not None:
+                self._add(row)
+
+    def _add(self, row: dict[str, Any]) -> None:
+        sequence = row.get("sequence")
+        if not isinstance(sequence, int) or sequence >= self.current_sequence:
+            return
+        normalized = {"id": row.get("id"), "sequence": sequence, "location": row.get("location"), "participants": list(row.get("participants") or []), "story_threads": list(row.get("story_threads") or [])}
+        if normalized["id"]:
+            self.by_id[normalized["id"]] = normalized
+        self.by_sequence[sequence] = normalized
+
+    def by_scene(self, scene_id: str | None) -> dict[str, Any] | None:
+        return self.by_id.get(scene_id) if scene_id else None
+
+    def by_sequence_value(self, sequence: int | None) -> dict[str, Any] | None:
+        return self.by_sequence.get(sequence) if sequence is not None else None
 
 
 class ReplayCharacterMindViewBuilder:
@@ -334,10 +369,18 @@ class ReplayCharacterMindViewBuilder:
         cues = StructuredActorCueExtractor().extract(proposal, character_id)
         beliefs, conflicts = CharacterBeliefViewBuilder().build(cognition["knowledge"])
         usage = ReplayCognitionUsageProvider(db, replay_session, scene.sequence)
-        knowledge = CharacterKnowledgeRetriever().retrieve(db, replay_session.project_id, cognition["knowledge"], cues, beliefs, usage=usage, current_sequence=scene.sequence)
-        scene_rows = {row.get("id"): row for row in (replay_session.staged_world_state or {}).get("current_world", {}).get("scenes", []) if row.get("id")}
-        scene_provider = lambda ident: scene_rows.get(ident)
-        memories = CharacterMemoryRetriever().retrieve(db, replay_session.project_id, cognition["memories"], cues, usage=usage, current_sequence=scene.sequence, scene_provider=scene_provider)
+        metadata = ReplaySceneMetadataProvider(replay_session, scene.sequence)
+        knowledge = CharacterKnowledgeRetriever().retrieve(db, replay_session.project_id, cognition["knowledge"], cues, beliefs, usage_provider=usage, current_sequence=scene.sequence)
+        def source_scene_provider(memory_source):
+            return metadata.by_scene(memory_source) or metadata.by_sequence_value(memory_source if isinstance(memory_source, int) else None)
+        memories = CharacterMemoryRetriever().retrieve(db, replay_session.project_id, cognition["memories"], cues, usage_provider=usage, current_sequence=scene.sequence, scene_provider=source_scene_provider)
+        for item in memories:
+            if item.get("source_scene_id"):
+                source = metadata.by_scene(item["source_scene_id"])
+            else:
+                source = metadata.by_sequence_value(next((getattr(row, "source_sequence", None) for row in cognition["memories"] if row.id == item.get("memory_id")), None))
+            if source:
+                item["source_scene_sequence"] = source["sequence"]
         result = {"character_id": character_id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": {key: character.get(key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}, "proposal_id": proposal.id, "cues": cues, "knowledge": knowledge, "memories": memories, "belief_conflicts": conflicts}
         result["mind_fingerprint"] = _stable_fingerprint("replay-character-mind-v1", result)
         return result
