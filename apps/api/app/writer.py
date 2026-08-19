@@ -82,6 +82,83 @@ class WriterWordCounter:
         return len(self._cjk.findall(text)) + len(self._latin.findall(text))
 
 
+class WriterRenderConfigResolver:
+    """Resolve and validate the effective render configuration once."""
+
+    fields = ("target_words", "min_words", "max_words")
+    project_fields = {"target_words": "target_chapter_words", "min_words": "min_chapter_words", "max_words": "max_chapter_words"}
+
+    def resolve(self, project, request: dict[str, Any] | None = None) -> dict[str, Any]:
+        request = request or {}
+        values = {}
+        explicit = {}
+        for field in self.fields:
+            raw = request[field] if field in request else getattr(project, self.project_fields[field])
+            if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0):
+                raise WriterDomainError("INVALID_WRITER_CONFIG", {"field": field})
+            values[field] = raw
+            explicit[field] = field in request
+        if values["min_words"] is not None and values["max_words"] is not None and values["min_words"] > values["max_words"]:
+            raise WriterDomainError("INVALID_WRITER_CONFIG", {"field": "min_words"})
+        return {**values, "explicit": explicit, "visibility_protocol": "writer-visibility-v2", "secret_policy": "formal-visible-history-v1"}
+
+
+class WriterVisibilityProjector:
+    """Project full formal history into conservative writer-visible history."""
+
+    protocol = "writer-visibility-v2"
+
+    def project(self, scenes: list[dict[str, Any]], mode: WriterPOVMode, pov_character_id: str | None) -> list[dict[str, Any]]:
+        rows = json.loads(_canonical(scenes))
+        omniscient = mode == WriterPOVMode.THIRD_PERSON_OMNISCIENT
+        for scene in rows:
+            visible_turns = []
+            visible_ids: set[str] = set()
+            visible_visibility: dict[str, str | None] = {}
+            for turn in scene.get("turns", []):
+                visibility = turn.get("visibility")
+                actor = turn.get("actor_character_id")
+                recipients = set(turn.get("recipient_character_ids") or [])
+                if omniscient:
+                    allowed = True
+                elif mode == WriterPOVMode.OBJECTIVE:
+                    allowed = visibility == "PUBLIC"
+                elif visibility == "PUBLIC":
+                    allowed = True
+                elif visibility == "TARGETED":
+                    allowed = pov_character_id == actor or pov_character_id in recipients
+                elif visibility in {"PRIVATE", "COVERT"}:
+                    allowed = pov_character_id == actor
+                else:
+                    allowed = False
+                if allowed:
+                    visible_turns.append(turn)
+                    visible_ids.add(turn["id"])
+                    visible_visibility[turn["id"]] = visibility
+            scene["turns"] = visible_turns
+            resolutions = []
+            for resolution in scene.get("resolutions", []):
+                if resolution.get("turn_id") not in visible_ids:
+                    continue
+                if not omniscient:
+                    resolution["objective_facts"] = []
+                    if mode == WriterPOVMode.OBJECTIVE:
+                        resolution["actor_observation"] = None
+                    elif resolution.get("actor_character_id") != pov_character_id:
+                        resolution["actor_observation"] = None
+                if visible_visibility.get(resolution.get("turn_id")) != "PUBLIC":
+                    resolution["public_observation"] = None
+                resolutions.append(resolution)
+            scene["resolutions"] = resolutions
+            if not omniscient:
+                # World truth remains in the full source fingerprint, but raw values are not prose authority.
+                scene["state_delta_items"] = []
+                scene["state_changes"] = []
+                scene.pop("legacy_facts", None)
+                scene.pop("legacy_result", None)
+        return rows
+
+
 class WriterPOVResolver:
     def resolve(self, db: Session, chapter: Chapter, request: dict[str, Any] | None = None, bible: WritingBible | None = None) -> tuple[WriterPOVMode, str | None]:
         request = request or {}
@@ -196,28 +273,30 @@ class WriterContextBuilder:
             raise WriterDomainError("WRITING_BIBLE_AMBIGUOUS")
         bible = bibles[0] if bibles else None
         mode, pov_character_id = WriterPOVResolver().resolve(db, chapter, request, bible)
+        project = db.get(__import__("app.models", fromlist=["Project"]).Project, chapter.project_id)
         rules = bible.rules if bible else {"protocol": "writer-default-v1"}
-        bible_fp = _fp(rules, "writing-bible-v1") if bible else "writer-default-v1"
-        allowed_reveals = self._allowed_reveals(db, chapter.project_id, request, pov_character_id)
-        safe_scenes = self._visible_history(source["scenes"], mode, pov_character_id)
+        bible_fp = _fp({"version": bible.version, "rules": rules}, "writing-bible-v2") if bible else "writer-default-v1"
+        config = WriterRenderConfigResolver().resolve(project, request)
+        allowed_reveals: list[str] = []
+        safe_scenes = WriterVisibilityProjector().project(source["scenes"], mode, pov_character_id)
         manifest = dict(source["manifest"])
         manifest["scenes"] = safe_scenes
+        manifest["rendering_config"] = {**config, "pov_mode": mode.value, "pov_character_id": pov_character_id}
         context = {
             "writing_rules": rules,
             "chapter": {"id": chapter.id, "number": chapter.number, "title": chapter.title, "structure_status": _value(chapter.structure_status)},
             "formal_history": {"scenes": safe_scenes},
             "pov_subjective_context": self._subjective(db, safe_scenes, pov_character_id, mode, chapter.project_id, set(allowed_reveals)),
-            "entity_labels": self._labels(db, source["scenes"]),
-            "rendering_contract": {"pov_mode": mode.value, "pov_character_id": pov_character_id, "grounding": "structured references only", "allowed_reveal_ids": allowed_reveals, "no_formal_mutation": True},
+            "entity_labels": self._labels(db, safe_scenes),
+            "rendering_contract": {"pov_mode": mode.value, "pov_character_id": pov_character_id, "grounding": "structured references only", "allowed_reveal_ids": [], "no_formal_mutation": True, "visibility_protocol": config["visibility_protocol"], "secret_policy": config["secret_policy"]},
             "source_manifest": manifest,
             "fingerprints": {"chapter_structure": source["structure_fingerprint"], "chapter_source": source["source_fingerprint"], "writing_bible": bible_fp},
         }
-        context["writer_context_fingerprint"] = _fp({key: value for key, value in context.items() if key not in {"writer_context_fingerprint", "formal_history"}}, self.protocol)
-        context["writer_context_fingerprint"] = _fp({"source": source["source_fingerprint"], "bible": bible_fp, "pov_mode": mode.value, "pov_character_id": pov_character_id, "rules": rules}, self.protocol)
+        context["writer_context_fingerprint"] = _fp({"chapter_source_fingerprint": source["source_fingerprint"], "chapter_structure_fingerprint": source["structure_fingerprint"], "writing_bible": bible_fp, "pov_mode": mode.value, "pov_character_id": pov_character_id, "rendering_config": config, "entity_labels": context["entity_labels"], "rendering_contract": context["rendering_contract"]}, self.protocol)
         context["writing_bible"] = bible
         context["pov_mode"] = mode
         context["pov_character_id"] = pov_character_id
-        context["renderable_source_refs"] = sorted(self._source_refs(safe_scenes, context["pov_subjective_context"]) + [{"source_type": "CANON_FACT", "source_id": item} for item in allowed_reveals], key=lambda item: (item["source_type"], item["source_id"]))
+        context["renderable_source_refs"] = sorted(self._source_refs(safe_scenes, context["pov_subjective_context"]), key=lambda item: (item["source_type"], item["source_id"]))
         return context
 
     @staticmethod
@@ -232,49 +311,13 @@ class WriterContextBuilder:
             refs.update(("TIMELINE_EVENT", item["id"]) for item in scene.get("state_changes", []))
         for row in subjective:
             refs.update(("CHARACTER_KNOWLEDGE", item["id"]) for item in row.get("knowledge", []))
-            refs.update(("CHARACTER_MEMORY", item["id"]) for item in row.get("memories", []))
+            refs.update(("CHARACTER_MEMORY", item["id"]) for item in row.get("memories", []) if item.get("renderable", True))
         return [{"source_type": kind, "source_id": item_id} for kind, item_id in sorted(refs)]
 
     @staticmethod
-    def _visible_history(scenes: list[dict[str, Any]], mode: WriterPOVMode, pov_character_id: str | None) -> list[dict[str, Any]]:
-        rows = json.loads(_canonical(scenes))
-        for scene in rows:
-            visible = []
-            visible_turn_ids = set()
-            for turn in scene.get("turns", []):
-                visibility = turn.get("visibility")
-                actor = turn.get("actor_character_id")
-                recipients = set(turn.get("recipient_character_ids") or [])
-                allowed = mode == WriterPOVMode.THIRD_PERSON_OMNISCIENT
-                if mode == WriterPOVMode.OBJECTIVE:
-                    allowed = visibility == "PUBLIC"
-                elif mode in {WriterPOVMode.FIRST_PERSON, WriterPOVMode.THIRD_PERSON_LIMITED}:
-                    allowed = visibility == "PUBLIC" or (visibility == "TARGETED" and (pov_character_id == actor or pov_character_id in recipients)) or (visibility == "PRIVATE" and pov_character_id == actor)
-                    if visibility == "COVERT": allowed = False
-                if allowed:
-                    visible.append(turn); visible_turn_ids.add(turn["id"])
-            scene["turns"] = visible
-            scene["resolutions"] = [item for item in scene.get("resolutions", []) if item.get("turn_id") in visible_turn_ids]
-            for resolution in scene["resolutions"]:
-                if mode == WriterPOVMode.OBJECTIVE:
-                    resolution["actor_observation"] = None
-                elif mode in {WriterPOVMode.FIRST_PERSON, WriterPOVMode.THIRD_PERSON_LIMITED}:
-                    if resolution.get("actor_character_id") != pov_character_id:
-                        resolution["actor_observation"] = None
-                    if pov_character_id not in set(resolution.get("recipient_character_ids") or []):
-                        resolution["public_observation"] = None
-                    resolution["objective_facts"] = []
-        return rows
-
-    @staticmethod
     def _allowed_reveals(db: Session, project_id: str, request: dict[str, Any], pov_character_id: str | None) -> list[str]:
-        requested = set(_ids(request.get("allowed_reveal_ids")))
-        allowed = []
-        for item in db.scalars(select(RevealConstraint).where(RevealConstraint.project_id == project_id, (RevealConstraint.id.in_(requested) | RevealConstraint.canon_fact_id.in_(requested)))).all() if requested else []:
-            status = _value(item.status)
-            if status == RevealStatus.REVEALED.value:
-                allowed.append(item.canon_fact_id)
-        return sorted(allowed)
+        # Canon status never authorizes raw proposition injection; only formal visible history does.
+        return []
 
     def _labels(self, db: Session, scenes: list[dict[str, Any]]) -> dict[str, str]:
         ids = sorted({item for scene in scenes for item in scene["participants"]})
@@ -298,7 +341,11 @@ class WriterContextBuilder:
                     blocked_secret_propositions = set(db.scalars(select(CanonFact.proposition).where(CanonFact.project_id == project_id, CanonFact.fact_type == CanonType.SECRET_CANON, CanonFact.id.not_in(allowed_reveals))).all())
                     knowledge = [item for item in knowledge if item.proposition not in blocked_secret_propositions]
                     memories = db.scalars(select(CharacterMemory).where(CharacterMemory.id.in_(memory_ids), CharacterMemory.character_id == pov_character_id).order_by(CharacterMemory.id)).all() if memory_ids else []
-                    rows.append({"scene_id": scene["scene_id"], "character_id": pov_character_id, "chosen_action": decision.get("chosen_action"), "motivation": formal.motivation if formal else None, "knowledge": [{"id": item.id, "proposition": item.proposition, "status": _value(item.status), "confidence": item.confidence} for item in knowledge], "memories": [{"id": item.id, "content": item.content, "confidence": item.confidence} for item in memories]})
+                    visible_memories = []
+                    for memory in memories:
+                        blocked = any(secret and secret in (memory.content or "") for secret in blocked_secret_propositions)
+                        visible_memories.append({"id": memory.id, "content": None if blocked else memory.content, "confidence": memory.confidence, "renderable": not blocked})
+                    rows.append({"scene_id": scene["scene_id"], "character_id": pov_character_id, "chosen_action": decision.get("chosen_action"), "motivation": formal.motivation if formal else None, "knowledge": [{"id": item.id, "proposition": item.proposition, "status": _value(item.status), "confidence": item.confidence} for item in knowledge], "memories": visible_memories})
         return rows
 
 
@@ -368,14 +415,17 @@ class WriterProjectionAudit:
 
 
 class WriterProjectionService:
-    def __init__(self, provider_factory=None):
+    def __init__(self, provider_factory=None, failure_injector=None):
         self.provider_factory = provider_factory
+        self.failure_injector = failure_injector
 
     def preview(self, db: Session, chapter_id: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
         source = WriterChapterSourceBuilder().build(db, chapter_id)
         context = WriterContextBuilder().build(db, source, request or {})
         project = db.get(__import__("app.models", fromlist=["Project"]).Project, source["chapter"].project_id)
-        return {"chapter_id": chapter_id, "chapter_number": source["chapter"].number, "structure_status": _value(source["chapter"].structure_status), "source_scene_ids": source["source_scene_ids"], "chapter_source_fingerprint": source["source_fingerprint"], "writer_context_fingerprint": context["writer_context_fingerprint"], "writing_bible": {"id": context["writing_bible"].id, "version": context["writing_bible"].version, "fingerprint": context["fingerprints"]["writing_bible"]} if context.get("writing_bible") else {"id": None, "version": None, "fingerprint": "writer-default-v1"}, "pov_mode": context["pov_mode"].value, "pov_character_id": context["pov_character_id"], "target_words": (request or {}).get("target_words", project.target_chapter_words), "min_words": (request or {}).get("min_words", project.min_chapter_words), "max_words": (request or {}).get("max_words", project.max_chapter_words), "source_counts": {"scenes": len(source["scenes"]), "refs": len(context["renderable_source_refs"])}, "visibility": {"renderable_ref_count": len(context["renderable_source_refs"])}, "prompt_fingerprint": _fp({"writer_context": context["writer_context_fingerprint"]}, "writer-prompt-v1"), "request_fingerprint": self.request_fingerprint(request or {}, context)}
+        config = context["source_manifest"]["rendering_config"]
+        prompt_fingerprint = self.prompt_fingerprint(context)
+        return {"chapter_id": chapter_id, "chapter_number": source["chapter"].number, "structure_status": _value(source["chapter"].structure_status), "source_scene_ids": source["source_scene_ids"], "chapter_source_fingerprint": source["source_fingerprint"], "writer_context_fingerprint": context["writer_context_fingerprint"], "writing_bible": {"id": context["writing_bible"].id, "version": context["writing_bible"].version, "fingerprint": context["fingerprints"]["writing_bible"]} if context.get("writing_bible") else {"id": None, "version": None, "fingerprint": "writer-default-v1"}, "pov_mode": context["pov_mode"].value, "pov_character_id": context["pov_character_id"], "target_words": config["target_words"], "min_words": config["min_words"], "max_words": config["max_words"], "rendering_config": config, "source_counts": {"scenes": len(source["scenes"]), "refs": len(context["renderable_source_refs"])}, "visibility": {"renderable_ref_count": len(context["renderable_source_refs"])}, "prompt_fingerprint": prompt_fingerprint, "request_fingerprint": self.request_fingerprint(request or {}, context)}
 
     @staticmethod
     def request_fingerprint(request: dict[str, Any], context: dict[str, Any] | None = None) -> str:
@@ -383,6 +433,10 @@ class WriterProjectionService:
         if context:
             semantic["writer_context_fingerprint"] = context.get("writer_context_fingerprint")
         return _fp(semantic, "writer-request-v1")
+
+    @staticmethod
+    def prompt_fingerprint(context: dict[str, Any]) -> str:
+        return _fp(WriterPromptBuilder().build(context), "writer-prompt-v2")
 
     def render(self, db: Session, chapter_id: str, request: dict[str, Any] | None = None, *, provider=None, model: str | None = None, settings=None) -> ChapterWriterDraft:
         request = dict(request or {})
@@ -420,7 +474,7 @@ class WriterProjectionService:
             result = route_provider.generate(WriterPromptBuilder().build(context), route_model)
             parsed = self._parse(result.content)
             report = WriterGroundingValidator().validate(parsed, context)
-            draft.provider = result.provider; draft.model = result.model; draft.model_request_id = result.request_id; draft.prompt_fingerprint = _fp({"writer_context": context["writer_context_fingerprint"], "model": route_model}, "writer-prompt-v1"); draft.title_candidate = parsed.get("chapter_title"); draft.content = parsed.get("prose", "")
+            draft.provider = result.provider; draft.model = result.model; draft.model_request_id = result.request_id; draft.prompt_fingerprint = self.prompt_fingerprint(context); draft.title_candidate = parsed.get("chapter_title"); draft.content = parsed.get("prose", "")
             draft.content_fingerprint = _fp(draft.content, "writer-content-v1"); draft.word_count = WriterWordCounter().count(draft.content); draft.scene_coverage = parsed.get("scene_coverage", []); draft.source_refs = parsed.get("source_refs", [])
             draft.validation_report = report; draft.completed_at = datetime.utcnow()
             if not report["valid"]:
@@ -428,8 +482,9 @@ class WriterProjectionService:
                 ExecutionTraceRecorder().block(trace, report["issues"][0]["code"], validation_report=report, request_id=result.request_id)
             else:
                 project = db.get(__import__("app.models", fromlist=["Project"]).Project, chapter.project_id)
-                min_words = request.get("min_words", project.min_chapter_words)
-                max_words = request.get("max_words", project.max_chapter_words)
+                config = context["source_manifest"]["rendering_config"]
+                min_words = config["min_words"]
+                max_words = config["max_words"]
                 if min_words is not None and draft.word_count < min_words or max_words is not None and draft.word_count > max_words:
                     draft.validation_report = {"valid": False, "issues": [{"code": "WRITER_WORD_COUNT_OUT_OF_RANGE", "blocking": True, "word_count": draft.word_count}]}; draft.status = WriterDraftStatus.REJECTED
                     ExecutionTraceRecorder().block(trace, "WRITER_WORD_COUNT_OUT_OF_RANGE", validation_report=draft.validation_report, request_id=result.request_id)
@@ -444,7 +499,7 @@ class WriterProjectionService:
         db.flush()
         return draft
 
-    def adopt(self, db: Session, draft_id: str, *, force_replace_untracked: bool = False) -> Chapter:
+    def adopt(self, db: Session, draft_id: str, *, force_replace_untracked: bool = False, replace_title: bool = False) -> Chapter:
         draft = db.get(ChapterWriterDraft, draft_id)
         if not draft:
             raise WriterDomainError("WRITER_DRAFT_NOT_FOUND")
@@ -463,7 +518,12 @@ class WriterProjectionService:
             draft.status = WriterDraftStatus.STALE; draft.stale_at = datetime.utcnow(); db.flush(); raise WriterDomainError("WRITER_DRAFT_STALE")
         chapter = current["chapter"]
         try:
-            current_context = WriterContextBuilder().build(db, current, {"pov_mode": _value(draft.pov_mode), "pov_character_id": draft.pov_character_id})
+            config = dict((draft.source_manifest or {}).get("rendering_config") or {})
+            adopt_request = {"pov_mode": config.get("pov_mode", _value(draft.pov_mode)), "pov_character_id": config.get("pov_character_id", draft.pov_character_id)}
+            for field in WriterRenderConfigResolver.fields:
+                if config.get("explicit", {}).get(field):
+                    adopt_request[field] = config.get(field)
+            current_context = WriterContextBuilder().build(db, current, adopt_request)
         except WriterDomainError as exc:
             draft.status = WriterDraftStatus.STALE; draft.stale_at = datetime.utcnow(); db.flush(); raise WriterDomainError("WRITER_STYLE_SOURCE_CHANGED") from exc
         if current_context["writer_context_fingerprint"] != draft.writer_context_fingerprint:
@@ -473,8 +533,17 @@ class WriterProjectionService:
         prior = db.get(ChapterWriterDraft, chapter.current_writer_draft_id) if chapter.current_writer_draft_id else None
         if prior and prior.id != draft.id and _value(prior.status) == WriterDraftStatus.ADOPTED.value:
             prior.status = WriterDraftStatus.SUPERSEDED
-        chapter.content = draft.content; chapter.title = draft.title_candidate or chapter.title; chapter.word_count = draft.word_count; chapter.writer_content_fingerprint = draft.content_fingerprint; chapter.writer_context_fingerprint = draft.writer_context_fingerprint; chapter.current_writer_draft_id = draft.id; chapter.written_at = datetime.utcnow(); draft.status = WriterDraftStatus.ADOPTED; draft.adopted_at = datetime.utcnow(); db.flush(); WriterProjectionAudit().audit(db, chapter.id)
+        chapter.content = draft.content
+        if replace_title or chapter.title is None:
+            chapter.title = draft.title_candidate or chapter.title
+        chapter.word_count = draft.word_count; chapter.writer_content_fingerprint = draft.content_fingerprint; chapter.writer_context_fingerprint = draft.writer_context_fingerprint; chapter.current_writer_draft_id = draft.id; chapter.written_at = datetime.utcnow()
+        self._inject("AFTER_CHAPTER_CONTENT_BEFORE_DRAFT_FINALIZATION")
+        draft.status = WriterDraftStatus.ADOPTED; draft.adopted_at = datetime.utcnow(); db.flush(); WriterProjectionAudit().audit(db, chapter.id)
         return chapter
+
+    def _inject(self, stage: str) -> None:
+        if self.failure_injector:
+            self.failure_injector(stage)
 
     def _provider(self, db: Session, project_id: str, provider, model, settings):
         if provider is not None:

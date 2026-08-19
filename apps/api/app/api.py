@@ -624,7 +624,7 @@ def writer_adopt(project_id: str, draft_id: str, payload: Payload | None = None,
         raise HTTPException(status_code=404, detail="Writer draft not found")
     values = payload.model_dump() if payload else {}
     try:
-        chapter = WriterProjectionService().adopt(db, draft_id, force_replace_untracked=bool(values.get("force_replace_untracked", False)))
+        chapter = WriterProjectionService().adopt(db, draft_id, force_replace_untracked=bool(values.get("force_replace_untracked", False)), replace_title=bool(values.get("replace_title", False)))
         db.commit(); db.refresh(chapter)
         return record_dict(chapter)
     except WriterDomainError as exc:

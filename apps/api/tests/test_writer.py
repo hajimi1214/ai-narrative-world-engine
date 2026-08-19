@@ -14,15 +14,18 @@ from app.ai.fake import FakeModelProvider
 from app.db import Base
 from app.main import app
 from app.models import (
-    Chapter, ChapterWriterDraft, Character, NarrativeStructureRevision, Project,
+    Chapter, ChapterWriterDraft, Character, CharacterDecision, NarrativeStructureRevision, Project,
     RetconApplication, RetconApplicationStatus, Scene, WritingBible,
-    WriterDraftStatus, WriterPOVMode,
+    SceneExecutionBinding, ScenePerformance, ScenePerformanceTurn, SceneProposal,
+    SceneStateCheckpoint, StateDeltaBatch, StateDeltaItem, TimelineEvent,
+    WorldResolution, WriterDraftStatus, WriterPOVMode,
 )
 from app.narrative_structure import NarrativeStructureService
 from app.writer import (
     WriterChapterSourceBuilder, WriterContextBuilder, WriterDomainError,
     WriterGroundingValidator, WriterPOVResolver, WriterProjectionAudit,
-    WriterProjectionService, WriterPromptBuilder, WriterWordCounter,
+    WriterProjectionService, WriterPromptBuilder, WriterRenderConfigResolver,
+    WriterVisibilityProjector, WriterWordCounter,
 )
 
 
@@ -466,3 +469,130 @@ def test_nested_adopt_api_is_explicit(writer_project, session, monkeypatch):
     monkeypatch.setattr(api, "SessionLocal", sessionmaker(bind=session.bind, expire_on_commit=False))
     result = TestClient(app).post(f"/projects/{project.id}/chapters/{chapter.id}/writer/drafts/{draft.id}/adopt", json={})
     assert result.status_code == 200 and result.json()["current_writer_draft_id"] == draft.id
+
+
+def visibility_scene():
+    turns = []
+    resolutions = []
+    for index, (visibility, actor, recipients) in enumerate((
+        ("PUBLIC", "A", []), ("TARGETED", "A", ["B"]),
+        ("PRIVATE", "A", []), ("COVERT", "A", []),
+    ), 1):
+        turn_id = f"turn-{index}"
+        turns.append({"id": turn_id, "visibility": visibility, "actor_character_id": actor, "recipient_character_ids": recipients, "observable_action": visibility, "spoken_content": None, "decision": None})
+        resolutions.append({"id": f"resolution-{index}", "turn_id": turn_id, "actor_character_id": actor, "recipient_character_ids": recipients, "actor_observation": f"actor-{visibility}", "public_observation": f"public-{visibility}", "objective_facts": [{"secret": visibility}]})
+    return [{"scene_id": "scene", "participants": ["A", "B", "C"], "turns": turns, "resolutions": resolutions, "state_delta_items": [{"id": "delta", "target_type": "CHARACTER", "target_id": "C", "after_value": "terrified"}], "state_changes": [{"id": "event", "target_type": "WORLD_ENTITY", "target_id": "vault", "after_value": "Secret Vault"}]}]
+
+
+@pytest.mark.parametrize(("mode", "pov", "expected"), [
+    (WriterPOVMode.OBJECTIVE, None, ["turn-1"]),
+    (WriterPOVMode.THIRD_PERSON_LIMITED, "B", ["turn-1", "turn-2"]),
+    (WriterPOVMode.THIRD_PERSON_LIMITED, "C", ["turn-1"]),
+    (WriterPOVMode.FIRST_PERSON, "A", ["turn-1", "turn-2", "turn-3", "turn-4"]),
+])
+def test_visibility_projector_observation_matrix(mode, pov, expected):
+    rows = WriterVisibilityProjector().project(visibility_scene(), mode, pov)
+    assert [item["id"] for item in rows[0]["turns"]] == expected
+
+
+def test_public_resolution_does_not_require_recipient():
+    rows = WriterVisibilityProjector().project(visibility_scene(), WriterPOVMode.THIRD_PERSON_LIMITED, "C")
+    assert rows[0]["resolutions"][0]["public_observation"] == "public-PUBLIC"
+    assert rows[0]["resolutions"][0]["actor_observation"] is None
+
+
+def test_limited_projection_excludes_raw_world_truth_and_refs(writer_project, session):
+    source = WriterChapterSourceBuilder().build(session, writer_project[3].id)
+    source["scenes"][0]["state_delta_items"] = [{"id": "delta", "target_type": "CHARACTER", "target_id": "hidden", "after_value": "terrified"}]
+    source["scenes"][0]["state_changes"] = [{"id": "event", "target_type": "WORLD_ENTITY", "target_id": "vault", "after_value": "Secret Vault"}]
+    context = WriterContextBuilder().build(session, source, {"pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": writer_project[1].id})
+    encoded = json.dumps(context, default=str)
+    assert "terrified" not in encoded and "Secret Vault" not in encoded
+    assert not {"delta", "event"} & {item["source_id"] for item in context["renderable_source_refs"]}
+
+
+def test_writer_config_validation(writer_project):
+    project = writer_project[0]
+    with pytest.raises(WriterDomainError, match="INVALID_WRITER_CONFIG"):
+        WriterRenderConfigResolver().resolve(project, {"min_words": 10, "max_words": 5})
+    with pytest.raises(WriterDomainError, match="INVALID_WRITER_CONFIG"):
+        WriterRenderConfigResolver().resolve(project, {"target_words": 0})
+
+
+def test_same_rules_new_bible_version_stales_draft(writer_project, session):
+    project, _, _, chapter = writer_project
+    first = WritingBible(project_id=project.id, version=1, active=True, rules={"tone": "plain"}); session.add(first); session.flush()
+    draft = render(session, chapter)
+    first.active = False; session.add(WritingBible(project_id=project.id, version=2, active=True, rules={"tone": "plain"})); session.flush()
+    with pytest.raises(WriterDomainError, match="WRITER_STYLE_SOURCE_CHANGED"):
+        WriterProjectionService().adopt(session, draft.id)
+    assert draft.status == WriterDraftStatus.STALE
+
+
+def test_default_config_change_stales_but_explicit_override_does_not(writer_project, session):
+    project, _, _, chapter = writer_project
+    draft = render(session, chapter, target_words=2000)
+    project.target_chapter_words = 4000; session.flush()
+    WriterProjectionService().adopt(session, draft.id)
+    assert draft.status == WriterDraftStatus.ADOPTED
+
+
+def test_preview_and_render_prompt_fingerprint_match(writer_project, session):
+    chapter = writer_project[3]
+    preview = WriterProjectionService().preview(session, chapter.id, {"pov_mode": "OBJECTIVE"})
+    draft = render(session, chapter)
+    assert preview["prompt_fingerprint"] == draft.prompt_fingerprint
+
+
+def test_adopt_title_policy(writer_project, session):
+    chapter = writer_project[3]; chapter.title = "Existing"
+    first = render(session, chapter); WriterProjectionService().adopt(session, first.id)
+    assert chapter.title == "Existing"
+    second = render(session, chapter); WriterProjectionService().adopt(session, second.id, replace_title=True)
+    assert chapter.title == "Quiet"
+
+
+def test_adopt_uses_candidate_title_when_missing(writer_project, session):
+    chapter = writer_project[3]; chapter.title = None
+    draft = render(session, chapter); WriterProjectionService().adopt(session, draft.id)
+    assert chapter.title == "Quiet"
+
+
+def test_adopt_failure_rolls_back_in_fresh_session(writer_project, session):
+    _, _, _, chapter = writer_project
+    draft = render(session, chapter); session.commit()
+    service = WriterProjectionService(failure_injector=lambda stage: (_ for _ in ()).throw(RuntimeError(stage)))
+    with pytest.raises(RuntimeError, match="AFTER_CHAPTER_CONTENT_BEFORE_DRAFT_FINALIZATION"):
+        service.adopt(session, draft.id)
+    session.rollback()
+    with sessionmaker(bind=session.bind, expire_on_commit=False)() as fresh:
+        saved_chapter = fresh.get(Chapter, chapter.id)
+        saved_draft = fresh.get(ChapterWriterDraft, draft.id)
+        assert saved_chapter.content is None and saved_chapter.current_writer_draft_id is None
+        assert saved_draft.status == WriterDraftStatus.VALIDATED
+
+
+def test_formal_execution_lineage_is_writer_source(writer_project, session):
+    project, actor, scene, chapter = writer_project
+    proposal = SceneProposal(project_id=project.id, context_fingerprint="formal", proposal_type="CONTINUE_THREAD", participants=[actor.id], scene_goal="formal", character_motivations={}, entry_state={}, expected_progress={}, allowed_reveals=[], forbidden_reveals=[], required_canon=[], possible_outcomes=[], new_entity_requests=[], risk_flags=[], director_reasoning_summary="formal", status="EXECUTED")
+    session.add(proposal); session.flush()
+    decision = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=actor.id, context_fingerprint="formal", decision_type="OBSERVE", intent="observe", chosen_action="observe", motivation="observe", goal_refs=[], knowledge_used=[], memory_refs=[], ability_refs=[], inventory_refs=[], relationship_factors={}, uncertainties=[], refused_options=[], decision_summary="observe", status="VALID")
+    session.add(decision); session.flush()
+    performance = ScenePerformance(project_id=project.id, scene_proposal_id=proposal.id, take_number=1, proposal_context_fingerprint="formal", mode="HEURISTIC", status="COMPLETED", participant_order=[actor.id], active_participant_ids=[actor.id], max_turns=1, turn_count=1)
+    session.add(performance); session.flush()
+    turn = ScenePerformanceTurn(project_id=project.id, performance_id=performance.id, sequence=1, actor_character_id=actor.id, actor_context_fingerprint="formal", character_decision_id=decision.id, action_visibility="PUBLIC", observable_action="observe", spoken_content="I look around.", recipient_character_ids=[], requires_world_resolution=False, world_resolution_request=None, validation_result={})
+    session.add(turn); session.flush()
+    resolution = WorldResolution(project_id=project.id, performance_id=performance.id, performance_turn_id=turn.id, resolver_mode="HEURISTIC", world_context_fingerprint="formal", status="VALID", outcome="SUCCESS", outcome_summary="door opened", objective_facts=[], state_effects=[], actor_observation="I see the door open.", public_observation="The door opens.", recipient_character_ids=[], canon_fact_ids_used=[], world_entity_ids_used=[], resolution_basis_summary="formal", missing_information=[])
+    session.add(resolution); session.flush()
+    batch = StateDeltaBatch(project_id=project.id, source_type="WORLD_RESOLUTION", source_id=resolution.id, source_performance_id=performance.id, source_turn_id=turn.id, source_resolution_id=resolution.id, base_world_fingerprint="before", input_fingerprint="formal-input", status="APPLIED", derivation_version="formal", derivation_report={}, applied_scene_id=scene.id)
+    session.add(batch); session.flush()
+    session.add(StateDeltaItem(project_id=project.id, batch_id=batch.id, ordinal=1, target_type="WORLD_ENTITY", target_id="door", domain="WORLD_ENTITY_PROFILE", operation="SET", path="/profile/opened", before_value=False, after_value=True, causal_reason="formal", source_turn_id=turn.id, source_resolution_id=resolution.id, evidence={}, semantic_fingerprint="formal-delta-fp"))
+    session.add(SceneExecutionBinding(project_id=project.id, scene_id=scene.id, performance_id=performance.id, active=True))
+    session.add(SceneStateCheckpoint(project_id=project.id, scene_id=scene.id, sequence=scene.sequence, pre_snapshot_id="formal-pre", post_snapshot_id="formal-post", current_scene_id=scene.id, capture_protocol_version=3, version=1, active=True, checkpoint_fingerprint="formal-checkpoint"))
+    session.add(TimelineEvent(project_id=project.id, event_type="STATE_CHANGE", source_type="STATE_DELTA_ITEM", source_id="formal-delta", source_key="formal-event", scene_id=scene.id, sequence=scene.sequence, ordinal=1, origin="NORMAL_COMMIT", active=True, target_type="WORLD_ENTITY", target_id="door", path="/profile/opened", before_value=False, after_value=True, structured_payload={}, event_fingerprint="formal-event-fp"))
+    session.flush()
+    source = WriterChapterSourceBuilder().build(session, chapter.id, run_audit=False)
+    row = source["scenes"][0]
+    assert row["legacy_source"] is False and row["binding_id"] and row["performance_id"]
+    assert row["turns"][0]["spoken_content"] == "I look around."
+    assert row["checkpoint_id"] and row["state_changes"][0]["path"] == "/profile/opened"
