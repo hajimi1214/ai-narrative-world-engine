@@ -670,4 +670,7 @@ class ReplayService:
         # Ledger records are derived from the now-final current history and
         # remain inside the replay transaction for atomic rollback semantics.
         CausalLedgerService().sync_after_replay_commit(db, session)
+        from .scaling import ProjectHistoryProjectionService
+        earliest = min((run.original_sequence for run in runs), default=1)
+        ProjectHistoryProjectionService().sync_after_replay_commit(db, session.project_id, earliest)
         db.flush(); return session

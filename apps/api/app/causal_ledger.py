@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from .execution_trace import stable_fingerprint
@@ -207,7 +207,9 @@ class CausalLedgerService:
             raise ValueError("CAUSAL_LEDGER_SCENE_COMMIT_INVALID")
         self.index_scene(db, commit.project_id, commit.scene_id)
         self.index_retcon_and_replay(db, commit.project_id)
-        self.rebuild_temporal_edges(db, commit.project_id)
+        # Normal append has exactly one new temporal adjacency.  Rebuilding
+        # all current history here was an O(total-scenes) Phase 8 carry-over.
+        self.sync_temporal_append(db, commit.project_id, commit.scene_id)
         self._inject_failure()
 
     def sync_after_replay_commit(self, db: Session, session: RetconReplaySession) -> None:
@@ -215,7 +217,10 @@ class CausalLedgerService:
             raise ValueError("CAUSAL_LEDGER_REPLAY_NOT_COMPLETED")
         self.index_current_history(db, session.project_id)
         self.index_retcon_and_replay(db, session.project_id)
-        self.rebuild_temporal_edges(db, session.project_id)
+        earliest = db.scalar(select(func.min(ReplaySceneRun.original_sequence)).where(
+            ReplaySceneRun.replay_session_id == session.id,
+        ))
+        self.rebuild_temporal_edges_from_sequence(db, session.project_id, earliest or 1)
         self._inject_failure()
 
     def _inject_failure(self) -> None:
@@ -453,6 +458,42 @@ class CausalLedgerService:
         scenes = db.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == "OCCURRED", Scene.history_status == "ACTIVE").order_by(Scene.sequence, Scene.id)).all()
         for before, after in zip(scenes, scenes[1:]):
             self._link(db, project_id, CausalResourceType.SCENE, before.id, CausalResourceType.SCENE, after.id, CausalEdgeKind.TEMPORAL, CausalRelationType.SCENE_PRECEDES_SCENE, after, {"ordered_by": ["sequence", "id"]})
+
+    def sync_temporal_append(self, db: Session, project_id: str, scene_id: str) -> None:
+        """Create only predecessor -> appended scene, retaining every prefix edge."""
+        scene = db.get(Scene, scene_id)
+        if not scene or scene.project_id != project_id or _value(scene.status) != "OCCURRED" or scene.history_status != "ACTIVE":
+            raise ValueError("CAUSAL_LEDGER_SCENE_NOT_CURRENT")
+        previous = db.scalar(select(Scene).where(
+            Scene.project_id == project_id, Scene.status == "OCCURRED", Scene.history_status == "ACTIVE",
+            Scene.sequence < scene.sequence,
+        ).order_by(Scene.sequence.desc(), Scene.id.desc()).limit(1))
+        if previous:
+            self._link(db, project_id, CausalResourceType.SCENE, previous.id, CausalResourceType.SCENE, scene.id,
+                       CausalEdgeKind.TEMPORAL, CausalRelationType.SCENE_PRECEDES_SCENE, scene,
+                       {"ordered_by": ["sequence", "id"]})
+
+    def rebuild_temporal_edges_from_sequence(self, db: Session, project_id: str, from_sequence: int) -> None:
+        """Repair only replay's adjacency suffix, starting with its predecessor."""
+        start = max(1, int(from_sequence) - 1)
+        db.execute(update(CausalLink).where(
+            CausalLink.project_id == project_id,
+            CausalLink.relation_type == CausalRelationType.SCENE_PRECEDES_SCENE,
+            CausalLink.sequence >= start,
+        ).values(active=False))
+        predecessor = db.scalar(select(Scene).where(
+            Scene.project_id == project_id, Scene.status == "OCCURRED", Scene.history_status == "ACTIVE",
+            Scene.sequence < start,
+        ).order_by(Scene.sequence.desc(), Scene.id.desc()).limit(1))
+        suffix = db.scalars(select(Scene).where(
+            Scene.project_id == project_id, Scene.status == "OCCURRED", Scene.history_status == "ACTIVE",
+            Scene.sequence >= start,
+        ).order_by(Scene.sequence, Scene.id)).all()
+        scenes = ([predecessor] if predecessor else []) + suffix
+        for before, after in zip(scenes, scenes[1:]):
+            self._link(db, project_id, CausalResourceType.SCENE, before.id, CausalResourceType.SCENE, after.id,
+                       CausalEdgeKind.TEMPORAL, CausalRelationType.SCENE_PRECEDES_SCENE, after,
+                       {"ordered_by": ["sequence", "id"]})
 
     def _event(self, db: Session, *, project_id: str, event_type: TimelineEventType, source_type: str, source_id: str, source_key: str, origin: TimelineOrigin, structured_payload: dict[str, Any], scene: Scene | None = None, ordinal: int | None = None, checkpoint: SceneStateCheckpoint | None = None, target_type: str | None = None, target_id: str | None = None, path: str | None = None, before: Any = None, after: Any = None) -> TimelineEvent:
         values = {

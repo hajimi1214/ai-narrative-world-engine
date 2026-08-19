@@ -150,6 +150,13 @@ class StoryGravityContextBuilder:
         project = session.get(Project, project_id)
         if not project:
             raise ValueError("Project not found")
+        # Phase 16A projections are optional accelerators.  Their service is
+        # read-only here; missing or dirty rows deliberately use this frozen
+        # formal-history path instead of repairing data during a Director read.
+        from .scaling import ProjectHistoryProjectionService
+        fast = ProjectHistoryProjectionService().fast_context(session, project_id, self)
+        if fast is not None:
+            return StoryGravityContext(fast)
         scenes = session.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == SceneStatus.OCCURRED, Scene.history_status == "ACTIVE").order_by(Scene.sequence, Scene.id)).all()
         current_sequence = max((scene.sequence for scene in scenes), default=0)
         characters = session.scalars(select(Character).where(Character.project_id == project_id, Character.active.is_(True)).order_by(Character.id)).all()
@@ -212,6 +219,9 @@ class StoryGravityEngine:
         current = context["current_sequence"]
         scenes = context["scenes"]
         recent = scenes[-2:]
+        history_stats = context.get("history_stats") or {}
+        thread_stats = history_stats.get("thread_stats") or {}
+        character_stats = history_stats.get("character_stats") or {}
         consequence = sorted(context["state_changes"], key=lambda row: (-(row["sequence"] or -1), -(row["ordinal"] or -1), row["target_type"] or "", row["target_id"] or "", row["path"] or ""))
         for row in consequence:
             row["freshness"] = round(1.0 / (1.0 + max(0, current - (row.get("sequence") or current))) * self.weights.freshness, 8)
@@ -237,26 +247,29 @@ class StoryGravityEngine:
         for thread in context["story_threads"]:
             if thread["status"] != ThreadStatus.OPEN.value:
                 continue
+            stat = thread_stats.get(thread["id"])
             touched = [scene["sequence"] for scene in scenes if thread["id"] in scene.get("story_threads", [])]
-            last = max(touched) if touched else None
+            last = stat.get("last_touched_sequence") if stat else (max(touched) if touched else None)
             stale = current - last if last is not None else current + 1
             repetition = sum(thread["id"] in scene.get("story_threads", []) for scene in recent)
             progress_signal = 1.0 - abs(thread["progress"] - 0.5)
             explicit_ids = self._thread_character_ids(thread)
-            scene_alignment = sum(1 for scene in scenes if thread["id"] in scene.get("story_threads", []) and set(scene.get("participants", [])).intersection({row["id"] for row in context["characters"]}))
+            scene_alignment = stat.get("scene_alignment_count", 0) if stat else sum(1 for scene in scenes if thread["id"] in scene.get("story_threads", []) and set(scene.get("participants", [])).intersection({row["id"] for row in context["characters"]}))
             character_alignment = (len(explicit_ids) + scene_alignment) * self.weights.character_alignment
             consequence_alignment = sum(row["pressure_score"] for row in consequence if row.get("target_type") == "STORY_THREAD" and row.get("target_id") == thread["id"])
-            consequence_alignment += sum(row["pressure_score"] for row in consequence if row.get("scene_id") and any(scene["id"] == row["scene_id"] and thread["id"] in scene.get("story_threads", []) for scene in scenes))
+            consequence_alignment += sum(row["pressure_score"] for row in consequence if row.get("scene_id") and (thread["id"] in row.get("thread_ids", []) if "thread_ids" in row else any(scene["id"] == row["scene_id"] and thread["id"] in scene.get("story_threads", []) for scene in scenes)))
             components = {"base_weight": thread["weight"] * self.weights.thread_weight, "staleness": min(stale, 20) * self.weights.staleness, "progress_pressure": progress_signal * self.weights.progress, "recent_repetition_penalty": -repetition * self.weights.repetition, "character_alignment": character_alignment, "consequence_alignment": consequence_alignment * self.weights.consequence_alignment, "arc_alignment": self.weights.arc_alignment if context.get("story_arc") and (thread["state"].get("arc_id") == context["story_arc"].get("id") or context["story_arc"].get("id") in (thread["state"].get("arc_ids") or [])) else 0.0}
             thread_rows.append({"thread_id": thread["id"], "status": thread["status"], "last_touched_sequence": last, "staleness": stale, "score_components": components, "thread_gravity_score": round(sum(components.values()), 8)})
         thread_rows.sort(key=lambda row: (-row["thread_gravity_score"], row["thread_id"]))
         char_rows = []
         for character in context["characters"]:
+            stat = character_stats.get(character["id"])
             sequences = [scene["sequence"] for scene in scenes if character["id"] in scene.get("participants", [])]
             recent_count = sum(character["id"] in scene.get("participants", []) for scene in recent)
-            absence = current - max(sequences) if sequences else current + 1
+            last_participation = stat.get("last_participation_sequence") if stat else (max(sequences) if sequences else None)
+            absence = current - last_participation if last_participation is not None else current + 1
             components = {"narrative_relevance": float(character["narrative_relevance"] or 0), "goal_pressure": self.weights.goal if character["has_goal"] else 0.0, "absence": min(absence, 20) * self.weights.absence, "overuse_penalty": -recent_count * self.weights.overuse, "belief_conflict_signal": float(character.get("belief_conflict_count", 0)) * self.weights.belief_conflict, "consequence_pressure": character_consequence.get(character["id"], 0.0), "relationship_pressure": character_relationship.get(character["id"], 0.0)}
-            char_rows.append({"character_id": character["id"], "last_participation_sequence": max(sequences) if sequences else None, "score_components": components, "character_gravity_score": round(sum(components.values()), 8)})
+            char_rows.append({"character_id": character["id"], "last_participation_sequence": last_participation, "score_components": components, "character_gravity_score": round(sum(components.values()), 8)})
         char_rows.sort(key=lambda row: (-row["character_gravity_score"], row["character_id"]))
         repetition = {"proposal_types": {}, "threads": {}, "participants": {}, "locations": {}}
         for signature in context["recent_scene_signatures"]:
@@ -265,9 +278,11 @@ class StoryGravityEngine:
             for value in signature.get("participants", []): repetition["participants"][value] = repetition["participants"].get(value, 0) + 1
         seeds = [{"thread_id": row["thread_id"], "score": row["thread_gravity_score"]} for row in thread_rows[:5]]
         paused = [thread for thread in context["story_threads"] if thread["status"] == ThreadStatus.PAUSED.value]
-        semantic = {"protocol": "story-gravity-v1", "current_sequence": current, "threads": thread_rows, "paused": paused, "characters": char_rows, "consequence": consequence, "relationship": relationship, "reveals": context["reveals"], "repetition": repetition, "source_ids": {"scenes": [row["id"] for row in context["scenes"]], "events": [row["id"] for row in consequence], "causal_links": [row["fingerprint"] for row in context.get("causal_links", [])]}}
-        fingerprint = "story-gravity-v1:" + hashlib.sha256(json.dumps(semantic, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        return StoryGravityReport("story-gravity-v1", current, thread_rows, char_rows, consequence, relationship, context["reveals"], repetition, seeds, fingerprint, paused)
+        fast = context.get("protocol_version") == "story-gravity-context-v2"
+        protocol = "story-gravity-v2" if fast else "story-gravity-v1"
+        semantic = {"protocol": protocol, "current_sequence": current, "threads": thread_rows, "paused": paused, "characters": char_rows, "consequence": consequence, "relationship": relationship, "reveals": context["reveals"], "repetition": repetition, "source_ids": {"events": [row["id"] for row in consequence], "projection": history_stats.get("projection_fingerprint")} if fast else {"scenes": [row["id"] for row in context["scenes"]], "events": [row["id"] for row in consequence], "causal_links": [row["fingerprint"] for row in context.get("causal_links", [])]}}
+        fingerprint = protocol + ":" + hashlib.sha256(json.dumps(semantic, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return StoryGravityReport(protocol, current, thread_rows, char_rows, consequence, relationship, context["reveals"], repetition, seeds, fingerprint, paused)
 
     @staticmethod
     def _thread_character_ids(thread: dict[str, Any]) -> set[str]:
@@ -291,14 +306,17 @@ class DirectorCandidateEngine:
         for top_thread in gravity.thread_gravity[:self.MAX_THREAD_CANDIDATES]:
             thread = next(row for row in context["story_threads"] if row["id"] == top_thread["thread_id"])
             aligned_ids = StoryGravityEngine._thread_character_ids(thread)
-            aligned_ids.update(participant for scene in context["scenes"] if thread["id"] in scene.get("story_threads", []) for participant in scene.get("participants", []))
+            stats = (context.get("history_stats") or {}).get("thread_stats", {}).get(thread["id"], {})
+            aligned_ids.update(stats.get("aligned_participant_ids", []))
+            if not stats:
+                aligned_ids.update(participant for scene in context["scenes"] if thread["id"] in scene.get("story_threads", []) for participant in scene.get("participants", []))
             aligned = [row for row in context["characters"] if row["id"] in aligned_ids]
             aligned.sort(key=lambda row: (-(next((item["character_gravity_score"] for item in gravity.character_gravity if item["character_id"] == row["id"]), 0.0)), row["id"]))
             thread_character = aligned[0] if aligned else character
             participants = (thread_character["id"],) if thread_character else ()
             location = thread_character.get("location_id") if thread_character else None
             candidates.append(self._candidate(ProposalType.CONTINUE_THREAD.value, thread["id"], participants, location, "THREAD", (thread["id"],), "thread", {"thread_gravity": top_thread["thread_gravity_score"]}, ("STALE_THREAD",) if top_thread["staleness"] > 3 else (), gravity=gravity, expected_progress={"thread": thread["id"]}, evidence={"thread_id": thread["id"]}))
-            fresh = [row for row in gravity.consequence_pressure if (row.get("target_type") == "STORY_THREAD" and row.get("target_id") == thread["id"]) or any(scene.get("id") == row.get("scene_id") and thread["id"] in scene.get("story_threads", []) for scene in context["scenes"])]
+            fresh = [row for row in gravity.consequence_pressure if (row.get("target_type") == "STORY_THREAD" and row.get("target_id") == thread["id"]) or (thread["id"] in row.get("thread_ids", []) if "thread_ids" in row else any(scene.get("id") == row.get("scene_id") and thread["id"] in scene.get("story_threads", []) for scene in context["scenes"]))]
             if fresh and gravity.repetition_pressure["threads"].get(thread["id"], 0) < 2:
                 candidates.append(self._candidate(ProposalType.ESCALATION.value, thread["id"], participants, location, "THREAD", (thread["id"],), "escalation", {"thread_gravity": top_thread["thread_gravity_score"], "fresh_consequence": fresh[0]["pressure_score"]}, ("THREAD_ESCALATION",), gravity=gravity, expected_progress={"thread": thread["id"], "escalation": True}, evidence={"timeline_event_ids": sorted(row["id"] for row in fresh), "thread_id": thread["id"]}))
         if character:

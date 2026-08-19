@@ -78,6 +78,7 @@ class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED
 class EmbeddingStatus(str, enum.Enum): PENDING="PENDING"; READY="READY"; FAILED="FAILED"
 class ProviderCredentialPurpose(str, enum.Enum): GENERATION="GENERATION"; EMBEDDING="EMBEDDING"
 class MemoryRetrievalMode(str, enum.Enum): DETERMINISTIC="DETERMINISTIC"; HYBRID_RRF="HYBRID_RRF"
+class HistoryProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
 class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
 
@@ -838,6 +839,72 @@ class CausalLink(Base):
     link_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     replay_session_id: Mapped[str | None] = mapped_column(ForeignKey("retcon_replay_sessions.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ProjectHistoryProjection(TimestampMixin, Base):
+    """A rebuildable, bounded summary of current formal scene history."""
+    __tablename__ = "project_history_projections"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_project_history_projection_project"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    protocol_version: Mapped[str] = mapped_column(String(60), nullable=False)
+    status: Mapped[HistoryProjectionStatus] = mapped_column(Enum(HistoryProjectionStatus, native_enum=False, length=30), nullable=False, default=HistoryProjectionStatus.DIRTY)
+    built_through_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_scene_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id"))
+    recent_scene_signatures: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    thread_stats: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    character_stats: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    source_history_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    projection_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    dirty_from_sequence: Mapped[int | None] = mapped_column(Integer)
+    last_rebuilt_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class SceneHistoryFeature(TimestampMixin, Base):
+    """One current-history feature row per Scene; never a formal-history source."""
+    __tablename__ = "scene_history_features"
+    __table_args__ = (
+        UniqueConstraint("project_id", "scene_id", name="uq_scene_history_feature_project_scene"),
+        Index("ix_scene_history_feature_project_sequence", "project_id", "sequence"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id"), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    world_time: Mapped[datetime | None] = mapped_column(DateTime)
+    location_id: Mapped[str | None] = mapped_column(String(36))
+    participant_ids: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    thread_ids: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    proposal_type: Mapped[str | None] = mapped_column(String(30))
+    primary_thread_id: Mapped[str | None] = mapped_column(String(36))
+    checkpoint_id: Mapped[str | None] = mapped_column(ForeignKey("scene_state_checkpoints.id"))
+    checkpoint_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    state_change_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    state_change_targets: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    state_change_paths: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    thread_state_event_ids: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    feature_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+
+
+class CurrentStateChangeHead(TimestampMixin, Base):
+    """Pointer to the newest active STATE_CHANGE for one structured state path."""
+    __tablename__ = "current_state_change_heads"
+    __table_args__ = (
+        UniqueConstraint("project_id", "target_type", "target_id", "path", name="uq_current_state_change_head_path"),
+        Index("ix_current_state_change_head_project_target_path", "project_id", "target_type", "target_id", "path"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    timeline_event_id: Mapped[str] = mapped_column(ForeignKey("timeline_events.id"), nullable=False)
+    scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id"))
+    sequence: Mapped[int | None] = mapped_column(Integer)
+    ordinal: Mapped[int | None] = mapped_column(Integer)
+    target_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    path: Mapped[str] = mapped_column(String(500), nullable=False)
+    event_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
 
 class SceneExecutionBinding(Base):
     __tablename__ = "scene_execution_bindings"

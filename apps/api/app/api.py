@@ -38,6 +38,7 @@ from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionSe
 from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
 from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider, embedding_error_code
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
+from .scaling import ProjectHistoryProjectionService
 
 router = APIRouter()
 
@@ -1065,6 +1066,24 @@ def director_gravity(project_id: str, db: Session = Depends(get_db)):
     gravity = StoryGravityEngine().build(gravity_context)
     candidates = DirectorCandidateEngine().generate(gravity_context, gravity)
     return {**gravity.as_dict(), "ranked_candidate_seeds": [candidate.as_dict() for candidate in DirectorCandidateEngine().top_diverse(candidates)]}
+
+
+@router.get("/projects/{project_id}/scaling/status")
+def scaling_status(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return ProjectHistoryProjectionService().status(db, project_id)
+
+
+@router.post("/projects/{project_id}/scaling/history-index/rebuild")
+def rebuild_history_index(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        projection = ProjectHistoryProjectionService().rebuild(db, project_id)
+        db.commit()
+        return ProjectHistoryProjectionService().status(db, project_id) | {"projection_id": projection.id}
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 
 
 @router.post("/projects/{project_id}/narrative-structure/preview")

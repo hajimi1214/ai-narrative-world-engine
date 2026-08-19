@@ -33,6 +33,7 @@ from .state_effect_contract import StateEffectPayload
 from .versioning import WorldSnapshotBuilder
 from .historical import SceneCheckpointService, SceneCheckpointOrigin
 from .causal_ledger import CausalLedgerService
+from .scaling import ProjectHistoryProjectionService
 
 
 @dataclass
@@ -416,6 +417,10 @@ class SceneCommitService:
         # Phase 8 is a derived audit write in this same transaction.  A ledger
         # failure therefore rolls back formal scene materialization as well.
         CausalLedgerService().sync_after_scene_commit(db, record)
+        # The Phase 16A projection is non-authoritative.  Its own service
+        # contains a savepoint and marks failures DIRTY, leaving this frozen
+        # formal commit and its Phase 8 ledger boundary intact.
+        ProjectHistoryProjectionService().sync_after_scene_commit(db, project_id, scene.id)
         db.flush()
         if self.failure_injector:
             self.failure_injector("AFTER_SCENE_COMMIT_MATERIALIZATION")
