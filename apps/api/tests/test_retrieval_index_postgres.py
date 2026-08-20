@@ -1,8 +1,9 @@
 """PostgreSQL-only Phase 16C1 retrieval parity proofs."""
 import os
+import uuid
 
 import pytest
-from sqlalchemy import create_engine, delete, select
+from sqlalchemy import event, create_engine, delete, select
 from sqlalchemy.orm import sessionmaker
 
 from app.character_mind import CharacterMindViewBuilder
@@ -13,6 +14,7 @@ from app.models import (
     ResearchChunkLexicalIndex, ResearchDocument, ResearchDocumentRevision,
     ResearchLexicalIndexState, ResearchTermPosting, ResearchTermStat, SceneProposal,
     ProjectModelConfig, MemoryRetrievalMode, CharacterMemoryEmbedding, EmbeddingStatus,
+    RetrievalIndexStatus, ResearchSourceTier, ResearchSourceKind,
 )
 from app.research import ResearchBM25Retriever, ResearchIngestionService, ResearchRetrievalConfig
 from app.retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService, ResearchIndexedBM25Retriever
@@ -151,5 +153,63 @@ def test_postgres_ready_top_level_research_invokes_indexed_retriever(monkeypatch
         monkeypatch.setattr(ResearchIndexedBM25Retriever, "search", tracked)
         assert ResearchBM25Retriever().search(db, project.id, "steam engine")
         assert called["value"]
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_fast_cognition_read_is_bounded_at_100k():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="cognition-100k"); db.add(project); db.flush()
+        actor = Character(project_id=project.id, name="Actor"); db.add(actor); db.flush()
+        rows = []
+        indexes = []
+        for _ in range(100_000):
+            memory_id = str(uuid.uuid4())
+            rows.append({"id": memory_id, "character_id": actor.id, "content": "bounded memory", "importance": .5, "emotional_weight": 0.0, "confidence": 1.0, "distortion": {}})
+            indexes.append({"id": str(uuid.uuid4()), "project_id": project.id, "character_id": actor.id, "memory_id": memory_id, "importance": .5, "emotional_weight": 0.0, "confidence": 1.0, "source_bucket": f"memory:{memory_id}", "content_fingerprint": "fp", "index_fingerprint": "index"})
+        db.execute(CharacterMemory.__table__.insert(), rows)
+        db.execute(CharacterMemorySearchIndex.__table__.insert(), indexes)
+        db.add(ProjectCognitionRetrievalIndex(project_id=project.id, protocol_version="character-cognition-search-v1", status=RetrievalIndexStatus.READY, indexed_knowledge_count=0, indexed_memory_count=100_000, usage_head_count=0, built_through_sequence=0, index_fingerprint="state"))
+        db.commit(); statements = []
+        def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+        event.listen(engine, "before_cursor_execute", capture)
+        from app.retrieval_index import CurrentCharacterCognitionFastRetriever
+        result = CurrentCharacterCognitionFastRetriever().memories(db, project.id, actor.id, {"entity_ids": (), "participant_ids": (), "thread_ids": (), "item_ids": (), "location_ids": ()})
+        event.remove(engine, "before_cursor_execute", capture)
+        assert len(result) == 12
+        assert len(statements) <= 4
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_indexed_research_selective_query_avoids_corpus_tokenization(monkeypatch):
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="research-100k"); db.add(project); db.flush()
+        document = ResearchDocument(project_id=project.id, title="Corpus", source_tier=ResearchSourceTier.PROJECT_RESEARCH, source_kind=ResearchSourceKind.MANUAL_TEXT, active=True, source_metadata={})
+        db.add(document); db.flush()
+        revision = ResearchDocumentRevision(project_id=project.id, document_id=document.id, version=1, active=True, content="synthetic", content_fingerprint="revision-fp", normalized_fingerprint="normalized", ingestion_config={}, ingestion_config_fingerprint="ingestion")
+        db.add(revision); db.flush()
+        chunks = []
+        lexical = []
+        postings = []
+        for ordinal in range(100_000):
+            chunk_id = str(uuid.uuid4()); content = "needle" if ordinal == 0 else "background"
+            chunks.append({"id": chunk_id, "project_id": project.id, "document_id": document.id, "revision_id": revision.id, "ordinal": ordinal, "start_offset": ordinal, "end_offset": ordinal + len(content), "content": content, "content_fingerprint": f"chunk-{ordinal}", "token_count": 1, "char_count": len(content), "metadata": {}, "active": True})
+            lexical.append({"id": str(uuid.uuid4()), "project_id": project.id, "document_id": document.id, "revision_id": revision.id, "chunk_id": chunk_id, "content_fingerprint": f"chunk-{ordinal}", "token_count": 1, "index_fingerprint": "index"})
+            postings.append({"id": str(uuid.uuid4()), "project_id": project.id, "chunk_id": chunk_id, "term": content, "term_frequency": 1})
+        db.execute(ResearchChunk.__table__.insert(), chunks)
+        db.execute(ResearchChunkLexicalIndex.__table__.insert(), lexical)
+        db.execute(ResearchTermPosting.__table__.insert(), postings)
+        db.add_all([ResearchTermStat(project_id=project.id, term="needle", document_frequency=1), ResearchTermStat(project_id=project.id, term="background", document_frequency=99_999)])
+        db.add(ResearchLexicalIndexState(project_id=project.id, status=RetrievalIndexStatus.READY, protocol_version="research-inverted-index-v1", corpus_fingerprint="corpus", active_chunk_count=100_000, total_token_count=100_000, average_document_length=1.0, posting_count=100_000, term_count=2, index_fingerprint="state"))
+        db.commit(); seen = []
+        original = __import__("app.research", fromlist=["KnowledgeTokenizer"]).KnowledgeTokenizer.tokenize
+        monkeypatch.setattr("app.research.KnowledgeTokenizer.tokenize", lambda _self, text: (seen.append(text), original(_self, text))[1])
+        result = ResearchIndexedBM25Retriever().search(db, project.id, "needle", filters={}, config=ResearchRetrievalConfig())
+        assert [item.content for item in result] == ["needle"]
+        assert seen == ["needle"]
         cleanup(db, project.id)
     engine.dispose()
