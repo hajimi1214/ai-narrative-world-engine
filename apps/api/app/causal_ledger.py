@@ -22,7 +22,11 @@ from .models import (
     TimelineEventType, TimelineOrigin, WorldEntity, WorldResolution, WorldSnapshot,
 )
 from .state_delta_validation import normalize_world_time
-from .state_delta import WorldResolutionStateDeltaTranslator, compute_state_delta_after
+from .state_delta import (
+    WorldResolutionStateDeltaTranslator, compute_state_delta_after,
+    state_delta_item_fingerprint,
+)
+from .state_effect_contract import StateEffectPayload
 
 
 def _value(value: Any) -> Any:
@@ -208,7 +212,7 @@ class CausalLedgerService:
     def sync_after_scene_commit(self, db: Session, commit: SceneCommit) -> None:
         if _value(commit.status) != SceneCommitStatus.COMMITTED.value or not commit.scene_id:
             raise ValueError("CAUSAL_LEDGER_SCENE_COMMIT_INVALID")
-        self.index_scene(db, commit.project_id, commit.scene_id)
+        self.index_scene(db, commit.project_id, commit.scene_id, verify_current_formal_state=True)
         self.index_retcon_and_replay(db, commit.project_id)
         # Normal append has exactly one new temporal adjacency.  Rebuilding
         # all current history here was an O(total-scenes) Phase 8 carry-over.
@@ -236,12 +240,21 @@ class CausalLedgerService:
         for scene in scenes:
             if _value(scene.status) == "OCCURRED" and scene.history_status == "ACTIVE":
                 active_ids.add(scene.id)
-                self.index_scene(db, project_id, scene.id)
+                # A rebuild proves each scene against its own frozen boundary,
+                # never against the latest formal value of a later scene.
+                self.index_scene(db, project_id, scene.id, verify_current_formal_state=False)
             elif scene.history_status == "SUPERSEDED":
                 self.deactivate_scene_history(db, project_id, scene.id)
         db.execute(update(TimelineEvent).where(TimelineEvent.project_id == project_id, TimelineEvent.event_type == TimelineEventType.SCENE_OCCURRED, TimelineEvent.scene_id.not_in(active_ids) if active_ids else True).values(active=False))
 
-    def index_scene(self, db: Session, project_id: str, scene_id: str) -> TimelineEvent:
+    def index_scene(
+        self,
+        db: Session,
+        project_id: str,
+        scene_id: str,
+        *,
+        verify_current_formal_state: bool = True,
+    ) -> TimelineEvent:
         scene = db.get(Scene, scene_id)
         if not scene or scene.project_id != project_id:
             raise ValueError("CAUSAL_LEDGER_SCENE_NOT_FOUND")
@@ -251,7 +264,13 @@ class CausalLedgerService:
         try:
             checkpoint = CurrentSceneCheckpointResolver().current(db, project_id, scene_id)
             if checkpoint.capture_protocol_version >= 3:
-                SceneCheckpointIntegrityValidator().validate_integrity(db, checkpoint)
+                compact_normal = (
+                    checkpoint.capture_protocol_version >= 4
+                    and self._origin(checkpoint) == TimelineOrigin.NORMAL_COMMIT
+                )
+                SceneCheckpointIntegrityValidator().validate_integrity(
+                    db, checkpoint, full_chain=not compact_normal,
+                )
         except ValueError as exc:
             raise ValueError("CAUSAL_LEDGER_CHECKPOINT_INVALID") from exc
         binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
@@ -298,16 +317,25 @@ class CausalLedgerService:
                     CausalLink.effect_id.in_(old_state_event_ids),
                 ),
             ).values(active=False))
-        state_events = self._index_state_changes(db, scene, checkpoint, transitions, pre_payload, post_payload)
+        state_events = self._index_state_changes(
+            db, scene, checkpoint, transitions, pre_payload, post_payload,
+            verify_current_formal_state=verify_current_formal_state,
+        )
         for event in state_events:
             self._link(db, project_id, CausalResourceType.TIMELINE_EVENT, event.id, CausalResourceType.SCENE, scene.id, CausalEdgeKind.PROVENANCE, CausalRelationType.STATE_CHANGE_COMMITTED_IN_SCENE, scene, {"checkpoint_id": checkpoint.id})
         self._index_execution_links(db, scene, binding, state_events)
         return scene_event
 
-    def _index_state_changes(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition], pre: dict[str, Any] | None, post: dict[str, Any] | None) -> list[TimelineEvent]:
+    def _index_state_changes(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint,
+                             transitions: list[SceneStateTransition], pre: dict[str, Any] | None,
+                             post: dict[str, Any] | None, *,
+                             verify_current_formal_state: bool) -> list[TimelineEvent]:
         origin = self._origin(checkpoint)
         if origin == TimelineOrigin.NORMAL_COMMIT:
-            return self._normal_state_events(db, scene, checkpoint, transitions, pre, post)
+            return self._normal_state_events(
+                db, scene, checkpoint, transitions, pre, post,
+                verify_current_formal_state=verify_current_formal_state,
+            )
         if origin == TimelineOrigin.LEGACY_BACKFILL:
             return [
                 self._state_event(
@@ -318,11 +346,16 @@ class CausalLedgerService:
             ]
         return self._replay_state_events(db, scene, checkpoint, transitions)
 
-    def _normal_state_events(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition], pre: dict[str, Any] | None, post: dict[str, Any] | None) -> list[TimelineEvent]:
+    def _normal_state_events(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint,
+                             transitions: list[SceneStateTransition], pre: dict[str, Any] | None,
+                             post: dict[str, Any] | None, *,
+                             verify_current_formal_state: bool) -> list[TimelineEvent]:
         commit = db.get(SceneCommit, checkpoint.source_scene_commit_id) if checkpoint.source_scene_commit_id else None
         if not commit or _value(commit.status) != "COMMITTED" or commit.scene_id != scene.id:
             raise ValueError("CAUSAL_LEDGER_STATE_DELTA_MISMATCH")
         batches = db.scalars(select(StateDeltaBatch).where(StateDeltaBatch.applied_commit_id == commit.id, StateDeltaBatch.status == StateDeltaBatchStatus.APPLIED).order_by(StateDeltaBatch.id)).all()
+        if any(batch.applied_scene_id != scene.id or batch.applied_commit_id != commit.id for batch in batches):
+            raise ValueError("CAUSAL_LEDGER_STATE_DELTA_MISMATCH")
         items = [item for batch in batches for item in db.scalars(select(StateDeltaItem).where(StateDeltaItem.batch_id == batch.id).order_by(StateDeltaItem.ordinal, StateDeltaItem.id)).all()]
         by_key = {(item.target_type.value, item.target_id, item.path): item for item in items}
         if len(by_key) != len(items):
@@ -352,10 +385,23 @@ class CausalLedgerService:
             ),
         )
         for index, item in enumerate(ordered, 1):
+            try:
+                effect = StateEffectPayload.model_validate((item.evidence or {}).get("state_effect"))
+                expected_item_fingerprint = state_delta_item_fingerprint(
+                    scene.project_id, item.source_resolution_id, item.source_turn_id,
+                    effect, item.before_value, item.after_value, item.evidence,
+                )
+            except Exception as exc:
+                raise ValueError("CAUSAL_LEDGER_STATE_DELTA_MISMATCH") from exc
+            if item.semantic_fingerprint != expected_item_fingerprint:
+                raise ValueError("CAUSAL_LEDGER_STATE_DELTA_MISMATCH")
             if checkpoint.capture_protocol_version >= 4:
                 found_before, actual_before = True, item.before_value
                 found_after, actual_after = self._compact_delta_value(db, checkpoint, item.target_type.value, item.target_id, item.path)
-                formal_found, formal_after = self._formal_value(db, item.target_type.value, item.target_id, item.path)
+                formal_found, formal_after = (
+                    self._formal_value(db, item.target_type.value, item.target_id, item.path)
+                    if verify_current_formal_state else (True, item.after_value)
+                )
             else:
                 found_before, actual_before = self._snapshot_value(pre or {}, item.target_type.value, item.target_id, item.path)
                 found_after, actual_after = self._snapshot_value(post or {}, item.target_type.value, item.target_id, item.path)

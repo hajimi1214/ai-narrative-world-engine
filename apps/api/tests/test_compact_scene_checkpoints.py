@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -93,6 +93,18 @@ def test_resolver_is_iterative_at_ten_thousand_reference_depth(session):
         node = service.reference(session, project.id, SnapshotType.PRE_SCENE_STATE, node)
     assert node.materialization_depth == 10_000
     assert SnapshotPayloadResolver().materialize(session, node) == payload
+    ProjectWorldSnapshotHeadService().update(session, project.id, node, source_type="TEST")
+    session.expire_all()
+    statements = []
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "world_snapshots" in statement.lower():
+            statements.append(statement)
+    event.listen(session.bind, "before_cursor_execute", record)
+    try:
+        assert ProjectWorldSnapshotHeadService().current_fast(session, project.id).id == node.id
+    finally:
+        event.remove(session.bind, "before_cursor_execute", record)
+    assert len(statements) <= 2
 
 
 def test_resolver_fails_closed_for_missing_cycle_cross_project_and_storage_tamper(session):
@@ -141,3 +153,33 @@ def test_explicit_audit_compares_head_materialization_to_formal_db(session):
     anchor.payload["project"]["status"] = "TAMPERED"
     with pytest.raises(ValueError, match="SNAPSHOT_CHAIN_INVALID"):
         CompactSnapshotAudit().audit_snapshot(session, anchor)
+
+
+def test_fast_head_read_is_bounded_while_explicit_audit_checks_ancestors(session):
+    project = _project(session, "Deep head")
+    service = CompactSnapshotService()
+    node = service.anchor(session, project.id, SnapshotType.BASELINE, _payload(project.id))
+    anchor = node
+    for _ in range(250):
+        node = service.reference(session, project.id, SnapshotType.PRE_SCENE_STATE, node)
+    heads = ProjectWorldSnapshotHeadService()
+    heads.update(session, project.id, node, source_type="TEST")
+    session.expire_all()
+
+    statements = []
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "world_snapshots" in statement.lower():
+            statements.append(statement)
+    event.listen(session.bind, "before_cursor_execute", record)
+    try:
+        assert heads.current_fast(session, project.id).id == node.id
+    finally:
+        event.remove(session.bind, "before_cursor_execute", record)
+    assert len(statements) <= 2
+
+    # The current node and its immediate base remain structurally valid, but
+    # an explicit historical audit must still discover an older corruption.
+    anchor.payload["project"]["status"] = "TAMPERED"
+    assert heads.current_fast(session, project.id).id == node.id
+    with pytest.raises(ValueError, match="PROJECT_SNAPSHOT_HEAD_INVALID"):
+        heads.current_audited(session, project.id)

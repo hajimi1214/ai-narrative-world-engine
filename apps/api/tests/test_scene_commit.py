@@ -480,6 +480,44 @@ def test_apply_result_verification_failure_rolls_back(session, monkeypatch):
     assert location.profile["opened"] is False and batch.status == StateDeltaBatchStatus.VALIDATED
 
 
+def test_compact_delta_guard_rejects_unrelated_formal_mutation_atomically(session, monkeypatch):
+    project, location, _actor, other, _proposal, performance, _turn, _resolution, batch, client = prepared_commit(session, monkeypatch)
+    before = copy.deepcopy(other.current_state)
+
+    def mutate_unrelated(db, _prepared):
+        target = db.get(Character, other.id)
+        target.current_state = {**target.current_state, "guard_tamper": True}
+
+    monkeypatch.setattr(SceneCommitService, "apply_verifier", staticmethod(mutate_unrelated))
+    response = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION"
+    session.expire_all(); session.refresh(other); session.refresh(location); session.refresh(batch)
+    assert other.current_state == before
+    assert location.profile["opened"] is False
+    assert batch.status == StateDeltaBatchStatus.VALIDATED
+    assert not session.scalars(select(Scene).where(Scene.project_id == project.id)).all()
+
+
+def test_immediate_ledger_still_rejects_post_delta_formal_tamper(session, monkeypatch):
+    project, location, _actor, _other, _proposal, performance, _turn, _resolution, batch, client = prepared_commit(session, monkeypatch)
+    from app.causal_ledger import CausalLedgerService
+    original = CausalLedgerService.index_scene
+
+    def tamper_then_index(self, db, project_id, scene_id, **kwargs):
+        target = db.get(WorldEntity, location.id)
+        target.profile = {**target.profile, "opened": False}
+        return original(self, db, project_id, scene_id, **kwargs)
+
+    monkeypatch.setattr(CausalLedgerService, "index_scene", tamper_then_index)
+    response = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CAUSAL_LEDGER_STATE_DELTA_MISMATCH"
+    session.expire_all(); session.refresh(location); session.refresh(batch)
+    assert location.profile["opened"] is False
+    assert batch.status == StateDeltaBatchStatus.VALIDATED
+
+
 def test_pending_replay_blocks_normal_scene_commit(session, monkeypatch):
     project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
     from app.models import RetconApplication, RetconApplicationStatus
@@ -641,7 +679,7 @@ def test_two_performances_commit_to_distinct_active_scene_sequences(session, mon
         active_participant_ids=[actor.id, other.id], max_turns=1, turn_count=0,
     )
     session.add(performance2); session.commit()
-    add_resolution_turn(session, project, location, proposal2, performance2, actor, 1, [])
+    add_resolution_turn(session, project, location, proposal2, performance2, actor, 1, [effect(location.id, value=False)])
     proposal2.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]
     performance2.proposal_context_fingerprint = proposal2.context_fingerprint
     session.commit()
@@ -654,6 +692,18 @@ def test_two_performances_commit_to_distinct_active_scene_sequences(session, mon
     ).order_by(Scene.sequence)).all()
     assert [scene.sequence for scene in active] == [1, 2]
     assert first["scene"]["id"] != second.json()["scene"]["id"]
+    # Rebuilding historical ledger rows must prove Scene 1 against its own
+    # compact POST delta, not against Scene 2's newer formal value.
+    from app.causal_ledger import CausalLedgerService
+    from app.models import TimelineEvent, TimelineEventType
+    CausalLedgerService().index_current_history(session, project.id)
+    events = session.scalars(select(TimelineEvent).where(
+        TimelineEvent.project_id == project.id,
+        TimelineEvent.event_type == TimelineEventType.STATE_CHANGE,
+        TimelineEvent.active.is_(True),
+    ).order_by(TimelineEvent.sequence, TimelineEvent.ordinal)).all()
+    opened = [event for event in events if event.target_id == location.id and event.path == "/profile/opened"]
+    assert [(event.before_value, event.after_value) for event in opened] == [(False, True), (True, False)]
 
 
 def test_scene_commit_never_calls_an_ai_provider(session, monkeypatch):

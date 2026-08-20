@@ -6,13 +6,14 @@ import hashlib
 import json
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .models import (
-    Project, ProjectWorldSnapshotHead, SnapshotStorageMode, SnapshotType,
-    WorldSnapshot,
+    CanonFact, Chapter, Character, CharacterKnowledge, CharacterMemory, Project,
+    ProjectWorldSnapshotHead, RevealConstraint, Scene, SnapshotStorageMode,
+    SnapshotType, StoryArc, StoryThread, WorldEntity, WorldSnapshot,
 )
 
 
@@ -115,7 +116,7 @@ class SnapshotPayloadResolver:
             if current.id in seen:
                 raise ValueError("SNAPSHOT_CHAIN_INVALID")
             seen.add(current.id)
-            self._validate_node(db, current)
+            self.validate_node_local(db, current)
             nodes.append(current)
             mode = _value(current.storage_mode)
             if mode == SnapshotStorageMode.LEGACY_FULL.value:
@@ -157,7 +158,7 @@ class SnapshotPayloadResolver:
             if current.id in seen:
                 raise ValueError("SNAPSHOT_CHAIN_INVALID")
             seen.add(current.id)
-            self._validate_node(db, current)
+            self.validate_node_local(db, current)
             mode = _value(current.storage_mode)
             if mode in {SnapshotStorageMode.LEGACY_FULL.value, SnapshotStorageMode.COMPACT_ANCHOR.value}:
                 return
@@ -174,12 +175,21 @@ class SnapshotPayloadResolver:
                 raise ValueError("SNAPSHOT_CHAIN_INVALID")
             current = base
 
-    def _validate_node(self, db: Session, snapshot: WorldSnapshot) -> None:
+    def validate_node_local(self, db: Session, snapshot_or_id: WorldSnapshot | str) -> WorldSnapshot:
+        """Validate one compact node and, at most, its immediate base metadata.
+
+        This is deliberately the normal-runtime contract.  It proves that the
+        current pointer is structurally safe without walking historical state;
+        callers needing historical integrity must use ``validate_chain``.
+        """
+        snapshot = db.get(WorldSnapshot, snapshot_or_id) if isinstance(snapshot_or_id, str) else snapshot_or_id
+        if not snapshot:
+            raise ValueError("SNAPSHOT_BASE_MISSING")
         mode = _value(snapshot.storage_mode)
         if mode == SnapshotStorageMode.LEGACY_FULL.value:
             if snapshot_fingerprint(snapshot.payload) != snapshot.state_fingerprint:
                 raise ValueError("SNAPSHOT_CHAIN_INVALID")
-            return
+            return snapshot
         if mode not in {SnapshotStorageMode.COMPACT_ANCHOR.value, SnapshotStorageMode.COMPACT_DELTA.value, SnapshotStorageMode.REFERENCE.value}:
             raise ValueError("SNAPSHOT_CHAIN_INVALID")
         base = db.get(WorldSnapshot, snapshot.base_snapshot_id) if snapshot.base_snapshot_id else None
@@ -192,12 +202,16 @@ class SnapshotPayloadResolver:
         else:
             if not base or base.project_id != snapshot.project_id:
                 raise ValueError("SNAPSHOT_BASE_MISSING" if not base else "SNAPSHOT_CHAIN_INVALID")
+            if snapshot.materialization_depth != base.materialization_depth + 1:
+                raise ValueError("SNAPSHOT_CHAIN_INVALID")
             base_fingerprint = base.state_fingerprint
             if mode == SnapshotStorageMode.COMPACT_DELTA.value and snapshot.payload.get("protocol") != COMPACT_PROTOCOL:
                 raise ValueError("SNAPSHOT_CHAIN_INVALID")
             if mode == SnapshotStorageMode.REFERENCE.value:
                 expected_manifest = {"protocol": COMPACT_PROTOCOL, "kind": "reference", "base_snapshot_id": snapshot.base_snapshot_id}
                 if snapshot.payload != expected_manifest:
+                    raise ValueError("SNAPSHOT_CHAIN_INVALID")
+                if snapshot.state_fingerprint != base.state_fingerprint:
                     raise ValueError("SNAPSHOT_CHAIN_INVALID")
         expected = self.codec.fingerprint(
             project_id=snapshot.project_id, mode=mode, base_snapshot_id=snapshot.base_snapshot_id,
@@ -206,6 +220,10 @@ class SnapshotPayloadResolver:
         )
         if snapshot.storage_fingerprint != expected:
             raise ValueError("SNAPSHOT_CHAIN_INVALID")
+        return snapshot
+
+    # Compatibility for callers that used the private helper in early 16B.
+    _validate_node = validate_node_local
 
 
 class ProjectWorldSnapshotHeadService:
@@ -218,7 +236,8 @@ class ProjectWorldSnapshotHeadService:
             json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
         ).hexdigest()
 
-    def current(self, db: Session, project_id: str) -> WorldSnapshot | None:
+    def current_fast(self, db: Session, project_id: str) -> WorldSnapshot | None:
+        """Return a locally verified current head in bounded work."""
         head = db.scalar(select(ProjectWorldSnapshotHead).where(ProjectWorldSnapshotHead.project_id == project_id))
         if not head:
             return None
@@ -230,10 +249,24 @@ class ProjectWorldSnapshotHeadService:
                                                        sequence=head.sequence):
             raise ValueError("PROJECT_SNAPSHOT_HEAD_INVALID")
         try:
+            SnapshotPayloadResolver().validate_node_local(db, snapshot)
+        except ValueError as exc:
+            raise ValueError("PROJECT_SNAPSHOT_HEAD_INVALID") from exc
+        return snapshot
+
+    def current_audited(self, db: Session, project_id: str) -> WorldSnapshot | None:
+        """Return the current head only after explicit full-chain validation."""
+        snapshot = self.current_fast(db, project_id)
+        if not snapshot:
+            return None
+        try:
             SnapshotPayloadResolver().validate_chain(db, snapshot)
         except ValueError as exc:
             raise ValueError("PROJECT_SNAPSHOT_HEAD_INVALID") from exc
         return snapshot
+
+    # ``current`` intentionally remains the bounded runtime read API.
+    current = current_fast
 
     def update(self, db: Session, project_id: str, snapshot: WorldSnapshot, *, source_type: str,
                source_id: str | None = None, sequence: int | None = None) -> ProjectWorldSnapshotHead:
@@ -277,7 +310,7 @@ class ProjectWorldSnapshotHeadService:
         head = db.scalar(select(ProjectWorldSnapshotHead).where(ProjectWorldSnapshotHead.project_id == project_id))
         if not head:
             raise ValueError("PROJECT_SNAPSHOT_HEAD_INVALID")
-        self.current(db, project_id)
+        self.current_audited(db, project_id)
 
     def rebuild(self, db: Session, project_id: str) -> ProjectWorldSnapshotHead:
         """Create a deliberately explicit full anchor for pointer repair."""
@@ -351,6 +384,108 @@ class CompactSnapshotService:
         return pre, post
 
 
+class SceneCommitFormalMutationGuard:
+    """Fail closed for snapshot-covered writes made during one normal commit.
+
+    The guard observes flushes instead of diffing a full PRE snapshot.  This
+    keeps the normal path bounded while retaining an exact row-level manifest
+    for the compact delta builder.
+    """
+
+    collection_by_model = {
+        CanonFact: "canon_facts",
+        WorldEntity: "world_entities",
+        Character: "characters",
+        CharacterKnowledge: "character_knowledge",
+        CharacterMemory: "character_memories",
+        RevealConstraint: "reveal_constraints",
+        StoryThread: "story_threads",
+        StoryArc: "story_arcs",
+        Scene: "scenes",
+        Chapter: "chapters",
+        Project: "project",
+    }
+
+    def __init__(self, db: Session):
+        self.db = db
+        self._observed: dict[int, tuple[Any, bool, bool]] = {}
+
+    def observe(self) -> None:
+        """Capture current unit-of-work changes before a controlled flush."""
+        for row in set(self.db.new).union(self.db.dirty).union(self.db.deleted):
+            if type(row) not in self.collection_by_model:
+                continue
+            state = inspect(row)
+            changed = row in self.db.new or row in self.db.deleted or state.modified
+            if changed:
+                self._observed[id(row)] = (row, row in self.db.new, row in self.db.deleted)
+
+    def close(self) -> None:
+        # Kept as a no-op lifecycle seam for callers that use a guard in a
+        # failure path.  This guard intentionally owns no Session listeners.
+        return None
+
+    def assert_complete(self, *, project_id: str, items: list[Any], scene: Any,
+                        knowledge: list[Any], memories: list[Any]) -> dict[str, Any]:
+        target_ids: dict[str, set[str]] = {
+            "PROJECT": set(), "WORLD_ENTITY": set(), "CHARACTER": set(), "STORY_THREAD": set(),
+        }
+        for item in items:
+            target_type = _value(item.target_type)
+            if target_type in target_ids:
+                target_ids[target_type].add(item.target_id)
+        allowed_new = {
+            "scenes": {scene.id},
+            "character_knowledge": {row.id for row in knowledge},
+            "character_memories": {row.id for row in memories},
+        }
+        actual: dict[str, set[str]] = {}
+        include_project = False
+        try:
+            for row, was_new, was_deleted in self._observed.values():
+                collection = self.collection_by_model[type(row)]
+                row_id = getattr(row, "id", None)
+                if was_deleted or not row_id or getattr(row, "project_id", project_id) != project_id:
+                    raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
+                if collection == "project":
+                    if row_id != project_id or project_id not in target_ids["PROJECT"]:
+                        raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
+                    include_project = True
+                    continue
+                expected_target_type = {
+                    "world_entities": "WORLD_ENTITY",
+                    "characters": "CHARACTER",
+                    "story_threads": "STORY_THREAD",
+                }.get(collection)
+                if expected_target_type:
+                    if row_id not in target_ids[expected_target_type]:
+                        raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
+                elif collection in allowed_new:
+                    if not was_new or row_id not in allowed_new[collection]:
+                        raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
+                else:
+                    # Canon, reveal constraints, arcs, chapters, and every
+                    # other snapshot-covered row are outside normal authority.
+                    raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
+                actual.setdefault(collection, set()).add(row_id)
+            expected = {
+                "scenes": {scene.id},
+                "character_knowledge": {row.id for row in knowledge},
+                "character_memories": {row.id for row in memories},
+            }
+            for item in items:
+                collection = SceneCommitSnapshotDeltaBuilder.collection_by_target.get(_value(item.target_type))
+                if collection:
+                    expected.setdefault(collection, set()).add(item.target_id)
+            if {key: value for key, value in actual.items() if value} != {key: value for key, value in expected.items() if value}:
+                raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
+            if include_project != bool(target_ids["PROJECT"]):
+                raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
+            return {"project": include_project, "collections": actual}
+        finally:
+            self.close()
+
+
 class SceneCommitSnapshotDeltaBuilder:
     """Bounded normal-commit delta from known formal mutations and final rows."""
     collection_by_target = {
@@ -358,7 +493,7 @@ class SceneCommitSnapshotDeltaBuilder:
     }
 
     def build(self, post_payload: dict[str, Any], items: list[Any], knowledge: list[Any],
-              memories: list[Any], scene: Any) -> dict[str, Any]:
+              memories: list[Any], scene: Any, *, mutation_manifest: dict[str, Any] | None = None) -> dict[str, Any]:
         codec = SnapshotDeltaCodec()
         full = codec.normalize(post_payload)
         upsert_ids: dict[str, set[str]] = {
@@ -376,6 +511,15 @@ class SceneCommitSnapshotDeltaBuilder:
             if not collection:
                 raise ValueError("COMPACT_SNAPSHOT_DELTA_INVALID")
             upsert_ids.setdefault(collection, set()).add(item.target_id)
+        if mutation_manifest is not None:
+            observed = {
+                collection: set(ids)
+                for collection, ids in (mutation_manifest.get("collections") or {}).items()
+                if ids
+            }
+            expected = {collection: ids for collection, ids in upsert_ids.items() if ids}
+            if observed != expected or bool(mutation_manifest.get("project")) != include_project:
+                raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
         collections: dict[str, Any] = {}
         for collection, ids in upsert_ids.items():
             rows = {row.get("id"): row for row in full.get(collection, []) if row.get("id")}
@@ -405,7 +549,7 @@ class CompactSnapshotAudit:
 
     def audit_current_formal_state(self, db: Session, project_id: str) -> dict[str, Any]:
         """Expensive explicit audit: storage reconstruction must equal Formal DB."""
-        head = ProjectWorldSnapshotHeadService().current(db, project_id)
+        head = ProjectWorldSnapshotHeadService().current_audited(db, project_id)
         if not head:
             raise ValueError("PROJECT_SNAPSHOT_HEAD_INVALID")
         materialized = self.audit_snapshot(db, head)

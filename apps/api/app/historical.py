@@ -37,13 +37,15 @@ class CurrentSceneCheckpointResolver:
         return db.scalars(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == project_id, SceneStateCheckpoint.scene_id == scene_id).order_by(SceneStateCheckpoint.version.desc(), SceneStateCheckpoint.id.desc())).all()
 
 class SceneCheckpointIntegrityValidator:
-    def validate_integrity(self, db, checkpoint):
+    def validate_integrity(self, db, checkpoint, *, full_chain: bool = True):
         scene = db.get(Scene, checkpoint.scene_id); pre = db.get(WorldSnapshot, checkpoint.pre_snapshot_id); post = db.get(WorldSnapshot, checkpoint.post_snapshot_id)
         if not scene or scene.project_id != checkpoint.project_id or checkpoint.sequence != scene.sequence or checkpoint.current_scene_id != scene.id: raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
         if not pre or not post or pre.project_id != checkpoint.project_id or post.project_id != checkpoint.project_id: raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
         if checkpoint.capture_protocol_version >= 4:
             try:
-                resolver = SnapshotPayloadResolver(); resolver.validate_chain(db, pre); resolver.validate_chain(db, post)
+                resolver = SnapshotPayloadResolver()
+                validate = resolver.validate_chain if full_chain else resolver.validate_node_local
+                validate(db, pre); validate(db, post)
             except ValueError as exc:
                 raise ValueError("SCENE_CHECKPOINT_SNAPSHOT_FINGERPRINT_INVALID") from exc
         elif snapshot_fingerprint(pre.payload) != pre.state_fingerprint or snapshot_fingerprint(post.payload) != post.state_fingerprint:
@@ -93,9 +95,12 @@ class SceneCheckpointService:
                                         lambda: WorldSnapshotBuilder().build(db, project_id))
     def finalize_formal_post(self, db, project_id): return WorldSnapshotBuilder().create(db, project_id, SnapshotType.POST_SCENE_STATE)
     def create_normal_checkpoint(self, db, project_id, scene, pre, *, items, knowledge, memories,
-                                 source_scene_commit_id=None):
+                                 source_scene_commit_id=None, mutation_manifest=None):
         post_payload, post_fingerprint = WorldSnapshotBuilder().build(db, project_id)
-        delta = SceneCommitSnapshotDeltaBuilder().build(post_payload, items, knowledge, memories, scene)
+        delta = SceneCommitSnapshotDeltaBuilder().build(
+            post_payload, items, knowledge, memories, scene,
+            mutation_manifest=mutation_manifest,
+        )
         post = self.compact.delta(db, project_id, SnapshotType.POST_SCENE_STATE, pre, delta, post_fingerprint)
         self.compact.heads.update(db, project_id, post, source_type="SCENE_CHECKPOINT",
                                  source_id=scene.id, sequence=scene.sequence)

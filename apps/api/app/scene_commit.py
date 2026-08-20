@@ -32,7 +32,7 @@ from .state_delta_validation import StateDeltaValidationWorldView, StateDeltaVal
 from .state_effect_contract import StateEffectPayload
 from .versioning import WorldSnapshotBuilder
 from .historical import SceneCheckpointService, SceneCheckpointOrigin
-from .snapshot_storage import ProjectWorldSnapshotHeadService
+from .snapshot_storage import ProjectWorldSnapshotHeadService, SceneCommitFormalMutationGuard
 from .causal_ledger import CausalLedgerService
 from .scaling import ProjectHistoryProjectionService
 
@@ -72,6 +72,9 @@ class SceneDeltaApplyEngine:
             self.builder._validate_effect(effect)
             target = self.reader.target(db, project_id, item.target_type, item.target_id)
             self._assign(target, item, effect)
+        guard = db.info.get("scene_commit_mutation_guard")
+        if guard:
+            guard.observe()
         db.flush()
         self.verify(db, project_id, items)
 
@@ -368,12 +371,18 @@ class SceneCommitService:
         # PRE_SCENE_COMMIT remains the global legacy audit boundary.  The
         # current-history boundary is always the v3 service checkpoint.
         pre_snapshot = SceneCheckpointService().capture_formal_pre(db, project_id)
+        mutation_guard = SceneCommitFormalMutationGuard(db)
         record = SceneCommit(project_id=project_id, proposal_id=prepared.proposal.id, performance_id=prepared.performance.id, status=SceneCommitStatus.PENDING, delta_batch_ids=[batch.id for batch in prepared.batches], pre_snapshot_id=pre_snapshot.id, pre_world_fingerprint=prepared.pre_fingerprint, source_fingerprint=prepared.source_fingerprint)
         db.add(record)
         db.flush()
-        self.apply_engine.apply(db, project_id, prepared.items)
+        db.info["scene_commit_mutation_guard"] = mutation_guard
+        try:
+            self.apply_engine.apply(db, project_id, prepared.items)
+        finally:
+            db.info.pop("scene_commit_mutation_guard", None)
         if self.apply_verifier:
             self.apply_verifier(db, prepared)
+            mutation_guard.observe()
             self.apply_engine.verify(db, project_id, prepared.items)
         sequence = (db.scalar(select(func.max(Scene.sequence)).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE")) or 0) + 1
         resolutions_by_turn = {resolution.performance_turn_id: resolution for resolution in prepared.resolutions}
@@ -386,11 +395,14 @@ class SceneCommitService:
             )
         ]
         scene = Scene(project_id=project_id, sequence=sequence, world_time=prepared.project.current_world_time, location=prepared.proposal.location_id or prepared.proposal.proposed_location, participants=list(prepared.performance.participant_order or []), intent=prepared.proposal.scene_goal, facts=facts, result={"proposal_id": prepared.proposal.id, "performance_id": prepared.performance.id, "turns": [{"decision_id": turn.character_decision_id, "turn_id": turn.id} for turn in prepared.turns], "resolutions": [{"turn_id": resolution.performance_turn_id, "resolution_id": resolution.id, "outcome": getattr(resolution.outcome, "value", resolution.outcome), "outcome_summary": resolution.outcome_summary} for resolution in prepared.resolutions], "state_delta_batch_ids": [batch.id for batch in prepared.batches], "applied_item_count": len(prepared.items)}, summary=None, story_threads=([prepared.proposal.primary_thread_id] if prepared.proposal.primary_thread_id else []), status=SceneStatus.OCCURRED, history_status="ACTIVE")
-        db.add(scene); db.flush()
+        db.add(scene); mutation_guard.observe(); db.flush()
         binding = SceneExecutionBinding(project_id=project_id, scene_id=scene.id, performance_id=prepared.performance.id, replay_session_id=None, active=True)
         db.add(binding)
         knowledge, memories = self.cognition_builder.build(db, scene, prepared.performance, prepared.turns, resolutions_by_turn, prepared.items)
         db.add_all(knowledge + memories)
+        # The sibling lookup below may autoflush new cognition, so capture the
+        # bounded formal manifest before any query can clear Session.new.
+        mutation_guard.observe()
         for batch in prepared.batches:
             batch.status = StateDeltaBatchStatus.APPLIED
             batch.applied_scene_id = scene.id
@@ -403,10 +415,19 @@ class SceneCommitService:
         for sibling in siblings:
             sibling.status = PerformanceStatus.INVALIDATED
             sibling.stop_reason = "PROPOSAL_EXECUTED"
+        mutation_guard.observe()
         db.flush()
+        mutation_manifest = mutation_guard.assert_complete(
+            project_id=project_id,
+            items=prepared.items,
+            scene=scene,
+            knowledge=knowledge,
+            memories=memories,
+        )
         checkpoint, post_snapshot = SceneCheckpointService().create_normal_checkpoint(
             db, project_id, scene, pre_snapshot, items=prepared.items, knowledge=knowledge,
             memories=memories, source_scene_commit_id=record.id,
+            mutation_manifest=mutation_manifest,
         )
         post_fingerprint = post_snapshot.state_fingerprint
         record.scene_id = scene.id
