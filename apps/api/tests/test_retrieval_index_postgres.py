@@ -14,11 +14,11 @@ from app.models import (
     KnowledgeStatus, Project, ProjectCognitionRetrievalIndex, ResearchChunk,
     ResearchChunkLexicalIndex, ResearchDocument, ResearchDocumentRevision,
     ResearchLexicalIndexState, ResearchTermPosting, ResearchTermStat, SceneProposal,
-    ProjectModelConfig, MemoryRetrievalMode, CharacterMemoryEmbedding, EmbeddingStatus,
+    ProjectModelConfig, MemoryRetrievalMode, MemoryVectorSearchMode, CharacterMemoryEmbedding, EmbeddingStatus,
     RetrievalIndexStatus, ResearchSourceTier, ResearchSourceKind, WorldEntity, EntityType, Scene,
 )
 from app.research import ResearchBM25Retriever, ResearchIngestionService, ResearchRetrievalConfig
-from app.retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService, ResearchIndexedBM25Retriever
+from app.retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService, ResearchIndexedBM25Retriever, CharacterMemoryANNSemanticRetriever, CurrentCharacterCognitionFastRetriever, MemoryANNIndexStatusService
 from app.embeddings import EmbeddingRoute, FakeEmbeddingProvider, memory_content_fingerprint
 
 
@@ -226,6 +226,49 @@ def test_postgres_hybrid_semantic_rescues_memory_outside_deterministic_top12():
         hybrid = fast.hybrid_memories(db, project.id, actor.id, {"entity_ids": (), "participant_ids": (), "thread_ids": (), "item_ids": (), "location_ids": ()}, [1.0, 0.0], "rescue-cfg", config)
         assert target.id not in [item["memory_id"] for item in deterministic]
         assert target.id in [item["memory_id"] for item in hybrid]
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_ann_unsupported_dimension_uses_exact_parity():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="ann-unsupported"); db.add(project); db.flush()
+        actor = Character(project_id=project.id, name="Actor"); db.add(actor); db.flush()
+        memories = [CharacterMemory(character_id=actor.id, content=f"memory-{index}", importance=.1, emotional_weight=0, confidence=1, distortion={}) for index in range(14)]
+        db.add_all(memories); db.flush(); CognitionRetrievalProjectionService().rebuild(db, project.id)
+        config = ProjectModelConfig(project_id=project.id, embedding_enabled=True, embedding_dimension=2, memory_retrieval_mode=MemoryRetrievalMode.HYBRID_RRF, memory_vector_search_mode=MemoryVectorSearchMode.ANN)
+        db.add(config)
+        for index, memory in enumerate(memories):
+            db.add(CharacterMemoryEmbedding(project_id=project.id, character_id=actor.id, memory_id=memory.id, embedding_config_fingerprint="ann-unsupported", provider="fake", model="fake", dimension=2, content_fingerprint=memory_content_fingerprint(memory.content), status=EmbeddingStatus.READY, embedding=[1.0, float(index) / 100]))
+        db.commit(); cues = {"entity_ids": (), "participant_ids": (), "thread_ids": (), "item_ids": (), "location_ids": ()}
+        assert MemoryANNIndexStatusService().status(db, project.id)["effective_mode"] == "EXACT"
+        fast = CurrentCharacterCognitionFastRetriever()
+        ann = fast.hybrid_memories(db, project.id, actor.id, cues, [1.0, 0.0], "ann-unsupported", config)
+        config.memory_vector_search_mode = MemoryVectorSearchMode.EXACT; db.commit()
+        exact = fast.hybrid_memories(db, project.id, actor.id, cues, [1.0, 0.0], "ann-unsupported", config)
+        assert ann == exact
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_ann_halfvec_discovers_bounded_candidates_and_reranks():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="ann-halfvec"); db.add(project); db.flush()
+        actor = Character(project_id=project.id, name="Actor"); db.add(actor); db.flush()
+        memories = [CharacterMemory(character_id=actor.id, content=f"memory-{index}", importance=.1, emotional_weight=0, confidence=1, distortion={}) for index in range(14)]
+        db.add_all(memories); db.flush(); CognitionRetrievalProjectionService().rebuild(db, project.id)
+        config = ProjectModelConfig(project_id=project.id, embedding_enabled=True, embedding_dimension=3072, memory_retrieval_mode=MemoryRetrievalMode.HYBRID_RRF, memory_vector_search_mode=MemoryVectorSearchMode.ANN)
+        db.add(config)
+        for index, memory in enumerate(memories):
+            vector = [0.0] * 3072; vector[index] = 1.0
+            db.add(CharacterMemoryEmbedding(project_id=project.id, character_id=actor.id, memory_id=memory.id, embedding_config_fingerprint="ann-halfvec", provider="fake", model="fake", dimension=3072, content_fingerprint=memory_content_fingerprint(memory.content), status=EmbeddingStatus.READY, embedding=vector))
+        db.commit(); status = MemoryANNIndexStatusService().status(db, project.id)
+        hidden = CurrentCharacterCognitionFastRetriever()._hidden(project.id, actor.id, "MEMORY", CharacterMemory.id)
+        ids = CharacterMemoryANNSemanticRetriever().retrieve(db, project.id, actor.id, [1.0] + [0.0] * 3071, "ann-halfvec", 12, None, config, hidden)
+        assert status["index_kind"] == "HALFVEC" and status["effective_mode"] == "ANN"
+        assert ids is not None and len(ids) == 12 and ids[0] == memories[0].id
         cleanup(db, project.id)
     engine.dispose()
 

@@ -11,7 +11,7 @@ from collections import Counter
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Float, and_, case, cast, delete, exists, func, literal, or_, select
+from sqlalchemy import Float, and_, case, cast, delete, exists, func, literal, or_, select, text
 from sqlalchemy.orm import Session
 
 from .character_mind import CognitionFactIdentityParser, memory_source_bucket
@@ -25,12 +25,100 @@ from .models import (
     ResearchLexicalIndexState, ResearchTermPosting, ResearchTermStat, RetrievalIndexStatus,
     Scene, Project,
     KnowledgeStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus,
-    CharacterMemoryEmbedding, EmbeddingStatus,
+    CharacterMemoryEmbedding, EmbeddingStatus, MemoryVectorSearchMode, ProjectModelConfig,
 )
 
 
 COGNITION_PROTOCOL = "character-cognition-search-v1"
 RESEARCH_PROTOCOL = "research-inverted-index-v1"
+ANN_VECTOR_DIMS = (384, 512, 768, 1024, 1536)
+ANN_HALFVEC_DIMS = (3072,)
+ANN_CANDIDATE_HARD_LIMIT = 512
+
+
+class PgvectorANNCaps:
+    """Fixed, schema-owned ANN capabilities. Unsupported dimensions stay exact."""
+
+    @staticmethod
+    def index_spec(dimension: int) -> tuple[str, str] | None:
+        if dimension in ANN_VECTOR_DIMS:
+            return ("VECTOR", f"ix_memory_embedding_hnsw_cosine_{dimension}")
+        if dimension in ANN_HALFVEC_DIMS:
+            return ("HALFVEC", f"ix_memory_embedding_hnsw_halfvec_cosine_{dimension}")
+        return None
+
+    def version(self, db: Session) -> str | None:
+        if db.bind is None or db.bind.dialect.name != "postgresql":
+            return None
+        return db.scalar(text("SELECT extversion FROM pg_extension WHERE extname = 'vector'"))
+
+    def physical_index(self, db: Session, dimension: int) -> dict[str, Any]:
+        spec = self.index_spec(dimension)
+        if db.bind is None or db.bind.dialect.name != "postgresql":
+            return {"supported": False, "index_kind": "NONE", "physical_index_name": None, "physical_index_valid": False, "fallback_reason": "POSTGRESQL_REQUIRED", "pgvector_version": None}
+        version = self.version(db)
+        try:
+            version_ok = tuple(int(part) for part in (version or "0").split(".")[:2]) >= (0, 8)
+        except ValueError:
+            version_ok = False
+        if not version_ok:
+            return {"supported": False, "index_kind": "NONE", "physical_index_name": None, "physical_index_valid": False, "fallback_reason": "PGVECTOR_VERSION_UNSUPPORTED", "pgvector_version": version}
+        if not spec:
+            return {"supported": False, "index_kind": "NONE", "physical_index_name": None, "physical_index_valid": False, "fallback_reason": "UNSUPPORTED_DIMENSION", "pgvector_version": version}
+        kind, name = spec
+        row = db.execute(text("SELECT i.indisvalid, i.indisready, pg_get_indexdef(i.indexrelid) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = :name"), {"name": name}).first()
+        expected_cast = f"{kind.lower()}({dimension})"
+        definition = row[2].lower() if row else ""
+        valid = bool(row and row[0] and row[1] and "using hnsw" in definition and expected_cast in definition and "cosine_ops" in definition and "status" in definition and "ready" in definition and f"dimension = {dimension}" in definition)
+        return {"supported": True, "index_kind": kind, "physical_index_name": name, "physical_index_valid": valid, "fallback_reason": None if valid else "ANN_INDEX_UNAVAILABLE", "pgvector_version": self.version(db)}
+
+
+class MemoryANNIndexStatusService:
+    def status(self, db: Session, project_id: str) -> dict[str, Any]:
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        requested = _value(config.memory_vector_search_mode) if config else MemoryVectorSearchMode.EXACT.value
+        dimension = config.embedding_dimension if config else None
+        physical = PgvectorANNCaps().physical_index(db, dimension or 0)
+        effective = MemoryVectorSearchMode.ANN.value if requested == MemoryVectorSearchMode.ANN.value and physical["physical_index_valid"] else MemoryVectorSearchMode.EXACT.value
+        return {"requested_mode": requested, "effective_mode": effective, "dimension": dimension, **physical}
+
+
+class MemoryANNPhysicalIndexAudit:
+    def audit(self, db: Session, project_id: str) -> dict[str, Any]:
+        status = MemoryANNIndexStatusService().status(db, project_id)
+        if status["requested_mode"] == MemoryVectorSearchMode.ANN.value and not status["physical_index_valid"]:
+            raise ValueError("MEMORY_ANN_PHYSICAL_INDEX_INVALID")
+        return {"valid": True, **status}
+
+
+class MemoryANNCertificationService:
+    """Diagnostic ANN-vs-exact comparison; never an eligibility authority."""
+
+    def certify(self, db: Session, project_id: str, character_id: str, query_vector: list[float], config_fingerprint: str, top_k: int, min_similarity: float | None, config) -> dict[str, Any]:
+        hidden = CurrentCharacterCognitionFastRetriever()._hidden(project_id, character_id, "MEMORY", CharacterMemory.id)
+        ann = CharacterMemoryANNSemanticRetriever().retrieve(db, project_id, character_id, query_vector, config_fingerprint, top_k, min_similarity, config, hidden)
+        distance = cast(CharacterMemoryEmbedding.embedding.op("<=>")(query_vector), Float)
+        filters = CharacterMemoryANNSemanticRetriever._filters(project_id, character_id, len(query_vector), config_fingerprint, hidden)
+        exact_rows = db.execute(
+            select(CharacterMemoryEmbedding.memory_id, distance.label("distance"))
+            .select_from(CharacterMemoryEmbedding)
+            .join(CharacterMemorySearchIndex, and_(CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id, CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint))
+            .join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id)
+            .join(Character, Character.id == CharacterMemory.character_id)
+            .where(*filters, (literal(1.0) - distance) >= min_similarity if min_similarity is not None else literal(True))
+            .order_by(distance.asc(), CharacterMemoryEmbedding.memory_id).limit(top_k)
+        ).all()
+        exact = [row[0] for row in exact_rows]
+        ann_ids = ann or []
+        overlap = len(set(ann_ids).intersection(exact))
+        return {
+            "diagnostic_only": True,
+            "ann_available": ann is not None,
+            "recall_at_k": overlap / len(exact) if exact else 1.0,
+            "rank_overlap": overlap,
+            "exact_top_k_match": ann_ids == exact,
+            "fallback_count": 0 if ann is not None else 1,
+        }
 
 
 def _value(value: Any) -> Any:
@@ -300,6 +388,90 @@ class CognitionRetrievalIndexAudit:
         return {"valid": True, "project_id": project_id, "index_fingerprint": state.index_fingerprint}
 
 
+class CharacterMemoryANNSemanticRetriever:
+    """Explicit HNSW candidate discovery with full-precision exact reranking.
+
+    This class owns no cognition authority. Every query joins formal ownership
+    rows and a returned candidate list is bounded before it reaches Python.
+    ``None`` means the caller must use the frozen exact pgvector path.
+    """
+
+    def __init__(self, caps: PgvectorANNCaps | None = None):
+        self.caps = caps or PgvectorANNCaps()
+
+    @staticmethod
+    def _filters(project_id: str, character_id: str, query_dimension: int, config_fingerprint: str, hidden):
+        return (
+            CharacterMemoryEmbedding.project_id == project_id,
+            CharacterMemoryEmbedding.character_id == character_id,
+            CharacterMemorySearchIndex.project_id == project_id,
+            CharacterMemorySearchIndex.character_id == character_id,
+            Character.project_id == project_id,
+            CharacterMemory.character_id == character_id,
+            CharacterMemoryEmbedding.embedding_config_fingerprint == config_fingerprint,
+            CharacterMemoryEmbedding.status == EmbeddingStatus.READY,
+            CharacterMemoryEmbedding.dimension == query_dimension,
+            CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint,
+            ~hidden,
+        )
+
+    @staticmethod
+    def _base(filters):
+        return select(CharacterMemoryEmbedding.memory_id).join(
+            CharacterMemorySearchIndex,
+            and_(
+                CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id,
+                CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint,
+            ),
+        ).join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id).join(
+            Character, Character.id == CharacterMemory.character_id,
+        ).where(*filters)
+
+    def retrieve(self, db: Session, project_id: str, character_id: str, query_vector: list[float], config_fingerprint: str, top_k: int, min_similarity: float | None, config, hidden) -> list[str] | None:
+        dimension = len(query_vector)
+        physical = self.caps.physical_index(db, dimension)
+        if not physical["physical_index_valid"]:
+            return None
+        filters = self._filters(project_id, character_id, dimension, config_fingerprint, hidden)
+        # A bounded probe distinguishes genuinely small eligible sets from ANN
+        # post-filter starvation without recounting a character's corpus.
+        probe = db.scalars(self._base(filters).limit(top_k + 1)).all()
+        if len(probe) <= top_k:
+            return None
+        candidate_limit = min(ANN_CANDIDATE_HARD_LIMIT, max(top_k, top_k * config.memory_ann_candidate_multiplier))
+        try:
+            # An ANN failure must leave the outer read transaction usable for
+            # the exact pgvector fallback below.
+            with db.begin_nested():
+                db.execute(select(func.set_config("hnsw.ef_search", str(config.memory_ann_ef_search), True)))
+                db.execute(select(func.set_config("hnsw.iterative_scan", "strict_order", True)))
+                if physical["index_kind"] == "VECTOR":
+                    from pgvector.sqlalchemy import Vector
+                    vector_type = Vector(dimension)
+                else:
+                    from pgvector.sqlalchemy import HALFVEC
+                    vector_type = HALFVEC(dimension)
+                ann_distance = cast(cast(CharacterMemoryEmbedding.embedding, vector_type).op("<=>")(cast(literal(query_vector), vector_type)), Float)
+                discovered = db.scalars(self._base(filters).order_by(ann_distance.asc(), CharacterMemoryEmbedding.memory_id).limit(candidate_limit)).all()
+        except Exception:
+            return None
+        if len(discovered) < top_k:
+            return None
+        # The HNSW result is only a bounded discovery set. Exact original
+        # vectors decide both similarity eligibility and the final rank.
+        exact_distance = cast(CharacterMemoryEmbedding.embedding.op("<=>")(query_vector), Float)
+        rows = db.execute(
+            select(CharacterMemoryEmbedding.memory_id, exact_distance.label("distance"))
+            .select_from(CharacterMemoryEmbedding)
+            .join(CharacterMemorySearchIndex, and_(CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id, CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint))
+            .join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id)
+            .join(Character, Character.id == CharacterMemory.character_id)
+            .where(*filters, CharacterMemoryEmbedding.memory_id.in_(discovered))
+            .order_by(exact_distance.asc(), CharacterMemoryEmbedding.memory_id)
+        ).all()
+        return [memory_id for memory_id, distance in rows if min_similarity is None or 1.0 - float(distance) >= min_similarity][:top_k]
+
+
 class CurrentCharacterCognitionFastRetriever:
     """Bounded PostgreSQL read implementation for frozen deterministic mind.
 
@@ -436,8 +608,33 @@ class CurrentCharacterCognitionFastRetriever:
         order = (score.desc(), cue.desc(), usage_count.desc(), source_sequence.desc(), CharacterMemory.happened_at.nullsfirst(), CharacterMemory.id)
         deterministic = select(CharacterMemory.id.label("memory_id"), score.label("score"), cue.label("cue"), usage_count.label("usage_count"), source_sequence.label("source_sequence"), memory_index.source_bucket.label("source_bucket"), func.row_number().over(order_by=order).label("det_rank"), func.row_number().over(partition_by=memory_index.source_bucket, order_by=order).label("bucket_position")).join(Character, Character.id == CharacterMemory.character_id).join(memory_index, memory_index.memory_id == CharacterMemory.id).outerjoin(usage, and_(usage.project_id == project_id, usage.resource_type == CausalResourceType.CHARACTER_MEMORY.value, usage.resource_id == CharacterMemory.id)).where(memory_index.project_id == project_id, memory_index.character_id == character_id, Character.project_id == project_id, CharacterMemory.character_id == character_id, ~hidden).subquery("deterministic_ranked")
         distance = cast(CharacterMemoryEmbedding.embedding.op("<=>")(query_vector), Float)
-        semantic_ranked = select(CharacterMemoryEmbedding.memory_id.label("memory_id"), func.row_number().over(order_by=(distance.asc(), CharacterMemoryEmbedding.memory_id)).label("sem_rank")).join(CharacterMemorySearchIndex, and_(CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id, CharacterMemorySearchIndex.project_id == project_id, CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint)).join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id).join(Character, Character.id == CharacterMemory.character_id).where(CharacterMemoryEmbedding.project_id == project_id, CharacterMemoryEmbedding.character_id == character_id, CharacterMemorySearchIndex.character_id == character_id, Character.project_id == project_id, CharacterMemory.character_id == character_id, CharacterMemoryEmbedding.embedding_config_fingerprint == config_fingerprint, CharacterMemoryEmbedding.status == EmbeddingStatus.READY, CharacterMemoryEmbedding.dimension == len(query_vector), ~hidden, (literal(1.0) - distance) >= config.memory_semantic_min_similarity if config.memory_semantic_min_similarity is not None else literal(True)).subquery("semantic_ranked_all")
-        semantic = select(semantic_ranked).where(semantic_ranked.c.sem_rank <= config.memory_vector_top_k).subquery("semantic_ranked")
+        semantic_filters = (
+            CharacterMemoryEmbedding.project_id == project_id,
+            CharacterMemoryEmbedding.character_id == character_id,
+            CharacterMemorySearchIndex.character_id == character_id,
+            Character.project_id == project_id,
+            CharacterMemory.character_id == character_id,
+            CharacterMemoryEmbedding.embedding_config_fingerprint == config_fingerprint,
+            CharacterMemoryEmbedding.status == EmbeddingStatus.READY,
+            CharacterMemoryEmbedding.dimension == len(query_vector),
+            ~hidden,
+        )
+        ann_ids = None
+        if _value(getattr(config, "memory_vector_search_mode", MemoryVectorSearchMode.EXACT)) == MemoryVectorSearchMode.ANN.value:
+            ann_ids = CharacterMemoryANNSemanticRetriever().retrieve(
+                db, project_id, character_id, query_vector, config_fingerprint,
+                config.memory_vector_top_k, config.memory_semantic_min_similarity,
+                config, hidden,
+            )
+        if ann_ids:
+            # ``ann_ids`` already has an exact full-vector rerank. A CASE rank
+            # retains that order in the frozen SQL RRF calculation.
+            rank = case({memory_id: position for position, memory_id in enumerate(ann_ids, 1)}, value=CharacterMemoryEmbedding.memory_id).label("sem_rank")
+            semantic_ranked = select(CharacterMemoryEmbedding.memory_id.label("memory_id"), rank).join(CharacterMemorySearchIndex, and_(CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id, CharacterMemorySearchIndex.project_id == project_id, CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint)).join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id).join(Character, Character.id == CharacterMemory.character_id).where(*semantic_filters, CharacterMemoryEmbedding.memory_id.in_(ann_ids)).subquery("semantic_ranked_all")
+            semantic = select(semantic_ranked).subquery("semantic_ranked")
+        else:
+            semantic_ranked = select(CharacterMemoryEmbedding.memory_id.label("memory_id"), func.row_number().over(order_by=(distance.asc(), CharacterMemoryEmbedding.memory_id)).label("sem_rank")).join(CharacterMemorySearchIndex, and_(CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id, CharacterMemorySearchIndex.project_id == project_id, CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint)).join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id).join(Character, Character.id == CharacterMemory.character_id).where(*semantic_filters, (literal(1.0) - distance) >= config.memory_semantic_min_similarity if config.memory_semantic_min_similarity is not None else literal(True)).subquery("semantic_ranked_all")
+            semantic = select(semantic_ranked).where(semantic_ranked.c.sem_rank <= config.memory_vector_top_k).subquery("semantic_ranked")
         # semantic eligibility is intentionally a subset of deterministic
         # current eligibility, so every vector candidate already has a source
         # bucket and deterministic rank. No semantic-only Python hydration is

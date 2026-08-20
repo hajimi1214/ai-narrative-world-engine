@@ -30,6 +30,9 @@ class ProjectModelConfigPayload(BaseModel):
     memory_vector_top_k: int = Field(default=12, gt=0, le=100)
     memory_rrf_k: int = Field(default=60, gt=0, le=1000)
     memory_semantic_min_similarity: float | None = Field(default=None, ge=-1, le=1)
+    memory_vector_search_mode: str = "EXACT"
+    memory_ann_ef_search: int = Field(default=200, ge=10, le=1000)
+    memory_ann_candidate_multiplier: int = Field(default=8, ge=1, le=32)
     api_key: str | None = None
     embedding_api_key: str | None = None
     clear_api_key: bool = False
@@ -54,6 +57,13 @@ class ProjectModelConfigPayload(BaseModel):
     def validate_memory_retrieval_mode(cls, value):
         if value not in {"DETERMINISTIC", "HYBRID_RRF"}:
             raise ValueError("unsupported memory retrieval mode")
+        return value
+
+    @field_validator("memory_vector_search_mode")
+    @classmethod
+    def validate_memory_vector_search_mode(cls, value):
+        if value not in {"EXACT", "ANN"}:
+            raise ValueError("unsupported memory vector search mode")
         return value
 
     @field_validator("base_url", "embedding_base_url")

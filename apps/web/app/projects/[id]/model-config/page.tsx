@@ -11,6 +11,7 @@ const editableConfigFields = [
   "provider", "base_url", "character_model", "world_model", "director_model", "writer_model", "critic_model", "repair_model", "fallback_model",
   "auto_failover", "max_repair_attempts", "embedding_enabled", "embedding_use_main_connection", "embedding_provider", "embedding_base_url", "embedding_model", "embedding_dimension",
   "memory_retrieval_mode", "memory_vector_top_k", "memory_rrf_k", "memory_semantic_min_similarity",
+  "memory_vector_search_mode", "memory_ann_ef_search", "memory_ann_candidate_multiplier",
 ] as const;
 
 function buildModelConfigWritePayload(config: Config, generationKey: string, embeddingKey: string): Config {
@@ -29,6 +30,7 @@ const defaults: Config = {
   auto_failover: false, max_repair_attempts: 1,
   embedding_enabled: false, embedding_use_main_connection: true, embedding_provider: "openai_compatible", embedding_base_url: "", embedding_model: "", embedding_dimension: "",
   memory_retrieval_mode: "DETERMINISTIC", memory_vector_top_k: 12, memory_rrf_k: 60, memory_semantic_min_similarity: "",
+  memory_vector_search_mode: "EXACT", memory_ann_ef_search: 200, memory_ann_candidate_multiplier: 8,
 };
 
 export default function ModelConfigPage({ params }: { params: { id: string } }) {
@@ -80,6 +82,8 @@ export default function ModelConfigPage({ params }: { params: { id: string } }) 
       {!config.embedding_use_main_connection && <label className="field"><span>新嵌入密钥</span><input type="password" autoComplete="new-password" value={embeddingKey} onChange={(e) => setEmbeddingKey(e.target.value)} placeholder={config.credentials?.EMBEDDING?.configured ? `已配置 ${config.credentials.EMBEDDING.hint}` : "仅写入，不会回显"} /></label>}
       <label className="field"><span>向量候选数</span><input type="number" min="1" value={config.memory_vector_top_k} onChange={(e) => update("memory_vector_top_k", Number(e.target.value))} /></label>
       <label className="field"><span>RRF 常量</span><input type="number" min="1" value={config.memory_rrf_k} onChange={(e) => update("memory_rrf_k", Number(e.target.value))} /></label>
+      <label className="field"><span>向量搜索</span><select value={config.memory_vector_search_mode} onChange={(e) => update("memory_vector_search_mode", e.target.value)}><option value="EXACT">精确余弦（默认）</option><option value="ANN">ANN 候选加速</option></select></label>
+      {config.memory_vector_search_mode === "ANN" && <><label className="field"><span>ANN ef_search</span><input type="number" min="10" max="1000" value={config.memory_ann_ef_search} onChange={(e) => update("memory_ann_ef_search", Number(e.target.value))} /></label><label className="field"><span>ANN 候选倍率</span><input type="number" min="1" max="32" value={config.memory_ann_candidate_multiplier} onChange={(e) => update("memory_ann_candidate_multiplier", Number(e.target.value))} /></label></>}
     </div><div className="button-row"><button className="button secondary" type="button" disabled={saving} onClick={testEmbedding}><Zap size={16} />测试嵌入连接</button><button className="button secondary" type="button" disabled={saving} onClick={() => indexMemories(false)}><Database size={16} />索引缺失记忆</button><button className="button secondary" type="button" disabled={saving} onClick={() => indexMemories(true)}><RotateCcw size={16} />重建索引</button></div>{indexStatus && <div className="metric-grid"><div><strong>{indexStatus.current_valid_memory_count}</strong><span>当前有效记忆</span></div><div><strong>{indexStatus.ready_count}</strong><span>已建立</span></div><div><strong>{indexStatus.missing_count}</strong><span>缺失</span></div><div><strong>{indexStatus.failed_count}</strong><span>失败</span></div><div><strong>{Math.round((indexStatus.coverage_ratio || 0) * 100)}%</strong><span>覆盖率</span></div><div><strong>{indexStatus.dimension || "-"}</strong><span>向量维度</span></div></div>}</SectionCard></div>
   </form>;
 }

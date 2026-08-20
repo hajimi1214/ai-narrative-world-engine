@@ -39,7 +39,7 @@ from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, Qual
 from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider, embedding_error_code
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
 from .scaling import ProjectHistoryProjectionService
-from .retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService
+from .retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService, MemoryANNIndexStatusService
 
 router = APIRouter()
 
@@ -1084,6 +1084,7 @@ def retrieval_status(project_id: str, db: Session = Depends(get_db)):
     return {
         "cognition": CognitionRetrievalProjectionService().status(db, project_id),
         "research": ResearchLexicalIndexService().status(db, project_id),
+        "ann": MemoryANNIndexStatusService().status(db, project_id),
     }
 
 

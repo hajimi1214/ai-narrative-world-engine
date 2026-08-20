@@ -78,6 +78,7 @@ class RecoveryCandidateStatus(str, enum.Enum): OPEN="OPEN"; VALIDATED="VALIDATED
 class EmbeddingStatus(str, enum.Enum): PENDING="PENDING"; READY="READY"; FAILED="FAILED"
 class ProviderCredentialPurpose(str, enum.Enum): GENERATION="GENERATION"; EMBEDDING="EMBEDDING"
 class MemoryRetrievalMode(str, enum.Enum): DETERMINISTIC="DETERMINISTIC"; HYBRID_RRF="HYBRID_RRF"
+class MemoryVectorSearchMode(str, enum.Enum): EXACT="EXACT"; ANN="ANN"
 class HistoryProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class RetrievalIndexStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class SnapshotStorageMode(str, enum.Enum): LEGACY_FULL="LEGACY_FULL"; COMPACT_ANCHOR="COMPACT_ANCHOR"; COMPACT_DELTA="COMPACT_DELTA"; REFERENCE="REFERENCE"
@@ -977,6 +978,9 @@ class ProjectModelConfig(TimestampMixin, Base):
     memory_vector_top_k: Mapped[int]=mapped_column(Integer,default=12,nullable=False)
     memory_rrf_k: Mapped[int]=mapped_column(Integer,default=60,nullable=False)
     memory_semantic_min_similarity: Mapped[float|None]=mapped_column(Float)
+    memory_vector_search_mode: Mapped[MemoryVectorSearchMode]=mapped_column(Enum(MemoryVectorSearchMode, native_enum=False, length=10),default=MemoryVectorSearchMode.EXACT,nullable=False)
+    memory_ann_ef_search: Mapped[int]=mapped_column(Integer,default=200,nullable=False)
+    memory_ann_candidate_multiplier: Mapped[int]=mapped_column(Integer,default=8,nullable=False)
 
 
 class ProjectProviderCredential(TimestampMixin, Base):
