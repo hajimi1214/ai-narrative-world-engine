@@ -116,7 +116,7 @@ class RevisionApplyService:
             db, project_id, post, source_type="REVISION_APPLY", source_id=revision.id
         )
         from .formal_state import FormalStateIdentityService
-        FormalStateIdentityService().rebuild_and_anchor(db, project_id, source_type="REVISION_APPLY_V2", source_id=revision.id)
+        FormalStateIdentityService().rebuild_and_anchor(db, project_id, source_type="REVISION_APPLY_V2", source_id=revision.id, project_locked=True)
         application.post_snapshot_id = post.id
         application.status = RevisionApplicationStatus.APPLIED
         application.applied_change_count = len(changes)
@@ -171,5 +171,5 @@ class RevisionApplyService:
             db, project_id, rollback_snapshot, source_type="REVISION_ROLLBACK", source_id=revision.id
         )
         from .formal_state import FormalStateIdentityService
-        FormalStateIdentityService().rebuild_and_anchor(db, project_id, source_type="REVISION_ROLLBACK_V2", source_id=revision.id)
+        FormalStateIdentityService().rebuild_and_anchor(db, project_id, source_type="REVISION_ROLLBACK_V2", source_id=revision.id, project_locked=True)
         return application

@@ -141,8 +141,13 @@ class FormalStateIdentityService:
         identity.dirty_reason = None
         identity.last_rebuilt_at = datetime.utcnow()
 
-    def rebuild(self, db: Session, project_id: str, *, built_through_sequence: int | None = None) -> ProjectFormalStateIdentity:
+    def rebuild(self, db: Session, project_id: str, *, built_through_sequence: int | None = None, project_locked: bool = False) -> ProjectFormalStateIdentity:
         from .versioning import WorldSnapshotBuilder
+        # The Project row is the existing serialization boundary for formal
+        # world writes.  Rebuilds take it first so concurrent PG rebuilds and
+        # SceneCommit cannot publish competing current roots.
+        if not project_locked and not db.scalar(select(Project).where(Project.id == project_id).with_for_update()):
+            raise ValueError("FORMAL_STATE_PROJECT_NOT_FOUND")
         payload, _ = WorldSnapshotBuilder().build(db, project_id)
         rows = FormalSnapshotRowSerializer().payload_rows(payload)
         db.execute(delete(FormalStateLeaf).where(FormalStateLeaf.project_id == project_id))
@@ -253,8 +258,8 @@ class FormalStateIdentityService:
         identity = self._identity(db, project_id)
         return {"status": getattr(identity.status, "value", identity.status) if identity else "DIRTY", "protocol": identity.protocol_version if identity else self.protocol, "resource_count": identity.resource_count if identity else 0, "built_through_sequence": identity.built_through_sequence if identity else None, "state_fingerprint": identity.state_fingerprint if identity else None, "fast_path_available": bool(identity and identity.status == FormalStateIdentityStatus.READY and identity.protocol_version == self.protocol)}
 
-    def rebuild_and_anchor(self, db: Session, project_id: str, *, source_type: str, source_id: str | None = None):
-        identity = self.rebuild(db, project_id)
+    def rebuild_and_anchor(self, db: Session, project_id: str, *, source_type: str, source_id: str | None = None, project_locked: bool = False):
+        identity = self.rebuild(db, project_id, project_locked=project_locked)
         from .versioning import WorldSnapshotBuilder
         from .snapshot_storage import CompactSnapshotService
         payload, _ = WorldSnapshotBuilder().build(db, project_id)
