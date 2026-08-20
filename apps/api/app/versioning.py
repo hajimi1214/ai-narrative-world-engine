@@ -11,14 +11,23 @@ from .revision import RevisionChangeNormalizer, RevisionChangePayload, RevisionP
 from .snapshot_storage import ProjectWorldSnapshotHeadService, SnapshotPayloadResolver
 
 
+def formal_world_state_v2_fingerprint(payload):
+    """Compatibility export for callers that keep fingerprint helpers here."""
+    from .formal_state import formal_world_state_v2_fingerprint as calculate
+    return calculate(payload)
+
+
 class WorldSnapshotBuilder:
+    protocol = "world-snapshot-v1"
     MODELS = (CanonFact, WorldEntity, Character, CharacterKnowledge, CharacterMemory, RevealConstraint, StoryThread, StoryArc, Scene, Chapter)
 
     def build(self, db: Session, project_id: str):
+        from .formal_state import FormalSnapshotRowSerializer
+        serializer = FormalSnapshotRowSerializer()
         characters = db.scalars(select(Character).where(Character.project_id == project_id)).all()
         character_ids = [item.id for item in characters]
         project = db.get(Project, project_id)
-        data = {"project": {key: value for key, value in _record(project).items() if key in {"id", "status", "creation_mode", "story_seed", "current_world_time"}}}
+        data = {"project": serializer.row_payload(project)}
         for model in self.MODELS:
             if model in (CharacterKnowledge, CharacterMemory):
                 rows = db.scalars(select(model).where(model.character_id.in_(character_ids)).order_by(model.id)).all() if character_ids else []
@@ -26,11 +35,7 @@ class WorldSnapshotBuilder:
                 rows = db.scalars(select(model).where(model.project_id == project_id).order_by(model.id)).all()
             values = []
             for row in rows:
-                value = _record(row)
-                value.pop("created_at", None)
-                value.pop("updated_at", None)
-                if model is Chapter:
-                    value.pop("content", None)
+                value = serializer.row_payload(row)
                 values.append(value)
             data[model.__tablename__] = values
         stable = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
@@ -110,6 +115,8 @@ class RevisionApplyService:
         ProjectWorldSnapshotHeadService().update(
             db, project_id, post, source_type="REVISION_APPLY", source_id=revision.id
         )
+        from .formal_state import FormalStateIdentityService
+        FormalStateIdentityService().rebuild_and_anchor(db, project_id, source_type="REVISION_APPLY_V2", source_id=revision.id)
         application.post_snapshot_id = post.id
         application.status = RevisionApplicationStatus.APPLIED
         application.applied_change_count = len(changes)
@@ -163,4 +170,6 @@ class RevisionApplyService:
         ProjectWorldSnapshotHeadService().update(
             db, project_id, rollback_snapshot, source_type="REVISION_ROLLBACK", source_id=revision.id
         )
+        from .formal_state import FormalStateIdentityService
+        FormalStateIdentityService().rebuild_and_anchor(db, project_id, source_type="REVISION_ROLLBACK_V2", source_id=revision.id)
         return application

@@ -24,6 +24,7 @@ from .state_delta import (
     compute_state_delta_after, state_delta_item_fingerprint,
 )
 from .state_effect_contract import StateEffectPayload
+from .formal_state import FormalStateIdentityService
 from .versioning import WorldSnapshotBuilder
 
 
@@ -95,7 +96,11 @@ class StateDeltaValidator:
         if batch.status != StateDeltaBatchStatus.CANDIDATE:
             raise ValueError("STATE_DELTA_INVALID_LIFECYCLE")
 
-        _, current_fingerprint = WorldSnapshotBuilder().build(db, project_id)
+        current_fingerprint, current_protocol = FormalStateIdentityService().current(db, project_id)
+        if current_protocol == "formal-world-state-v2" and batch.base_world_fingerprint.startswith("world-snapshot-v1:"):
+            # Legacy candidate batches remain readable until explicitly
+            # re-derived; compare them against the same v1 protocol.
+            _, current_fingerprint = WorldSnapshotBuilder().build(db, project_id)
         issues: list[dict[str, Any]] = []
         item_results: list[dict[str, Any]] = []
         resolution, performance, turn, proposal = self._source(db, batch, issues)

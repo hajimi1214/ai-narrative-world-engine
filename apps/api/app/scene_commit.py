@@ -35,6 +35,7 @@ from .historical import SceneCheckpointService, SceneCheckpointOrigin
 from .snapshot_storage import ProjectWorldSnapshotHeadService, SceneCommitFormalMutationGuard
 from .causal_ledger import CausalLedgerService
 from .scaling import ProjectHistoryProjectionService
+from .formal_state import FormalStateIdentityService
 from .retrieval_index import CognitionRetrievalProjectionService
 
 
@@ -324,11 +325,7 @@ class SceneCommitService:
                 raise ValueError("SCENE_COMMIT_EXECUTION_LINEAGE_INVALID")
         # A verified current-history head is the prior formal boundary.  This
         # avoids another full snapshot scan on the normal continuous path.
-        current_head = ProjectWorldSnapshotHeadService().current(db, project_id)
-        if current_head:
-            current_fingerprint = current_head.state_fingerprint
-        else:
-            _, current_fingerprint = WorldSnapshotBuilder().build(db, project_id)
+        current_fingerprint, _ = FormalStateIdentityService().current(db, project_id)
         batches: list[StateDeltaBatch] = []
         items: list[StateDeltaItem] = []
         for resolution in resolutions:
@@ -369,6 +366,7 @@ class SceneCommitService:
         prepared = self.preflight(db, project_id, performance_id)
         if isinstance(prepared, SceneCommitResult):
             return prepared
+        db.info["formal_state_sync_in_progress"] = True
         # PRE_SCENE_COMMIT remains the global legacy audit boundary.  The
         # current-history boundary is always the v3 service checkpoint.
         pre_snapshot = SceneCheckpointService().capture_formal_pre(db, project_id)
@@ -461,6 +459,7 @@ class SceneCommitService:
             with db.begin_nested():
                 CognitionRetrievalProjectionService().mark_dirty(db, project_id, scene.sequence)
         db.flush()
+        db.info.pop("formal_state_sync_in_progress", None)
         if self.failure_injector:
             self.failure_injector("AFTER_SCENE_COMMIT_MATERIALIZATION")
         return SceneCommitResult(record, scene, prepared.batches, checkpoint, False)

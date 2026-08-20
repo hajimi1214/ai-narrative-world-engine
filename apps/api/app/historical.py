@@ -10,6 +10,7 @@ from .snapshot_storage import (
     CompactSnapshotService, ProjectWorldSnapshotHeadService, SceneCommitSnapshotDeltaBuilder,
     SnapshotPayloadResolver, SnapshotStorageMode, snapshot_fingerprint,
 )
+from .formal_state import FormalStateIdentityService, FORMAL_WORLD_STATE_PROTOCOL, SCENE_CHECKPOINT_V5_PROTOCOL
 
 def checkpoint_fingerprint(checkpoint, scene, pre, post):
     value = {"project_id": checkpoint.project_id, "scene_id": checkpoint.scene_id, "sequence": scene.sequence, "version": checkpoint.version, "origin": getattr(checkpoint.origin, "value", checkpoint.origin), "pre": pre.state_fingerprint, "post": post.state_fingerprint, "source_scene_commit_id": checkpoint.source_scene_commit_id, "source_replay_session_id": checkpoint.source_replay_session_id, "supersedes_checkpoint_id": checkpoint.supersedes_checkpoint_id, "capture_protocol_version": checkpoint.capture_protocol_version}
@@ -21,7 +22,7 @@ def checkpoint_fingerprint(checkpoint, scene, pre, post):
             "pre_storage_fingerprint": pre.storage_fingerprint,
             "post_storage_fingerprint": post.storage_fingerprint,
         }
-        prefix = "scene-checkpoint-v4:"
+        prefix = "scene-checkpoint-v5:" if checkpoint.capture_protocol_version >= 5 else "scene-checkpoint-v4:"
     else:
         prefix = "scene-checkpoint-v3:"
     import hashlib, json
@@ -91,21 +92,35 @@ class SceneCheckpointService:
     resolver = CurrentSceneCheckpointResolver(); validator = SceneCheckpointIntegrityValidator()
     compact = CompactSnapshotService()
     def capture_formal_pre(self, db, project_id):
+        head = self.compact.heads.current(db, project_id)
+        force_anchor = False
+        identity = FormalStateIdentityService()._identity(db, project_id)
+        if head and getattr(head, "state_fingerprint_protocol", None) == FORMAL_WORLD_STATE_PROTOCOL:
+            if not identity or identity.status.value != "READY" or identity.protocol_version != FORMAL_WORLD_STATE_PROTOCOL:
+                head = None; force_anchor = True
+        if head:
+            return self.compact.reference(db, project_id, SnapshotType.PRE_SCENE_STATE, head)
+        if force_anchor:
+            payload, fingerprint = WorldSnapshotBuilder().build(db, project_id)
+            anchor = self.compact.anchor(db, project_id, SnapshotType.PRE_SCENE_STATE, payload, fingerprint)
+            self.compact.heads.update(db, project_id, anchor, source_type="DIRTY_V1_PRE")
+            return anchor
         return self.compact.capture_pre(db, project_id, SnapshotType.PRE_SCENE_STATE,
                                         lambda: WorldSnapshotBuilder().build(db, project_id))
     def finalize_formal_post(self, db, project_id): return WorldSnapshotBuilder().create(db, project_id, SnapshotType.POST_SCENE_STATE)
     def create_normal_checkpoint(self, db, project_id, scene, pre, *, items, knowledge, memories,
                                  source_scene_commit_id=None, mutation_manifest=None):
-        post_payload, post_fingerprint = WorldSnapshotBuilder().build(db, project_id)
-        delta = SceneCommitSnapshotDeltaBuilder().build(
-            post_payload, items, knowledge, memories, scene,
-            mutation_manifest=mutation_manifest,
-        )
+        identity = FormalStateIdentityService().sync_manifest(db, project_id, mutation_manifest or {}, sequence=scene.sequence)
+        post_fingerprint = identity.state_fingerprint
+        delta = FormalStateIdentityService().manifest_delta(db, project_id, mutation_manifest or {})
         post = self.compact.delta(db, project_id, SnapshotType.POST_SCENE_STATE, pre, delta, post_fingerprint)
         self.compact.heads.update(db, project_id, post, source_type="SCENE_CHECKPOINT",
                                  source_id=scene.id, sequence=scene.sequence)
         return self._create(db, project_id, scene, pre, post, origin=SceneCheckpointOrigin.NORMAL_COMMIT,
                             source_scene_commit_id=source_scene_commit_id, source_replay_session_id=None,
+                            # v4 remains the persisted checkpoint number for
+                            # legacy API consumers; the post snapshot carries
+                            # the explicit formal-world-state-v2 protocol.
                             capture_protocol_version=4), post
     def materialize_from_payloads(self, db, project_id, scene, pre_payload, post_payload, *, origin, source_scene_commit_id=None, source_replay_session_id=None):
         pre, post = self.compact.from_payloads(

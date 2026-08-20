@@ -144,7 +144,12 @@ class SnapshotPayloadResolver:
             elif mode == SnapshotStorageMode.REFERENCE.value:
                 pass
         result = self.codec.normalize(result) if _value(nodes[-1].storage_mode) != SnapshotStorageMode.LEGACY_FULL.value else result
-        if snapshot_fingerprint(result) != snapshot.state_fingerprint:
+        if getattr(snapshot, "state_fingerprint_protocol", "world-snapshot-v1") == "formal-world-state-v2":
+            from .formal_state import formal_world_state_v2_fingerprint
+            valid_fingerprint = formal_world_state_v2_fingerprint(result)
+        else:
+            valid_fingerprint = snapshot_fingerprint(result)
+        if valid_fingerprint != snapshot.state_fingerprint:
             raise ValueError("SNAPSHOT_CHAIN_INVALID")
         return result
 
@@ -196,7 +201,12 @@ class SnapshotPayloadResolver:
         if mode == SnapshotStorageMode.COMPACT_ANCHOR.value:
             if snapshot.base_snapshot_id or snapshot.materialization_depth != 0:
                 raise ValueError("SNAPSHOT_CHAIN_INVALID")
-            if snapshot_fingerprint(snapshot.payload) != snapshot.state_fingerprint:
+            if getattr(snapshot, "state_fingerprint_protocol", "world-snapshot-v1") == "formal-world-state-v2":
+                from .formal_state import formal_world_state_v2_fingerprint
+                anchor_fingerprint = formal_world_state_v2_fingerprint(snapshot.payload)
+            else:
+                anchor_fingerprint = snapshot_fingerprint(snapshot.payload)
+            if anchor_fingerprint != snapshot.state_fingerprint:
                 raise ValueError("SNAPSHOT_CHAIN_INVALID")
             base_fingerprint = None
         else:
@@ -331,8 +341,10 @@ class CompactSnapshotService:
         if base and base.project_id != project_id:
             raise ValueError("SNAPSHOT_CHAIN_INVALID")
         schema = 2
+        protocol = "formal-world-state-v2" if str(state_fingerprint).startswith("formal-world-state-v2:") else "world-snapshot-v1"
         node = WorldSnapshot(project_id=project_id, snapshot_type=kind, schema_version=schema,
                              state_fingerprint=state_fingerprint, payload=copy.deepcopy(payload),
+                             state_fingerprint_protocol=protocol,
                              source_revision_id=source_revision_id, storage_mode=mode,
                              base_snapshot_id=base.id if base else None,
                              materialization_depth=(base.materialization_depth + 1) if base else 0)
@@ -540,7 +552,12 @@ class CompactSnapshotAudit:
         if not snapshot:
             raise ValueError("SNAPSHOT_BASE_MISSING")
         payload = SnapshotPayloadResolver().materialize(db, snapshot)
-        if snapshot_fingerprint(payload) != snapshot.state_fingerprint:
+        if getattr(snapshot, "state_fingerprint_protocol", "world-snapshot-v1") == "formal-world-state-v2":
+            from .formal_state import formal_world_state_v2_fingerprint
+            actual_fingerprint = formal_world_state_v2_fingerprint(payload)
+        else:
+            actual_fingerprint = snapshot_fingerprint(payload)
+        if actual_fingerprint != snapshot.state_fingerprint:
             raise ValueError("SNAPSHOT_CHAIN_INVALID")
         return payload
 
@@ -555,6 +572,11 @@ class CompactSnapshotAudit:
         materialized = self.audit_snapshot(db, head)
         from .versioning import WorldSnapshotBuilder
         current, fingerprint = WorldSnapshotBuilder().build(db, project_id)
-        if fingerprint != head.state_fingerprint or materialized != current:
+        if getattr(head, "state_fingerprint_protocol", None) == "formal-world-state-v2":
+            from .formal_state import formal_world_state_v2_fingerprint
+            expected_fingerprint = formal_world_state_v2_fingerprint(current)
+        else:
+            expected_fingerprint = fingerprint
+        if expected_fingerprint != head.state_fingerprint or materialized != current:
             raise ValueError("SNAPSHOT_CHAIN_INVALID")
         return materialized

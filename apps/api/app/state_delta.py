@@ -17,7 +17,7 @@ from .models import (
     WorldEntity, WorldResolution,
 )
 from .revision import _pointer, _record
-from .versioning import WorldSnapshotBuilder
+from .formal_state import FormalStateIdentityService
 from .state_effect_contract import StateEffectPayload
 
 
@@ -154,7 +154,7 @@ class StateDeltaCandidateBuilder:
         if not proposal or proposal.project_id != project_id:
             raise ValueError("STATE_DELTA_SOURCE_LINEAGE_INVALID")
 
-        _, base_fingerprint = WorldSnapshotBuilder().build(db, project_id)
+        base_fingerprint, _ = FormalStateIdentityService().current(db, project_id)
         input_fingerprint = StateDeltaInputFingerprintBuilder().build(resolution, turn, performance, base_fingerprint)
         existing = db.scalar(select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id, StateDeltaBatch.input_fingerprint == input_fingerprint))
         if existing:

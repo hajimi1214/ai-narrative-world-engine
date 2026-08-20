@@ -708,4 +708,6 @@ class ReplayService:
         except Exception:
             with db.begin_nested():
                 CognitionRetrievalProjectionService().mark_dirty(db, session.project_id, earliest)
+        from .formal_state import FormalStateIdentityService
+        FormalStateIdentityService().rebuild_and_anchor(db, session.project_id, source_type="REPLAY_FINAL_V2", source_id=session.id)
         db.flush(); return session

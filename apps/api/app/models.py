@@ -81,6 +81,7 @@ class MemoryRetrievalMode(str, enum.Enum): DETERMINISTIC="DETERMINISTIC"; HYBRID
 class MemoryVectorSearchMode(str, enum.Enum): EXACT="EXACT"; ANN="ANN"
 class HistoryProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class RetrievalIndexStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
+class FormalStateIdentityStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class SnapshotStorageMode(str, enum.Enum): LEGACY_FULL="LEGACY_FULL"; COMPACT_ANCHOR="COMPACT_ANCHOR"; COMPACT_DELTA="COMPACT_DELTA"; REFERENCE="REFERENCE"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
 class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
@@ -792,6 +793,15 @@ class SceneStateCheckpoint(Base):
     post_state_fingerprint: Mapped[str | None] = mapped_column(String(120))
     checkpoint_fingerprint: Mapped[str | None] = mapped_column(String(120), index=True)
 
+    @property
+    def state_identity_protocol(self) -> str:
+        """Explicit protocol marker without changing the frozen v4 integer API."""
+        return "formal-world-state-v2" if self.post_state_fingerprint and str(self.post_state_fingerprint).startswith("formal-world-state-v2:") else "world-snapshot-v1"
+
+    @property
+    def capture_protocol(self) -> str:
+        return "scene-checkpoint-v5" if self.state_identity_protocol == "formal-world-state-v2" else f"scene-checkpoint-v{self.capture_protocol_version}"
+
 class TimelineEvent(Base):
     __tablename__ = "timeline_events"
     __table_args__ = (
@@ -944,7 +954,7 @@ class WorldSnapshot(Base):
     __tablename__="world_snapshots"
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False)
     snapshot_type: Mapped[SnapshotType]=mapped_column(String(30),nullable=False); schema_version: Mapped[int]=mapped_column(Integer,default=1,nullable=False)
-    state_fingerprint: Mapped[str]=mapped_column(String(100),nullable=False); payload: Mapped[dict[str,Any]]=mapped_column(JSON,nullable=False); source_revision_id: Mapped[str|None]=mapped_column(ForeignKey("world_revisions.id")); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False)
+    state_fingerprint: Mapped[str]=mapped_column(String(120),nullable=False); state_fingerprint_protocol: Mapped[str] = mapped_column(String(60), nullable=False, default="world-snapshot-v1"); payload: Mapped[dict[str,Any]]=mapped_column(JSON,nullable=False); source_revision_id: Mapped[str|None]=mapped_column(ForeignKey("world_revisions.id")); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False)
     storage_mode: Mapped[SnapshotStorageMode]=mapped_column(Enum(SnapshotStorageMode, native_enum=False, length=30),nullable=False,default=SnapshotStorageMode.LEGACY_FULL)
     base_snapshot_id: Mapped[str|None]=mapped_column(ForeignKey("world_snapshots.id"))
     storage_fingerprint: Mapped[str|None]=mapped_column(String(120))
@@ -961,6 +971,34 @@ class ProjectWorldSnapshotHead(TimestampMixin, Base):
     source_id: Mapped[str | None] = mapped_column(String(36))
     sequence: Mapped[int | None] = mapped_column(Integer)
     head_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+
+class ProjectFormalStateIdentity(TimestampMixin, Base):
+    """Bounded current-state identity; Formal rows remain authoritative."""
+    __tablename__ = "project_formal_state_identities"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_project_formal_state_identity_project"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    protocol_version: Mapped[str] = mapped_column(String(60), nullable=False)
+    status: Mapped[FormalStateIdentityStatus] = mapped_column(Enum(FormalStateIdentityStatus, native_enum=False, length=20), nullable=False, default=FormalStateIdentityStatus.DIRTY)
+    resource_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    collection_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    state_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    built_through_sequence: Mapped[int | None] = mapped_column(Integer)
+    dirty_reason: Mapped[str | None] = mapped_column(String(200))
+    last_rebuilt_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+class FormalStateLeaf(Base):
+    __tablename__ = "formal_state_leaves"
+    __table_args__ = (
+        UniqueConstraint("project_id", "collection_name", "resource_id", name="uq_formal_state_leaf_resource"),
+        Index("ix_formal_state_leaf_project_collection", "project_id", "collection_name"),
+        Index("ix_formal_state_leaf_project_resource", "project_id", "resource_id"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    collection_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    leaf_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
 class RevisionApplication(Base):
     __tablename__="revision_applications"
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); revision_id: Mapped[str]=mapped_column(ForeignKey("world_revisions.id"),nullable=False)

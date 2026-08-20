@@ -39,6 +39,7 @@ from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, Qual
 from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider, embedding_error_code
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
 from .scaling import ProjectHistoryProjectionService
+from .formal_state import FormalStateIdentityService
 from .retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService, MemoryANNIndexStatusService
 
 router = APIRouter()
@@ -1075,7 +1076,24 @@ def scaling_status(project_id: str, db: Session = Depends(get_db)):
     return ProjectHistoryProjectionService().status(db, project_id) | {
         "cognition": CognitionRetrievalProjectionService().status(db, project_id),
         "research": ResearchLexicalIndexService().status(db, project_id),
+        "formal_state": FormalStateIdentityService().status(db, project_id),
     }
+
+@router.get("/projects/{project_id}/scaling/formal-state/status")
+def formal_state_status(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return FormalStateIdentityService().status(db, project_id)
+
+@router.post("/projects/{project_id}/scaling/formal-state/rebuild")
+def rebuild_formal_state(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        identity = FormalStateIdentityService().rebuild(db, project_id)
+        db.commit()
+        return FormalStateIdentityService().status(db, project_id) | {"identity_id": identity.id}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "FORMAL_STATE_REBUILD_FAILED"}) from exc
 
 
 @router.get("/projects/{project_id}/scaling/retrieval/status")
