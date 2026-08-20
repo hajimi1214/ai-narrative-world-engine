@@ -20,6 +20,7 @@ from .world_resolution import HeuristicWorldResolver, WorldResolutionPayload, Wo
 from .historical import SceneCheckpointService, SceneCheckpointOrigin, CurrentSceneCheckpointResolver, snapshot_fingerprint
 from .causal_ledger import CausalLedgerService
 from .revision import _record
+from .snapshot_storage import ProjectWorldSnapshotHeadService, SnapshotPayloadResolver
 
 
 class PreservedSceneStateTransitionProjector:
@@ -418,7 +419,13 @@ class ReplayService:
                 state = deepcopy(session.staged_world_state or {})
                 invalidated = set(db.scalars(select(RetconCognitionInvalidation.resource_id).where(RetconCognitionInvalidation.project_id == session.project_id, RetconCognitionInvalidation.status != RetconCognitionInvalidationStatus.ROLLED_BACK)).all())
                 invalidated.update(value["resource_id"] for value in state.get("dynamic_cognition_invalidations", []))
-                state["current_world"] = PreservedSceneStateTransitionProjector().project(old_pre.payload, old_post.payload, state.get("current_world", {}), invalidated)
+                resolver = SnapshotPayloadResolver()
+                state["current_world"] = PreservedSceneStateTransitionProjector().project(
+                    resolver.materialize(db, old_pre),
+                    resolver.materialize(db, old_post),
+                    state.get("current_world", {}),
+                    invalidated,
+                )
                 scene_row = _record(scene)
                 scene_row["status"] = "OCCURRED"
                 scene_rows = {row.get("id"): row for row in state["current_world"].get("scenes", []) if row.get("id")}
@@ -666,7 +673,28 @@ class ReplayService:
         checkpoint_model = __import__("app.models", fromlist=["SceneStateCheckpoint"]).SceneStateCheckpoint
         for checkpoint in db.scalars(select(checkpoint_model).where(checkpoint_model.source_replay_session_id == session.id)).all():
             checkpoint_service.validate_integrity(db, checkpoint)
-        session.post_commit_snapshot_id = WorldSnapshotBuilder().create(db, session.project_id, __import__("app.models", fromlist=["SnapshotType"]).SnapshotType.POST_REPLAY_COMMIT).id
+        post_commit_snapshot = WorldSnapshotBuilder().create(
+            db, session.project_id, __import__("app.models", fromlist=["SnapshotType"]).SnapshotType.POST_REPLAY_COMMIT
+        )
+        session.post_commit_snapshot_id = post_commit_snapshot.id
+        current_checkpoint = db.scalar(
+            select(checkpoint_model).join(Scene, Scene.id == checkpoint_model.scene_id).where(
+                checkpoint_model.project_id == session.project_id,
+                checkpoint_model.active.is_(True),
+                Scene.history_status == "ACTIVE",
+                Scene.status == "OCCURRED",
+            ).order_by(Scene.sequence.desc(), Scene.id.desc())
+        )
+        if current_checkpoint:
+            from .models import WorldSnapshot
+            ProjectWorldSnapshotHeadService().update(
+                db,
+                session.project_id,
+                db.get(WorldSnapshot, current_checkpoint.post_snapshot_id),
+                source_type="REPLAY_FINAL",
+                source_id=session.id,
+                sequence=current_checkpoint.sequence,
+            )
         # Ledger records are derived from the now-final current history and
         # remain inside the replay transaction for atomic rollback semantics.
         CausalLedgerService().sync_after_replay_commit(db, session)

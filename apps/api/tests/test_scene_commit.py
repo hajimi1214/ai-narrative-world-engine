@@ -23,6 +23,7 @@ from app.models import (
 )
 from app.scene_commit import SceneCommitService
 from app.historical import SceneCheckpointIntegrityValidator
+from app.snapshot_storage import CompactSnapshotAudit, ProjectWorldSnapshotHeadService, SnapshotPayloadResolver
 from app.state_delta import StateDeltaCandidateBuilder
 from app.state_delta_validation import StateDeltaValidator
 from app.world_resolution import WorldResolutionPayload
@@ -168,7 +169,7 @@ def test_commit_scene_applies_validated_entity_delta_and_materializes_history(se
     assert performance.status == PerformanceStatus.COMPLETED and proposal.status == ProposalStatus.EXECUTED
     assert session.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == body["scene"]["id"], SceneExecutionBinding.active.is_(True)))
     checkpoint = session.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.scene_id == body["scene"]["id"]))
-    assert checkpoint.capture_protocol_version == 3 and checkpoint.version == 1 and checkpoint.active is True
+    assert checkpoint.capture_protocol_version == 4 and checkpoint.version == 1 and checkpoint.active is True
     assert checkpoint.origin == "NORMAL_COMMIT" and checkpoint.source_scene_commit_id == body["scene_commit"]["id"]
 
 
@@ -331,7 +332,7 @@ def test_commit_applies_world_time_as_canonical_naive_datetime(session, monkeypa
     session.commit()
     batch = StateDeltaCandidateBuilder().derive(session, project.id, resolution.id)[0]; session.commit(); StateDeltaValidator().validate(session, project.id, batch.id); session.commit()
     response = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     session.refresh(project)
     assert project.current_world_time == datetime.fromisoformat("2040-01-02T00:00:00")
     assert response.json()["scene"]["world_time"] == "2040-01-02T00:00:00"
@@ -375,17 +376,36 @@ def test_commit_checkpoint_contains_pre_and_post_formal_world(session, monkeypat
     checkpoint = session.get(SceneStateCheckpoint, body["checkpoint"]["id"])
     pre = session.get(WorldSnapshot, checkpoint.pre_snapshot_id)
     post = session.get(WorldSnapshot, checkpoint.post_snapshot_id)
-    pre_entity = next(row for row in pre.payload["world_entities"] if row["id"] == location.id)
-    post_entity = next(row for row in post.payload["world_entities"] if row["id"] == location.id)
+    resolver = SnapshotPayloadResolver()
+    pre_payload, post_payload = resolver.materialize(session, pre), resolver.materialize(session, post)
+    pre_entity = next(row for row in pre_payload["world_entities"] if row["id"] == location.id)
+    post_entity = next(row for row in post_payload["world_entities"] if row["id"] == location.id)
     assert pre_entity["profile"]["opened"] is False and post_entity["profile"]["opened"] is True
-    assert not any(row["id"] == body["scene"]["id"] for row in pre.payload["scenes"])
-    assert any(row["id"] == body["scene"]["id"] for row in post.payload["scenes"])
-    assert not any(row.get("source") == body["scene"]["id"] for row in pre.payload["character_knowledge"])
-    assert any(row.get("character_id") == actor.id and row.get("source") == body["scene"]["id"] for row in post.payload["character_knowledge"])
+    assert not any(row["id"] == body["scene"]["id"] for row in pre_payload["scenes"])
+    assert any(row["id"] == body["scene"]["id"] for row in post_payload["scenes"])
+    assert not any(row.get("source") == body["scene"]["id"] for row in pre_payload["character_knowledge"])
+    assert any(row.get("character_id") == actor.id and row.get("source") == body["scene"]["id"] for row in post_payload["character_knowledge"])
     assert checkpoint.pre_state_fingerprint == pre.state_fingerprint
     assert checkpoint.post_state_fingerprint == post.state_fingerprint
     assert checkpoint.checkpoint_fingerprint
     SceneCheckpointIntegrityValidator().validate_integrity(session, checkpoint)
+
+
+def test_normal_checkpoint_uses_anchor_then_reference_and_compact_delta(session, monkeypatch):
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    body = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()
+    session.expire_all()
+    checkpoint = session.get(SceneStateCheckpoint, body["checkpoint"]["id"])
+    pre, post = session.get(WorldSnapshot, checkpoint.pre_snapshot_id), session.get(WorldSnapshot, checkpoint.post_snapshot_id)
+    assert pre.storage_mode == "COMPACT_ANCHOR"
+    assert post.storage_mode == "COMPACT_DELTA"
+    assert "scenes" not in post.payload and "collections" in post.payload
+    assert SnapshotPayloadResolver().materialize(session, post) == __import__("app.versioning", fromlist=["WorldSnapshotBuilder"]).WorldSnapshotBuilder().build(session, project.id)[0]
+    ProjectWorldSnapshotHeadService().audit(session, project.id)
+    CompactSnapshotAudit().audit_current_formal_state(session, project.id)
+    from app.historical import SceneCheckpointService
+    next_pre = SceneCheckpointService().capture_formal_pre(session, project.id)
+    assert next_pre.storage_mode == "REFERENCE" and next_pre.base_snapshot_id == post.id
 
 
 def test_checkpoint_read_api_is_metadata_only(session, monkeypatch):
@@ -394,7 +414,7 @@ def test_checkpoint_read_api_is_metadata_only(session, monkeypatch):
     current = client.get(f"/projects/{project.id}/scenes/{committed['scene']['id']}/checkpoint")
     history = client.get(f"/projects/{project.id}/scenes/{committed['scene']['id']}/checkpoints")
     assert current.status_code == history.status_code == 200
-    assert current.json()["id"] == committed["checkpoint"]["id"] and current.json()["capture_protocol_version"] == 3
+    assert current.json()["id"] == committed["checkpoint"]["id"] and current.json()["capture_protocol_version"] == 4
     assert "payload" not in current.json() and [row["version"] for row in history.json()] == [1]
 
 

@@ -79,6 +79,7 @@ class EmbeddingStatus(str, enum.Enum): PENDING="PENDING"; READY="READY"; FAILED=
 class ProviderCredentialPurpose(str, enum.Enum): GENERATION="GENERATION"; EMBEDDING="EMBEDDING"
 class MemoryRetrievalMode(str, enum.Enum): DETERMINISTIC="DETERMINISTIC"; HYBRID_RRF="HYBRID_RRF"
 class HistoryProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
+class SnapshotStorageMode(str, enum.Enum): LEGACY_FULL="LEGACY_FULL"; COMPACT_ANCHOR="COMPACT_ANCHOR"; COMPACT_DELTA="COMPACT_DELTA"; REFERENCE="REFERENCE"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
 class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
 
@@ -942,6 +943,22 @@ class WorldSnapshot(Base):
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False)
     snapshot_type: Mapped[SnapshotType]=mapped_column(String(30),nullable=False); schema_version: Mapped[int]=mapped_column(Integer,default=1,nullable=False)
     state_fingerprint: Mapped[str]=mapped_column(String(100),nullable=False); payload: Mapped[dict[str,Any]]=mapped_column(JSON,nullable=False); source_revision_id: Mapped[str|None]=mapped_column(ForeignKey("world_revisions.id")); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False)
+    storage_mode: Mapped[SnapshotStorageMode]=mapped_column(Enum(SnapshotStorageMode, native_enum=False, length=30),nullable=False,default=SnapshotStorageMode.LEGACY_FULL)
+    base_snapshot_id: Mapped[str|None]=mapped_column(ForeignKey("world_snapshots.id"))
+    storage_fingerprint: Mapped[str|None]=mapped_column(String(120))
+    materialization_depth: Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+
+class ProjectWorldSnapshotHead(TimestampMixin, Base):
+    __tablename__ = "project_world_snapshot_heads"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_project_world_snapshot_head_project"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    snapshot_id: Mapped[str] = mapped_column(ForeignKey("world_snapshots.id"), nullable=False)
+    state_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_id: Mapped[str | None] = mapped_column(String(36))
+    sequence: Mapped[int | None] = mapped_column(Integer)
+    head_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
 class RevisionApplication(Base):
     __tablename__="revision_applications"
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); revision_id: Mapped[str]=mapped_column(ForeignKey("world_revisions.id"),nullable=False)

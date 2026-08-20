@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from .execution_trace import stable_fingerprint
 from .historical import CurrentSceneCheckpointResolver, SceneCheckpointIntegrityValidator
+from .snapshot_storage import SnapshotPayloadResolver
 from .models import (
     CanonFact, CausalEdgeKind, CausalLink, CausalRelationType, CausalResourceType,
     Character, CharacterDecision, CharacterKnowledge, CharacterMemory, Project,
@@ -139,7 +140,9 @@ def _same(left: Any, right: Any) -> bool:
 def _path_same(path: str, left: Any, right: Any) -> bool:
     if path == "/current_world_time":
         try:
-            return normalize_world_time(left) == normalize_world_time(right)
+            normalized_left = normalize_world_time(left.isoformat() if hasattr(left, "isoformat") else left)
+            normalized_right = normalize_world_time(right.isoformat() if hasattr(right, "isoformat") else right)
+            return normalized_left == normalized_right
         except (TypeError, ValueError):
             return False
     return _same(left, right)
@@ -264,7 +267,15 @@ class CausalLedgerService:
         pre, post = db.get(WorldSnapshot, checkpoint.pre_snapshot_id), db.get(WorldSnapshot, checkpoint.post_snapshot_id)
         if not pre or not post:
             raise ValueError("CAUSAL_LEDGER_CHECKPOINT_INVALID")
-        transitions = self.extractor.extract(pre.payload, post.payload)
+        origin = self._origin(checkpoint)
+        compact_normal = checkpoint.capture_protocol_version >= 4 and origin == TimelineOrigin.NORMAL_COMMIT
+        if compact_normal:
+            transitions = []
+            pre_payload = post_payload = None
+        else:
+            resolver = SnapshotPayloadResolver()
+            pre_payload, post_payload = resolver.materialize(db, pre), resolver.materialize(db, post)
+            transitions = self.extractor.extract(pre_payload, post_payload)
         old_state_event_ids = list(db.scalars(
             select(TimelineEvent.id).where(
                 TimelineEvent.project_id == project_id,
@@ -287,13 +298,13 @@ class CausalLedgerService:
                     CausalLink.effect_id.in_(old_state_event_ids),
                 ),
             ).values(active=False))
-        state_events = self._index_state_changes(db, scene, checkpoint, transitions, pre.payload, post.payload)
+        state_events = self._index_state_changes(db, scene, checkpoint, transitions, pre_payload, post_payload)
         for event in state_events:
             self._link(db, project_id, CausalResourceType.TIMELINE_EVENT, event.id, CausalResourceType.SCENE, scene.id, CausalEdgeKind.PROVENANCE, CausalRelationType.STATE_CHANGE_COMMITTED_IN_SCENE, scene, {"checkpoint_id": checkpoint.id})
         self._index_execution_links(db, scene, binding, state_events)
         return scene_event
 
-    def _index_state_changes(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition], pre: dict[str, Any], post: dict[str, Any]) -> list[TimelineEvent]:
+    def _index_state_changes(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition], pre: dict[str, Any] | None, post: dict[str, Any] | None) -> list[TimelineEvent]:
         origin = self._origin(checkpoint)
         if origin == TimelineOrigin.NORMAL_COMMIT:
             return self._normal_state_events(db, scene, checkpoint, transitions, pre, post)
@@ -307,7 +318,7 @@ class CausalLedgerService:
             ]
         return self._replay_state_events(db, scene, checkpoint, transitions)
 
-    def _normal_state_events(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition], pre: dict[str, Any], post: dict[str, Any]) -> list[TimelineEvent]:
+    def _normal_state_events(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition], pre: dict[str, Any] | None, post: dict[str, Any] | None) -> list[TimelineEvent]:
         commit = db.get(SceneCommit, checkpoint.source_scene_commit_id) if checkpoint.source_scene_commit_id else None
         if not commit or _value(commit.status) != "COMMITTED" or commit.scene_id != scene.id:
             raise ValueError("CAUSAL_LEDGER_STATE_DELTA_MISMATCH")
@@ -341,15 +352,101 @@ class CausalLedgerService:
             ),
         )
         for index, item in enumerate(ordered, 1):
-            found_before, actual_before = self._snapshot_value(pre, item.target_type.value, item.target_id, item.path)
-            found_after, actual_after = self._snapshot_value(post, item.target_type.value, item.target_id, item.path)
+            if checkpoint.capture_protocol_version >= 4:
+                found_before, actual_before = True, item.before_value
+                found_after, actual_after = self._compact_delta_value(db, checkpoint, item.target_type.value, item.target_id, item.path)
+                formal_found, formal_after = self._formal_value(db, item.target_type.value, item.target_id, item.path)
+            else:
+                found_before, actual_before = self._snapshot_value(pre or {}, item.target_type.value, item.target_id, item.path)
+                found_after, actual_after = self._snapshot_value(post or {}, item.target_type.value, item.target_id, item.path)
+                formal_found, formal_after = True, item.after_value
             # UPSERT may intentionally create the final leaf.  It is still
             # causally proven when the absent PRE and present POST agree.
-            if (found_before and not _path_same(item.path, actual_before, item.before_value)) or (not found_before and item.before_value is not None) or (found_after and not _path_same(item.path, actual_after, item.after_value)) or (not found_after and item.after_value is not None):
+            if (found_before and not _path_same(item.path, actual_before, item.before_value)) or (not found_before and item.before_value is not None) or (found_after and not _path_same(item.path, actual_after, item.after_value)) or (not found_after and item.after_value is not None) or (not formal_found or not _path_same(item.path, formal_after, item.after_value)):
                 raise ValueError("CAUSAL_LEDGER_STATE_DELTA_MISMATCH")
             transition = SceneStateTransition(item.target_type.value, item.target_id, item.path, item.before_value, item.after_value)
             events.append(self._state_event(db, scene, checkpoint, transition, {"state_delta_batch_id": item.batch_id, "state_delta_item_id": item.id, "source_resolution_id": item.source_resolution_id, "source_turn_id": item.source_turn_id, "domain": _value(item.domain), "operation": _value(item.operation), "item_semantic_fingerprint": item.semantic_fingerprint}, index))
         return events
+
+    def _compact_delta_value(
+        self,
+        db: Session,
+        checkpoint: SceneStateCheckpoint,
+        target_type: str,
+        target_id: str,
+        path: str,
+    ) -> tuple[bool, Any]:
+        """Read a leaf directly from this checkpoint's bounded POST delta."""
+        post = db.get(WorldSnapshot, checkpoint.post_snapshot_id)
+        if not post or _value(post.storage_mode) != "COMPACT_DELTA":
+            return False, None
+        payload = post.payload or {}
+        if target_type == "PROJECT":
+            row = payload.get("project")
+        else:
+            collection = {
+                "WORLD_ENTITY": "world_entities",
+                "CHARACTER": "characters",
+                "STORY_THREAD": "story_threads",
+            }.get(target_type)
+            if not collection:
+                return False, None
+            row = next(
+                (
+                    candidate
+                    for candidate in payload.get("collections", {}).get(collection, {}).get("upsert", [])
+                    if candidate.get("id") == target_id
+                ),
+                None,
+            )
+        return self._overlay_value(row, path)
+
+    @staticmethod
+    def _formal_value(db: Session, target_type: str, target_id: str, path: str) -> tuple[bool, Any]:
+        model = {
+            "PROJECT": Project,
+            "WORLD_ENTITY": WorldEntity,
+            "CHARACTER": Character,
+            "STORY_THREAD": StoryThread,
+        }.get(target_type)
+        row = db.execute(
+            select(model.__table__).where(model.__table__.c.id == target_id)
+        ).mappings().one_or_none() if model else None
+        if not row:
+            return False, None
+        # Matches WorldSnapshotBuilder's formal serialization contract without
+        # scanning any collection: only this StateDelta target is loaded.
+        if target_type == "PROJECT":
+            document = {
+                "id": row["id"],
+                "status": _value(row["status"]),
+                "creation_mode": _value(row["creation_mode"]),
+                "story_seed": row["story_seed"],
+                "current_world_time": row["current_world_time"],
+            }
+        else:
+            document = {
+                column.key: _value(row[column.key])
+                for column in model.__table__.columns
+                if column.key not in {"created_at", "updated_at"}
+            }
+        return read_overlay_path(document, path)
+
+    @staticmethod
+    def _overlay_value(row: dict[str, Any] | None, path: str) -> tuple[bool, Any]:
+        if row is None:
+            return False, None
+        value: Any = row
+        if not path or path == "/":
+            return True, value
+        for segment in path.lstrip("/").split("/"):
+            if isinstance(value, dict) and segment in value:
+                value = value[segment]
+            elif isinstance(value, list) and segment.isdigit() and int(segment) < len(value):
+                value = value[int(segment)]
+            else:
+                return False, None
+        return True, value
 
     def _replay_state_events(self, db: Session, scene: Scene, checkpoint: SceneStateCheckpoint, transitions: list[SceneStateTransition]) -> list[TimelineEvent]:
         session = db.get(RetconReplaySession, checkpoint.source_replay_session_id) if checkpoint.source_replay_session_id else None

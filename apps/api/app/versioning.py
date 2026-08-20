@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from .models import CanonFact, Character, CharacterKnowledge, CharacterMemory, Chapter, Project, RevealConstraint, RevisionApplication, RevisionApplicationStatus, RevisionStatus, Scene, StoryArc, StoryThread, WorldEntity, WorldRevision, WorldSnapshot, SnapshotType
 from .revision import RevisionChangeNormalizer, RevisionChangePayload, RevisionPatchEngine, RevisionStateFingerprintBuilder, _record, target_fingerprint
+from .snapshot_storage import ProjectWorldSnapshotHeadService, SnapshotPayloadResolver
 
 
 class WorldSnapshotBuilder:
@@ -83,6 +84,8 @@ class RevisionApplyService:
         return actual, changes, candidates
 
     def apply(self, db, project_id, revision, override, reason, prepared=None):
+        if not db.scalar(select(Project).where(Project.id == project_id).with_for_update()):
+            raise ValueError("REVISION_PROJECT_NOT_FOUND")
         actual, changes, candidates = prepared or self.preflight(db, project_id, revision, override, reason)
         pre = WorldSnapshotBuilder().create(db, project_id, SnapshotType.PRE_REVISION, revision.id)
         application = RevisionApplication(project_id=project_id, revision_id=revision.id, status=RevisionApplicationStatus.PENDING, pre_snapshot_id=pre.id, expected_base_fingerprint=revision.base_state_fingerprint, actual_base_fingerprint=actual, author_override=override, author_override_reason=reason, applied_change_count=0)
@@ -104,6 +107,9 @@ class RevisionApplyService:
             if target_fingerprint(persisted) != expected[(target_type, target_id)]:
                 raise ValueError("APPLY_RESULT_MISMATCH")
         post = WorldSnapshotBuilder().create(db, project_id, SnapshotType.POST_REVISION, revision.id)
+        ProjectWorldSnapshotHeadService().update(
+            db, project_id, post, source_type="REVISION_APPLY", source_id=revision.id
+        )
         application.post_snapshot_id = post.id
         application.status = RevisionApplicationStatus.APPLIED
         application.applied_change_count = len(changes)
@@ -112,16 +118,21 @@ class RevisionApplyService:
         return application
 
     def rollback(self, db, project_id, application):
+        if not db.scalar(select(Project).where(Project.id == project_id).with_for_update()):
+            raise ValueError("REVISION_PROJECT_NOT_FOUND")
         latest = db.scalar(select(RevisionApplication).where(RevisionApplication.project_id == project_id, RevisionApplication.status == RevisionApplicationStatus.APPLIED).order_by(RevisionApplication.completed_at.desc(), RevisionApplication.id.desc()))
         if not latest or latest.id != application.id:
             raise ValueError("ROLLBACK_NOT_LATEST")
         revision = db.get(WorldRevision, application.revision_id)
         pre = db.get(WorldSnapshot, application.pre_snapshot_id)
         post = db.get(WorldSnapshot, application.post_snapshot_id)
+        resolver = SnapshotPayloadResolver()
+        pre_payload = resolver.materialize(db, pre)
+        post_payload = resolver.materialize(db, post)
         targets = {(item.target_type, item.target_id) for item in self._changes(revision)}
         for target_type, target_id in targets:
             current = _record(db.get(self.MODELS[target_type], target_id))
-            expected = copy.deepcopy(next(item for item in post.payload[self.SNAPSHOT_KEYS[target_type]] if item["id"] == target_id))
+            expected = copy.deepcopy(next(item for item in post_payload[self.SNAPSHOT_KEYS[target_type]] if item["id"] == target_id))
             for field in ("created_at", "updated_at"):
                 current.pop(field, None)
                 expected.pop(field, None)
@@ -130,14 +141,14 @@ class RevisionApplyService:
         normalizer = RevisionChangeNormalizer()
         for target_type, target_id in targets:
             target = db.get(self.MODELS[target_type], target_id)
-            saved = next(item for item in pre.payload[self.SNAPSHOT_KEYS[target_type]] if item["id"] == target_id)
+            saved = next(item for item in pre_payload[self.SNAPSHOT_KEYS[target_type]] if item["id"] == target_id)
             for field, value in saved.items():
                 if field not in self.IMMUTABLE:
                     setattr(target, field, value)
         db.flush()
         for target_type, target_id in targets:
             current = _record(db.get(self.MODELS[target_type], target_id))
-            expected = copy.deepcopy(next(item for item in pre.payload[self.SNAPSHOT_KEYS[target_type]] if item["id"] == target_id))
+            expected = copy.deepcopy(next(item for item in pre_payload[self.SNAPSHOT_KEYS[target_type]] if item["id"] == target_id))
             for field in ("created_at", "updated_at"):
                 current.pop(field, None)
                 expected.pop(field, None)
@@ -148,5 +159,8 @@ class RevisionApplyService:
         application.status = RevisionApplicationStatus.ROLLED_BACK
         application.completed_at = datetime.utcnow()
         revision.status = RevisionStatus.ROLLED_BACK
-        WorldSnapshotBuilder().create(db, project_id, SnapshotType.ROLLBACK_POINT, revision.id)
+        rollback_snapshot = WorldSnapshotBuilder().create(db, project_id, SnapshotType.ROLLBACK_POINT, revision.id)
+        ProjectWorldSnapshotHeadService().update(
+            db, project_id, rollback_snapshot, source_type="REVISION_ROLLBACK", source_id=revision.id
+        )
         return application

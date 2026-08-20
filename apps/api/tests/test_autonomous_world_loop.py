@@ -605,8 +605,10 @@ def test_three_scene_e2e_has_checkpoint_and_causal_continuity(session, world):
     snapshots = [(session.get(WorldSnapshot, item.pre_snapshot_id), session.get(WorldSnapshot, item.post_snapshot_id)) for item in checkpoints]
     assert snapshots[0][1].state_fingerprint == snapshots[1][0].state_fingerprint
     assert snapshots[1][1].state_fingerprint == snapshots[2][0].state_fingerprint
-    assert snapshots[0][1].payload == snapshots[1][0].payload
-    assert snapshots[1][1].payload == snapshots[2][0].payload
+    from app.snapshot_storage import SnapshotPayloadResolver
+    resolver = SnapshotPayloadResolver()
+    assert resolver.materialize(session, snapshots[0][1]) == resolver.materialize(session, snapshots[1][0])
+    assert resolver.materialize(session, snapshots[1][1]) == resolver.materialize(session, snapshots[2][0])
     CurrentHistoryCheckpointAudit().audit(session, world.project.id)
     CurrentCausalLedgerAudit().audit(session, world.project.id)
     for scene in scenes:

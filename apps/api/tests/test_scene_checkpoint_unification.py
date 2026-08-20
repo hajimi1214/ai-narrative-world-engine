@@ -237,7 +237,8 @@ def test_replay_checkpoint_final_integrity_uses_completed_session(session, monke
     assert checkpoints
     for checkpoint in checkpoints:
         post = session.get(__import__("app.models", fromlist=["WorldSnapshot"]).WorldSnapshot, checkpoint.post_snapshot_id)
-        formal_scene = next((row for row in post.payload.get("scenes", []) if row.get("id") == checkpoint.scene_id), None)
+        from app.snapshot_storage import SnapshotPayloadResolver
+        formal_scene = next((row for row in SnapshotPayloadResolver().materialize(session, post).get("scenes", []) if row.get("id") == checkpoint.scene_id), None)
         assert formal_scene and formal_scene.get("status") == "OCCURRED" and formal_scene.get("history_status") == "ACTIVE", formal_scene
         SceneCheckpointIntegrityValidator().validate_integrity(session, checkpoint)
 
@@ -334,41 +335,45 @@ def test_real_multiscene_replay_has_formal_continuous_boundaries(session, monkey
     checkpoint2 = resolver.current(session, fixture.project.id, replacement2.id)
     checkpoint3 = resolver.current(session, fixture.project.id, scene3.id)
     checkpoint4 = resolver.current(session, fixture.project.id, replacement4.id)
+    from app.snapshot_storage import SnapshotPayloadResolver
+    storage = SnapshotPayloadResolver()
     post2 = session.get(WorldSnapshot, checkpoint2.post_snapshot_id)
     pre3 = session.get(WorldSnapshot, checkpoint3.pre_snapshot_id)
     post3 = session.get(WorldSnapshot, checkpoint3.post_snapshot_id)
     pre4 = session.get(WorldSnapshot, checkpoint4.pre_snapshot_id)
+    post2_payload, pre3_payload = storage.materialize(session, post2), storage.materialize(session, pre3)
+    post3_payload, pre4_payload = storage.materialize(session, post3), storage.materialize(session, pre4)
     summarize = lambda payload: [(row.get("id"), row.get("sequence"), row.get("status"), row.get("history_status"), row.get("summary")) for row in payload.get("scenes", [])]
-    differing23 = {key: ((summarize(post2.payload), summarize(pre3.payload)) if key == "scenes" else (post2.payload.get(key), pre3.payload.get(key))) for key in post2.payload.keys() | pre3.payload.keys() if post2.payload.get(key) != pre3.payload.get(key)}
-    differing34 = {key: ((summarize(post3.payload), summarize(pre4.payload)) if key == "scenes" else (post3.payload.get(key), pre4.payload.get(key))) for key in post3.payload.keys() | pre4.payload.keys() if post3.payload.get(key) != pre4.payload.get(key)}
-    assert post2.state_fingerprint == pre3.state_fingerprint and post2.payload == pre3.payload, differing23
-    assert post3.state_fingerprint == pre4.state_fingerprint and post3.payload == pre4.payload, differing34
+    differing23 = {key: ((summarize(post2_payload), summarize(pre3_payload)) if key == "scenes" else (post2_payload.get(key), pre3_payload.get(key))) for key in post2_payload.keys() | pre3_payload.keys() if post2_payload.get(key) != pre3_payload.get(key)}
+    differing34 = {key: ((summarize(post3_payload), summarize(pre4_payload)) if key == "scenes" else (post3_payload.get(key), pre4_payload.get(key))) for key in post3_payload.keys() | pre4_payload.keys() if post3_payload.get(key) != pre4_payload.get(key)}
+    assert post2.state_fingerprint == pre3.state_fingerprint and post2_payload == pre3_payload, differing23
+    assert post3.state_fingerprint == pre4.state_fingerprint and post3_payload == pre4_payload, differing34
 
     knowledge2 = session.scalars(select(CharacterKnowledge).where(CharacterKnowledge.replay_session_id == state["id"], CharacterKnowledge.source == replacement2.id)).all()
     memories2 = session.scalars(select(CharacterMemory).where(CharacterMemory.replay_session_id == state["id"], CharacterMemory.source_scene == replacement2.id)).all()
     assert knowledge2 and memories2
-    assert {row.id for row in knowledge2}.issubset({row["id"] for row in post2.payload["character_knowledge"]})
-    assert {row.id for row in memories2}.issubset({row["id"] for row in post2.payload["character_memories"]})
-    formal_knowledge = next(row for row in post2.payload["character_knowledge"] if row["id"] == knowledge2[0].id)
-    formal_memory = next(row for row in post2.payload["character_memories"] if row["id"] == memories2[0].id)
+    assert {row.id for row in knowledge2}.issubset({row["id"] for row in post2_payload["character_knowledge"]})
+    assert {row.id for row in memories2}.issubset({row["id"] for row in post2_payload["character_memories"]})
+    formal_knowledge = next(row for row in post2_payload["character_knowledge"] if row["id"] == knowledge2[0].id)
+    formal_memory = next(row for row in post2_payload["character_memories"] if row["id"] == memories2[0].id)
     assert formal_knowledge["source"] == replacement2.id and formal_knowledge["replay_session_id"] == state["id"]
     assert formal_memory["source_scene"] == replacement2.id and formal_memory["replay_session_id"] == state["id"]
-    serialized = json.dumps([post2.payload, pre3.payload, post3.payload, pre4.payload], sort_keys=True)
+    serialized = json.dumps([post2_payload, pre3_payload, post3_payload, pre4_payload], sort_keys=True)
     for forbidden in ("replay-knowledge:", "replay-memory:", '"temp_id"', '"source_turn_temp_id"', '"source_resolution_temp_id"', '"fact_identity"', '"reason"'):
         assert forbidden not in serialized
-    assert next(row for row in post2.payload["scenes"] if row["id"] == replacement2.id)["history_status"] == "ACTIVE"
-    assert next(row for row in pre3.payload["scenes"] if row["id"] == replacement2.id)["history_status"] == "ACTIVE"
-    assert all(row["id"] != scene2.id for row in post2.payload["scenes"])
-    assert all(row["id"] != replacement4.id for row in post2.payload["scenes"])
-    assert fixture.preserved_ids[3] in {row["id"] for row in post3.payload["character_knowledge"]}
-    assert fixture.preserved_ids[4] in {row["id"] for row in post3.payload["character_memories"]}
+    assert next(row for row in post2_payload["scenes"] if row["id"] == replacement2.id)["history_status"] == "ACTIVE"
+    assert next(row for row in pre3_payload["scenes"] if row["id"] == replacement2.id)["history_status"] == "ACTIVE"
+    assert all(row["id"] != scene2.id for row in post2_payload["scenes"])
+    assert all(row["id"] != replacement4.id for row in post2_payload["scenes"])
+    assert fixture.preserved_ids[3] in {row["id"] for row in post3_payload["character_knowledge"]}
+    assert fixture.preserved_ids[4] in {row["id"] for row in post3_payload["character_memories"]}
     assert session.get(CharacterDecision, fixture.preserved_ids[0]) and session.get(ScenePerformanceTurn, fixture.preserved_ids[1]) and session.get(WorldResolution, fixture.preserved_ids[2])
     future_cognition = set(runs[scene4.id].new_knowledge_ids or []) | set(runs[scene4.id].new_memory_ids or [])
-    assert future_cognition.isdisjoint({row["id"] for row in post2.payload["character_knowledge"] + post2.payload["character_memories"]})
-    assert post3.payload["project"]["current_world_time"].startswith("2040-01-02")
+    assert future_cognition.isdisjoint({row["id"] for row in post2_payload["character_knowledge"] + post2_payload["character_memories"]})
+    assert post3_payload["project"]["current_world_time"].startswith("2040-01-02")
     assert checkpoint3.version == 2 and checkpoint3.active is True
     baseline, _ = ReplayBaselineBuilder().build(session, fixture.project.id, scene3.id)
-    assert baseline == pre3.payload
+    assert baseline == pre3_payload
     replay_session = session.get(RetconReplaySession, state["id"])
     assert replay_session.pre_commit_snapshot_id and replay_session.post_commit_snapshot_id
     scene_snapshot_ids = {checkpoint2.pre_snapshot_id, checkpoint2.post_snapshot_id, checkpoint3.pre_snapshot_id, checkpoint3.post_snapshot_id, checkpoint4.pre_snapshot_id, checkpoint4.post_snapshot_id}

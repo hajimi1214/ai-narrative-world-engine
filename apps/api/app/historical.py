@@ -1,18 +1,31 @@
 """Versioned scene-state boundaries and legacy historical helpers."""
 from __future__ import annotations
-import copy, hashlib, json
+import copy
 from typing import Any
 from sqlalchemy import func, select
 from .models import CharacterKnowledge, CharacterMemory, Scene, SceneCheckpointOrigin, SceneCommit, SceneStateCheckpoint, SnapshotType, WorldSnapshot, RetconCognitionInvalidation
 from .revision import RevisionPatchEngine
 from .versioning import WorldSnapshotBuilder
-
-def snapshot_fingerprint(payload: dict[str, Any]) -> str:
-    return "world-snapshot-v1:" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+from .snapshot_storage import (
+    CompactSnapshotService, ProjectWorldSnapshotHeadService, SceneCommitSnapshotDeltaBuilder,
+    SnapshotPayloadResolver, SnapshotStorageMode, snapshot_fingerprint,
+)
 
 def checkpoint_fingerprint(checkpoint, scene, pre, post):
     value = {"project_id": checkpoint.project_id, "scene_id": checkpoint.scene_id, "sequence": scene.sequence, "version": checkpoint.version, "origin": getattr(checkpoint.origin, "value", checkpoint.origin), "pre": pre.state_fingerprint, "post": post.state_fingerprint, "source_scene_commit_id": checkpoint.source_scene_commit_id, "source_replay_session_id": checkpoint.source_replay_session_id, "supersedes_checkpoint_id": checkpoint.supersedes_checkpoint_id, "capture_protocol_version": checkpoint.capture_protocol_version}
-    return "scene-checkpoint-v3:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    if checkpoint.capture_protocol_version >= 4:
+        value["storage"] = {
+            "pre_snapshot_id": pre.id, "post_snapshot_id": post.id,
+            "pre_storage_mode": getattr(pre.storage_mode, "value", pre.storage_mode),
+            "post_storage_mode": getattr(post.storage_mode, "value", post.storage_mode),
+            "pre_storage_fingerprint": pre.storage_fingerprint,
+            "post_storage_fingerprint": post.storage_fingerprint,
+        }
+        prefix = "scene-checkpoint-v4:"
+    else:
+        prefix = "scene-checkpoint-v3:"
+    import hashlib, json
+    return prefix + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 class CurrentSceneCheckpointResolver:
     def current(self, db, project_id, scene_id):
@@ -28,7 +41,13 @@ class SceneCheckpointIntegrityValidator:
         scene = db.get(Scene, checkpoint.scene_id); pre = db.get(WorldSnapshot, checkpoint.pre_snapshot_id); post = db.get(WorldSnapshot, checkpoint.post_snapshot_id)
         if not scene or scene.project_id != checkpoint.project_id or checkpoint.sequence != scene.sequence or checkpoint.current_scene_id != scene.id: raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
         if not pre or not post or pre.project_id != checkpoint.project_id or post.project_id != checkpoint.project_id: raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
-        if snapshot_fingerprint(pre.payload) != pre.state_fingerprint or snapshot_fingerprint(post.payload) != post.state_fingerprint: raise ValueError("SCENE_CHECKPOINT_SNAPSHOT_FINGERPRINT_INVALID")
+        if checkpoint.capture_protocol_version >= 4:
+            try:
+                resolver = SnapshotPayloadResolver(); resolver.validate_chain(db, pre); resolver.validate_chain(db, post)
+            except ValueError as exc:
+                raise ValueError("SCENE_CHECKPOINT_SNAPSHOT_FINGERPRINT_INVALID") from exc
+        elif snapshot_fingerprint(pre.payload) != pre.state_fingerprint or snapshot_fingerprint(post.payload) != post.state_fingerprint:
+            raise ValueError("SCENE_CHECKPOINT_SNAPSHOT_FINGERPRINT_INVALID")
         if checkpoint.capture_protocol_version < 3: return
         if pre.snapshot_type != SnapshotType.PRE_SCENE_STATE or post.snapshot_type != SnapshotType.POST_SCENE_STATE: raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
         if checkpoint.pre_state_fingerprint != pre.state_fingerprint or checkpoint.post_state_fingerprint != post.state_fingerprint: raise ValueError("SCENE_CHECKPOINT_SNAPSHOT_FINGERPRINT_INVALID")
@@ -42,8 +61,14 @@ class SceneCheckpointIntegrityValidator:
             replay = db.get(RetconReplaySession, checkpoint.source_replay_session_id) if checkpoint.source_replay_session_id else None
             if not replay or checkpoint.source_scene_commit_id or replay.project_id != checkpoint.project_id or getattr(replay.status, "value", replay.status) != "COMPLETED": raise ValueError("SCENE_CHECKPOINT_PROVENANCE_INVALID")
         else: raise ValueError("SCENE_CHECKPOINT_PROVENANCE_INVALID")
-        before = next((row for row in pre.payload.get("scenes", []) if row.get("id") == scene.id and row.get("history_status") == "ACTIVE"), None)
-        after = next((row for row in post.payload.get("scenes", []) if row.get("id") == scene.id), None)
+        if checkpoint.capture_protocol_version >= 4 and getattr(checkpoint.origin, "value", checkpoint.origin) == "NORMAL_COMMIT":
+            before = None
+            after = next((row for row in (post.payload.get("collections", {}).get("scenes", {}).get("upsert", [])) if row.get("id") == scene.id), None)
+        else:
+            resolver = SnapshotPayloadResolver()
+            pre_payload, post_payload = resolver.materialize(db, pre), resolver.materialize(db, post)
+            before = next((row for row in pre_payload.get("scenes", []) if row.get("id") == scene.id and row.get("history_status") == "ACTIVE"), None)
+            after = next((row for row in post_payload.get("scenes", []) if row.get("id") == scene.id), None)
         # A replay replacement is a new Scene identity and must not appear in
         # its PRE.  A preserved Scene deliberately keeps its identity while
         # receiving a new boundary version, so its historical row may appear.
@@ -62,12 +87,34 @@ class SceneCheckpointIntegrityValidator:
 
 class SceneCheckpointService:
     resolver = CurrentSceneCheckpointResolver(); validator = SceneCheckpointIntegrityValidator()
-    def capture_formal_pre(self, db, project_id): return WorldSnapshotBuilder().create(db, project_id, SnapshotType.PRE_SCENE_STATE)
+    compact = CompactSnapshotService()
+    def capture_formal_pre(self, db, project_id):
+        return self.compact.capture_pre(db, project_id, SnapshotType.PRE_SCENE_STATE,
+                                        lambda: WorldSnapshotBuilder().build(db, project_id))
     def finalize_formal_post(self, db, project_id): return WorldSnapshotBuilder().create(db, project_id, SnapshotType.POST_SCENE_STATE)
+    def create_normal_checkpoint(self, db, project_id, scene, pre, *, items, knowledge, memories,
+                                 source_scene_commit_id=None):
+        post_payload, post_fingerprint = WorldSnapshotBuilder().build(db, project_id)
+        delta = SceneCommitSnapshotDeltaBuilder().build(post_payload, items, knowledge, memories, scene)
+        post = self.compact.delta(db, project_id, SnapshotType.POST_SCENE_STATE, pre, delta, post_fingerprint)
+        self.compact.heads.update(db, project_id, post, source_type="SCENE_CHECKPOINT",
+                                 source_id=scene.id, sequence=scene.sequence)
+        return self._create(db, project_id, scene, pre, post, origin=SceneCheckpointOrigin.NORMAL_COMMIT,
+                            source_scene_commit_id=source_scene_commit_id, source_replay_session_id=None,
+                            capture_protocol_version=4), post
     def materialize_from_payloads(self, db, project_id, scene, pre_payload, post_payload, *, origin, source_scene_commit_id=None, source_replay_session_id=None):
-        pre = WorldSnapshot(project_id=project_id, snapshot_type=SnapshotType.PRE_SCENE_STATE, state_fingerprint=snapshot_fingerprint(pre_payload), payload=copy.deepcopy(pre_payload)); post = WorldSnapshot(project_id=project_id, snapshot_type=SnapshotType.POST_SCENE_STATE, state_fingerprint=snapshot_fingerprint(post_payload), payload=copy.deepcopy(post_payload)); db.add_all([pre, post]); db.flush(); return self._create(db, project_id, scene, pre, post, origin=origin, source_scene_commit_id=source_scene_commit_id, source_replay_session_id=source_replay_session_id)
+        pre, post = self.compact.from_payloads(
+            db, project_id, pre_kind=SnapshotType.PRE_SCENE_STATE, post_kind=SnapshotType.POST_SCENE_STATE,
+            pre_payload=pre_payload, post_payload=post_payload, source_type="REPLAY_CHECKPOINT",
+            source_id=scene.id, sequence=scene.sequence,
+        )
+        return self._create(db, project_id, scene, pre, post, origin=origin,
+                            source_scene_commit_id=source_scene_commit_id,
+                            source_replay_session_id=source_replay_session_id,
+                            capture_protocol_version=4)
     def create_from_snapshots(self, db, project_id, scene, pre, post, *, origin, source_scene_commit_id=None, source_replay_session_id=None): return self._create(db, project_id, scene, pre, post, origin=origin, source_scene_commit_id=source_scene_commit_id, source_replay_session_id=source_replay_session_id)
-    def _create(self, db, project_id, scene, pre, post, *, origin, source_scene_commit_id, source_replay_session_id):
+    def _create(self, db, project_id, scene, pre, post, *, origin, source_scene_commit_id,
+                source_replay_session_id, capture_protocol_version=3):
         if scene.project_id != project_id or pre.project_id != project_id or post.project_id != project_id: raise ValueError("SCENE_CHECKPOINT_LINEAGE_INVALID")
         active = db.scalars(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == project_id, SceneStateCheckpoint.scene_id == scene.id, SceneStateCheckpoint.active.is_(True))).all()
         if len(active) > 1: raise ValueError("SCENE_CHECKPOINT_CURRENT_AMBIGUOUS")
@@ -77,7 +124,7 @@ class SceneCheckpointService:
         if prior:
             prior.active = False
             db.flush()
-        checkpoint = SceneStateCheckpoint(project_id=project_id, scene_id=scene.id, sequence=scene.sequence, pre_snapshot_id=pre.id, post_snapshot_id=post.id, current_scene_id=scene.id, capture_protocol_version=3, version=version, active=True, origin=getattr(origin, "value", origin), source_scene_commit_id=source_scene_commit_id, source_replay_session_id=source_replay_session_id, supersedes_checkpoint_id=prior.id if prior else None, pre_state_fingerprint=pre.state_fingerprint, post_state_fingerprint=post.state_fingerprint)
+        checkpoint = SceneStateCheckpoint(project_id=project_id, scene_id=scene.id, sequence=scene.sequence, pre_snapshot_id=pre.id, post_snapshot_id=post.id, current_scene_id=scene.id, capture_protocol_version=capture_protocol_version, version=version, active=True, origin=getattr(origin, "value", origin), source_scene_commit_id=source_scene_commit_id, source_replay_session_id=source_replay_session_id, supersedes_checkpoint_id=prior.id if prior else None, pre_state_fingerprint=pre.state_fingerprint, post_state_fingerprint=post.state_fingerprint)
         db.add(checkpoint); db.flush(); checkpoint.checkpoint_fingerprint = checkpoint_fingerprint(checkpoint, scene, pre, post); db.flush(); return checkpoint
     def current(self, db, project_id, scene_id): return self.resolver.current(db, project_id, scene_id)
     def history(self, db, project_id, scene_id): return self.resolver.history(db, project_id, scene_id)
@@ -109,7 +156,7 @@ class ReplayBaselineBuilder:
             except ValueError as exc: raise ValueError("SCENE_CHECKPOINT_INTEGRITY_INVALID") from exc
         snapshot = db.get(WorldSnapshot, checkpoint.pre_snapshot_id)
         if not snapshot: raise ValueError("HISTORICAL_BASELINE_UNAVAILABLE")
-        payload = copy.deepcopy(snapshot.payload)
+        payload = SnapshotPayloadResolver().materialize(db, snapshot)
         if revision is not None:
             models = {"CANON_FACT": "canon_facts", "WORLD_ENTITY": "world_entities", "CHARACTER": "characters"}; engine = RevisionPatchEngine()
             for change in revision.normalized_changes or []:
@@ -120,7 +167,7 @@ class ReplayBaselineBuilder:
 
 class TemporalCharacterCognitionReader:
     def read(self, db, project_id, character_id, replay_session, sequence):
-        snapshot = db.get(WorldSnapshot, replay_session.baseline_snapshot_id); source = snapshot.payload if snapshot else {}
+        snapshot = db.get(WorldSnapshot, replay_session.baseline_snapshot_id); source = SnapshotPayloadResolver().materialize(db, snapshot) if snapshot else {}
         invalidated = set(db.scalars(select(RetconCognitionInvalidation.resource_id).where(RetconCognitionInvalidation.project_id == project_id, RetconCognitionInvalidation.character_id == character_id, RetconCognitionInvalidation.status != "ROLLED_BACK")).all()); dynamic = (replay_session.staged_world_state or {}).get("dynamic_cognition_invalidations", []); invalidated.update(item["resource_id"] for item in dynamic if item.get("character_id") == character_id and item.get("sequence", 0) < sequence)
         knowledge = [self._row(CharacterKnowledge, row) for row in source.get("character_knowledge", []) if row.get("character_id") == character_id and row.get("id") not in invalidated]; memories = [self._row(CharacterMemory, row) for row in source.get("character_memories", []) if row.get("character_id") == character_id and row.get("id") not in invalidated]
         staged = (replay_session.staged_world_state or {}).get("staged_cognition", {})

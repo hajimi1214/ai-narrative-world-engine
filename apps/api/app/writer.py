@@ -253,7 +253,7 @@ class WriterChapterSourceBuilder:
             scene = db.get(Scene, binding.scene_id)
             if not scene or scene.project_id != chapter.project_id or _value(scene.status) != "OCCURRED" or scene.history_status != "ACTIVE":
                 raise WriterDomainError("WRITER_SOURCE_SCENE_INVALID")
-            checkpoint_rows = db.scalars(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == scene.project_id, SceneStateCheckpoint.scene_id == scene.id, SceneStateCheckpoint.active.is_(True), SceneStateCheckpoint.capture_protocol_version == 3).order_by(SceneStateCheckpoint.version.desc(), SceneStateCheckpoint.id)).all()
+            checkpoint_rows = db.scalars(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == scene.project_id, SceneStateCheckpoint.scene_id == scene.id, SceneStateCheckpoint.active.is_(True), SceneStateCheckpoint.capture_protocol_version >= 3).order_by(SceneStateCheckpoint.version.desc(), SceneStateCheckpoint.id)).all()
             if db.scalar(select(SceneExecutionBinding.id).where(SceneExecutionBinding.project_id == scene.project_id, SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True))) and len(checkpoint_rows) != 1:
                 raise WriterDomainError("WRITER_SCENE_CHECKPOINT_REQUIRED")
             scenes.append(self._scene(db, scene, binding.ordinal))
@@ -268,7 +268,7 @@ class WriterChapterSourceBuilder:
         return {"chapter": chapter, "revision": revision, "source_scene_ids": [row["scene_id"] for row in scenes], "scenes": scenes, "manifest": manifest, "source_fingerprint": source_fp, "structure_fingerprint": chapter.structure_fingerprint}
 
     def _scene(self, db: Session, scene: Scene, ordinal: int) -> dict[str, Any]:
-        checkpoint = db.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == scene.project_id, SceneStateCheckpoint.scene_id == scene.id, SceneStateCheckpoint.active.is_(True), SceneStateCheckpoint.capture_protocol_version == 3).order_by(SceneStateCheckpoint.version.desc(), SceneStateCheckpoint.id))
+        checkpoint = db.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == scene.project_id, SceneStateCheckpoint.scene_id == scene.id, SceneStateCheckpoint.active.is_(True), SceneStateCheckpoint.capture_protocol_version >= 3).order_by(SceneStateCheckpoint.version.desc(), SceneStateCheckpoint.id))
         binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.project_id == scene.project_id, SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
         performance = db.get(ScenePerformance, binding.performance_id) if binding else None
         turns: list[dict[str, Any]] = []

@@ -32,6 +32,7 @@ from .state_delta_validation import StateDeltaValidationWorldView, StateDeltaVal
 from .state_effect_contract import StateEffectPayload
 from .versioning import WorldSnapshotBuilder
 from .historical import SceneCheckpointService, SceneCheckpointOrigin
+from .snapshot_storage import ProjectWorldSnapshotHeadService
 from .causal_ledger import CausalLedgerService
 from .scaling import ProjectHistoryProjectionService
 
@@ -317,7 +318,13 @@ class SceneCommitService:
                 resolutions.append(matching[0])
             elif matching:
                 raise ValueError("SCENE_COMMIT_EXECUTION_LINEAGE_INVALID")
-        _, current_fingerprint = WorldSnapshotBuilder().build(db, project_id)
+        # A verified current-history head is the prior formal boundary.  This
+        # avoids another full snapshot scan on the normal continuous path.
+        current_head = ProjectWorldSnapshotHeadService().current(db, project_id)
+        if current_head:
+            current_fingerprint = current_head.state_fingerprint
+        else:
+            _, current_fingerprint = WorldSnapshotBuilder().build(db, project_id)
         batches: list[StateDeltaBatch] = []
         items: list[StateDeltaItem] = []
         for resolution in resolutions:
@@ -397,9 +404,11 @@ class SceneCommitService:
             sibling.status = PerformanceStatus.INVALIDATED
             sibling.stop_reason = "PROPOSAL_EXECUTED"
         db.flush()
-        post_snapshot = SceneCheckpointService().finalize_formal_post(db, project_id)
-        checkpoint = SceneCheckpointService().create_from_snapshots(db, project_id, scene, pre_snapshot, post_snapshot, origin=SceneCheckpointOrigin.NORMAL_COMMIT, source_scene_commit_id=record.id)
-        _, post_fingerprint = WorldSnapshotBuilder().build(db, project_id)
+        checkpoint, post_snapshot = SceneCheckpointService().create_normal_checkpoint(
+            db, project_id, scene, pre_snapshot, items=prepared.items, knowledge=knowledge,
+            memories=memories, source_scene_commit_id=record.id,
+        )
+        post_fingerprint = post_snapshot.state_fingerprint
         record.scene_id = scene.id
         record.post_snapshot_id = post_snapshot.id
         record.checkpoint_id = checkpoint.id
