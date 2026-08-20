@@ -48,6 +48,21 @@ def test_postgres_projection_rebuild_and_audit():
         ProjectHistoryProjectionAudit().audit(db, project_id)
 
 
+def test_postgres_cold_start_scene_sync_creates_ready_projection():
+    Session = _session()
+    with Session() as db:
+        project_id, scene_id = _fixture(db)
+        service = ProjectHistoryProjectionService()
+        service.sync_after_scene_commit(db, project_id, scene_id)
+        db.commit()
+        projection = service._projection(db, project_id)
+        assert projection and getattr(projection.status, "value", projection.status) == "READY"
+        assert projection.built_through_sequence == projection.active_scene_count == 1
+        assert projection.last_scene_id == scene_id
+        assert projection.thread_stats["__projection_meta__"]["active_character_ids"] == []
+        ProjectHistoryProjectionAudit().audit(db, project_id)
+
+
 def test_postgres_concurrent_rebuild_is_serialized():
     Session = _session()
     with Session() as db:

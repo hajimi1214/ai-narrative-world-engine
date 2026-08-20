@@ -19,7 +19,7 @@ from app.models import (
 from app.causal_ledger import CausalLedgerService
 from app.scaling import (
     HistoryProjectionFingerprintBuilder, ProjectHistoryProjectionAudit,
-    ProjectHistoryProjectionService, SceneHistoryFeatureAudit,
+    ProjectHistoryProjectionService, SceneHistoryFeatureAudit, THREAD_STATS_META_KEY,
 )
 
 
@@ -53,6 +53,37 @@ def make_history(db, count=4):
         scenes.append(scene)
     db.commit()
     return SimpleNamespace(project=project, character=character, thread=thread, scenes=scenes)
+
+
+def add_checkpoint(db, project_id, scene, fingerprint):
+    payload = {"project": {"id": project_id}, "scenes": [{"id": scene.id, "sequence": scene.sequence}]}
+    pre = WorldSnapshot(project_id=project_id, snapshot_type=SnapshotType.PRE_SCENE_STATE,
+                        payload=payload, state_fingerprint=snapshot_fingerprint(payload))
+    post = WorldSnapshot(project_id=project_id, snapshot_type=SnapshotType.POST_SCENE_STATE,
+                         payload=payload, state_fingerprint=snapshot_fingerprint(payload))
+    db.add_all([pre, post]); db.flush()
+    db.add(SceneStateCheckpoint(
+        project_id=project_id, scene_id=scene.id, sequence=scene.sequence,
+        pre_snapshot_id=pre.id, post_snapshot_id=post.id, current_scene_id=scene.id,
+        capture_protocol_version=2, version=1, active=True, origin=SceneCheckpointOrigin.LEGACY.value,
+        checkpoint_fingerprint=fingerprint,
+    ))
+    db.flush()
+
+
+def make_cold_scene(db, *, active_characters=1):
+    project = Project(name="Cold start")
+    db.add(project); db.flush()
+    characters = [Character(project_id=project.id, name=f"A{index}") for index in range(active_characters)]
+    thread = StoryThread(project_id=project.id, title="Thread", type="MYSTERY", weight=1,
+                         progress=0.0, status=ThreadStatus.OPEN)
+    db.add_all([*characters, thread]); db.flush()
+    scene = Scene(project_id=project.id, sequence=1, status=SceneStatus.OCCURRED,
+                  history_status="ACTIVE", location="loc",
+                  participants=[row.id for row in characters], story_threads=[thread.id])
+    db.add(scene); db.flush()
+    add_checkpoint(db, project.id, scene, "cold-checkpoint-1")
+    return SimpleNamespace(project=project, characters=characters, thread=thread, scene=scene)
 
 
 def test_rebuild_creates_projection_features_and_heads(session):
@@ -114,6 +145,65 @@ def test_incremental_append_preserves_prefix_and_bounds_recent_signatures(sessio
     assert all(after[scene_id] == fingerprint for scene_id, fingerprint in before.items())
     projection = session.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == world.project.id))
     assert projection.built_through_sequence == 11 and len(projection.recent_scene_signatures) == 10
+
+
+def test_cold_start_first_scene_with_active_characters_is_ready_and_fast(session):
+    world = make_cold_scene(session, active_characters=2)
+    service = ProjectHistoryProjectionService()
+    service.sync_after_scene_commit(session, world.project.id, world.scene.id)
+    session.commit()
+    projection = session.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == world.project.id))
+    assert getattr(projection.status, "value", projection.status) == "READY"
+    assert projection.built_through_sequence == projection.active_scene_count == 1
+    assert projection.last_scene_id == world.scene.id
+    assert projection.thread_stats[THREAD_STATS_META_KEY]["active_character_ids"] == sorted(row.id for row in world.characters)
+    assert len(projection.recent_scene_signatures) == 1
+    assert projection.source_history_fingerprint == service.current_source_fingerprint(session, world.project.id)
+    assert service.status(session, world.project.id)["fast_path_available"] is True
+    assert StoryGravityContextBuilder().build(session, world.project.id)["protocol_version"] == "story-gravity-context-v2"
+    ProjectHistoryProjectionAudit().audit(session, world.project.id)
+
+
+def test_cold_start_first_scene_with_no_active_characters_is_ready(session):
+    world = make_cold_scene(session, active_characters=0)
+    service = ProjectHistoryProjectionService()
+    service.sync_after_scene_commit(session, world.project.id, world.scene.id)
+    session.commit()
+    projection = session.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == world.project.id))
+    assert getattr(projection.status, "value", projection.status) == "READY"
+    assert projection.thread_stats == {THREAD_STATS_META_KEY: {"active_character_ids": []}, world.thread.id: {
+        "last_touched_sequence": 1, "scene_count": 1, "aligned_participant_ids": [], "scene_alignment_count": 0,
+    }}
+    ProjectHistoryProjectionAudit().audit(session, world.project.id)
+
+
+def test_cold_start_second_scene_appends_without_explicit_rebuild(session):
+    world = make_cold_scene(session, active_characters=1)
+    service = ProjectHistoryProjectionService()
+    service.sync_after_scene_commit(session, world.project.id, world.scene.id)
+    scene2 = Scene(project_id=world.project.id, sequence=2, status=SceneStatus.OCCURRED,
+                   history_status="ACTIVE", location="loc", participants=[world.characters[0].id],
+                   story_threads=[world.thread.id])
+    session.add(scene2); session.flush()
+    add_checkpoint(session, world.project.id, scene2, "cold-checkpoint-2")
+    service.sync_after_scene_commit(session, world.project.id, scene2.id)
+    session.commit()
+    projection = session.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == world.project.id))
+    assert getattr(projection.status, "value", projection.status) == "READY"
+    assert projection.built_through_sequence == projection.active_scene_count == 2
+    assert session.scalar(select(func.count(SceneHistoryFeature.id)).where(
+        SceneHistoryFeature.project_id == world.project.id, SceneHistoryFeature.active.is_(True),
+    )) == 2
+    ProjectHistoryProjectionAudit().audit(session, world.project.id)
+
+
+def test_missing_projection_beyond_first_scene_stays_dirty(session):
+    world = make_history(session, 2)
+    ProjectHistoryProjectionService().sync_after_scene_commit(session, world.project.id, world.scenes[1].id)
+    session.commit()
+    projection = session.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == world.project.id))
+    assert getattr(projection.status, "value", projection.status) == "DIRTY"
+    assert projection.dirty_from_sequence == 1
 
 
 def test_fast_projection_preserves_formal_scene_and_legacy_proposal_signature_semantics(session):
@@ -244,6 +334,39 @@ def test_projection_audit_detects_tampered_thread_stats(session):
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(projection, "thread_stats")
     session.flush()
+    with pytest.raises(ValueError, match="SCALING_PROJECTION_INTEGRITY_INVALID"):
+        ProjectHistoryProjectionAudit().audit(session, world.project.id)
+
+
+@pytest.mark.parametrize(("field", "tampered_value"), [
+    ("location_id", "tampered-location"),
+    ("participant_ids", ["tampered-participant"]),
+    ("thread_ids", ["tampered-thread"]),
+    ("state_change_paths", ["/tampered"]),
+    ("checkpoint_fingerprint", "tampered-checkpoint"),
+])
+def test_feature_audit_detects_semantic_column_tampering(session, field, tampered_value):
+    world = make_history(session, 2)
+    ProjectHistoryProjectionService().rebuild(session, world.project.id)
+    session.commit()
+    feature = session.scalar(select(SceneHistoryFeature).where(
+        SceneHistoryFeature.project_id == world.project.id,
+        SceneHistoryFeature.scene_id == world.scenes[-1].id,
+    ))
+    setattr(feature, field, tampered_value)
+    with pytest.raises(ValueError, match="SCALING_PROJECTION_INTEGRITY_INVALID"):
+        SceneHistoryFeatureAudit().audit(session, world.project.id)
+
+
+def test_project_audit_propagates_feature_semantic_tampering(session):
+    world = make_history(session, 2)
+    ProjectHistoryProjectionService().rebuild(session, world.project.id)
+    session.commit()
+    feature = session.scalar(select(SceneHistoryFeature).where(
+        SceneHistoryFeature.project_id == world.project.id,
+        SceneHistoryFeature.scene_id == world.scenes[-1].id,
+    ))
+    feature.state_change_count += 1
     with pytest.raises(ValueError, match="SCALING_PROJECTION_INTEGRITY_INVALID"):
         ProjectHistoryProjectionAudit().audit(session, world.project.id)
 

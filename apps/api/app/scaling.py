@@ -44,6 +44,15 @@ def _canonical(value: Any) -> Any:
     return value
 
 
+def empty_thread_stats(active_character_ids: set[str] | list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Canonical bounded metadata carried by every thread-stat projection."""
+    return {
+        THREAD_STATS_META_KEY: {
+            "active_character_ids": sorted(str(value) for value in active_character_ids),
+        },
+    }
+
+
 class HistoryProjectionFingerprintBuilder:
     """Deterministic append chain; timestamps never participate."""
     initial = stable_fingerprint({"protocol": PROJECTION_PROTOCOL}, PROJECTION_PROTOCOL)
@@ -245,11 +254,14 @@ class ProjectHistoryProjectionService:
         scene = db.get(Scene, scene_id)
         if not scene or scene.project_id != project_id:
             raise ValueError("SCALING_PROJECTION_INTEGRITY_INVALID")
+        active_character_ids = self._active_character_ids(db, project_id)
         projection = self._projection(db, project_id)
         if projection is None:
             projection = ProjectHistoryProjection(project_id=project_id, protocol_version=PROJECTION_PROTOCOL,
-                                                  status=HistoryProjectionStatus.DIRTY,
-                                                  recent_scene_signatures=[], thread_stats={}, character_stats={})
+                                                   status=HistoryProjectionStatus.DIRTY,
+                                                   recent_scene_signatures=[],
+                                                   thread_stats=empty_thread_stats(active_character_ids),
+                                                   character_stats={})
             db.add(projection)
             db.flush()
             if scene.sequence != 1:
@@ -259,7 +271,6 @@ class ProjectHistoryProjectionService:
         if _value(projection.status) != HistoryProjectionStatus.READY.value or projection.built_through_sequence != scene.sequence - 1:
             self._mark_dirty_row(projection, scene.sequence)
             return
-        active_character_ids = self._active_character_ids(db, project_id)
         stored_active_ids = set((projection.thread_stats or {}).get(THREAD_STATS_META_KEY, {}).get("active_character_ids", []))
         if stored_active_ids != active_character_ids:
             self._mark_dirty_row(projection, scene.sequence)
@@ -462,6 +473,7 @@ class ProjectHistoryProjectionService:
         signatures = list(projection.recent_scene_signatures or []) + [self._signature(db, projection.project_id, feature)]
         projection.recent_scene_signatures = signatures[-RECENT_SCENE_LIMIT:]
         thread_stats = copy.deepcopy(projection.thread_stats or {})
+        thread_stats[THREAD_STATS_META_KEY] = empty_thread_stats(active_character_ids)[THREAD_STATS_META_KEY]
         for thread_id in feature.thread_ids or []:
             row = thread_stats.setdefault(thread_id, {"last_touched_sequence": None, "scene_count": 0, "aligned_participant_ids": [], "scene_alignment_count": 0})
             row["last_touched_sequence"] = feature.sequence
@@ -478,9 +490,7 @@ class ProjectHistoryProjectionService:
 
     @staticmethod
     def _thread_stats(features: list[SceneHistoryFeature], active_character_ids: set[str]) -> dict[str, Any]:
-        stats: dict[str, Any] = {
-            THREAD_STATS_META_KEY: {"active_character_ids": sorted(active_character_ids)},
-        }
+        stats: dict[str, Any] = empty_thread_stats(active_character_ids)
         for feature in features:
             for thread_id in feature.thread_ids or []:
                 row = stats.setdefault(thread_id, {"last_touched_sequence": None, "scene_count": 0, "aligned_participant_ids": [], "scene_alignment_count": 0})
@@ -555,8 +565,10 @@ class SceneHistoryFeatureAudit:
             if not scene or scene.project_id != project_id:
                 raise ValueError("SCALING_PROJECTION_INTEGRITY_INVALID")
             expected = service.feature_builder.build(db, project_id, scene)
-            if feature.feature_fingerprint != expected["feature_fingerprint"] or feature.checkpoint_id != expected["checkpoint_id"]:
-                raise ValueError("SCALING_PROJECTION_INTEGRITY_INVALID")
+            expected_columns = service._feature_columns(expected)
+            for field, expected_value in expected_columns.items():
+                if _canonical(getattr(feature, field)) != _canonical(expected_value):
+                    raise ValueError("SCALING_PROJECTION_INTEGRITY_INVALID")
 
 
 class ProjectHistoryProjectionAudit:
