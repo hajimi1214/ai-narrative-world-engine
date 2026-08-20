@@ -305,6 +305,24 @@ class CharacterMindViewBuilder:
         if proposal.project_id != project_id:
             raise ValueError("Scene Proposal not found in project")
         cues = self.cues.extract(proposal, character_id)
+        # Phase 16C1's current-history SQL projection is deliberately opt-in:
+        # temporal replay and hybrid RRF retain their frozen reference path
+        # until their respective indexed equivalence is available.
+        config = session.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        if not config or not config.embedding_enabled or config.memory_retrieval_mode == MemoryRetrievalMode.DETERMINISTIC:
+            try:
+                from .retrieval_index import CognitionRetrievalProjectionService, CurrentCharacterCognitionFastRetriever
+                if CognitionRetrievalProjectionService().fast_path_available(session, project_id):
+                    recalled_knowledge, conflicts = CurrentCharacterCognitionFastRetriever().knowledge(session, project_id, character_id, cues)
+                    recalled_memories = CurrentCharacterCognitionFastRetriever().memories(session, project_id, character_id, cues)
+                    identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
+                    result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
+                    result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
+                    return result
+            except Exception:
+                # A dirty/corrupt or unsupported projection must not alter a
+                # character's legal cognition. The legacy path below is exact.
+                pass
         active_knowledge = self.reader.knowledge(session, project_id, character_id)
         beliefs, conflicts = self.beliefs.build(active_knowledge)
         recalled_knowledge = self.knowledge.retrieve(session, project_id, active_knowledge, cues, beliefs)

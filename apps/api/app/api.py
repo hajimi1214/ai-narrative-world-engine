@@ -39,6 +39,7 @@ from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, Qual
 from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider, embedding_error_code
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
 from .scaling import ProjectHistoryProjectionService
+from .retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService
 
 router = APIRouter()
 
@@ -1071,7 +1072,19 @@ def director_gravity(project_id: str, db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/scaling/status")
 def scaling_status(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
-    return ProjectHistoryProjectionService().status(db, project_id)
+    return ProjectHistoryProjectionService().status(db, project_id) | {
+        "cognition": CognitionRetrievalProjectionService().status(db, project_id),
+        "research": ResearchLexicalIndexService().status(db, project_id),
+    }
+
+
+@router.get("/projects/{project_id}/scaling/retrieval/status")
+def retrieval_status(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return {
+        "cognition": CognitionRetrievalProjectionService().status(db, project_id),
+        "research": ResearchLexicalIndexService().status(db, project_id),
+    }
 
 
 @router.post("/projects/{project_id}/scaling/history-index/rebuild")
@@ -1084,6 +1097,30 @@ def rebuild_history_index(project_id: str, db: Session = Depends(get_db)):
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+
+@router.post("/projects/{project_id}/scaling/cognition-index/rebuild")
+def rebuild_cognition_index(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        projection = CognitionRetrievalProjectionService().rebuild(db, project_id)
+        db.commit()
+        return CognitionRetrievalProjectionService().status(db, project_id) | {"projection_id": projection.id}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "COGNITION_RETRIEVAL_INDEX_REBUILD_FAILED"}) from exc
+
+
+@router.post("/projects/{project_id}/scaling/research-index/rebuild")
+def rebuild_research_index(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        projection = ResearchLexicalIndexService().rebuild(db, project_id)
+        db.commit()
+        return ResearchLexicalIndexService().status(db, project_id) | {"projection_id": projection.id}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "RESEARCH_LEXICAL_INDEX_REBUILD_FAILED"}) from exc
 
 
 @router.post("/projects/{project_id}/narrative-structure/preview")

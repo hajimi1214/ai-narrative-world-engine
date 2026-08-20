@@ -79,6 +79,7 @@ class EmbeddingStatus(str, enum.Enum): PENDING="PENDING"; READY="READY"; FAILED=
 class ProviderCredentialPurpose(str, enum.Enum): GENERATION="GENERATION"; EMBEDDING="EMBEDDING"
 class MemoryRetrievalMode(str, enum.Enum): DETERMINISTIC="DETERMINISTIC"; HYBRID_RRF="HYBRID_RRF"
 class HistoryProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
+class RetrievalIndexStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class SnapshotStorageMode(str, enum.Enum): LEGACY_FULL="LEGACY_FULL"; COMPACT_ANCHOR="COMPACT_ANCHOR"; COMPACT_DELTA="COMPACT_DELTA"; REFERENCE="REFERENCE"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
 class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
@@ -1185,3 +1186,145 @@ class ResearchChunk(Base):
     char_count: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+# Phase 16C1 derived retrieval projections.  These tables deliberately carry
+# only searchable projections; the formal cognition and research rows remain
+# the sole authority for payloads and eligibility.
+class ProjectCognitionRetrievalIndex(TimestampMixin, Base):
+    __tablename__ = "project_cognition_retrieval_indexes"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_project_cognition_retrieval_index_project"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    protocol_version: Mapped[str] = mapped_column(String(60), nullable=False)
+    status: Mapped[RetrievalIndexStatus] = mapped_column(Enum(RetrievalIndexStatus, native_enum=False, length=20), nullable=False, default=RetrievalIndexStatus.DIRTY)
+    built_through_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    indexed_knowledge_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    indexed_memory_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    usage_head_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    index_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    dirty_from_sequence: Mapped[int | None] = mapped_column(Integer)
+    last_rebuilt_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class CharacterKnowledgeSearchIndex(TimestampMixin, Base):
+    __tablename__ = "character_knowledge_search_indexes"
+    __table_args__ = (
+        UniqueConstraint("knowledge_id", name="uq_character_knowledge_search_knowledge"),
+        Index("ix_knowledge_search_project_character_status", "project_id", "character_id", "knowledge_status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    character_id: Mapped[str] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True)
+    knowledge_id: Mapped[str] = mapped_column(ForeignKey("character_knowledge.id", ondelete="CASCADE"), nullable=False, index=True)
+    knowledge_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    subject_type: Mapped[str | None] = mapped_column(String(80))
+    subject_id: Mapped[str | None] = mapped_column(String(200))
+    predicate: Mapped[str | None] = mapped_column(String(300))
+    value_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    proposition_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id", ondelete="SET NULL"))
+    acquired_at: Mapped[datetime | None] = mapped_column(DateTime)
+    index_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+
+
+class CharacterMemorySearchIndex(TimestampMixin, Base):
+    __tablename__ = "character_memory_search_indexes"
+    __table_args__ = (
+        UniqueConstraint("memory_id", name="uq_character_memory_search_memory"),
+        Index("ix_memory_search_project_character", "project_id", "character_id"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    character_id: Mapped[str] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True)
+    memory_id: Mapped[str] = mapped_column(ForeignKey("character_memories.id", ondelete="CASCADE"), nullable=False, index=True)
+    importance: Mapped[float] = mapped_column(Float, nullable=False)
+    emotional_weight: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    happened_at: Mapped[datetime | None] = mapped_column(DateTime)
+    source_scene_id: Mapped[str | None] = mapped_column(ForeignKey("scenes.id", ondelete="SET NULL"))
+    source_sequence: Mapped[int | None] = mapped_column(Integer)
+    source_bucket: Mapped[str] = mapped_column(String(160), nullable=False)
+    content_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    index_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+
+
+class CharacterMemoryCueRef(TimestampMixin, Base):
+    __tablename__ = "character_memory_cue_refs"
+    __table_args__ = (
+        UniqueConstraint("memory_id", "cue_type", "cue_value", "source", name="uq_memory_cue_ref"),
+        Index("ix_memory_cue_ref_lookup", "project_id", "character_id", "cue_type", "cue_value", "memory_id"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    character_id: Mapped[str] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True)
+    memory_id: Mapped[str] = mapped_column(ForeignKey("character_memories.id", ondelete="CASCADE"), nullable=False, index=True)
+    cue_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    cue_value: Mapped[str] = mapped_column(String(300), nullable=False)
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
+
+
+class CognitionUsageHead(TimestampMixin, Base):
+    __tablename__ = "cognition_usage_heads"
+    __table_args__ = (
+        UniqueConstraint("project_id", "resource_type", "resource_id", name="uq_cognition_usage_head_resource"),
+        Index("ix_cognition_usage_head_lookup", "project_id", "resource_type", "resource_id"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    resource_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    latest_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=-1)
+    usage_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+
+
+class ResearchLexicalIndexState(TimestampMixin, Base):
+    __tablename__ = "research_lexical_index_states"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_research_lexical_index_state_project"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[RetrievalIndexStatus] = mapped_column(Enum(RetrievalIndexStatus, native_enum=False, length=20), nullable=False, default=RetrievalIndexStatus.DIRTY)
+    protocol_version: Mapped[str] = mapped_column(String(60), nullable=False)
+    corpus_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    active_chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    average_document_length: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    posting_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    term_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    index_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    last_rebuilt_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class ResearchChunkLexicalIndex(TimestampMixin, Base):
+    __tablename__ = "research_chunk_lexical_indexes"
+    __table_args__ = (UniqueConstraint("chunk_id", name="uq_research_chunk_lexical_chunk"), Index("ix_research_chunk_lexical_project", "project_id", "document_id", "revision_id"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("research_documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    revision_id: Mapped[str] = mapped_column(ForeignKey("research_document_revisions.id", ondelete="CASCADE"), nullable=False, index=True)
+    chunk_id: Mapped[str] = mapped_column(ForeignKey("research_chunks.id", ondelete="CASCADE"), nullable=False, index=True)
+    content_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    index_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+
+
+class ResearchTermPosting(TimestampMixin, Base):
+    __tablename__ = "research_term_postings"
+    __table_args__ = (UniqueConstraint("chunk_id", "term", name="uq_research_term_posting"), Index("ix_research_term_posting_lookup", "project_id", "term", "chunk_id"), Index("ix_research_term_posting_chunk", "chunk_id"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    chunk_id: Mapped[str] = mapped_column(ForeignKey("research_chunks.id", ondelete="CASCADE"), nullable=False, index=True)
+    term: Mapped[str] = mapped_column(String(300), nullable=False)
+    term_frequency: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class ResearchTermStat(TimestampMixin, Base):
+    __tablename__ = "research_term_stats"
+    __table_args__ = (UniqueConstraint("project_id", "term", name="uq_research_term_stat"), Index("ix_research_term_stat_lookup", "project_id", "term"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    term: Mapped[str] = mapped_column(String(300), nullable=False)
+    document_frequency: Mapped[int] = mapped_column(Integer, nullable=False)

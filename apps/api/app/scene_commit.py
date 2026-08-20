@@ -35,6 +35,7 @@ from .historical import SceneCheckpointService, SceneCheckpointOrigin
 from .snapshot_storage import ProjectWorldSnapshotHeadService, SceneCommitFormalMutationGuard
 from .causal_ledger import CausalLedgerService
 from .scaling import ProjectHistoryProjectionService
+from .retrieval_index import CognitionRetrievalProjectionService
 
 
 @dataclass
@@ -451,6 +452,14 @@ class SceneCommitService:
         # contains a savepoint and marks failures DIRTY, leaving this frozen
         # formal commit and its Phase 8 ledger boundary intact.
         ProjectHistoryProjectionService().sync_after_scene_commit(db, project_id, scene.id)
+        # Phase 16C1 is a rebuildable accelerator. Its failure is contained in
+        # a savepoint and can only make the next mind read use legacy recall.
+        try:
+            with db.begin_nested():
+                CognitionRetrievalProjectionService().sync_after_scene_commit(db, project_id, scene.id, scene.sequence)
+        except Exception:
+            with db.begin_nested():
+                CognitionRetrievalProjectionService().mark_dirty(db, project_id, scene.sequence)
         db.flush()
         if self.failure_injector:
             self.failure_injector("AFTER_SCENE_COMMIT_MATERIALIZATION")

@@ -399,6 +399,14 @@ class ResearchIngestionService:
         self._inject("AFTER_REVISION_BEFORE_ACTIVE_SWITCH")
         revision.active = True
         db.flush()
+        try:
+            from .retrieval_index import ResearchLexicalIndexService
+            with db.begin_nested():
+                ResearchLexicalIndexService().sync_after_ingestion(db, project_id, document.id)
+        except Exception:
+            from .retrieval_index import ResearchLexicalIndexService
+            with db.begin_nested():
+                ResearchLexicalIndexService().mark_dirty(db, project_id)
         return ResearchIngestionResult(document, revision, tuple(chunks), False)
 
     create_document = ingest
@@ -436,6 +444,14 @@ class ResearchIngestionService:
             db.flush()
         revision.active = True
         db.flush()
+        try:
+            from .retrieval_index import ResearchLexicalIndexService
+            with db.begin_nested():
+                ResearchLexicalIndexService().sync_after_ingestion(db, document.project_id, document.id)
+        except Exception:
+            from .retrieval_index import ResearchLexicalIndexService
+            with db.begin_nested():
+                ResearchLexicalIndexService().mark_dirty(db, document.project_id)
         return ResearchIngestionResult(document, revision, tuple(chunks), False)
 
     update_revision = add_revision
@@ -455,6 +471,14 @@ class ResearchIngestionService:
             ).all():
                 chunk.active = False
         db.flush()
+        try:
+            from .retrieval_index import ResearchLexicalIndexService
+            with db.begin_nested():
+                ResearchLexicalIndexService().sync_after_ingestion(db, document.project_id, document.id)
+        except Exception:
+            from .retrieval_index import ResearchLexicalIndexService
+            with db.begin_nested():
+                ResearchLexicalIndexService().mark_dirty(db, document.project_id)
         return document
 
 
@@ -575,6 +599,17 @@ class ResearchBM25Retriever:
             filters = ResearchFilters.model_validate(filters or {}).model_dump(mode="json", exclude_none=True)
         except (ValidationError, ValueError, TypeError) as exc:
             raise ResearchDomainError("RESEARCH_FILTER_INVALID") from exc
+        # READY postings are a derived acceleration only. Any indexed-path
+        # error falls through to this frozen Python reference implementation.
+        # Browse and tag filters deliberately remain here until their bounded
+        # MMR/JSON contracts have a direct exact SQL proof.
+        if not browse_mode and not filters.get("tags"):
+            try:
+                from .retrieval_index import ResearchIndexedBM25Retriever, ResearchLexicalIndexService
+                if ResearchLexicalIndexService().fast_path_available(db, project_id):
+                    return ResearchIndexedBM25Retriever().search(db, project_id, query_text, filters=filters, config=cfg)
+            except Exception:
+                pass
         docs = db.scalars(select(ResearchDocument).where(ResearchDocument.project_id == project_id, ResearchDocument.active.is_(True)).order_by(ResearchDocument.id)).all()
         rows: list[tuple[ResearchDocument, ResearchDocumentRevision, ResearchChunk]] = []
         for document in docs:
@@ -775,7 +810,12 @@ class KnowledgePacketBuilder:
             {"source_type": "RESEARCH_CHUNK", "source_id": hit.chunk_id, "authority": resolver.for_research(hit.source_tier).value, "authority_rank": hit.authority_rank}
             for hit in hits
         )
-        corpus_fingerprint = ResearchCorpusFingerprintBuilder().build(db, project_id)
+        try:
+            from .retrieval_index import ResearchLexicalIndexService
+            state = ResearchLexicalIndexService()._state(db, project_id)
+            corpus_fingerprint = state.corpus_fingerprint if state and state.status.value == "READY" and state.corpus_fingerprint else ResearchCorpusFingerprintBuilder().build(db, project_id)
+        except Exception:
+            corpus_fingerprint = ResearchCorpusFingerprintBuilder().build(db, project_id)
         config_fingerprint = research_fingerprint(config.model_dump(mode="json"), "research-retrieval-config-v1")
         query_fingerprint = research_fingerprint(query_text, "knowledge-query-v1")
         hit_values = tuple(hit.as_dict() for hit in hits)

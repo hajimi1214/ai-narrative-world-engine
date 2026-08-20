@@ -701,4 +701,11 @@ class ReplayService:
         from .scaling import ProjectHistoryProjectionService
         earliest = min((run.original_sequence for run in runs), default=1)
         ProjectHistoryProjectionService().sync_after_replay_commit(db, session.project_id, earliest)
+        from .retrieval_index import CognitionRetrievalProjectionService
+        try:
+            with db.begin_nested():
+                CognitionRetrievalProjectionService().rebuild(db, session.project_id)
+        except Exception:
+            with db.begin_nested():
+                CognitionRetrievalProjectionService().mark_dirty(db, session.project_id, earliest)
         db.flush(); return session
