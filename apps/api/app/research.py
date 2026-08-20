@@ -601,9 +601,9 @@ class ResearchBM25Retriever:
             raise ResearchDomainError("RESEARCH_FILTER_INVALID") from exc
         # READY postings are a derived acceleration only. Any indexed-path
         # error falls through to this frozen Python reference implementation.
-        # Browse and tag filters deliberately remain here until their bounded
-        # MMR/JSON contracts have a direct exact SQL proof.
-        if not browse_mode and not filters.get("tags"):
+        # Browse remains a legacy-only mode; normal tag filters have an exact
+        # PostgreSQL JSONB predicate in the indexed path.
+        if not browse_mode:
             try:
                 from .retrieval_index import ResearchIndexedBM25Retriever, ResearchLexicalIndexService
                 if ResearchLexicalIndexService().fast_path_available(db, project_id):

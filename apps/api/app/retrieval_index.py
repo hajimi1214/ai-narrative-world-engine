@@ -11,7 +11,7 @@ from collections import Counter
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, case, delete, exists, func, literal, or_, select
+from sqlalchemy import Float, and_, case, cast, delete, exists, func, literal, or_, select
 from sqlalchemy.orm import Session
 
 from .character_mind import CognitionFactIdentityParser, memory_source_bucket
@@ -25,6 +25,7 @@ from .models import (
     ResearchLexicalIndexState, ResearchTermPosting, ResearchTermStat, RetrievalIndexStatus,
     Scene, Project,
     KnowledgeStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus,
+    CharacterMemoryEmbedding, EmbeddingStatus,
 )
 
 
@@ -65,6 +66,10 @@ class CognitionRetrievalProjectionService:
             "memories": [(row.id, row.character_id, row.content, row.importance, row.emotional_weight, row.confidence, row.distortion, row.source_scene, row.happened_at) for row in memories],
             "usage": [(row.id, _value(row.cause_type), row.cause_id, _value(row.relation_type), row.active, row.sequence) for row in links],
         }, "character-cognition-source-v1")
+
+    @staticmethod
+    def _state_fingerprint(source: str | None, knowledge_count: int, memory_count: int, usage_count: int, built_through: int) -> str:
+        return _fingerprint({"source": source, "knowledge": knowledge_count, "memory": memory_count, "usage": usage_count, "built_through": built_through}, COGNITION_PROTOCOL)
 
     @staticmethod
     def _cue_rows(memory: CharacterMemory, project_id: str, source_scene: Scene | None) -> list[tuple[str, str, str]]:
@@ -132,7 +137,7 @@ class CognitionRetrievalProjectionService:
         state.protocol_version, state.status, state.built_through_sequence = COGNITION_PROTOCOL, RetrievalIndexStatus.READY, max_sequence
         state.indexed_knowledge_count, state.indexed_memory_count, state.usage_head_count = len(knowledge), len(memories), len(usage)
         state.source_fingerprint = self._source_fingerprint(knowledge, memories, links)
-        state.index_fingerprint = _fingerprint({"source": state.source_fingerprint, "knowledge": len(knowledge), "memory": len(memories), "usage": len(usage)}, COGNITION_PROTOCOL)
+        state.index_fingerprint = self._state_fingerprint(state.source_fingerprint, len(knowledge), len(memories), len(usage), max_sequence)
         state.dirty_from_sequence, state.last_rebuilt_at = None, datetime.utcnow()
         db.flush()
         return state
@@ -175,38 +180,64 @@ class CognitionRetrievalProjectionService:
             raise ValueError("COGNITION_RETRIEVAL_INDEX_SCENE_INVALID")
         knowledge = db.scalars(select(CharacterKnowledge).join(Character).where(Character.project_id == project_id, CharacterKnowledge.source == scene_id)).all()
         memories = db.scalars(select(CharacterMemory).join(Character).where(Character.project_id == project_id, CharacterMemory.source_scene == scene_id)).all()
+        inserted_knowledge = 0
+        inserted_memories = 0
         for row in knowledge:
             identity = self.parser.parse(row.proposition)
             value_fp = _fingerprint(identity["value"], "cognition-fact-value-v1") if identity else None
             index = db.scalar(select(CharacterKnowledgeSearchIndex).where(CharacterKnowledgeSearchIndex.knowledge_id == row.id))
             payload = {"knowledge": row.id, "character": row.character_id, "status": _value(row.status), "confidence": row.confidence, "identity": identity, "source": row.source, "acquired": row.acquired_at}
             values = dict(project_id=project_id, character_id=row.character_id, knowledge_id=row.id, knowledge_status=_value(row.status), confidence=row.confidence, subject_type=identity["subject_type"] if identity else None, subject_id=identity["subject_id"] if identity else None, predicate=identity["predicate"] if identity else None, value_fingerprint=value_fp, proposition_fingerprint=_fingerprint(row.proposition, "character-knowledge-proposition-v1"), source_scene_id=scene_id, acquired_at=row.acquired_at, index_fingerprint=_fingerprint(payload, COGNITION_PROTOCOL))
-            if index is None: db.add(CharacterKnowledgeSearchIndex(**values))
+            if index is None:
+                db.add(CharacterKnowledgeSearchIndex(**values)); inserted_knowledge += 1
             else:
                 for key, value in values.items(): setattr(index, key, value)
         for row in memories:
             index = db.scalar(select(CharacterMemorySearchIndex).where(CharacterMemorySearchIndex.memory_id == row.id))
             payload = {"memory": row.id, "character": row.character_id, "importance": row.importance, "emotional": row.emotional_weight, "confidence": row.confidence, "happened": row.happened_at, "source": row.source_scene, "sequence": scene.sequence, "content": memory_content_fingerprint(row.content)}
             values = dict(project_id=project_id, character_id=row.character_id, memory_id=row.id, importance=row.importance, emotional_weight=row.emotional_weight, confidence=row.confidence, happened_at=row.happened_at, source_scene_id=row.source_scene, source_sequence=scene.sequence, source_bucket=memory_source_bucket({"memory_id": row.id, "source_scene_id": row.source_scene, "source_scene_sequence": scene.sequence}), content_fingerprint=memory_content_fingerprint(row.content), index_fingerprint=_fingerprint(payload, COGNITION_PROTOCOL))
-            if index is None: db.add(CharacterMemorySearchIndex(**values))
+            if index is None:
+                db.add(CharacterMemorySearchIndex(**values)); inserted_memories += 1
             else:
                 for key, value in values.items(): setattr(index, key, value)
             db.execute(delete(CharacterMemoryCueRef).where(CharacterMemoryCueRef.memory_id == row.id))
             for cue_type, cue_value, source_kind in self._cue_rows(row, project_id, scene):
                 db.add(CharacterMemoryCueRef(project_id=project_id, character_id=row.character_id, memory_id=row.id, cue_type=cue_type, cue_value=cue_value, source=source_kind))
         links = db.scalars(select(CausalLink).where(CausalLink.project_id == project_id, CausalLink.scene_id == scene_id, CausalLink.cause_type.in_([CausalResourceType.CHARACTER_KNOWLEDGE, CausalResourceType.CHARACTER_MEMORY]), CausalLink.relation_type.in_([CausalRelationType.KNOWLEDGE_INFORMED_DECISION, CausalRelationType.MEMORY_INFORMED_DECISION]))).all()
-        self._refresh_usage_heads(db, project_id, {(_value(link.cause_type), link.cause_id) for link in links})
+        resource_ids = {(_value(link.cause_type), link.cause_id) for link in links}
+        before_heads = {
+            (row.resource_type, row.resource_id): (row.usage_count, row.latest_sequence)
+            for row in db.scalars(select(CognitionUsageHead).where(
+                CognitionUsageHead.project_id == project_id,
+                CognitionUsageHead.resource_type.in_([kind for kind, _ in resource_ids]) if resource_ids else literal(False),
+                CognitionUsageHead.resource_id.in_([ident for _, ident in resource_ids]) if resource_ids else literal(False),
+            )).all()
+        }
+        self._refresh_usage_heads(db, project_id, resource_ids)
         db.flush()
         state.built_through_sequence = max(state.built_through_sequence, scene.sequence)
-        state.indexed_knowledge_count = db.scalar(select(func.count(CharacterKnowledgeSearchIndex.id)).where(CharacterKnowledgeSearchIndex.project_id == project_id)) or 0
-        state.indexed_memory_count = db.scalar(select(func.count(CharacterMemorySearchIndex.id)).where(CharacterMemorySearchIndex.project_id == project_id)) or 0
-        state.usage_head_count = db.scalar(select(func.count(CognitionUsageHead.id)).where(CognitionUsageHead.project_id == project_id)) or 0
-        state.index_fingerprint = _fingerprint({"previous": state.index_fingerprint, "scene": scene_id, "sequence": scene.sequence}, COGNITION_PROTOCOL)
+        state.indexed_knowledge_count += inserted_knowledge
+        state.indexed_memory_count += inserted_memories
+        after_heads = {
+            (row.resource_type, row.resource_id): row
+            for row in db.scalars(select(CognitionUsageHead).where(
+                CognitionUsageHead.project_id == project_id,
+                CognitionUsageHead.resource_type.in_([kind for kind, _ in resource_ids]) if resource_ids else literal(False),
+                CognitionUsageHead.resource_id.in_([ident for _, ident in resource_ids]) if resource_ids else literal(False),
+            )).all()
+        }
+        state.usage_head_count += sum((1 if key in after_heads else 0) - (1 if key in before_heads else 0) for key in resource_ids)
+        # Full source hashes are intentionally rebuild/audit-only. Marking the
+        # value unknown avoids advertising a stale whole-history hash after a
+        # bounded append.
+        state.source_fingerprint = None
+        state.index_fingerprint = self._state_fingerprint(None, state.indexed_knowledge_count, state.indexed_memory_count, state.usage_head_count, state.built_through_sequence)
         db.flush()
 
     def fast_path_available(self, db: Session, project_id: str) -> bool:
         state = self._state(db, project_id)
-        return bool(db.bind and db.bind.dialect.name == "postgresql" and state and state.status == RetrievalIndexStatus.READY and state.protocol_version == COGNITION_PROTOCOL)
+        latest = db.scalar(select(Scene.sequence).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc()).limit(1)) or 0
+        return bool(db.bind and db.bind.dialect.name == "postgresql" and state and state.status == RetrievalIndexStatus.READY and state.protocol_version == COGNITION_PROTOCOL and state.built_through_sequence == latest)
 
     def status(self, db: Session, project_id: str) -> dict[str, Any]:
         state = self._state(db, project_id)
@@ -227,23 +258,34 @@ class CognitionRetrievalIndexAudit:
             raise ValueError("COGNITION_RETRIEVAL_INDEX_INTEGRITY_INVALID")
         for row in knowledge:
             index = indexed_knowledge[row.id]; identity = service.parser.parse(row.proposition)
-            if index.character_id != row.character_id or index.knowledge_status != _value(row.status) or index.confidence != row.confidence or index.subject_id != (identity["subject_id"] if identity else None):
-                raise ValueError("COGNITION_RETRIEVAL_INDEX_INTEGRITY_INVALID")
-        for row in memories:
-            index = indexed_memories[row.id]
-            if index.character_id != row.character_id or index.importance != row.importance or index.content_fingerprint != memory_content_fingerprint(row.content):
+            value_fp = _fingerprint(identity["value"], "cognition-fact-value-v1") if identity else None
+            payload = {"knowledge": row.id, "character": row.character_id, "status": _value(row.status), "confidence": row.confidence, "identity": identity, "source": row.source, "acquired": row.acquired_at}
+            if (index.project_id != project_id or index.character_id != row.character_id or index.knowledge_status != _value(row.status) or index.confidence != row.confidence or index.subject_type != (identity["subject_type"] if identity else None) or index.subject_id != (identity["subject_id"] if identity else None) or index.predicate != (identity["predicate"] if identity else None) or index.value_fingerprint != value_fp or index.proposition_fingerprint != _fingerprint(row.proposition, "character-knowledge-proposition-v1") or index.source_scene_id != (row.source if row.source in {scene.id for scene in db.scalars(select(Scene).where(Scene.project_id == project_id)).all()} else None) or index.acquired_at != row.acquired_at or index.index_fingerprint != _fingerprint(payload, COGNITION_PROTOCOL)):
                 raise ValueError("COGNITION_RETRIEVAL_INDEX_INTEGRITY_INVALID")
         scenes = {row.id: row for row in db.scalars(select(Scene).where(Scene.project_id == project_id)).all()}
-        actual_cues = {(row.memory_id, row.cue_type, row.cue_value, row.source) for row in db.scalars(select(CharacterMemoryCueRef).where(CharacterMemoryCueRef.project_id == project_id)).all()}
-        expected_cues = {(memory.id, cue_type, cue_value, source) for memory in memories for cue_type, cue_value, source in service._cue_rows(memory, project_id, scenes.get(memory.source_scene))}
+        for row in memories:
+            index = indexed_memories[row.id]
+            source = scenes.get(row.source_scene) if row.source_scene else None
+            sequence = source.sequence if source and source.history_status == "ACTIVE" else None
+            payload = {"memory": row.id, "character": row.character_id, "importance": row.importance, "emotional": row.emotional_weight, "confidence": row.confidence, "happened": row.happened_at, "source": row.source_scene, "sequence": sequence, "content": memory_content_fingerprint(row.content)}
+            bucket = memory_source_bucket({"memory_id": row.id, "source_scene_id": row.source_scene, "source_scene_sequence": sequence})
+            if (index.project_id != project_id or index.character_id != row.character_id or index.importance != row.importance or index.emotional_weight != row.emotional_weight or index.confidence != row.confidence or index.happened_at != row.happened_at or index.source_scene_id != row.source_scene or index.source_sequence != sequence or index.source_bucket != bucket or index.content_fingerprint != memory_content_fingerprint(row.content) or index.index_fingerprint != _fingerprint(payload, COGNITION_PROTOCOL)):
+                raise ValueError("COGNITION_RETRIEVAL_INDEX_INTEGRITY_INVALID")
+        actual_cues = {(row.project_id, row.character_id, row.memory_id, row.cue_type, row.cue_value, row.source) for row in db.scalars(select(CharacterMemoryCueRef).where(CharacterMemoryCueRef.project_id == project_id)).all()}
+        expected_cues = {(project_id, memory.character_id, memory.id, cue_type, cue_value, source) for memory in memories for cue_type, cue_value, source in service._cue_rows(memory, project_id, scenes.get(memory.source_scene))}
         if actual_cues != expected_cues:
             raise ValueError("COGNITION_RETRIEVAL_INDEX_INTEGRITY_INVALID")
         links = db.scalars(select(CausalLink).where(CausalLink.project_id == project_id, CausalLink.active.is_(True), CausalLink.cause_type.in_([CausalResourceType.CHARACTER_KNOWLEDGE, CausalResourceType.CHARACTER_MEMORY]), CausalLink.relation_type.in_([CausalRelationType.KNOWLEDGE_INFORMED_DECISION, CausalRelationType.MEMORY_INFORMED_DECISION]))).all()
         expected_usage: dict[tuple[str, str], tuple[int, int]] = {}
         for link in links:
             key = (_value(link.cause_type), link.cause_id); count, latest = expected_usage.get(key, (0, -1)); expected_usage[key] = (count + 1, max(latest, link.sequence if link.sequence is not None else -1))
-        actual_usage = {(row.resource_type, row.resource_id): (row.usage_count, row.latest_sequence) for row in db.scalars(select(CognitionUsageHead).where(CognitionUsageHead.project_id == project_id)).all()}
-        if actual_usage != expected_usage:
+        actual_usage = {(row.resource_type, row.resource_id): (row.usage_count, row.latest_sequence, row.usage_fingerprint) for row in db.scalars(select(CognitionUsageHead).where(CognitionUsageHead.project_id == project_id)).all()}
+        expected_usage_with_fp = {key: (count, latest, _fingerprint({"type": key[0], "id": key[1], "count": count, "latest": latest}, "cognition-usage-head-v1")) for key, (count, latest) in expected_usage.items()}
+        latest_sequence = db.scalar(select(Scene.sequence).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc()).limit(1)) or 0
+        expected_state_fp = service._state_fingerprint(state.source_fingerprint, len(knowledge), len(memories), len(expected_usage), latest_sequence)
+        if actual_usage != expected_usage_with_fp or state.indexed_knowledge_count != len(knowledge) or state.indexed_memory_count != len(memories) or state.usage_head_count != len(expected_usage) or state.built_through_sequence != latest_sequence or state.protocol_version != COGNITION_PROTOCOL or state.index_fingerprint != expected_state_fp:
+            raise ValueError("COGNITION_RETRIEVAL_INDEX_INTEGRITY_INVALID")
+        if state.source_fingerprint and state.source_fingerprint != service._source_fingerprint(knowledge, memories, links):
             raise ValueError("COGNITION_RETRIEVAL_INDEX_INTEGRITY_INVALID")
         return {"valid": True, "project_id": project_id, "index_fingerprint": state.index_fingerprint}
 
@@ -349,13 +391,59 @@ class CurrentCharacterCognitionFastRetriever:
         result = []
         for row in rows:
             item = {"memory_id": row["id"], "content": row["content"], "importance": row["importance"], "emotional_weight": row["emotional_weight"], "confidence": row["confidence"], "distortion": row["distortion"] or {}, "happened_at": row["happened_at"].isoformat() if row["happened_at"] else None, "source_scene_id": row["source_scene"]}
-            if row["source_sequence"] is not None:
-                item["source_scene_sequence"] = row["source_sequence"]
             result.append(item)
+        return result
+
+    def hybrid_memories(self, db: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]], query_vector: list[float], config_fingerprint: str, config) -> list[dict[str, Any]]:
+        """Current-only exact vector + deterministic RRF query.
+
+        The CTEs rank the complete eligible set in PostgreSQL; Python only
+        hydrates the final bounded formal rows.
+        """
+        if db.bind is None or db.bind.dialect.name != "postgresql":
+            return self.memories(db, project_id, character_id, cues)
+        memory_index, cue_ref, usage = CharacterMemorySearchIndex, CharacterMemoryCueRef, CognitionUsageHead
+        current_sequence = self._current_sequence(db, project_id)
+        def matched(cue_type: str, values: tuple[str, ...], distinct: bool = False):
+            if not values:
+                return literal(0)
+            aggregate = func.count(func.distinct(cue_ref.cue_value)) if distinct else func.count(cue_ref.id)
+            return func.coalesce(select(aggregate).where(cue_ref.project_id == project_id, cue_ref.character_id == character_id, cue_ref.memory_id == CharacterMemory.id, cue_ref.cue_type == cue_type, cue_ref.cue_value.in_(list(values))).scalar_subquery(), 0)
+        cue = (case((matched("LOCATION", cues.get("location_ids", ())) > 0, 1), else_=0) * 4 + matched("PARTICIPANT", cues.get("participant_ids", ()), True) * 3 + case((matched("THREAD", cues.get("thread_ids", ())) > 0, 1), else_=0) * 3 + (matched("ENTITY", cues.get("entity_ids", ()), True) + matched("ITEM", cues.get("item_ids", ()), True)) * 2).label("cue")
+        usage_count = func.coalesce(usage.usage_count, 0).label("usage_count")
+        source_sequence = func.coalesce(memory_index.source_sequence, -1).label("source_sequence")
+        project_time = select(Project.current_world_time).where(Project.id == project_id).scalar_subquery()
+        happened_recency = case((and_(CharacterMemory.happened_at.is_not(None), project_time.is_not(None)), 1.0 / (1 + func.abs(func.extract("epoch", project_time - CharacterMemory.happened_at)) / 86400.0)), else_=0.0)
+        recency = case((memory_index.source_sequence.is_not(None), 2.0 / (1 + func.greatest(0, current_sequence - memory_index.source_sequence))), else_=happened_recency)
+        score = (cue + 2 * func.greatest(0.0, memory_index.importance) + func.abs(memory_index.emotional_weight) + func.greatest(0.0, memory_index.confidence) + func.least(usage_count, 4) + recency)
+        hidden = self._hidden(project_id, character_id, "MEMORY", CharacterMemory.id)
+        order = (score.desc(), cue.desc(), usage_count.desc(), source_sequence.desc(), CharacterMemory.happened_at.nullsfirst(), CharacterMemory.id)
+        deterministic = select(CharacterMemory.id.label("memory_id"), score.label("score"), cue.label("cue"), usage_count.label("usage_count"), source_sequence.label("source_sequence"), memory_index.source_bucket.label("source_bucket"), func.row_number().over(order_by=order).label("det_rank"), func.row_number().over(partition_by=memory_index.source_bucket, order_by=order).label("bucket_position")).join(Character, Character.id == CharacterMemory.character_id).join(memory_index, memory_index.memory_id == CharacterMemory.id).outerjoin(usage, and_(usage.project_id == project_id, usage.resource_type == CausalResourceType.CHARACTER_MEMORY.value, usage.resource_id == CharacterMemory.id)).where(memory_index.project_id == project_id, memory_index.character_id == character_id, Character.project_id == project_id, ~hidden).subquery("deterministic_ranked")
+        distance = cast(CharacterMemoryEmbedding.embedding.op("<=>")(query_vector), Float)
+        semantic_ranked = select(CharacterMemoryEmbedding.memory_id.label("memory_id"), func.row_number().over(order_by=(distance.asc(), CharacterMemoryEmbedding.memory_id)).label("sem_rank")).join(CharacterMemorySearchIndex, and_(CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id, CharacterMemorySearchIndex.project_id == project_id, CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint)).join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id).join(Character, Character.id == CharacterMemory.character_id).where(CharacterMemoryEmbedding.project_id == project_id, CharacterMemoryEmbedding.character_id == character_id, Character.project_id == project_id, CharacterMemoryEmbedding.embedding_config_fingerprint == config_fingerprint, CharacterMemoryEmbedding.status == EmbeddingStatus.READY, CharacterMemoryEmbedding.dimension == len(query_vector), ~hidden, (literal(1.0) - distance) >= config.memory_semantic_min_similarity if config.memory_semantic_min_similarity is not None else literal(True)).subquery("semantic_ranked_all")
+        semantic = select(semantic_ranked).where(semantic_ranked.c.sem_rank <= config.memory_vector_top_k).subquery("semantic_ranked")
+        # semantic eligibility is intentionally a subset of deterministic
+        # current eligibility, so every vector candidate already has a source
+        # bucket and deterministic rank. No semantic-only Python hydration is
+        # needed.
+        fused_raw = select(deterministic.c.memory_id, (1.0 / (config.memory_rrf_k + deterministic.c.det_rank) + func.coalesce(1.0 / (config.memory_rrf_k + semantic.c.sem_rank), 0.0)).label("rrf_score"), deterministic.c.cue, deterministic.c.source_bucket).outerjoin(semantic, semantic.c.memory_id == deterministic.c.memory_id).subquery("fused_raw")
+        fused = select(fused_raw, func.row_number().over(partition_by=fused_raw.c.source_bucket, order_by=(fused_raw.c.rrf_score.desc(), fused_raw.c.memory_id)).label("bucket_position")).subquery("fused")
+        rows = db.execute(select(fused).where(or_(fused.c.cue >= 4, fused.c.bucket_position <= 3)).order_by(fused.c.rrf_score.desc(), fused.c.memory_id).limit(12)).mappings().all()
+        ids = [row["memory_id"] for row in rows]
+        if not ids:
+            return []
+        formal = {row.id: row for row in db.scalars(select(CharacterMemory).where(CharacterMemory.id.in_(ids))).all()}
+        result = []
+        for memory_id in ids:
+            row = formal[memory_id]
+            result.append({"memory_id": row.id, "content": row.content, "importance": row.importance, "emotional_weight": row.emotional_weight, "confidence": row.confidence, "distortion": row.distortion or {}, "happened_at": row.happened_at.isoformat() if row.happened_at else None, "source_scene_id": row.source_scene})
         return result
 
 
 class ResearchLexicalIndexService:
+    @staticmethod
+    def _state_fingerprint(corpus: str, chunks: int, tokens: int, postings: int, terms: int) -> str:
+        return _fingerprint({"corpus": corpus, "chunks": chunks, "tokens": tokens, "postings": postings, "terms": terms}, RESEARCH_PROTOCOL)
     def _state(self, db: Session, project_id: str) -> ResearchLexicalIndexState | None:
         return db.scalar(select(ResearchLexicalIndexState).where(ResearchLexicalIndexState.project_id == project_id))
 
@@ -395,7 +483,7 @@ class ResearchLexicalIndexService:
         state.status, state.protocol_version, state.corpus_fingerprint = RetrievalIndexStatus.READY, RESEARCH_PROTOCOL, corpus
         state.active_chunk_count, state.total_token_count, state.average_document_length = count, total, total / count if count else 1.0
         state.posting_count, state.term_count = sum(dfs.values()), len(dfs)
-        state.index_fingerprint = _fingerprint({"corpus": corpus, "chunks": count, "tokens": total, "terms": sorted(dfs.items())}, RESEARCH_PROTOCOL)
+        state.index_fingerprint = self._state_fingerprint(corpus, count, total, sum(dfs.values()), len(dfs))
         state.last_rebuilt_at = datetime.utcnow(); db.flush()
         return state
 
@@ -409,28 +497,48 @@ class ResearchLexicalIndexService:
         document = db.get(ResearchDocument, document_id)
         if not document or document.project_id != project_id:
             raise ValueError("RESEARCH_LEXICAL_INDEX_DOCUMENT_INVALID")
+        old_indexes = db.scalars(select(ResearchChunkLexicalIndex).where(ResearchChunkLexicalIndex.project_id == project_id, ResearchChunkLexicalIndex.document_id == document_id)).all()
+        old_chunk_ids = [row.chunk_id for row in old_indexes]
+        old_term_counts = Counter()
+        old_posting_count = 0
+        if old_chunk_ids:
+            for term, count in db.execute(select(ResearchTermPosting.term, func.count(func.distinct(ResearchTermPosting.chunk_id))).where(ResearchTermPosting.project_id == project_id, ResearchTermPosting.chunk_id.in_(old_chunk_ids)).group_by(ResearchTermPosting.term)).all():
+                old_term_counts[term] = count
+            old_posting_count = db.scalar(select(func.count(ResearchTermPosting.id)).where(ResearchTermPosting.project_id == project_id, ResearchTermPosting.chunk_id.in_(old_chunk_ids))) or 0
+        old_chunk_count, old_token_total = len(old_indexes), sum(row.token_count for row in old_indexes)
         stale_chunks = select(ResearchChunkLexicalIndex.chunk_id).where(ResearchChunkLexicalIndex.project_id == project_id, ResearchChunkLexicalIndex.document_id == document_id)
         db.execute(delete(ResearchTermPosting).where(ResearchTermPosting.project_id == project_id, ResearchTermPosting.chunk_id.in_(stale_chunks)))
         db.execute(delete(ResearchChunkLexicalIndex).where(ResearchChunkLexicalIndex.project_id == project_id, ResearchChunkLexicalIndex.document_id == document_id))
         rows = db.execute(select(ResearchDocumentRevision, ResearchChunk).join(ResearchChunk, ResearchChunk.revision_id == ResearchDocumentRevision.id).where(ResearchDocumentRevision.document_id == document_id, ResearchDocumentRevision.active.is_(True), ResearchChunk.active.is_(True)).order_by(ResearchChunk.id)).all()
-        tokenizer = KnowledgeTokenizer()
+        tokenizer = KnowledgeTokenizer(); new_term_counts = Counter(); new_posting_count = 0; new_token_total = 0
         for revision, chunk in rows:
-            counts = Counter(tokenizer.tokenize(chunk.content))
-            db.add(ResearchChunkLexicalIndex(project_id=project_id, document_id=document_id, revision_id=revision.id, chunk_id=chunk.id, content_fingerprint=chunk.content_fingerprint, token_count=len(tokenizer.tokenize(chunk.content)), index_fingerprint=_fingerprint({"chunk": chunk.id, "content": chunk.content_fingerprint, "tokens": len(tokenizer.tokenize(chunk.content))}, RESEARCH_PROTOCOL)))
+            counts = Counter(tokenizer.tokenize(chunk.content)); token_count = len(tokenizer.tokenize(chunk.content))
+            new_token_total += token_count; new_posting_count += len(counts); new_term_counts.update(counts.keys())
+            db.add(ResearchChunkLexicalIndex(project_id=project_id, document_id=document_id, revision_id=revision.id, chunk_id=chunk.id, content_fingerprint=chunk.content_fingerprint, token_count=token_count, index_fingerprint=_fingerprint({"chunk": chunk.id, "content": chunk.content_fingerprint, "tokens": token_count}, RESEARCH_PROTOCOL)))
             for term, frequency in sorted(counts.items()):
                 db.add(ResearchTermPosting(project_id=project_id, chunk_id=chunk.id, term=term, term_frequency=frequency))
         db.flush()
-        db.execute(delete(ResearchTermStat).where(ResearchTermStat.project_id == project_id))
-        for term, df in db.execute(select(ResearchTermPosting.term, func.count(func.distinct(ResearchTermPosting.chunk_id))).where(ResearchTermPosting.project_id == project_id).group_by(ResearchTermPosting.term)).all():
-            db.add(ResearchTermStat(project_id=project_id, term=term, document_frequency=df))
+        affected_terms = sorted(set(old_term_counts) | set(new_term_counts))
+        existing_stats = {row.term: row for row in db.scalars(select(ResearchTermStat).where(ResearchTermStat.project_id == project_id, ResearchTermStat.term.in_(affected_terms))).all()} if affected_terms else {}
+        term_delta = 0
+        for term in affected_terms:
+            previous = existing_stats.get(term)
+            global_df = (previous.document_frequency if previous else 0) - old_term_counts[term] + new_term_counts[term]
+            if global_df <= 0:
+                if previous:
+                    db.delete(previous); term_delta -= 1
+            elif previous:
+                previous.document_frequency = global_df
+            else:
+                db.add(ResearchTermStat(project_id=project_id, term=term, document_frequency=global_df)); term_delta += 1
         state.status = RetrievalIndexStatus.READY
         state.corpus_fingerprint = ResearchCorpusFingerprintBuilder().build(db, project_id)
-        state.active_chunk_count = db.scalar(select(func.count(ResearchChunkLexicalIndex.id)).where(ResearchChunkLexicalIndex.project_id == project_id)) or 0
-        state.total_token_count = db.scalar(select(func.coalesce(func.sum(ResearchChunkLexicalIndex.token_count), 0)).where(ResearchChunkLexicalIndex.project_id == project_id)) or 0
+        state.active_chunk_count += len(rows) - old_chunk_count
+        state.total_token_count += new_token_total - old_token_total
         state.average_document_length = state.total_token_count / state.active_chunk_count if state.active_chunk_count else 1.0
-        state.posting_count = db.scalar(select(func.count(ResearchTermPosting.id)).where(ResearchTermPosting.project_id == project_id)) or 0
-        state.term_count = db.scalar(select(func.count(ResearchTermStat.id)).where(ResearchTermStat.project_id == project_id)) or 0
-        state.index_fingerprint = _fingerprint({"previous": state.index_fingerprint, "document": document_id, "corpus": state.corpus_fingerprint}, RESEARCH_PROTOCOL)
+        state.posting_count += new_posting_count - old_posting_count
+        state.term_count += term_delta
+        state.index_fingerprint = self._state_fingerprint(state.corpus_fingerprint, state.active_chunk_count, state.total_token_count, state.posting_count, state.term_count)
         db.flush()
 
     def fast_path_available(self, db: Session, project_id: str) -> bool:
@@ -455,13 +563,18 @@ class ResearchLexicalIndexAudit:
         expected = Counter(); tokenizer = KnowledgeTokenizer()
         for chunk in chunks:
             index = indexes[chunk.id]
-            if index.content_fingerprint != chunk.content_fingerprint or index.token_count != len(tokenizer.tokenize(chunk.content)):
+            token_count = len(tokenizer.tokenize(chunk.content))
+            expected_index_fp = _fingerprint({"chunk": chunk.id, "content": chunk.content_fingerprint, "tokens": token_count}, RESEARCH_PROTOCOL)
+            if index.project_id != project_id or index.document_id != chunk.document_id or index.revision_id != chunk.revision_id or index.content_fingerprint != chunk.content_fingerprint or index.token_count != token_count or index.index_fingerprint != expected_index_fp:
                 raise ValueError("RESEARCH_LEXICAL_INDEX_INTEGRITY_INVALID")
             expected.update(set(tokenizer.tokenize(chunk.content)))
         actual = {row.term: row.document_frequency for row in db.scalars(select(ResearchTermStat).where(ResearchTermStat.project_id == project_id)).all()}
         postings = {(row.chunk_id, row.term): row.term_frequency for row in db.scalars(select(ResearchTermPosting).where(ResearchTermPosting.project_id == project_id)).all()}
         expected_postings = {(chunk.id, term): count for chunk in chunks for term, count in Counter(tokenizer.tokenize(chunk.content)).items()}
-        if actual != dict(expected) or postings != expected_postings or state.corpus_fingerprint != ResearchCorpusFingerprintBuilder().build(db, project_id):
+        corpus = ResearchCorpusFingerprintBuilder().build(db, project_id)
+        total_tokens = sum(index.token_count for index in indexes.values())
+        expected_state_fp = ResearchLexicalIndexService._state_fingerprint(corpus, len(chunks), total_tokens, len(postings), len(expected))
+        if actual != dict(expected) or postings != expected_postings or state.corpus_fingerprint != corpus or state.active_chunk_count != len(chunks) or state.total_token_count != total_tokens or state.posting_count != len(postings) or state.term_count != len(expected) or state.index_fingerprint != expected_state_fp:
             raise ValueError("RESEARCH_LEXICAL_INDEX_INTEGRITY_INVALID")
         return {"valid": True, "project_id": project_id, "index_fingerprint": state.index_fingerprint}
 
@@ -483,11 +596,17 @@ class ResearchIndexedBM25Retriever:
         tokens = KnowledgeTokenizer().tokenize(query_text or "")
         if not tokens:
             raise ResearchDomainError("RESEARCH_QUERY_EMPTY")
-        # PostgreSQL JSON tag semantics have intentionally not been replaced
-        # by an approximate operator. The caller uses frozen legacy search for
-        # tags/browse, leaving this path exact for all remaining filters.
         if filters.get("tags"):
-            raise ValueError("RESEARCH_INDEXED_TAG_FALLBACK")
+            from sqlalchemy.dialects.postgresql import JSONB
+            requested_tags = list(filters["tags"])
+            doc_tag_values = func.jsonb_array_elements_text(cast(ResearchDocument.source_metadata["tags"], JSONB)).table_valued("value").alias("doc_tag_values")
+            chunk_tag_values = func.jsonb_array_elements_text(cast(ResearchChunk.chunk_metadata["tags"], JSONB)).table_valued("value").alias("chunk_tag_values")
+            tag_match = or_(
+                exists(select(literal(1)).select_from(doc_tag_values).where(doc_tag_values.c.value.in_(requested_tags))),
+                exists(select(literal(1)).select_from(chunk_tag_values).where(chunk_tag_values.c.value.in_(requested_tags))),
+            )
+        else:
+            tag_match = None
         clauses = [
             ResearchDocument.project_id == project_id, ResearchDocument.active.is_(True),
             ResearchDocumentRevision.active.is_(True), ResearchChunk.active.is_(True),
@@ -498,6 +617,8 @@ class ResearchIndexedBM25Retriever:
             clauses.append(ResearchDocument.source_tier.in_(filters["source_tiers"]))
         if filters.get("source_kinds"):
             clauses.append(ResearchDocument.source_kind.in_(filters["source_kinds"]))
+        if tag_match is not None:
+            clauses.append(tag_match)
         base = select(ResearchChunk.id.label("chunk_id"), ResearchChunk.token_count.label("token_count")).join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id).join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id).where(*clauses).subquery()
         n, total = db.execute(select(func.count(base.c.chunk_id), func.coalesce(func.sum(base.c.token_count), 0))).one()
         if not n:

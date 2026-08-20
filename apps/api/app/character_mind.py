@@ -305,24 +305,26 @@ class CharacterMindViewBuilder:
         if proposal.project_id != project_id:
             raise ValueError("Scene Proposal not found in project")
         cues = self.cues.extract(proposal, character_id)
-        # Phase 16C1's current-history SQL projection is deliberately opt-in:
-        # temporal replay and hybrid RRF retain their frozen reference path
-        # until their respective indexed equivalence is available.
+        # Current-history retrieval uses the derived PostgreSQL projection for
+        # both deterministic and hybrid recall. Replay keeps its independent
+        # temporal authority path below.
         config = session.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
-        if not config or not config.embedding_enabled or config.memory_retrieval_mode == MemoryRetrievalMode.DETERMINISTIC:
-            try:
-                from .retrieval_index import CognitionRetrievalProjectionService, CurrentCharacterCognitionFastRetriever
-                if CognitionRetrievalProjectionService().fast_path_available(session, project_id):
-                    recalled_knowledge, conflicts = CurrentCharacterCognitionFastRetriever().knowledge(session, project_id, character_id, cues)
-                    recalled_memories = CurrentCharacterCognitionFastRetriever().memories(session, project_id, character_id, cues)
-                    identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
-                    result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
-                    result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
-                    return result
-            except Exception:
-                # A dirty/corrupt or unsupported projection must not alter a
-                # character's legal cognition. The legacy path below is exact.
-                pass
+        try:
+            from .retrieval_index import CognitionRetrievalProjectionService, CurrentCharacterCognitionFastRetriever
+            if CognitionRetrievalProjectionService().fast_path_available(session, project_id):
+                fast = CurrentCharacterCognitionFastRetriever()
+                recalled_knowledge, conflicts = fast.knowledge(session, project_id, character_id, cues)
+                recalled_memories = fast.memories(session, project_id, character_id, cues)
+                if config and config.embedding_enabled and config.memory_retrieval_mode == MemoryRetrievalMode.HYBRID_RRF:
+                    recalled_memories = self._fast_hybrid_memories(session, project_id, character_id, cues, recalled_memories, character, proposal, config, fast)
+                identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
+                result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
+                result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
+                return result
+        except Exception:
+            # A dirty/corrupt or unsupported projection must not alter a
+            # character's legal cognition. The legacy path below is exact.
+            pass
         active_knowledge = self.reader.knowledge(session, project_id, character_id)
         beliefs, conflicts = self.beliefs.build(active_knowledge)
         recalled_knowledge = self.knowledge.retrieve(session, project_id, active_knowledge, cues, beliefs)
@@ -336,6 +338,28 @@ class CharacterMindViewBuilder:
         result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
         result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
         return result
+
+    def _fast_hybrid_memories(self, session: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]], deterministic: list[dict[str, Any]], character: Any, proposal: SceneProposal, config: ProjectModelConfig, fast) -> list[dict[str, Any]]:
+        """Run current-only vector eligibility and RRF in PostgreSQL.
+
+        The deterministic result is already SQL-derived. Any provider or
+        vector-route failure returns that exact result without invoking a
+        legacy cognition reader.
+        """
+        try:
+            from .embeddings import CharacterSemanticCueBuilder, EmbeddingRouter, OpenAICompatibleEmbeddingProvider
+            from .settings import get_settings
+            route = EmbeddingRouter().resolve(session, project_id, get_settings())
+            query = CharacterSemanticCueBuilder().build(cues, character=character, scene=proposal)
+            if not route.enabled or not query:
+                return deterministic
+            provider = self.embedding_provider_factory(route) if self.embedding_provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
+            embedding = provider.embed([query], route.model)
+            if embedding.dimension != route.dimension:
+                return deterministic
+            return fast.hybrid_memories(session, project_id, character_id, cues, embedding.vectors[0], route.embedding_config_fingerprint, config)
+        except Exception:
+            return deterministic
 
     def _hybrid_memories(self, session: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]], records: list[CharacterMemory], entries: list[tuple], deterministic: list[dict[str, Any]], character: Any = None, scene: Any = None, location: Any = None, participants: list[Any] | None = None) -> list[dict[str, Any]]:
         """Optional derived ranking. Any embedding failure preserves Phase9 recall."""
