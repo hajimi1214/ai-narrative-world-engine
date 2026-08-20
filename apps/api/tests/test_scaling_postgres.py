@@ -8,8 +8,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.models import (
-    Project, Scene, SceneHistoryFeature, SceneStateCheckpoint, SceneStatus,
-    SnapshotType, StoryThread, ThreadStatus, WorldSnapshot,
+    CurrentStateChangeHead, Project, Scene, SceneHistoryFeature, SceneStateCheckpoint, SceneStatus,
+    SnapshotType, StoryThread, ThreadStatus, TimelineEvent, TimelineEventType, TimelineOrigin, WorldSnapshot,
 )
 from app.historical import snapshot_fingerprint
 from app.scaling import ProjectHistoryProjectionService, ProjectHistoryProjectionAudit
@@ -73,3 +73,32 @@ def test_postgres_concurrent_rebuild_is_serialized():
         assert projection and projection.built_through_sequence == 1
         assert db.scalar(select(__import__("sqlalchemy").func.count(SceneHistoryFeature.id)).where(SceneHistoryFeature.project_id == project_id)) == 1
         ProjectHistoryProjectionAudit().audit(db, project_id)
+
+
+def test_postgres_current_state_head_rebuilds_to_latest_active_event():
+    Session = _session()
+    with Session() as db:
+        project_id, scene_id = _fixture(db)
+        events = []
+        for sequence in (1, 10, 20):
+            event = TimelineEvent(
+                project_id=project_id, event_type=TimelineEventType.STATE_CHANGE,
+                source_type="SCENE", source_id=scene_id, source_key=f"head:{sequence}",
+                scene_id=scene_id, sequence=sequence, ordinal=1,
+                origin=TimelineOrigin.LEGACY_BACKFILL, active=True,
+                target_type="CHARACTER", target_id="character", path="/physical_state/injured",
+                before_value=False, after_value=True, structured_payload={}, event_fingerprint=f"head-{sequence}",
+            )
+            db.add(event); events.append(event)
+        db.flush()
+        service = ProjectHistoryProjectionService()
+        service.rebuild(db, project_id)
+        db.commit()
+        head = db.scalar(select(CurrentStateChangeHead).where(CurrentStateChangeHead.project_id == project_id))
+        assert head.timeline_event_id == events[-1].id
+        events[-1].active = False
+        service.rebuild(db, project_id)
+        db.commit()
+        head = db.scalar(select(CurrentStateChangeHead).where(CurrentStateChangeHead.project_id == project_id))
+        assert head.timeline_event_id == events[-2].id
+        assert db.get(TimelineEvent, events[-1].id) is not None

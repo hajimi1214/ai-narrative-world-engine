@@ -27,6 +27,7 @@ from .models import (
 
 RECENT_SCENE_LIMIT = 10
 PROJECTION_PROTOCOL = "project-history-projection-v1"
+THREAD_STATS_META_KEY = "__projection_meta__"
 
 
 def _value(value: Any) -> Any:
@@ -83,8 +84,11 @@ class SceneHistoryFeatureBuilder:
             "scene_id": scene.id,
             "sequence": scene.sequence,
             "world_time": scene.world_time,
-            "location_id": proposal.location_id if proposal and proposal.location_id else scene.location,
-            "participant_ids": sorted(str(value) for value in (proposal.participants if proposal else scene.participants or [])),
+            # This row is the formal Scene projection.  Proposal metadata has
+            # distinct legacy semantics and is retained only in the bounded
+            # recent-signature payload below.
+            "location_id": scene.location,
+            "participant_ids": sorted(str(value) for value in (scene.participants or [])),
             "thread_ids": sorted(str(value) for value in (scene.story_threads or [])),
             "proposal_type": _value(proposal.proposal_type) if proposal else None,
             "primary_thread_id": proposal.primary_thread_id if proposal else None,
@@ -101,14 +105,15 @@ class SceneHistoryFeatureBuilder:
         return payload
 
     @staticmethod
-    def signature(feature: SceneHistoryFeature | dict[str, Any]) -> dict[str, Any]:
-        def read(name: str):
-            return feature.get(name) if isinstance(feature, dict) else getattr(feature, name)
+    def signature(scene: Scene, proposal: SceneProposal | None) -> dict[str, Any]:
+        """The frozen legacy ``_signature`` contract, not formal Scene data."""
         return {
-            "scene_id": read("scene_id"), "sequence": read("sequence"),
-            "proposal_type": read("proposal_type"), "primary_thread_id": read("primary_thread_id"),
-            "participants": sorted(str(value) for value in (read("participant_ids") or [])),
-            "location_id": read("location_id"),
+            "scene_id": scene.id, "sequence": scene.sequence,
+            "proposal_type": _value(proposal.proposal_type) if proposal else None,
+            "primary_thread_id": proposal.primary_thread_id if proposal else None,
+            "participants": sorted(str(value) for value in (proposal.participants if proposal else scene.participants or [])),
+            # Intentionally no fallback for a proposal with no location_id.
+            "location_id": proposal.location_id if proposal else scene.location,
         }
 
 
@@ -150,40 +155,11 @@ class ProjectHistoryProjectionService:
             head_events = {row.id: row for row in db.scalars(select(TimelineEvent).where(
                 TimelineEvent.id.in_([head.timeline_event_id for head in heads]),
             )).all()}
-        characters = db.scalars(select(Character).where(
+        active_character_ids = list(db.scalars(select(Character.id).where(
             Character.project_id == project_id, Character.active.is_(True),
-        ).order_by(Character.id)).all()
-        character_rows = []
-        reader = ActiveCharacterCognitionReader()
-        for character in characters:
-            knowledge = reader.knowledge(db, project_id, character.id)
-            character_rows.append({
-                "id": character.id, "narrative_relevance": character.narrative_relevance or {},
-                "goals": character.goals or {}, "current_state": character.current_state or {},
-                "physical_state": character.physical_state or {}, "emotional_state": character.emotional_state or {},
-                "relationships": character.relationships or {},
-                "knowledge": [{"id": row.id, "proposition": row.proposition,
-                               "status": _value(row.status), "confidence": row.confidence} for row in knowledge],
-            })
-        threads = [{"id": row.id, "weight": row.weight, "progress": row.progress,
-                    "status": _value(row.status), "state": row.state or {}}
-                   for row in db.scalars(select(StoryThread).where(
-                       StoryThread.project_id == project_id,
-                       StoryThread.status.in_((ThreadStatus.OPEN, ThreadStatus.PAUSED)),
-                   ).order_by(StoryThread.id)).all()]
-        reveals = [{"id": row.id, "canon_fact_id": row.canon_fact_id, "status": _value(row.status),
-                    "allowed_character_ids": sorted(row.allowed_character_ids or [])}
-                   for row in db.scalars(select(RevealConstraint).where(
-                       RevealConstraint.project_id == project_id,
-                   ).order_by(RevealConstraint.id)).all()]
-        locations = [{"id": row.id, "name": row.name} for row in db.scalars(select(WorldEntity).where(
-            WorldEntity.project_id == project_id, WorldEntity.active.is_(True),
-            WorldEntity.entity_type == EntityType.LOCATION,
-        ).order_by(WorldEntity.id)).all()]
+        ).order_by(Character.id)).all())
         return stable_fingerprint(_canonical({
-            "project": {"id": project.id, "story_seed": project.story_seed,
-                        "autonomy_settings": project.autonomy_settings,
-                        "current_world_time": project.current_world_time.isoformat() if project.current_world_time else None},
+            "protocol": PROJECTION_PROTOCOL,
             "latest": {"id": latest.id if latest else None, "sequence": latest.sequence if latest else 0,
                        "checkpoint": checkpoint_fingerprint,
                        "location": latest.location if latest else None,
@@ -194,7 +170,9 @@ class ProjectHistoryProjectionService:
                              "active": bool(head_events.get(head.timeline_event_id) and head_events[head.timeline_event_id].active),
                              "event_fingerprint": head_events.get(head.timeline_event_id).event_fingerprint if head_events.get(head.timeline_event_id) else None}
                             for head in heads],
-            "characters": character_rows, "threads": threads, "reveals": reveals, "locations": locations,
+            # Thread alignment is projected against the *current* active set.
+            # Other Gravity inputs are live reads and must not stale history.
+            "active_character_ids": active_character_ids,
         }), "project-history-source-v1")
 
     def rebuild(self, db: Session, project_id: str, *, project_locked: bool = False) -> ProjectHistoryProjection:
@@ -235,7 +213,8 @@ class ProjectHistoryProjectionService:
                 feature.active = False
         db.flush()
         self._rebuild_heads(db, project_id)
-        self._assign_projection(projection, features)
+        active_character_ids = self._active_character_ids(db, project_id)
+        self._assign_projection(db, projection, features, active_character_ids)
         projection.status = HistoryProjectionStatus.READY
         projection.dirty_from_sequence = None
         projection.last_rebuilt_at = datetime.utcnow()
@@ -280,6 +259,11 @@ class ProjectHistoryProjectionService:
         if _value(projection.status) != HistoryProjectionStatus.READY.value or projection.built_through_sequence != scene.sequence - 1:
             self._mark_dirty_row(projection, scene.sequence)
             return
+        active_character_ids = self._active_character_ids(db, project_id)
+        stored_active_ids = set((projection.thread_stats or {}).get(THREAD_STATS_META_KEY, {}).get("active_character_ids", []))
+        if stored_active_ids != active_character_ids:
+            self._mark_dirty_row(projection, scene.sequence)
+            return
         existing = db.scalar(select(SceneHistoryFeature).where(
             SceneHistoryFeature.project_id == project_id, SceneHistoryFeature.scene_id == scene.id,
         ))
@@ -293,7 +277,7 @@ class ProjectHistoryProjectionService:
             self._assign_feature(feature, values)
         db.flush()
         self._upsert_heads_for_scene(db, project_id, scene.id)
-        self._append_projection(projection, feature)
+        self._append_projection(db, projection, feature, active_character_ids)
         projection.source_history_fingerprint = self.current_source_fingerprint(db, project_id)
         projection.status = HistoryProjectionStatus.READY
         projection.dirty_from_sequence = None
@@ -435,23 +419,47 @@ class ProjectHistoryProjectionService:
         for key, value in self._feature_columns(values).items():
             setattr(feature, key, copy.deepcopy(value))
 
-    def _assign_projection(self, projection: ProjectHistoryProjection, features: list[SceneHistoryFeature]) -> None:
+    @staticmethod
+    def _active_character_ids(db: Session, project_id: str) -> set[str]:
+        return set(db.scalars(select(Character.id).where(
+            Character.project_id == project_id, Character.active.is_(True),
+        )).all())
+
+    @staticmethod
+    def _proposal_for_scene(db: Session, project_id: str, scene_id: str) -> SceneProposal | None:
+        binding = db.scalar(select(SceneExecutionBinding).where(
+            SceneExecutionBinding.project_id == project_id,
+            SceneExecutionBinding.scene_id == scene_id,
+            SceneExecutionBinding.active.is_(True),
+        ))
+        performance = db.get(ScenePerformance, binding.performance_id) if binding else None
+        return db.get(SceneProposal, performance.scene_proposal_id) if performance else None
+
+    def _signature(self, db: Session, project_id: str, feature: SceneHistoryFeature) -> dict[str, Any]:
+        scene = db.get(Scene, feature.scene_id)
+        if not scene:
+            raise ValueError("SCALING_PROJECTION_INTEGRITY_INVALID")
+        return self.feature_builder.signature(scene, self._proposal_for_scene(db, project_id, scene.id))
+
+    def _assign_projection(self, db: Session, projection: ProjectHistoryProjection,
+                           features: list[SceneHistoryFeature], active_character_ids: set[str]) -> None:
         features = sorted(features, key=lambda row: (row.sequence, row.scene_id))
         projection.protocol_version = PROJECTION_PROTOCOL
         projection.built_through_sequence = features[-1].sequence if features else 0
         projection.active_scene_count = len(features)
         projection.last_scene_id = features[-1].scene_id if features else None
-        projection.recent_scene_signatures = [self.feature_builder.signature(row) for row in features[-RECENT_SCENE_LIMIT:]]
-        projection.thread_stats = self._thread_stats(features)
+        projection.recent_scene_signatures = [self._signature(db, projection.project_id, row) for row in features[-RECENT_SCENE_LIMIT:]]
+        projection.thread_stats = self._thread_stats(features, active_character_ids)
         projection.character_stats = self._character_stats(features)
         projection.projection_fingerprint = self.fingerprint_builder.build(features)
 
-    def _append_projection(self, projection: ProjectHistoryProjection, feature: SceneHistoryFeature) -> None:
+    def _append_projection(self, db: Session, projection: ProjectHistoryProjection,
+                           feature: SceneHistoryFeature, active_character_ids: set[str]) -> None:
         projection.protocol_version = PROJECTION_PROTOCOL
         projection.built_through_sequence = feature.sequence
         projection.active_scene_count += 1
         projection.last_scene_id = feature.scene_id
-        signatures = list(projection.recent_scene_signatures or []) + [self.feature_builder.signature(feature)]
+        signatures = list(projection.recent_scene_signatures or []) + [self._signature(db, projection.project_id, feature)]
         projection.recent_scene_signatures = signatures[-RECENT_SCENE_LIMIT:]
         thread_stats = copy.deepcopy(projection.thread_stats or {})
         for thread_id in feature.thread_ids or []:
@@ -459,7 +467,7 @@ class ProjectHistoryProjectionService:
             row["last_touched_sequence"] = feature.sequence
             row["scene_count"] += 1
             row["aligned_participant_ids"] = sorted(set(row["aligned_participant_ids"]) | set(feature.participant_ids or []))
-            row["scene_alignment_count"] += 1 if feature.participant_ids else 0
+            row["scene_alignment_count"] += 1 if set(feature.participant_ids or []).intersection(active_character_ids) else 0
         character_stats = copy.deepcopy(projection.character_stats or {})
         for character_id in feature.participant_ids or []:
             row = character_stats.setdefault(character_id, {"last_participation_sequence": None, "scene_count": 0})
@@ -469,15 +477,17 @@ class ProjectHistoryProjectionService:
         projection.projection_fingerprint = self.fingerprint_builder.extend(projection.projection_fingerprint, feature.feature_fingerprint)
 
     @staticmethod
-    def _thread_stats(features: list[SceneHistoryFeature]) -> dict[str, Any]:
-        stats: dict[str, Any] = {}
+    def _thread_stats(features: list[SceneHistoryFeature], active_character_ids: set[str]) -> dict[str, Any]:
+        stats: dict[str, Any] = {
+            THREAD_STATS_META_KEY: {"active_character_ids": sorted(active_character_ids)},
+        }
         for feature in features:
             for thread_id in feature.thread_ids or []:
                 row = stats.setdefault(thread_id, {"last_touched_sequence": None, "scene_count": 0, "aligned_participant_ids": [], "scene_alignment_count": 0})
                 row["last_touched_sequence"] = feature.sequence
                 row["scene_count"] += 1
                 row["aligned_participant_ids"] = sorted(set(row["aligned_participant_ids"]) | set(feature.participant_ids or []))
-                row["scene_alignment_count"] += 1 if feature.participant_ids else 0
+                row["scene_alignment_count"] += 1 if set(feature.participant_ids or []).intersection(active_character_ids) else 0
         return stats
 
     @staticmethod
@@ -560,10 +570,11 @@ class ProjectHistoryProjectionAudit:
             SceneHistoryFeature.project_id == project_id, SceneHistoryFeature.active.is_(True),
         ).order_by(SceneHistoryFeature.sequence, SceneHistoryFeature.scene_id)).all()
         expected_fingerprint = service.fingerprint_builder.build(features)
-        expected_recent = [service.feature_builder.signature(row) for row in features[-RECENT_SCENE_LIMIT:]]
+        active_character_ids = service._active_character_ids(db, project_id)
+        expected_recent = [service._signature(db, project_id, row) for row in features[-RECENT_SCENE_LIMIT:]]
         if (
             projection.projection_fingerprint != expected_fingerprint
-            or projection.thread_stats != service._thread_stats(features)
+            or projection.thread_stats != service._thread_stats(features, active_character_ids)
             or projection.character_stats != service._character_stats(features)
             or projection.recent_scene_signatures != expected_recent
             or projection.active_scene_count != len(features)
