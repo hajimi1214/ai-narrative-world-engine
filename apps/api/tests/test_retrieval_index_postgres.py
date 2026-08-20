@@ -325,11 +325,19 @@ def test_postgres_indexed_research_selective_query_avoids_corpus_tokenization(mo
         db.execute(ResearchTermPosting.__table__.insert(), postings)
         db.add_all([ResearchTermStat(project_id=project.id, term="needle", document_frequency=1), ResearchTermStat(project_id=project.id, term="background", document_frequency=99_999)])
         db.add(ResearchLexicalIndexState(project_id=project.id, status=RetrievalIndexStatus.READY, protocol_version="research-inverted-index-v1", corpus_fingerprint="corpus", active_chunk_count=100_000, total_token_count=100_000, average_document_length=1.0, posting_count=100_000, term_count=2, index_fingerprint="state"))
-        db.commit(); seen = []
+        db.commit(); seen = []; statements = []
         original = __import__("app.research", fromlist=["KnowledgeTokenizer"]).KnowledgeTokenizer.tokenize
         monkeypatch.setattr("app.research.KnowledgeTokenizer.tokenize", lambda _self, text: (seen.append(text), original(_self, text))[1])
+        def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+        event.listen(engine, "before_cursor_execute", capture)
         result = ResearchIndexedBM25Retriever().search(db, project.id, "needle", filters={}, config=ResearchRetrievalConfig())
+        event.remove(engine, "before_cursor_execute", capture)
         assert [item.content for item in result] == ["needle"]
         assert seen == ["needle"]
+        normalized = " ".join(statements).lower()
+        assert "count(" not in normalized
+        assert "sum(" not in normalized
+        assert "research_term_stat" in normalized
         cleanup(db, project.id)
     engine.dispose()

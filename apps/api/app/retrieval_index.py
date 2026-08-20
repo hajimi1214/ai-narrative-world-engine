@@ -528,7 +528,7 @@ class ResearchLexicalIndexService:
         rows = db.execute(select(ResearchDocumentRevision, ResearchChunk).join(ResearchChunk, ResearchChunk.revision_id == ResearchDocumentRevision.id).where(ResearchDocumentRevision.document_id == document_id, ResearchDocumentRevision.active.is_(True), ResearchChunk.active.is_(True)).order_by(ResearchChunk.id)).all()
         tokenizer = KnowledgeTokenizer(); new_term_counts = Counter(); new_posting_count = 0; new_token_total = 0
         for revision, chunk in rows:
-            counts = Counter(tokenizer.tokenize(chunk.content)); token_count = len(tokenizer.tokenize(chunk.content))
+            tokens = tokenizer.tokenize(chunk.content); counts = Counter(tokens); token_count = len(tokens)
             new_token_total += token_count; new_posting_count += len(counts); new_term_counts.update(counts.keys())
             db.add(ResearchChunkLexicalIndex(project_id=project_id, document_id=document_id, revision_id=revision.id, chunk_id=chunk.id, content_fingerprint=chunk.content_fingerprint, token_count=token_count, index_fingerprint=_fingerprint({"chunk": chunk.id, "content": chunk.content_fingerprint, "tokens": token_count}, RESEARCH_PROTOCOL)))
             for term, frequency in sorted(counts.items()):
@@ -635,13 +635,34 @@ class ResearchIndexedBM25Retriever:
             clauses.append(ResearchDocument.source_kind.in_(filters["source_kinds"]))
         if tag_match is not None:
             clauses.append(tag_match)
-        base = select(ResearchChunk.id.label("chunk_id"), ResearchChunk.token_count.label("token_count")).join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id).join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id).where(*clauses).subquery()
-        n, total = db.execute(select(func.count(base.c.chunk_id), func.coalesce(func.sum(base.c.token_count), 0))).one()
-        if not n:
-            return []
-        avgdl = total / n
         terms = sorted(set(tokens))
-        df_rows = db.execute(select(ResearchTermPosting.term, func.count(func.distinct(ResearchTermPosting.chunk_id))).join(base, base.c.chunk_id == ResearchTermPosting.chunk_id).where(ResearchTermPosting.project_id == project_id, ResearchTermPosting.term.in_(terms)).group_by(ResearchTermPosting.term)).all()
+        has_corpus_filters = any(filters.get(key) for key in ("document_ids", "source_tiers", "source_kinds", "tags"))
+        if not has_corpus_filters:
+            # READY state and term stats are the synchronized current-corpus
+            # authority for the unfiltered path.  This avoids recounting every
+            # active chunk on ordinary queries while candidate SQL still
+            # validates formal active document/revision/chunk ownership.
+            state = db.scalar(select(ResearchLexicalIndexState).where(
+                ResearchLexicalIndexState.project_id == project_id,
+                ResearchLexicalIndexState.status == RetrievalIndexStatus.READY,
+                ResearchLexicalIndexState.protocol_version == RESEARCH_PROTOCOL,
+            ))
+            if state is None:
+                raise ResearchDomainError("RESEARCH_LEXICAL_INDEX_NOT_READY")
+            n, avgdl = state.active_chunk_count, state.average_document_length
+            if not n:
+                return []
+            df_rows = db.execute(select(ResearchTermStat.term, ResearchTermStat.document_frequency).where(
+                ResearchTermStat.project_id == project_id,
+                ResearchTermStat.term.in_(terms),
+            )).all()
+        else:
+            base = select(ResearchChunk.id.label("chunk_id"), ResearchChunk.token_count.label("token_count")).join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id).join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id).where(*clauses).subquery()
+            n, total = db.execute(select(func.count(base.c.chunk_id), func.coalesce(func.sum(base.c.token_count), 0))).one()
+            if not n:
+                return []
+            avgdl = total / n
+            df_rows = db.execute(select(ResearchTermPosting.term, func.count(func.distinct(ResearchTermPosting.chunk_id))).join(base, base.c.chunk_id == ResearchTermPosting.chunk_id).where(ResearchTermPosting.project_id == project_id, ResearchTermPosting.term.in_(terms)).group_by(ResearchTermPosting.term)).all()
         df = {term: count for term, count in df_rows}
         posting_rows = db.execute(select(ResearchDocument, ResearchDocumentRevision, ResearchChunk, ResearchTermPosting.term, ResearchTermPosting.term_frequency).join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id).join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id).join(ResearchTermPosting, ResearchTermPosting.chunk_id == ResearchChunk.id).where(*clauses, ResearchTermPosting.project_id == project_id, ResearchTermPosting.term.in_(terms)).order_by(ResearchChunk.id, ResearchTermPosting.term)).all()
         grouped: dict[str, dict[str, Any]] = {}
