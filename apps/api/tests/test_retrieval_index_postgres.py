@@ -1,5 +1,6 @@
 """PostgreSQL-only Phase 16C1 retrieval parity proofs."""
 import os
+import threading
 import uuid
 
 import pytest
@@ -14,7 +15,7 @@ from app.models import (
     ResearchChunkLexicalIndex, ResearchDocument, ResearchDocumentRevision,
     ResearchLexicalIndexState, ResearchTermPosting, ResearchTermStat, SceneProposal,
     ProjectModelConfig, MemoryRetrievalMode, CharacterMemoryEmbedding, EmbeddingStatus,
-    RetrievalIndexStatus, ResearchSourceTier, ResearchSourceKind,
+    RetrievalIndexStatus, ResearchSourceTier, ResearchSourceKind, WorldEntity, EntityType, Scene,
 )
 from app.research import ResearchBM25Retriever, ResearchIngestionService, ResearchRetrievalConfig
 from app.retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService, ResearchIndexedBM25Retriever
@@ -31,7 +32,7 @@ def cleanup(db, project_id):
     for model in (ResearchTermPosting, ResearchTermStat, ResearchChunkLexicalIndex, ResearchLexicalIndexState,
                   CharacterMemoryCueRef, CharacterMemorySearchIndex, CharacterKnowledgeSearchIndex,
                   CognitionUsageHead, ProjectCognitionRetrievalIndex, CharacterMemoryEmbedding, ResearchChunk,
-                  ResearchDocumentRevision, ResearchDocument, ProjectModelConfig):
+                  ResearchDocumentRevision, ResearchDocument, ProjectModelConfig, WorldEntity, SceneProposal, Scene):
         db.execute(delete(model).where(model.project_id == project_id))
     db.execute(delete(CharacterMemory).where(CharacterMemory.id.in_(memory_ids)))
     db.execute(delete(CharacterKnowledge).where(CharacterKnowledge.id.in_(knowledge_ids)))
@@ -83,6 +84,125 @@ def test_postgres_hybrid_current_fast_path_does_not_call_legacy_reader(monkeypat
         result = CharacterMindViewBuilder(embedding_provider_factory=lambda _route: FakeEmbeddingProvider({"{\"location_ids\":[\"room\"],\"participant_ids\":[\"" + actor.id + "\"]}": [1.0, 0.0]})).build(db, project.id, actor.id, proposal)
         assert {item["memory_id"] for item in result["memories"]} == {target.id, other.id}
         cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_fast_and_legacy_hybrid_send_byte_exact_cjk_semantic_query(monkeypatch):
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="cue-parity"); db.add(project); db.flush()
+        actor = Character(project_id=project.id, name="沈砚", goals={"goal": "寻人"}, emotional_state={"mood": "忧"})
+        peer = Character(project_id=project.id, name="顾清辞")
+        location = WorldEntity(project_id=project.id, entity_type=EntityType.LOCATION, name="长安酒楼")
+        db.add_all([actor, peer, location]); db.flush()
+        memory = CharacterMemory(character_id=actor.id, content="故人离去", importance=.5, emotional_weight=.2, confidence=1, distortion={})
+        db.add(memory); db.add(ProjectModelConfig(project_id=project.id, embedding_enabled=True, embedding_use_main_connection=False, embedding_provider="openai_compatible", embedding_base_url="https://example.test", embedding_model="fake", embedding_dimension=2, memory_retrieval_mode=MemoryRetrievalMode.HYBRID_RRF))
+        CognitionRetrievalProjectionService().rebuild(db, project.id)
+        route = EmbeddingRoute(True, "openai_compatible", "https://example.test", "fake", 2, "key", "TEST", "cue-cfg")
+        db.add(CharacterMemoryEmbedding(project_id=project.id, character_id=actor.id, memory_id=memory.id, embedding_config_fingerprint="cue-cfg", provider="fake", model="fake", dimension=2, content_fingerprint=memory_content_fingerprint(memory.content), status=EmbeddingStatus.READY, embedding=[1.0, 0.0]))
+        db.commit(); received = []
+        class RecordingProvider:
+            def embed(self, inputs, _model):
+                received.extend(inputs)
+                from app.embeddings import EmbeddingResult
+                return EmbeddingResult([[1.0, 0.0] for _ in inputs], "fake", "fake", 2, 0)
+        monkeypatch.setattr("app.embeddings.EmbeddingRouter.resolve", lambda *_args, **_kwargs: route)
+        proposal = SceneProposal(id="cue-parity-proposal", project_id=project.id, location_id=location.id, participants=[actor.id, peer.id], entry_state={"visible_context": {"situation": "故人再次不告而别"}})
+        builder = CharacterMindViewBuilder(embedding_provider_factory=lambda _route: RecordingProvider())
+        CognitionRetrievalProjectionService().mark_dirty(db, project.id); db.commit()
+        legacy = builder.build(db, project.id, actor.id, proposal)
+        CognitionRetrievalProjectionService().rebuild(db, project.id); db.commit()
+        fast = builder.build(db, project.id, actor.id, proposal)
+        assert len(received) == 2 and received[0] == received[1]
+        assert "长安酒楼" in received[1] and "沈砚" in received[1] and "顾清辞" in received[1] and "故人再次不告而别" in received[1]
+        assert legacy["memories"] == fast["memories"]
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_fast_formal_ownership_blocks_corrupt_derived_owners():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="owner-integrity"); db.add(project); db.flush()
+        actor_a = Character(project_id=project.id, name="A"); actor_b = Character(project_id=project.id, name="B")
+        db.add_all([actor_a, actor_b]); db.flush()
+        knowledge_b = CharacterKnowledge(character_id=actor_b.id, proposition="ENTITY door: open = true", status=KnowledgeStatus.KNOWN, confidence=1)
+        memory_b = CharacterMemory(character_id=actor_b.id, content="B secret", importance=1, emotional_weight=0, confidence=1, distortion={})
+        db.add_all([knowledge_b, memory_b]); db.flush(); CognitionRetrievalProjectionService().rebuild(db, project.id)
+        knowledge_index = db.scalar(select(CharacterKnowledgeSearchIndex).where(CharacterKnowledgeSearchIndex.knowledge_id == knowledge_b.id)); memory_index = db.scalar(select(CharacterMemorySearchIndex).where(CharacterMemorySearchIndex.memory_id == memory_b.id))
+        knowledge_index.character_id = actor_a.id; memory_index.character_id = actor_a.id
+        db.add(ProjectModelConfig(project_id=project.id, embedding_enabled=True, embedding_use_main_connection=False, embedding_provider="openai_compatible", embedding_base_url="https://example.test", embedding_model="fake", embedding_dimension=2, memory_retrieval_mode=MemoryRetrievalMode.HYBRID_RRF))
+        db.add(CharacterMemoryEmbedding(project_id=project.id, character_id=actor_a.id, memory_id=memory_b.id, embedding_config_fingerprint="owner-cfg", provider="fake", model="fake", dimension=2, content_fingerprint=memory_content_fingerprint(memory_b.content), status=EmbeddingStatus.READY, embedding=[1.0, 0.0]))
+        db.commit()
+        from app.retrieval_index import CurrentCharacterCognitionFastRetriever
+        fast = CurrentCharacterCognitionFastRetriever(); cues = {"entity_ids": (), "participant_ids": (), "thread_ids": (), "item_ids": (), "location_ids": ()}
+        knowledge, _ = fast.knowledge(db, project.id, actor_a.id, cues)
+        deterministic = fast.memories(db, project.id, actor_a.id, cues)
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project.id))
+        hybrid = fast.hybrid_memories(db, project.id, actor_a.id, cues, [1.0, 0.0], "owner-cfg", config)
+        assert knowledge_b.id not in [row["knowledge_id"] for row in knowledge]
+        assert memory_b.id not in [row["memory_id"] for row in deterministic]
+        assert memory_b.id not in [row["memory_id"] for row in hybrid]
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_cognition_rebuild_and_sync_share_project_lock():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="cognition-rebuild-sync"); db.add(project); db.flush()
+        actor = Character(project_id=project.id, name="Actor"); db.add(actor); db.flush()
+        scene = Scene(project_id=project.id, sequence=1, location="room", participants=[actor.id], history_status="ACTIVE")
+        db.add(scene); db.flush()
+        db.add(CharacterMemory(character_id=actor.id, content="scene memory", importance=.5, emotional_weight=0, confidence=1, source_scene=scene.id, distortion={}))
+        CognitionRetrievalProjectionService().rebuild(db, project.id); db.commit(); project_id, scene_id = project.id, scene.id
+    barrier = threading.Barrier(2); errors = []
+    def rebuild():
+        try:
+            with Session() as db:
+                barrier.wait(); CognitionRetrievalProjectionService().rebuild(db, project_id); db.commit()
+        except Exception as exc: errors.append(exc)
+    def sync():
+        try:
+            with Session() as db:
+                barrier.wait(); CognitionRetrievalProjectionService().sync_after_scene_commit(db, project_id, scene_id, 1); db.commit()
+        except Exception as exc: errors.append(exc)
+    threads = [threading.Thread(target=rebuild), threading.Thread(target=sync)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert not errors
+    with Session() as db:
+        assert CognitionRetrievalProjectionService().fast_path_available(db, project_id)
+        assert __import__("app.retrieval_index", fromlist=["CognitionRetrievalIndexAudit"]).CognitionRetrievalIndexAudit().audit(db, project_id)["valid"]
+        cleanup(db, project_id)
+    engine.dispose()
+
+
+def test_postgres_research_rebuild_and_sync_share_project_lock():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="research-rebuild-sync"); db.add(project); db.flush()
+        document = ResearchIngestionService().ingest(db, project.id, title="Notes", content="steam engine workshop").document
+        db.commit(); project_id, document_id = project.id, document.id
+    barrier = threading.Barrier(2); errors = []
+    def rebuild():
+        try:
+            with Session() as db:
+                barrier.wait(); ResearchLexicalIndexService().rebuild(db, project_id); db.commit()
+        except Exception as exc: errors.append(exc)
+    def sync():
+        try:
+            with Session() as db:
+                barrier.wait(); ResearchLexicalIndexService().sync_after_ingestion(db, project_id, document_id); db.commit()
+        except Exception as exc: errors.append(exc)
+    threads = [threading.Thread(target=rebuild), threading.Thread(target=sync)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert not errors
+    with Session() as db:
+        assert ResearchLexicalIndexService().fast_path_available(db, project_id)
+        assert __import__("app.retrieval_index", fromlist=["ResearchLexicalIndexAudit"]).ResearchLexicalIndexAudit().audit(db, project_id)["valid"]
+        cleanup(db, project_id)
     engine.dispose()
 
 

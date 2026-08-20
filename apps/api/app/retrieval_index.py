@@ -41,6 +41,16 @@ def _fingerprint(value: Any, protocol: str) -> str:
     return stable_fingerprint(value, protocol)
 
 
+def _acquire_cognition_index_lock(db: Session, project_id: str) -> None:
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"cognition-index:{project_id}"))))
+
+
+def _acquire_research_index_lock(db: Session, project_id: str) -> None:
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"research-index:{project_id}"))))
+
+
 class CognitionRetrievalProjectionService:
     """Builds current cognition search rows from immutable formal records."""
 
@@ -93,8 +103,7 @@ class CognitionRetrievalProjectionService:
         return sorted(rows)
 
     def rebuild(self, db: Session, project_id: str) -> ProjectCognitionRetrievalIndex:
-        if db.bind is not None and db.bind.dialect.name == "postgresql":
-            db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"cognition-index:{project_id}"))))
+        _acquire_cognition_index_lock(db, project_id)
         state = self._state(db, project_id)
         if state is None:
             state = ProjectCognitionRetrievalIndex(project_id=project_id, protocol_version=COGNITION_PROTOCOL, status=RetrievalIndexStatus.REBUILDING)
@@ -166,6 +175,7 @@ class CognitionRetrievalProjectionService:
         silently rebuilt during a scene commit, because that turns a normal
         O(new-scene) write into an unbounded history scan.
         """
+        _acquire_cognition_index_lock(db, project_id)
         state = self._state(db, project_id)
         if state is None and (sequence or 0) <= 1:
             # Cold start has no historical prefix to conceal, so a one-time
@@ -331,6 +341,7 @@ class CurrentCharacterCognitionFastRetriever:
             CharacterKnowledgeSearchIndex.project_id == project_id,
             CharacterKnowledgeSearchIndex.character_id == character_id,
             Character.project_id == project_id,
+            CharacterKnowledge.character_id == character_id,
             CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF]),
             ~self._hidden(project_id, character_id, "KNOWLEDGE", CharacterKnowledge.id),
         ).order_by(score.desc(), cue.desc(), count.desc(), latest.desc(), CharacterKnowledge.id).limit(32)
@@ -342,14 +353,18 @@ class CurrentCharacterCognitionFastRetriever:
         # those groups are hydrated. This never restricts conflict detection to
         # the recalled top 32.
         indexed = CharacterKnowledgeSearchIndex
-        eligible = select(indexed.subject_type, indexed.subject_id, indexed.predicate).join(CharacterKnowledge, CharacterKnowledge.id == indexed.knowledge_id).where(
+        eligible = select(indexed.subject_type, indexed.subject_id, indexed.predicate).join(CharacterKnowledge, CharacterKnowledge.id == indexed.knowledge_id).join(Character, Character.id == CharacterKnowledge.character_id).where(
             indexed.project_id == project_id, indexed.character_id == character_id,
+            CharacterKnowledge.character_id == character_id,
+            Character.project_id == project_id,
             indexed.subject_type.is_not(None), indexed.subject_id.is_not(None), indexed.predicate.is_not(None),
             CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF]),
             ~self._hidden(project_id, character_id, "KNOWLEDGE", CharacterKnowledge.id),
         ).group_by(indexed.subject_type, indexed.subject_id, indexed.predicate).having(func.count(func.distinct(indexed.value_fingerprint)) > 1).subquery()
-        conflict_rows = db.execute(select(indexed, CharacterKnowledge).join(CharacterKnowledge, CharacterKnowledge.id == indexed.knowledge_id).join(eligible, and_(eligible.c.subject_type == indexed.subject_type, eligible.c.subject_id == indexed.subject_id, eligible.c.predicate == indexed.predicate)).where(
+        conflict_rows = db.execute(select(indexed, CharacterKnowledge).join(CharacterKnowledge, CharacterKnowledge.id == indexed.knowledge_id).join(Character, Character.id == CharacterKnowledge.character_id).join(eligible, and_(eligible.c.subject_type == indexed.subject_type, eligible.c.subject_id == indexed.subject_id, eligible.c.predicate == indexed.predicate)).where(
             indexed.project_id == project_id, indexed.character_id == character_id,
+            CharacterKnowledge.character_id == character_id,
+            Character.project_id == project_id,
             CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF]),
             ~self._hidden(project_id, character_id, "KNOWLEDGE", CharacterKnowledge.id),
         ).order_by(indexed.subject_type, indexed.subject_id, indexed.predicate, CharacterKnowledge.id)).all()
@@ -385,6 +400,7 @@ class CurrentCharacterCognitionFastRetriever:
         ranked = select(CharacterMemory, memory_index.source_bucket, memory_index.source_sequence, cue, count, score, func.row_number().over(partition_by=memory_index.source_bucket, order_by=(score.desc(), cue.desc(), count.desc(), sequence.desc(), CharacterMemory.happened_at.nullsfirst(), CharacterMemory.id)).label("bucket_position")).join(Character, Character.id == CharacterMemory.character_id).join(memory_index, memory_index.memory_id == CharacterMemory.id).outerjoin(usage, and_(usage.project_id == project_id, usage.resource_type == CausalResourceType.CHARACTER_MEMORY.value, usage.resource_id == CharacterMemory.id)).where(
             memory_index.project_id == project_id, memory_index.character_id == character_id,
             Character.project_id == project_id,
+            CharacterMemory.character_id == character_id,
             ~self._hidden(project_id, character_id, "MEMORY", CharacterMemory.id),
         ).subquery()
         rows = db.execute(select(ranked).where(or_(ranked.c.cue >= 4, ranked.c.bucket_position <= 3)).order_by(ranked.c.score.desc(), ranked.c.cue.desc(), ranked.c.usage_count.desc(), ranked.c.source_sequence.desc(), ranked.c.happened_at.nullsfirst(), ranked.c.id).limit(12)).mappings().all()
@@ -418,9 +434,9 @@ class CurrentCharacterCognitionFastRetriever:
         score = (cue + 2 * func.greatest(0.0, memory_index.importance) + func.abs(memory_index.emotional_weight) + func.greatest(0.0, memory_index.confidence) + func.least(usage_count, 4) + recency)
         hidden = self._hidden(project_id, character_id, "MEMORY", CharacterMemory.id)
         order = (score.desc(), cue.desc(), usage_count.desc(), source_sequence.desc(), CharacterMemory.happened_at.nullsfirst(), CharacterMemory.id)
-        deterministic = select(CharacterMemory.id.label("memory_id"), score.label("score"), cue.label("cue"), usage_count.label("usage_count"), source_sequence.label("source_sequence"), memory_index.source_bucket.label("source_bucket"), func.row_number().over(order_by=order).label("det_rank"), func.row_number().over(partition_by=memory_index.source_bucket, order_by=order).label("bucket_position")).join(Character, Character.id == CharacterMemory.character_id).join(memory_index, memory_index.memory_id == CharacterMemory.id).outerjoin(usage, and_(usage.project_id == project_id, usage.resource_type == CausalResourceType.CHARACTER_MEMORY.value, usage.resource_id == CharacterMemory.id)).where(memory_index.project_id == project_id, memory_index.character_id == character_id, Character.project_id == project_id, ~hidden).subquery("deterministic_ranked")
+        deterministic = select(CharacterMemory.id.label("memory_id"), score.label("score"), cue.label("cue"), usage_count.label("usage_count"), source_sequence.label("source_sequence"), memory_index.source_bucket.label("source_bucket"), func.row_number().over(order_by=order).label("det_rank"), func.row_number().over(partition_by=memory_index.source_bucket, order_by=order).label("bucket_position")).join(Character, Character.id == CharacterMemory.character_id).join(memory_index, memory_index.memory_id == CharacterMemory.id).outerjoin(usage, and_(usage.project_id == project_id, usage.resource_type == CausalResourceType.CHARACTER_MEMORY.value, usage.resource_id == CharacterMemory.id)).where(memory_index.project_id == project_id, memory_index.character_id == character_id, Character.project_id == project_id, CharacterMemory.character_id == character_id, ~hidden).subquery("deterministic_ranked")
         distance = cast(CharacterMemoryEmbedding.embedding.op("<=>")(query_vector), Float)
-        semantic_ranked = select(CharacterMemoryEmbedding.memory_id.label("memory_id"), func.row_number().over(order_by=(distance.asc(), CharacterMemoryEmbedding.memory_id)).label("sem_rank")).join(CharacterMemorySearchIndex, and_(CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id, CharacterMemorySearchIndex.project_id == project_id, CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint)).join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id).join(Character, Character.id == CharacterMemory.character_id).where(CharacterMemoryEmbedding.project_id == project_id, CharacterMemoryEmbedding.character_id == character_id, Character.project_id == project_id, CharacterMemoryEmbedding.embedding_config_fingerprint == config_fingerprint, CharacterMemoryEmbedding.status == EmbeddingStatus.READY, CharacterMemoryEmbedding.dimension == len(query_vector), ~hidden, (literal(1.0) - distance) >= config.memory_semantic_min_similarity if config.memory_semantic_min_similarity is not None else literal(True)).subquery("semantic_ranked_all")
+        semantic_ranked = select(CharacterMemoryEmbedding.memory_id.label("memory_id"), func.row_number().over(order_by=(distance.asc(), CharacterMemoryEmbedding.memory_id)).label("sem_rank")).join(CharacterMemorySearchIndex, and_(CharacterMemorySearchIndex.memory_id == CharacterMemoryEmbedding.memory_id, CharacterMemorySearchIndex.project_id == project_id, CharacterMemorySearchIndex.content_fingerprint == CharacterMemoryEmbedding.content_fingerprint)).join(CharacterMemory, CharacterMemory.id == CharacterMemoryEmbedding.memory_id).join(Character, Character.id == CharacterMemory.character_id).where(CharacterMemoryEmbedding.project_id == project_id, CharacterMemoryEmbedding.character_id == character_id, CharacterMemorySearchIndex.character_id == character_id, Character.project_id == project_id, CharacterMemory.character_id == character_id, CharacterMemoryEmbedding.embedding_config_fingerprint == config_fingerprint, CharacterMemoryEmbedding.status == EmbeddingStatus.READY, CharacterMemoryEmbedding.dimension == len(query_vector), ~hidden, (literal(1.0) - distance) >= config.memory_semantic_min_similarity if config.memory_semantic_min_similarity is not None else literal(True)).subquery("semantic_ranked_all")
         semantic = select(semantic_ranked).where(semantic_ranked.c.sem_rank <= config.memory_vector_top_k).subquery("semantic_ranked")
         # semantic eligibility is intentionally a subset of deterministic
         # current eligibility, so every vector candidate already has a source
@@ -432,7 +448,7 @@ class CurrentCharacterCognitionFastRetriever:
         ids = [row["memory_id"] for row in rows]
         if not ids:
             return []
-        formal = {row.id: row for row in db.scalars(select(CharacterMemory).where(CharacterMemory.id.in_(ids))).all()}
+        formal = {row.id: row for row in db.scalars(select(CharacterMemory).join(Character, Character.id == CharacterMemory.character_id).where(CharacterMemory.id.in_(ids), CharacterMemory.character_id == character_id, Character.project_id == project_id)).all()}
         result = []
         for memory_id in ids:
             row = formal[memory_id]
@@ -457,8 +473,7 @@ class ResearchLexicalIndexService:
 
     def rebuild(self, db: Session, project_id: str) -> ResearchLexicalIndexState:
         from .research import KnowledgeTokenizer, ResearchCorpusFingerprintBuilder
-        if db.bind is not None and db.bind.dialect.name == "postgresql":
-            db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"research-index:{project_id}"))))
+        _acquire_research_index_lock(db, project_id)
         state = self._state(db, project_id)
         if state is None:
             state = ResearchLexicalIndexState(project_id=project_id, status=RetrievalIndexStatus.REBUILDING, protocol_version=RESEARCH_PROTOCOL)
@@ -490,6 +505,7 @@ class ResearchLexicalIndexService:
     def sync_after_ingestion(self, db: Session, project_id: str, document_id: str | None = None) -> None:
         """Replace one document's postings and update global stats in SQL."""
         from .research import KnowledgeTokenizer, ResearchCorpusFingerprintBuilder
+        _acquire_research_index_lock(db, project_id)
         state = self._state(db, project_id)
         if state is None or state.status != RetrievalIndexStatus.READY or not document_id:
             self.rebuild(db, project_id)

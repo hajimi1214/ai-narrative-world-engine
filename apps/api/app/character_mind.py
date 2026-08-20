@@ -347,10 +347,10 @@ class CharacterMindViewBuilder:
         legacy cognition reader.
         """
         try:
-            from .embeddings import CharacterSemanticCueBuilder, EmbeddingRouter, OpenAICompatibleEmbeddingProvider
+            from .embeddings import EmbeddingRouter, OpenAICompatibleEmbeddingProvider
             from .settings import get_settings
             route = EmbeddingRouter().resolve(session, project_id, get_settings())
-            query = CharacterSemanticCueBuilder().build(cues, character=character, scene=proposal)
+            query = self._semantic_query(session, project_id, character, proposal, cues, resolve_current_context=True)
             if not route.enabled or not query:
                 return deterministic
             provider = self.embedding_provider_factory(route) if self.embedding_provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
@@ -361,16 +361,34 @@ class CharacterMindViewBuilder:
         except Exception:
             return deterministic
 
+    def _semantic_query(self, session: Session, project_id: str, character: Character, proposal: SceneProposal, cues: dict[str, tuple[str, ...]], *, location: Any = None, participants: list[Any] | None = None, resolve_current_context: bool = False) -> str:
+        """Build the one Phase15A semantic-query contract for every path."""
+        from .embeddings import CharacterSemanticCueBuilder
+        if resolve_current_context and location is None and proposal.location_id:
+            location = session.get(WorldEntity, proposal.location_id)
+        if resolve_current_context and participants is None:
+            participants = session.scalars(select(Character).where(
+                Character.project_id == project_id,
+                Character.id.in_(proposal.participants or []),
+            ).order_by(Character.id)).all() if proposal.participants else []
+        return CharacterSemanticCueBuilder().build(
+            cues,
+            character=character,
+            scene=proposal,
+            location=location,
+            participants=participants,
+        )
+
     def _hybrid_memories(self, session: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]], records: list[CharacterMemory], entries: list[tuple], deterministic: list[dict[str, Any]], character: Any = None, scene: Any = None, location: Any = None, participants: list[Any] | None = None) -> list[dict[str, Any]]:
         """Optional derived ranking. Any embedding failure preserves Phase9 recall."""
         config = session.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
         if not config or not config.embedding_enabled or config.memory_retrieval_mode != MemoryRetrievalMode.HYBRID_RRF:
             return deterministic
         try:
-            from .embeddings import CharacterMemoryHybridRetriever, CharacterMemorySemanticRetriever, CharacterSemanticCueBuilder, EmbeddingRouter, OpenAICompatibleEmbeddingProvider
+            from .embeddings import CharacterMemoryHybridRetriever, CharacterMemorySemanticRetriever, EmbeddingRouter, OpenAICompatibleEmbeddingProvider
             from .settings import get_settings
             route = EmbeddingRouter().resolve(session, project_id, get_settings())
-            query = CharacterSemanticCueBuilder().build(cues, character=character, scene=scene, location=location, participants=participants)
+            query = self._semantic_query(session, project_id, character, scene, cues, location=location, participants=participants)
             if not route.enabled or not query:
                 return deterministic
             provider = self.embedding_provider_factory(route) if self.embedding_provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
