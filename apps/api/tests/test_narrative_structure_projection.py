@@ -1,14 +1,18 @@
 from datetime import datetime, timedelta
 from uuid import uuid4
 
+import json
+
 import pytest
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base
+from app.ai.fake import FakeModelProvider
 from app.models import (
-    Chapter, ChapterStructureStatus, NarrativeArc, NarrativeStructureProjectionStatus,
+    Chapter, ChapterQualityAssessment, ChapterStructureStatus, ChapterWriterDraft,
+    NarrativeArc, NarrativeStructureProjectionStatus,
     NarrativeStructureRevision, NarrativeStructureSceneFeature, Project,
     ProjectNarrativeStructureProjection, Scene,
 )
@@ -17,7 +21,9 @@ from app.narrative_structure import NarrativeStructureAudit
 from app.narrative_structure_projection import (
     NarrativeStructureProjectionAudit, NarrativeStructureProjectionService,
 )
+from app.quality import QualityGateService
 from app.scaling import ProjectHistoryProjectionService
+from app.writer import WriterProjectionService
 
 
 @pytest.fixture()
@@ -232,6 +238,26 @@ def test_history_suffix_rebuild_touching_sealed_structure_fails_closed(session):
     prefix = session.scalar(select(Chapter).where(
         Chapter.project_id == project.id, Chapter.active.is_(True), Chapter.end_sequence == 2,
     ))
+    writer_payload = json.dumps({
+        "chapter_title": "Sealed prefix", "prose": "The first boundary holds.",
+        "scene_coverage": list(prefix.source_scene_ids), "source_refs": [],
+        "pov_character_id": None,
+    })
+    draft = WriterProjectionService().render(
+        session, prefix.id, {"pov_mode": "OBJECTIVE"},
+        provider=FakeModelProvider(writer_payload), model="fixture-writer",
+    )
+    WriterProjectionService().adopt(session, draft.id)
+    assessment = QualityGateService().assess(
+        session, prefix.id, {"config": {"require_critic": False}},
+    )
+    QualityGateService().approve(session, assessment.id)
+    protected = {
+        "chapter_id": prefix.id,
+        "draft_id": draft.id,
+        "assessment_id": assessment.id,
+        "scene_ids": list(prefix.source_scene_ids),
+    }
     changed = session.scalar(select(Scene).where(Scene.project_id == project.id, Scene.sequence == 3))
     changed.location = "changed-location"; session.flush()
     service = NarrativeStructureProjectionService()
@@ -240,7 +266,13 @@ def test_history_suffix_rebuild_touching_sealed_structure_fails_closed(session):
     status = service.status(session, project.id)
     assert status["status"] == "DIRTY"
     assert status["dirty_reason"] == "HISTORY_REBUILD_TOUCHES_SEALED"
-    assert session.get(Chapter, prefix.id).active is True
+    current = session.get(Chapter, protected["chapter_id"])
+    assert current.active is True
+    assert current.source_scene_ids == protected["scene_ids"]
+    assert current.current_writer_draft_id == protected["draft_id"]
+    assert current.current_quality_assessment_id == protected["assessment_id"]
+    assert session.get(ChapterWriterDraft, protected["draft_id"]).chapter_id == current.id
+    assert session.get(ChapterQualityAssessment, protected["assessment_id"]).chapter_id == current.id
 
 
 def test_repeated_tail_append_matches_full_formation_at_each_boundary(session):
@@ -294,78 +326,89 @@ def test_repeated_tail_append_matches_full_formation_at_each_boundary(session):
         NarrativeStructureAudit().audit(session, project.id)
 
 
-@pytest.mark.parametrize("sealed_count", [10_000, 100_000])
-def test_open_tail_append_is_bounded_across_large_sealed_prefixes(session, sealed_count):
+def test_open_tail_append_is_bounded_across_large_sealed_prefixes(session):
     """A normal append may read its bounded open tail, never the sealed prefix."""
-    config_data = {
-        "chapter_min_scenes": 2, "chapter_target_scenes": 200_000,
-        "chapter_max_scenes": 200_000, "chapter_boundary_threshold": 999,
-    }
-    project = Project(name=f"D2 scale {sealed_count}", autonomy_settings={"narrative_structure": config_data})
-    session.add(project); session.flush()
-    revision = NarrativeStructureRevision(
-        project_id=project.id, active=True, protocol_version=2,
-        source_history_fingerprint="scale", source_max_sequence=sealed_count,
-        config=config_data, config_fingerprint="", rebuild_from_sequence=1,
-        structure_fingerprint="scale",
-    )
-    session.add(revision); session.flush()
-    from app.narrative_structure import NarrativeStructureConfig
-    from app.narrative_structure_projection import _config_fingerprint, _empty_accumulator
-    revision.config_fingerprint = _config_fingerprint(NarrativeStructureConfig.resolve(project))
-    projection = ProjectNarrativeStructureProjection(
-        project_id=project.id, protocol_version="narrative-structure-projection-v1",
-        status=NarrativeStructureProjectionStatus.READY,
-        config_fingerprint=revision.config_fingerprint,
-        source_feature_fingerprint="scale", feature_accumulator=_empty_accumulator(),
-        structure_fingerprint="scale", active_revision_id=revision.id,
-        built_through_sequence=sealed_count, sealed_through_sequence=sealed_count - 1,
-        tail_start_sequence=sealed_count,
-    )
-    session.add(projection)
-    prefix_rows = [{
-        "id": str(uuid4()), "project_id": project.id, "number": number,
-        "source_scene_ids": [], "word_count": 0, "quality_report": {}, "status": "DRAFT",
-        "structure_revision_id": revision.id, "active": True, "structure_status": "SEALED",
-        "start_sequence": number, "end_sequence": number,
-        "boundary_metadata": {},
-    } for number in range(1, sealed_count)]
-    session.execute(Chapter.__table__.insert(), prefix_rows)
-    prior = make_scene(session, project, sealed_count)
-    session.add(NarrativeStructureSceneFeature(
-        project_id=project.id, scene_id=prior.id, sequence=sealed_count, active=True,
-        world_time=None, location_id=prior.location, participant_ids=[], thread_ids=[],
-        primary_thread_id=None, proposal_type=None, state_change_count=0,
-        state_change_targets=[], state_change_paths=[], thread_state_event_ids=[],
-        checkpoint_fingerprint=None, source_fingerprint="scale", feature_fingerprint="scale-tail",
-    ))
-    open_chapter = Chapter(
-        project_id=project.id, number=sealed_count, source_scene_ids=[prior.id],
-        word_count=0, quality_report={}, status="DRAFT", structure_revision_id=revision.id,
-        active=True, structure_status=ChapterStructureStatus.PROVISIONAL,
-        start_sequence=sealed_count, end_sequence=sealed_count,
-        structure_fingerprint="open", boundary_metadata={},
-    )
-    session.add(open_chapter); session.flush()
-    first_sealed_id = session.scalar(select(Chapter.id).where(
-        Chapter.project_id == project.id, Chapter.number == 1,
-    ))
-    new_scene = make_scene(session, project, sealed_count + 1)
-    queries: list[str] = []
 
-    def capture(_conn, _cursor, statement, _params, _context, _executemany):
-        queries.append(statement)
-
-    event.listen(session.bind, "before_cursor_execute", capture)
-    try:
-        changed = NarrativeStructureProjectionService().prepare_for_scene_checkpoint(
-            session, project.id, new_scene, [],
+    def append_counts(sealed_count):
+        config_data = {
+            "chapter_min_scenes": 2, "chapter_target_scenes": 200_000,
+            "chapter_max_scenes": 200_000, "chapter_boundary_threshold": 999,
+        }
+        project = Project(name=f"D2 scale {sealed_count}", autonomy_settings={"narrative_structure": config_data})
+        session.add(project); session.flush()
+        revision = NarrativeStructureRevision(
+            project_id=project.id, active=True, protocol_version=2,
+            source_history_fingerprint="scale", source_max_sequence=sealed_count,
+            config=config_data, config_fingerprint="", rebuild_from_sequence=1,
+            structure_fingerprint="scale",
         )
-    finally:
-        event.remove(session.bind, "before_cursor_execute", capture)
-    assert changed == [open_chapter.id]
-    assert session.scalar(select(Chapter.id).where(Chapter.id == first_sealed_id)) == first_sealed_id
-    assert open_chapter.source_scene_ids == [prior.id, new_scene.id]
-    assert len(queries) < 40
-    hydrated_chapters = [row for row in session.identity_map.values() if isinstance(row, Chapter)]
-    assert len(hydrated_chapters) <= 3
+        session.add(revision); session.flush()
+        from app.narrative_structure import NarrativeStructureConfig
+        from app.narrative_structure_projection import _config_fingerprint, _empty_accumulator
+        revision.config_fingerprint = _config_fingerprint(NarrativeStructureConfig.resolve(project))
+        projection = ProjectNarrativeStructureProjection(
+            project_id=project.id, protocol_version="narrative-structure-projection-v1",
+            status=NarrativeStructureProjectionStatus.READY,
+            config_fingerprint=revision.config_fingerprint,
+            source_feature_fingerprint="scale", feature_accumulator=_empty_accumulator(),
+            structure_fingerprint="scale", active_revision_id=revision.id,
+            built_through_sequence=sealed_count, sealed_through_sequence=sealed_count - 1,
+            tail_start_sequence=sealed_count,
+        )
+        session.add(projection)
+        prefix_rows = [{
+            "id": str(uuid4()), "project_id": project.id, "number": number,
+            "source_scene_ids": [], "word_count": 0, "quality_report": {}, "status": "DRAFT",
+            "structure_revision_id": revision.id, "active": True, "structure_status": "SEALED",
+            "start_sequence": number, "end_sequence": number,
+            "boundary_metadata": {},
+        } for number in range(1, sealed_count)]
+        session.execute(Chapter.__table__.insert(), prefix_rows)
+        prior = make_scene(session, project, sealed_count)
+        session.add(NarrativeStructureSceneFeature(
+            project_id=project.id, scene_id=prior.id, sequence=sealed_count, active=True,
+            world_time=None, location_id=prior.location, participant_ids=[], thread_ids=[],
+            primary_thread_id=None, proposal_type=None, state_change_count=0,
+            state_change_targets=[], state_change_paths=[], thread_state_event_ids=[],
+            checkpoint_fingerprint=None, source_fingerprint="scale", feature_fingerprint="scale-tail",
+        ))
+        open_chapter = Chapter(
+            project_id=project.id, number=sealed_count, source_scene_ids=[prior.id],
+            word_count=0, quality_report={}, status="DRAFT", structure_revision_id=revision.id,
+            active=True, structure_status=ChapterStructureStatus.PROVISIONAL,
+            start_sequence=sealed_count, end_sequence=sealed_count,
+            structure_fingerprint="open", boundary_metadata={},
+        )
+        session.add(open_chapter); session.flush()
+        first_sealed_id = session.scalar(select(Chapter.id).where(
+            Chapter.project_id == project.id, Chapter.number == 1,
+        ))
+        new_scene = make_scene(session, project, sealed_count + 1)
+        queries: list[str] = []
+
+        def capture(_conn, _cursor, statement, _params, _context, _executemany):
+            queries.append(statement)
+
+        event.listen(session.bind, "before_cursor_execute", capture)
+        try:
+            changed = NarrativeStructureProjectionService().prepare_for_scene_checkpoint(
+                session, project.id, new_scene, [],
+            )
+        finally:
+            event.remove(session.bind, "before_cursor_execute", capture)
+        assert changed == [open_chapter.id]
+        assert session.scalar(select(Chapter.id).where(Chapter.id == first_sealed_id)) == first_sealed_id
+        assert open_chapter.source_scene_ids == [prior.id, new_scene.id]
+        hydrated_chapters = [
+            row for row in session.identity_map.values()
+            if isinstance(row, Chapter) and row.project_id == project.id
+        ]
+        return len(queries), len(hydrated_chapters)
+
+    small_queries, small_hydrated = append_counts(10_000)
+    large_queries, large_hydrated = append_counts(100_000)
+    # The two fixtures differ only in sealed-prefix cardinality. Normal tail
+    # work must therefore stay identical rather than merely below a broad cap.
+    assert (small_queries, small_hydrated) == (large_queries, large_hydrated)
+    assert small_queries <= 30
+    assert small_hydrated <= 3

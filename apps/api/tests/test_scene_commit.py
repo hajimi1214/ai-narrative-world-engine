@@ -709,8 +709,22 @@ def test_two_performances_commit_to_distinct_active_scene_sequences(session, mon
     session.commit()
     assert proposal2.context_fingerprint == performance2.proposal_context_fingerprint
     assert proposal2.context_fingerprint == DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    # The first commit deliberately performs the one-time D1 identity
+    # transition.  A steady-state Scene 2 must instead use the incremental
+    # identity and compact delta paths, even while D2 advances its open tail.
+    from app.versioning import WorldSnapshotBuilder
+    build_calls = 0
+    original_build = WorldSnapshotBuilder.build
+
+    def count_full_snapshot(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(WorldSnapshotBuilder, "build", count_full_snapshot)
     second = client.post(f"/projects/{project.id}/performances/{performance2.id}/commit-scene")
     assert second.status_code == 200, second.text
+    assert build_calls == 0
     active = session.scalars(select(Scene).where(
         Scene.project_id == project.id, Scene.history_status == "ACTIVE"
     ).order_by(Scene.sequence)).all()

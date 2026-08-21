@@ -12,6 +12,8 @@ from app.narrative_structure_projection import (
     NarrativeStructureProjectionAudit, NarrativeStructureProjectionService,
 )
 from app.scaling import ProjectHistoryProjectionService
+from app.scene_commit import SceneCommitService
+from test_scene_commit import prepared_commit
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -118,5 +120,47 @@ def test_postgres_structure_append_and_rebuild_are_serialized():
             NarrativeStructureSceneFeature.active.is_(True),
         ).order_by(NarrativeStructureSceneFeature.sequence)).all()
         assert [row.sequence for row in rows] == [1, 2, 3, 4]
+        NarrativeStructureProjectionAudit().audit(db, project_id)
+        NarrativeStructureAudit().audit(db, project_id)
+
+
+def test_postgres_real_scene_commit_append_and_rebuild_are_serialized(monkeypatch):
+    """The normal SceneCommit path and explicit D2 rebuild share Project locking."""
+    Session = _session()
+    with Session() as db:
+        project, _location, _actor, _other, _proposal, performance, *_ = prepared_commit(db, monkeypatch)
+        project_id, performance_id = project.id, performance.id
+        db.commit()
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def commit_worker():
+        try:
+            with Session() as db:
+                barrier.wait(timeout=10)
+                SceneCommitService().commit(db, project_id, performance_id)
+                db.commit()
+        except Exception as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    def rebuild_worker():
+        try:
+            with Session() as db:
+                barrier.wait(timeout=10)
+                NarrativeStructureProjectionService().rebuild(db, project_id)
+                db.commit()
+        except Exception as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=commit_worker), threading.Thread(target=rebuild_worker)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not errors
+    with Session() as db:
+        assert db.scalar(select(Scene.id).where(
+            Scene.project_id == project_id, Scene.history_status == "ACTIVE",
+        ))
         NarrativeStructureProjectionAudit().audit(db, project_id)
         NarrativeStructureAudit().audit(db, project_id)
