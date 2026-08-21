@@ -14,6 +14,7 @@ from app.causal_ledger import (
     explicit_knowledge_id, explicit_memory_id, read_overlay_path,
     resolve_explicit_knowledge_reference, resolve_explicit_memory_reference,
 )
+from app.scene_commit import SceneCommitService
 from app.db import Base
 from app.main import app
 from app.models import (
@@ -108,6 +109,18 @@ def test_normal_commit_materializes_scene_and_state_events(session, monkeypatch)
     assert state.target_id == location.id and state.path == "/profile/opened"
     assert state.before_value is False and state.after_value is True
     assert state.structured_payload["state_delta_item_id"]
+
+
+def test_normal_scene_commit_does_not_rescan_historical_retcon_lineage(session, monkeypatch):
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, _client = _commit(session, monkeypatch)
+
+    def historical_retcon_scan(*_args, **_kwargs):
+        raise AssertionError("NORMAL_APPEND_RESCANNED_RETCON_HISTORY")
+
+    monkeypatch.setattr(CausalLedgerService, "index_retcon_and_replay", historical_retcon_scan)
+    result = SceneCommitService().commit(session, project.id, performance.id)
+    assert result.scene.history_status == "ACTIVE"
+    assert result.commit.status.value == "COMMITTED"
 
 
 def test_state_change_has_resolution_item_and_scene_provenance(session, monkeypatch):

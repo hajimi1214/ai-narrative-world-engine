@@ -213,7 +213,10 @@ class CausalLedgerService:
         if _value(commit.status) != SceneCommitStatus.COMMITTED.value or not commit.scene_id:
             raise ValueError("CAUSAL_LEDGER_SCENE_COMMIT_INVALID")
         self.index_scene(db, commit.project_id, commit.scene_id, verify_current_formal_state=True)
-        self.index_retcon_and_replay(db, commit.project_id)
+        # A normal Scene cannot complete a Retcon or Replay.  Their lineage
+        # is indexed by ``sync_after_replay_commit`` and explicit backfill;
+        # rescanning every completed application here made every append grow
+        # with unrelated historical Retcons.
         # Normal append has exactly one new temporal adjacency.  Rebuilding
         # all current history here was an O(total-scenes) Phase 8 carry-over.
         self.sync_temporal_append(db, commit.project_id, commit.scene_id)
