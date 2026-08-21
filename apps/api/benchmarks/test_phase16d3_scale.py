@@ -36,7 +36,14 @@ from app.models import (
 from app.narrative_structure_projection import NarrativeStructureProjectionService
 from app.scaling import ProjectHistoryProjectionService
 
-from benchmarks.phase16d3_runner import measure, report_json, scene_sequence_is_continuous
+from benchmarks.phase16d3_runner import (
+    D3_FALLBACK_EVIDENCE_KEYS,
+    D3_ROUTE_EVIDENCE_KEYS,
+    measure,
+    report_json,
+    route_evidence_report,
+    scene_sequence_is_continuous,
+)
 
 
 @pytest.fixture()
@@ -133,6 +140,13 @@ def test_phase16d3_smoke_emits_metrics_and_sequence_proof(benchmark_session, cap
     assert metrics.route == "CURRENT_HEAD_BOUNDED_READ"
     print(report_json([metrics]))
     assert capsys.readouterr().out
+
+
+def test_phase16d3_route_report_is_fail_closed():
+    report = route_evidence_report({"COGNITION_FAST": {"status": "proven"}})
+    assert report["fast_path"]["COGNITION_FAST"]["status"] == "proven"
+    assert all(report["fast_path"][key]["status"] == "pending" for key in D3_ROUTE_EVIDENCE_KEYS if key != "COGNITION_FAST")
+    assert all(report["fallback"][key]["status"] == "pending" for key in D3_FALLBACK_EVIDENCE_KEYS)
 
 
 @pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in million-word/10k-100k benchmark")

@@ -18,6 +18,27 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 
+# Names used by the D3 evidence report.  A route is only considered proven
+# when a test records the concrete implementation/fallback that executed;
+# this list is a report contract, not fabricated runtime state.
+D3_ROUTE_EVIDENCE_KEYS = (
+    "FORMAL_STATE_FAST",
+    "COMPACT_HEAD_FAST",
+    "COGNITION_FAST",
+    "HYBRID_FAST",
+    "RESEARCH_INDEXED_FAST",
+    "NARRATIVE_STRUCTURE_INCREMENTAL",
+    "CURRENT_LEDGER_INCREMENTAL",
+)
+D3_FALLBACK_EVIDENCE_KEYS = (
+    "INDEX_DIRTY",
+    "PROJECTION_STALE",
+    "BASELINE_CHANGED",
+    "FORMAL_STATE_NOT_READY",
+    "RETRIEVAL_INDEX_NOT_READY",
+)
+
+
 @dataclass
 class BenchmarkMetrics:
     name: str
@@ -124,3 +145,21 @@ def scene_sequence_is_continuous(sequences: list[int]) -> bool:
 def report_json(metrics: list[BenchmarkMetrics]) -> str:
     """Stable machine-readable output for CI/artifact upload."""
     return json.dumps([item.as_dict() for item in metrics], ensure_ascii=False, sort_keys=True, indent=2)
+
+
+def route_evidence_report(routes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Normalize concrete route observations for the final D3 report.
+
+    Missing keys remain explicit ``pending`` entries.  This prevents a partial
+    benchmark run from silently claiming that every fast path was exercised.
+    """
+    return {
+        "fast_path": {
+            key: routes.get(key, {"status": "pending"})
+            for key in D3_ROUTE_EVIDENCE_KEYS
+        },
+        "fallback": {
+            key: routes.get(key, {"status": "pending"})
+            for key in D3_FALLBACK_EVIDENCE_KEYS
+        },
+    }
