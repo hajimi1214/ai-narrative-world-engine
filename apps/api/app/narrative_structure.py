@@ -294,6 +294,52 @@ class NarrativeStructureService:
         "NARRATIVE_STRUCTURE_VOLUME_COVERAGE_INVALID",
     }
 
+    @staticmethod
+    def _sealed_rebuild_conflict(
+        old_chapters: list[Chapter],
+        old_arcs: list[NarrativeArc],
+        old_volumes: list[NarrativeVolume],
+        preview: dict[str, Any],
+        *,
+        semantic_rebuild: bool,
+    ) -> bool:
+        """Whether this full formation would replace a protected structure row.
+
+        A v2 normal append updates only the open tail.  This guard applies to
+        the deliberately O(N) fallback path, whose old implementation would
+        supersede every Arc and Volume.  Matching sealed Chapters can remain
+        in place; a corruption-forced rebuild cannot safely assume that.
+        """
+        sealed_chapters = [row for row in old_chapters if _value(row.structure_status) == "SEALED"]
+        if not semantic_rebuild:
+            # A matching formal source with a damaged derived binding is an
+            # integrity repair, not a history rewrite. Existing repair
+            # semantics remain allowed to restore that exact same structure.
+            return False
+        plans = {item["number"]: item for item in preview["chapters"]}
+        for chapter in sealed_chapters:
+            plan = plans.get(chapter.number)
+            if not plan or plan["status"] != "SEALED":
+                return True
+            if chapter.source_scene_ids != plan["scene_ids"] or chapter.structure_fingerprint != plan["structure_fingerprint"]:
+                return True
+        # The current full formation writer can reuse matching Chapter rows,
+        # but it intentionally creates fresh Arc/Volume rows.  A semantic
+        # rebuild that reaches a sealed Arc or Volume therefore cannot
+        # preserve its identity and must stop before changing any bindings.
+        if any(_value(row.status) == "SEALED" for row in old_arcs) or any(
+            _value(row.status) == "SEALED" for row in old_volumes
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _mark_sealed_rebuild_dirty(db: Session, project_id: str) -> None:
+        from .narrative_structure_projection import NarrativeStructureProjectionService
+        NarrativeStructureProjectionService().mark_dirty(
+            db, project_id, 1, "FULL_REBUILD_TOUCHES_SEALED",
+        )
+
     def preview(self, db: Session, project_id: str, config_data: dict[str, Any] | None = None) -> dict[str, Any]:
         project = db.get(Project, project_id)
         if not project: raise LookupError("PROJECT_NOT_FOUND")
@@ -355,6 +401,15 @@ class NarrativeStructureService:
         old_chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True)).order_by(Chapter.number)).all()
         old_arcs = db.scalars(select(NarrativeArc).where(NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True)).order_by(NarrativeArc.number)).all()
         old_volumes = db.scalars(select(NarrativeVolume).where(NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True)).order_by(NarrativeVolume.number)).all()
+        semantic_rebuild = bool(current and (
+            current.source_history_fingerprint != preview["source_fingerprint"]
+            or current.config_fingerprint != preview["config_fingerprint"]
+        ))
+        if self._sealed_rebuild_conflict(
+            old_chapters, old_arcs, old_volumes, preview, semantic_rebuild=semantic_rebuild,
+        ):
+            self._mark_sealed_rebuild_dirty(db, project_id)
+            raise ValueError("NARRATIVE_STRUCTURE_REBUILD_TOUCHES_SEALED")
         keep: dict[int, Chapter] = {}
         first_divergent_number = 1
         if not force_rebuild:

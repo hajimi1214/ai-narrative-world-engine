@@ -12,9 +12,9 @@ from app.db import Base
 from app.ai.fake import FakeModelProvider
 from app.models import (
     Chapter, ChapterQualityAssessment, ChapterStructureStatus, ChapterWriterDraft,
-    NarrativeArc, NarrativeStructureProjectionStatus,
+    NarrativeArc, NarrativeArcStatus, NarrativeStructureProjectionStatus,
     NarrativeStructureRevision, NarrativeStructureSceneFeature, Project,
-    ProjectNarrativeStructureProjection, Scene,
+    ProjectNarrativeStructureProjection, NarrativeVolume, NarrativeVolumeStatus, Scene,
 )
 from app.narrative_structure import NarrativeStructureService
 from app.narrative_structure import NarrativeStructureAudit
@@ -273,6 +273,78 @@ def test_history_suffix_rebuild_touching_sealed_structure_fails_closed(session):
     assert current.current_quality_assessment_id == protected["assessment_id"]
     assert session.get(ChapterWriterDraft, protected["draft_id"]).chapter_id == current.id
     assert session.get(ChapterQualityAssessment, protected["assessment_id"]).chapter_id == current.id
+
+
+def test_full_sync_history_change_never_replaces_sealed_hierarchy(session):
+    """The public full-sync fallback must not detach sealed formal bindings."""
+    project = Project(name="D2 sealed full sync", autonomy_settings={"narrative_structure": {
+        "chapter_min_scenes": 1, "chapter_target_scenes": 2, "chapter_max_scenes": 3,
+        "chapter_boundary_threshold": 1, "arc_min_chapters": 2, "arc_max_chapters": 4,
+        "arc_boundary_threshold": 99, "volume_min_arcs": 2, "volume_max_arcs": 3,
+        "volume_boundary_threshold": 0,
+    }})
+    session.add(project); session.flush()
+    for sequence, thread in enumerate(("thread-a", "thread-a", "thread-b"), 1):
+        make_scene(session, project, sequence, location="location", thread=thread)
+    NarrativeStructureService().sync(session, project.id)
+    chapter = session.scalar(select(Chapter).where(
+        Chapter.project_id == project.id, Chapter.active.is_(True),
+        Chapter.structure_status == ChapterStructureStatus.SEALED,
+    ).order_by(Chapter.number))
+    arc = session.scalar(select(NarrativeArc).where(
+        NarrativeArc.project_id == project.id, NarrativeArc.active.is_(True),
+    ).order_by(NarrativeArc.number))
+    volume = session.scalar(select(NarrativeVolume).where(
+        NarrativeVolume.project_id == project.id, NarrativeVolume.active.is_(True),
+    ).order_by(NarrativeVolume.number))
+    protected = (chapter.id, list(chapter.source_scene_ids), arc.id, volume.id)
+    changed = session.scalar(select(Scene).where(Scene.project_id == project.id, Scene.sequence == 2))
+    changed.story_threads = ["thread-b"]; session.flush()
+    NarrativeStructureProjectionService().sync_after_history_change(
+        session, project.id, 2, "REPLAY_HISTORY_CHANGED",
+    )
+    with pytest.raises(ValueError, match="NARRATIVE_STRUCTURE_REBUILD_TOUCHES_SEALED"):
+        NarrativeStructureService().sync(session, project.id)
+    assert session.get(Chapter, protected[0]).active is True
+    assert session.get(Chapter, protected[0]).source_scene_ids == protected[1]
+    assert session.get(NarrativeArc, protected[2]).active is True
+    assert session.get(NarrativeVolume, protected[3]).active is True
+    status = NarrativeStructureProjectionService().status(session, project.id)
+    assert status["status"] == "DIRTY"
+    assert status["dirty_reason"] == "FULL_REBUILD_TOUCHES_SEALED"
+
+
+def test_full_sync_config_change_never_replaces_sealed_arc_or_volume(session):
+    project = Project(name="D2 sealed config", autonomy_settings={"narrative_structure": {
+        "chapter_min_scenes": 1, "chapter_target_scenes": 1, "chapter_max_scenes": 1,
+        "chapter_boundary_threshold": 0, "arc_min_chapters": 1, "arc_max_chapters": 1,
+        "arc_boundary_threshold": 0, "volume_min_arcs": 1, "volume_max_arcs": 1,
+        "volume_boundary_threshold": 0,
+    }})
+    session.add(project); session.flush()
+    for sequence in range(1, 4):
+        make_scene(session, project, sequence, location=f"location-{sequence}", thread=f"thread-{sequence}")
+    NarrativeStructureService().sync(session, project.id)
+    arc = session.scalar(select(NarrativeArc).where(
+        NarrativeArc.project_id == project.id, NarrativeArc.active.is_(True),
+        NarrativeArc.status == NarrativeArcStatus.SEALED,
+    ).order_by(NarrativeArc.number))
+    volume = session.scalar(select(NarrativeVolume).where(
+        NarrativeVolume.project_id == project.id, NarrativeVolume.active.is_(True),
+        NarrativeVolume.status == NarrativeVolumeStatus.SEALED,
+    ).order_by(NarrativeVolume.number))
+    with pytest.raises(ValueError, match="NARRATIVE_STRUCTURE_REBUILD_TOUCHES_SEALED"):
+        NarrativeStructureService().sync(session, project.id, {
+            "chapter_min_scenes": 1, "chapter_target_scenes": 1, "chapter_max_scenes": 1,
+            "chapter_boundary_threshold": 0, "arc_min_chapters": 1, "arc_max_chapters": 2,
+            "arc_boundary_threshold": 0, "volume_min_arcs": 1, "volume_max_arcs": 1,
+            "volume_boundary_threshold": 0,
+        })
+    assert session.get(NarrativeArc, arc.id).active is True
+    assert session.get(NarrativeVolume, volume.id).active is True
+    status = NarrativeStructureProjectionService().status(session, project.id)
+    assert status["status"] == "DIRTY"
+    assert status["dirty_reason"] == "FULL_REBUILD_TOUCHES_SEALED"
 
 
 def test_repeated_tail_append_matches_full_formation_at_each_boundary(session):

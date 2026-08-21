@@ -14,13 +14,14 @@ from app.db import Base
 from app.director import DirectorContextBuilder
 from app.main import app
 from app.models import (
-    ActionVisibility, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType,
+    ActionVisibility, Chapter, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType,
     Character, CharacterKnowledge, CharacterMemory, EntityType, ExecutionStage, ExecutionStatus, ExecutionTrace,
     PerformanceMode, PerformanceStatus, ProposalStatus, ResolutionOutcome, ResolutionStatus,
     ResolverMode, Scene, SceneCommit, SceneExecutionBinding, ScenePerformance,
     RetconImpactItem, ScenePerformanceTurn, SceneStateCheckpoint, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem,
-    StoryThread, ThreadStatus, WorldEntity, WorldResolution, WorldSnapshot,
+    FormalStateLeaf, StoryThread, ThreadStatus, WorldEntity, WorldResolution, WorldSnapshot,
 )
+from app.formal_state import FormalStateIdentityAudit, FormalStateIdentityService
 from app.scene_commit import SceneCommitService
 from app.narrative_structure import NarrativeStructureAudit
 from app.narrative_structure_projection import NarrativeStructureProjectionService
@@ -205,6 +206,26 @@ def test_structure_tail_failure_marks_dirty_without_rolling_back_scene(session, 
     status = NarrativeStructureProjectionService().status(session, project.id)
     assert status["status"] == "DIRTY"
     assert status["dirty_reason"].startswith("TAIL_PREPARE_FAILED:")
+
+
+def test_normal_scene_commit_includes_structure_chapter_in_formal_identity(session, monkeypatch):
+    """D2's bounded Chapter write is part of the exact D1 manifest."""
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    response = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
+    assert response.status_code == 200, response.text
+    session.expire_all()
+    chapter = session.scalar(select(Chapter).where(
+        Chapter.project_id == project.id, Chapter.active.is_(True),
+    ))
+    assert chapter is not None
+    leaf = session.scalar(select(FormalStateLeaf).where(
+        FormalStateLeaf.project_id == project.id,
+        FormalStateLeaf.collection_name == "chapters",
+        FormalStateLeaf.resource_id == chapter.id,
+    ))
+    assert leaf is not None
+    assert FormalStateIdentityService().status(session, project.id)["status"] == "READY"
+    FormalStateIdentityAudit().audit(session, project.id)
 
 
 def test_zero_item_validated_resolution_still_commits(session, monkeypatch):
