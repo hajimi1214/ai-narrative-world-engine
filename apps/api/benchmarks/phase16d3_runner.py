@@ -147,6 +147,21 @@ def report_json(metrics: list[BenchmarkMetrics]) -> str:
     return json.dumps([item.as_dict() for item in metrics], ensure_ascii=False, sort_keys=True, indent=2)
 
 
+def certification_report(
+    *,
+    metrics: list[BenchmarkMetrics],
+    route_evidence: dict[str, dict[str, Any]] | None = None,
+    checks: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the D3 report without filling unexecuted checks with PASS."""
+    return {
+        "metrics": [item.as_dict() for item in metrics],
+        "route_evidence": route_evidence_report(route_evidence or {}),
+        "checks": checks or {},
+        "acceptance": "PENDING",
+    }
+
+
 def route_evidence_report(routes: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Normalize concrete route observations for the final D3 report.
 

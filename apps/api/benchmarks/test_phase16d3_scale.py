@@ -14,6 +14,8 @@ the current head and projection status.
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -35,10 +37,12 @@ from app.models import (
 )
 from app.narrative_structure_projection import NarrativeStructureProjectionService
 from app.scaling import ProjectHistoryProjectionService
+from app.scene_commit import SceneCommitService
 
 from benchmarks.phase16d3_runner import (
     D3_FALLBACK_EVIDENCE_KEYS,
     D3_ROUTE_EVIDENCE_KEYS,
+    certification_report,
     measure,
     report_json,
     route_evidence_report,
@@ -167,6 +171,9 @@ def test_phase16d3_route_report_is_fail_closed():
     assert report["fast_path"]["COGNITION_FAST"]["status"] == "proven"
     assert all(report["fast_path"][key]["status"] == "pending" for key in D3_ROUTE_EVIDENCE_KEYS if key != "COGNITION_FAST")
     assert all(report["fallback"][key]["status"] == "pending" for key in D3_FALLBACK_EVIDENCE_KEYS)
+    final = certification_report(metrics=[], route_evidence={"COGNITION_FAST": {"status": "proven"}})
+    assert final["acceptance"] == "PENDING"
+    assert final["route_evidence"]["fast_path"]["COGNITION_FAST"]["status"] == "proven"
 
 
 def test_phase16d3_real_incremental_append_boundary_is_bounded(benchmark_session):
@@ -192,6 +199,42 @@ def test_phase16d3_real_incremental_append_boundary_is_bounded(benchmark_session
     )
     assert metrics.sql_query_count < 80
     assert metrics.orm_object_hydration_count < 40
+
+
+def test_phase16d3_scene_commit_full_chain_is_measured(benchmark_session, monkeypatch):
+    """Measure the real SceneCommit boundary, not a synthetic row insert."""
+    tests_path = str(Path(__file__).resolve().parents[1] / "tests")
+    if tests_path not in sys.path:
+        sys.path.insert(0, tests_path)
+    from tests.test_scene_commit import prepared_commit
+
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, _client = prepared_commit(
+        benchmark_session, monkeypatch, requires_resolution=False,
+    )
+    metrics_holder: dict[str, object] = {}
+
+    def operation():
+        result = SceneCommitService().commit(benchmark_session, project.id, performance.id)
+        benchmark_session.flush()
+        metrics_holder["scene_id"] = result.scene.id
+        metrics_holder["checkpoint_id"] = result.checkpoint.id
+        metrics_holder["commit_id"] = result.commit.id
+
+    metrics = measure(
+        benchmark_session,
+        name="scene_commit_full_chain",
+        scale=1,
+        operation=operation,
+        route="FORMAL_SCENE_COMMIT",
+        projection_status="READY_OR_DIRTY",
+        scene_sequence_continuous=True,
+        details={"state_delta": True, "checkpoint": True, "causal_ledger": True},
+    )
+    assert metrics_holder["scene_id"]
+    assert metrics_holder["checkpoint_id"]
+    assert metrics_holder["commit_id"]
+    assert metrics.sql_query_count > 0
+    assert metrics.orm_object_hydration_count >= 0
 
 
 @pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in million-word/10k-100k benchmark")
