@@ -21,7 +21,8 @@ from .models import (
     NarrativeArcChapterBinding, NarrativeArcStatus, NarrativeStructureProjectionStatus,
     NarrativeStructureRevision, NarrativeStructureSceneFeature, NarrativeVolume,
     NarrativeVolumeArcBinding, NarrativeVolumeStatus, Project,
-    ProjectNarrativeStructureProjection, Scene,
+    ProjectNarrativeStructureProjection, Scene, SceneExecutionBinding,
+    ScenePerformance, SceneProposal,
 )
 from .narrative_structure import (
     ChapterBoundaryScorer, ChapterFormationEngine, NarrativeArcFormationEngine, NarrativeSceneFeatureBuilder,
@@ -116,6 +117,74 @@ class NarrativeStructureProjectionService:
         db.add(projection); db.flush()
         return projection
 
+    @staticmethod
+    def _provisional_source(db: Session, scene: Scene, items: list[Any]) -> dict[str, Any]:
+        """Build the one-scene structure input available before its ledger exists.
+
+        Boundary formation consumes only the state-change shape, not Timeline
+        IDs or checkpoint fingerprints.  ``sync_after_scene_commit`` replaces
+        this row with the canonical frozen source after the ledger is written.
+        """
+        binding = db.scalar(select(SceneExecutionBinding).where(
+            SceneExecutionBinding.project_id == scene.project_id,
+            SceneExecutionBinding.scene_id == scene.id,
+            SceneExecutionBinding.active.is_(True),
+        ))
+        performance = db.get(ScenePerformance, binding.performance_id) if binding else None
+        proposal = db.get(SceneProposal, performance.scene_proposal_id) if performance else None
+        events = [{
+            "id": f"pending:{item.id}", "event_type": "STATE_CHANGE",
+            "event_fingerprint": item.semantic_fingerprint,
+            "target_type": _value(item.target_type), "target_id": item.target_id,
+            "path": item.path, "sequence": scene.sequence, "ordinal": item.ordinal,
+        } for item in sorted(items, key=lambda row: (row.ordinal, row.id))]
+        return {
+            "scene_id": scene.id, "sequence": scene.sequence,
+            "world_time": scene.world_time.isoformat() if scene.world_time else None,
+            "location_id": scene.location, "participant_ids": sorted(set(scene.participants or [])),
+            "thread_ids": sorted(set(scene.story_threads or [])), "status": _value(scene.status),
+            "history_status": scene.history_status, "checkpoint_fingerprint": None,
+            "checkpoint_id": None,
+            "execution": {
+                "binding_id": binding.id if binding else None,
+                "proposal_type": _value(proposal.proposal_type) if proposal else None,
+                "primary_thread_id": proposal.primary_thread_id if proposal else None,
+                "participant_ids": sorted(set(proposal.participants or [])) if proposal else [],
+                "location_id": (proposal.location_id or proposal.proposed_location) if proposal else None,
+            },
+            "timeline_events": events,
+        }
+
+    def _replace_feature(
+        self,
+        db: Session,
+        projection: ProjectNarrativeStructureProjection,
+        scene: Scene,
+        source: dict[str, Any],
+    ) -> NarrativeStructureSceneFeature:
+        feature = NarrativeSceneFeatureBuilder().one(source)
+        source_fp = stable_fingerprint(source, "narrative-structure-scene-source-v1")
+        row = db.scalar(select(NarrativeStructureSceneFeature).where(
+            NarrativeStructureSceneFeature.project_id == scene.project_id,
+            NarrativeStructureSceneFeature.scene_id == scene.id,
+        ))
+        accumulator = projection.feature_accumulator or _empty_accumulator()
+        if row and row.active:
+            accumulator = _accumulate(accumulator, row.feature_fingerprint, -1)
+        if row is None:
+            row = NarrativeStructureSceneFeature(
+                project_id=scene.project_id, scene_id=scene.id, active=True,
+                **self._feature_values(feature, source_fp),
+            )
+            db.add(row)
+        else:
+            for key, value in self._feature_values(feature, source_fp).items():
+                setattr(row, key, value)
+            row.active = True
+        projection.feature_accumulator = _accumulate(accumulator, feature["feature_fingerprint"], 1)
+        projection.source_feature_fingerprint = _accumulator_fingerprint(projection.feature_accumulator)
+        return row
+
     def mark_dirty(self, db: Session, project_id: str, from_sequence: int | None = None, reason: str = "SOURCE_CHANGED") -> ProjectNarrativeStructureProjection:
         projection = self._ensure_projection(db, project_id)
         projection.status = NarrativeStructureProjectionStatus.DIRTY
@@ -168,6 +237,12 @@ class NarrativeStructureProjectionService:
     def rebuild(self, db: Session, project_id: str, config_data: dict[str, Any] | None = None) -> ProjectNarrativeStructureProjection:
         """Explicit O(N) rebuild, delegated to the frozen full formation service."""
         from .narrative_structure import NarrativeStructureService
+        # Normal append acquires this same project row before it advances the
+        # open tail.  Keep the order Project lock -> structure reads/writes
+        # identical for explicit rebuild to serialize both paths on PG.
+        project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+        if not project:
+            raise LookupError("PROJECT_NOT_FOUND")
         # An operator explicitly asked for authority re-derivation; do not
         # shortcut through an otherwise healthy open-tail projection.
         self.mark_dirty(db, project_id, 1, "EXPLICIT_REBUILD")
@@ -249,7 +324,7 @@ class NarrativeStructureProjectionService:
         if volume is None:
             plan = self._volume_plan(1, [self._arc_as_plan(db, current_arc, config)], "OPEN", config)
             volume = NarrativeVolume(project_id=project_id, structure_revision_id=revision.id, number=1, title=None, active=True, **{key: plan[key] for key in ("status", "start_sequence", "end_sequence", "dominant_thread_ids", "structure_metadata", "structure_fingerprint")})
-            db.add(volume); db.flush(); db.add(NarrativeVolumeArcBinding(volume_id=volume.id, narrative_arc_id=current_arc.id, ordinal=1)); return
+            db.add(volume); db.flush(); db.add(NarrativeVolumeArcBinding(volume_id=volume.id, narrative_arc_id=current_arc.id, ordinal=1)); db.flush(); return
         arcs = self._open_volume_arcs(db, volume)
         if new_arc is None:
             plan = self._volume_plan(volume.number, [self._arc_as_plan(db, item, config) for item in arcs], "OPEN", config); self._assign_volume(volume, plan); return
@@ -257,54 +332,144 @@ class NarrativeStructureProjectionService:
         formed = NarrativeVolumeFormationEngine().form(candidate, config)
         if len(formed) == 1:
             plan = self._volume_plan(volume.number, candidate, "OPEN", config); self._assign_volume(volume, plan)
-            db.add(NarrativeVolumeArcBinding(volume_id=volume.id, narrative_arc_id=new_arc.id, ordinal=len(arcs) + 1)); return
+            db.add(NarrativeVolumeArcBinding(volume_id=volume.id, narrative_arc_id=new_arc.id, ordinal=len(arcs) + 1)); db.flush(); return
         volume.status = NarrativeVolumeStatus.SEALED
         self._assign_volume(volume, self._volume_plan(volume.number, [self._arc_as_plan(db, item, config) for item in arcs], "SEALED", config))
         number = (db.scalar(select(func.max(NarrativeVolume.number)).where(NarrativeVolume.project_id == project_id)) or 0) + 1
         plan = self._volume_plan(number, [self._arc_as_plan(db, new_arc, config)], "OPEN", config)
         next_volume = NarrativeVolume(project_id=project_id, structure_revision_id=revision.id, number=number, title=None, active=True, **{key: plan[key] for key in ("status", "start_sequence", "end_sequence", "dominant_thread_ids", "structure_metadata", "structure_fingerprint")})
-        db.add(next_volume); db.flush(); db.add(NarrativeVolumeArcBinding(volume_id=next_volume.id, narrative_arc_id=new_arc.id, ordinal=1))
+        db.add(next_volume); db.flush(); db.add(NarrativeVolumeArcBinding(volume_id=next_volume.id, narrative_arc_id=new_arc.id, ordinal=1)); db.flush()
 
     def _update_open_arc(self, db: Session, project_id: str, revision: NarrativeStructureRevision, chapter: Chapter, new_chapter: Chapter | None, config: NarrativeStructureConfig) -> None:
         arc = db.scalar(select(NarrativeArc).where(NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True), NarrativeArc.status == NarrativeArcStatus.OPEN).order_by(NarrativeArc.number.desc()).limit(1))
         if arc is None:
             plan = self._arc_plan(1, [self._chapter_plan(1, self._chapter_features(db, chapter), _value(chapter.structure_status), chapter.boundary_metadata or {})], "OPEN", config)
             arc = NarrativeArc(project_id=project_id, structure_revision_id=revision.id, number=1, active=True, **{key: plan[key] for key in ("status", "start_sequence", "end_sequence", "dominant_thread_ids", "supporting_thread_ids", "structure_metadata", "structure_fingerprint")})
-            db.add(arc); db.flush(); db.add(NarrativeArcChapterBinding(narrative_arc_id=arc.id, chapter_id=chapter.id, ordinal=1)); self._update_open_volume(db, project_id, revision, arc, None, config); return
+            db.add(arc); db.flush(); db.add(NarrativeArcChapterBinding(narrative_arc_id=arc.id, chapter_id=chapter.id, ordinal=1)); db.flush(); self._update_open_volume(db, project_id, revision, arc, None, config); return
         chapters = self._open_arc_chapters(db, arc)
         if new_chapter is None:
             self._assign_arc(arc, self._arc_plan(arc.number, chapters, "OPEN", config)); self._update_open_volume(db, project_id, revision, arc, None, config); return
         candidate = chapters + [self._chapter_plan(new_chapter.number, self._chapter_features(db, new_chapter), _value(new_chapter.structure_status), new_chapter.boundary_metadata or {})]
         formed = NarrativeArcFormationEngine().form(candidate, config)
         if len(formed) == 1:
-            self._assign_arc(arc, self._arc_plan(arc.number, candidate, "OPEN", config)); db.add(NarrativeArcChapterBinding(narrative_arc_id=arc.id, chapter_id=new_chapter.id, ordinal=len(chapters) + 1)); self._update_open_volume(db, project_id, revision, arc, None, config); return
+            self._assign_arc(arc, self._arc_plan(arc.number, candidate, "OPEN", config)); db.add(NarrativeArcChapterBinding(narrative_arc_id=arc.id, chapter_id=new_chapter.id, ordinal=len(chapters) + 1)); db.flush(); self._update_open_volume(db, project_id, revision, arc, None, config); return
         self._assign_arc(arc, self._arc_plan(arc.number, chapters, "SEALED", config))
         number = (db.scalar(select(func.max(NarrativeArc.number)).where(NarrativeArc.project_id == project_id)) or 0) + 1
         plan = self._arc_plan(number, [candidate[-1]], "OPEN", config)
         next_arc = NarrativeArc(project_id=project_id, structure_revision_id=revision.id, number=number, active=True, **{key: plan[key] for key in ("status", "start_sequence", "end_sequence", "dominant_thread_ids", "supporting_thread_ids", "structure_metadata", "structure_fingerprint")})
-        db.add(next_arc); db.flush(); db.add(NarrativeArcChapterBinding(narrative_arc_id=next_arc.id, chapter_id=new_chapter.id, ordinal=1)); self._update_open_volume(db, project_id, revision, arc, next_arc, config)
+        db.add(next_arc); db.flush(); db.add(NarrativeArcChapterBinding(narrative_arc_id=next_arc.id, chapter_id=new_chapter.id, ordinal=1)); db.flush(); self._update_open_volume(db, project_id, revision, arc, next_arc, config)
 
     def _append_structure(self, db: Session, project_id: str, revision: NarrativeStructureRevision, feature: dict[str, Any], config: NarrativeStructureConfig) -> None:
         chapter = db.scalar(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.structure_status == ChapterStructureStatus.PROVISIONAL).order_by(Chapter.number.desc()).limit(1))
         if chapter is None:
             plan = self._chapter_plan(1, [feature], "PROVISIONAL", {"reason_codes": ["HISTORY_START"], "score": 0.0, "components": {}})
             chapter = Chapter(project_id=project_id, number=1, title=None, source_scene_ids=plan["scene_ids"], content=None, word_count=0, quality_report={}, status="DRAFT", structure_revision_id=revision.id, active=True, structure_status=ChapterStructureStatus.PROVISIONAL, start_sequence=plan["start_sequence"], end_sequence=plan["end_sequence"], structure_fingerprint=plan["structure_fingerprint"], boundary_metadata=plan["boundary_metadata"])
-            db.add(chapter); db.flush(); db.add(ChapterSceneBinding(chapter_id=chapter.id, scene_id=feature["scene_id"], ordinal=1, scene_sequence=feature["sequence"])); self._update_open_arc(db, project_id, revision, chapter, None, config); return
+            db.add(chapter); db.flush(); db.add(ChapterSceneBinding(chapter_id=chapter.id, scene_id=feature["scene_id"], ordinal=1, scene_sequence=feature["sequence"])); db.flush(); self._update_open_arc(db, project_id, revision, chapter, None, config); return
         features = self._chapter_features(db, chapter)
         boundary = ChapterBoundaryScorer().score(features[-1], feature, len(features), config)
         hard = len(features) >= config.chapter_max_scenes
         soft = len(features) >= config.chapter_min_scenes and boundary["score"] >= config.chapter_boundary_threshold
         if not hard and not soft:
-            features.append(feature); self._assign_chapter(chapter, self._chapter_plan(chapter.number, features, "PROVISIONAL", chapter.boundary_metadata or {})); db.add(ChapterSceneBinding(chapter_id=chapter.id, scene_id=feature["scene_id"], ordinal=len(features), scene_sequence=feature["sequence"])); self._update_open_arc(db, project_id, revision, chapter, None, config); return
+            features.append(feature); self._assign_chapter(chapter, self._chapter_plan(chapter.number, features, "PROVISIONAL", chapter.boundary_metadata or {})); db.add(ChapterSceneBinding(chapter_id=chapter.id, scene_id=feature["scene_id"], ordinal=len(features), scene_sequence=feature["sequence"])); db.flush(); self._update_open_arc(db, project_id, revision, chapter, None, config); return
         if hard and "HARD_MAX_SCENES" not in boundary["reason_codes"]: boundary["reason_codes"] = sorted([*boundary["reason_codes"], "HARD_MAX_SCENES"])
         self._assign_chapter(chapter, self._chapter_plan(chapter.number, features, "SEALED", chapter.boundary_metadata or {}))
         number = (db.scalar(select(func.max(Chapter.number)).where(Chapter.project_id == project_id)) or 0) + 1
         plan = self._chapter_plan(number, [feature], "PROVISIONAL", boundary)
         next_chapter = Chapter(project_id=project_id, number=number, title=None, source_scene_ids=plan["scene_ids"], content=None, word_count=0, quality_report={}, status="DRAFT", structure_revision_id=revision.id, active=True, structure_status=ChapterStructureStatus.PROVISIONAL, start_sequence=plan["start_sequence"], end_sequence=plan["end_sequence"], structure_fingerprint=plan["structure_fingerprint"], boundary_metadata=plan["boundary_metadata"])
-        db.add(next_chapter); db.flush(); db.add(ChapterSceneBinding(chapter_id=next_chapter.id, scene_id=feature["scene_id"], ordinal=1, scene_sequence=feature["sequence"])); self._update_open_arc(db, project_id, revision, chapter, next_chapter, config)
+        db.add(next_chapter); db.flush(); db.add(ChapterSceneBinding(chapter_id=next_chapter.id, scene_id=feature["scene_id"], ordinal=1, scene_sequence=feature["sequence"])); db.flush(); self._update_open_arc(db, project_id, revision, chapter, next_chapter, config)
+
+    def prepare_for_scene_checkpoint(
+        self, db: Session, project_id: str, scene: Scene, items: list[Any],
+    ) -> list[str]:
+        """Advance the open formal tail before the Scene POST is captured.
+
+        The provisional feature has the exact state-change shape available at
+        this point.  The post-commit pass replaces it with the canonical
+        Timeline/Checkpoint-backed feature, without changing formal rows.
+        A contained failure only leaves this derived projection DIRTY.
+        """
+        try:
+            with db.begin_nested():
+                project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+                if not project or scene.project_id != project_id or scene.sequence < 1:
+                    return []
+                config = NarrativeStructureConfig.resolve(project)
+                config_fp = _config_fingerprint(config)
+                projection = self._projection(db, project_id)
+                revision = db.scalar(select(NarrativeStructureRevision).where(
+                    NarrativeStructureRevision.project_id == project_id,
+                    NarrativeStructureRevision.active.is_(True),
+                ))
+                if projection is None:
+                    if scene.sequence != 1:
+                        self.mark_dirty(db, project_id, 1, "PROJECTION_BASELINE_MISSING")
+                        return []
+                    projection = self._ensure_projection(db, project_id)
+                    projection.status = NarrativeStructureProjectionStatus.READY
+                    projection.config_fingerprint = config_fp
+                    projection.feature_accumulator = _empty_accumulator()
+                    projection.built_through_sequence = 0
+                    if revision is None:
+                        revision = NarrativeStructureRevision(
+                            project_id=project_id, active=True, protocol_version=2,
+                            source_history_fingerprint="", source_max_sequence=0,
+                            config=asdict(config), config_fingerprint=config_fp,
+                            rebuild_from_sequence=1,
+                            structure_fingerprint=_structure_fingerprint("", config_fp),
+                        )
+                        db.add(revision)
+                        db.flush()
+                if (
+                    revision is None
+                    or _value(projection.status) != "READY"
+                    or projection.config_fingerprint != config_fp
+                    or projection.built_through_sequence != scene.sequence - 1
+                    or revision.source_max_sequence != scene.sequence - 1
+                ):
+                    self.mark_dirty(db, project_id, scene.sequence, "APPEND_BOUNDARY_INVALID")
+                    return []
+                prior_open_chapter_id = db.scalar(select(Chapter.id).where(
+                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.structure_status == ChapterStructureStatus.PROVISIONAL,
+                ).order_by(Chapter.number.desc()).limit(1))
+                source = self._provisional_source(db, scene, items)
+                row = self._replace_feature(db, projection, scene, source)
+                self._append_structure(db, project_id, revision, self._feature_payload(row), config)
+                revision.protocol_version = 2
+                revision.source_history_fingerprint = projection.source_feature_fingerprint or ""
+                revision.source_max_sequence = scene.sequence
+                revision.config = asdict(config)
+                revision.config_fingerprint = config_fp
+                revision.structure_fingerprint = _structure_fingerprint(
+                    revision.source_history_fingerprint, config_fp,
+                )
+                revision.completed_at = datetime.utcnow()
+                projection.active_revision_id = revision.id
+                projection.structure_fingerprint = revision.structure_fingerprint
+                projection.built_through_sequence = scene.sequence
+                projection.sealed_through_sequence = db.scalar(select(func.max(Chapter.end_sequence)).where(
+                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.structure_status == ChapterStructureStatus.SEALED,
+                )) or 0
+                projection.tail_start_sequence = projection.sealed_through_sequence + 1
+                projection.dirty_from_sequence = None
+                projection.dirty_reason = None
+                db.flush()
+                current_open_chapter_id = db.scalar(select(Chapter.id).where(
+                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.structure_status == ChapterStructureStatus.PROVISIONAL,
+                ).order_by(Chapter.number.desc()).limit(1))
+                # The only formal D2 writes in a normal append are the prior
+                # open Chapter (which may seal) and its successor. This is the
+                # exact D1 manifest, not a tail-range approximation.
+                return sorted({item for item in (prior_open_chapter_id, current_open_chapter_id) if item})
+        except Exception as exc:
+            with db.begin_nested():
+                self.mark_dirty(db, project_id, scene.sequence, f"TAIL_PREPARE_FAILED:{type(exc).__name__}")
+            return []
 
     def sync_after_scene_commit(self, db: Session, project_id: str, scene_id: str) -> None:
-        """Best-effort projection update. Formal Scene commit remains authoritative."""
+        """Finalize a pre-checkpoint tail feature from canonical committed sources."""
         try:
             with db.begin_nested():
                 project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
@@ -316,41 +481,77 @@ class NarrativeStructureProjectionService:
                 config_fp = _config_fingerprint(config)
                 projection = self._projection(db, project_id)
                 revision = db.scalar(select(NarrativeStructureRevision).where(NarrativeStructureRevision.project_id == project_id, NarrativeStructureRevision.active.is_(True)))
-                if projection is None:
-                    projection = self._ensure_projection(db, project_id)
-                    if scene.sequence != 1:
-                        self.mark_dirty(db, project_id, 1, "PROJECTION_BASELINE_MISSING"); return
+                if projection and _value(projection.status) == "DIRTY" and str(projection.dirty_reason or "").startswith("TAIL_PREPARE_FAILED:"):
+                    return
+                existing = db.scalar(select(NarrativeStructureSceneFeature).where(
+                    NarrativeStructureSceneFeature.project_id == project_id,
+                    NarrativeStructureSceneFeature.scene_id == scene_id,
+                ))
+                # Compatibility for explicit projection callers and legacy
+                # fixtures which materialize Scene rows without SceneCommit.
+                # Normal runtime always has a commit and takes the guarded
+                # pre-checkpoint route above.
+                from .models import SceneCommit
+                committed = db.scalar(select(SceneCommit.id).where(
+                    SceneCommit.project_id == project_id, SceneCommit.scene_id == scene_id,
+                ))
+                if committed is None and existing is None:
+                    if projection is None:
+                        projection = self._ensure_projection(db, project_id)
+                        if scene.sequence != 1:
+                            self.mark_dirty(db, project_id, 1, "PROJECTION_BASELINE_MISSING"); return
+                        projection.status = NarrativeStructureProjectionStatus.READY
+                        projection.config_fingerprint = config_fp
+                        projection.feature_accumulator = _empty_accumulator()
+                        projection.built_through_sequence = 0
+                    if (
+                        _value(projection.status) != "READY"
+                        or projection.config_fingerprint != config_fp
+                        or projection.built_through_sequence != scene.sequence - 1
+                    ):
+                        self.mark_dirty(db, project_id, scene.sequence, "APPEND_BOUNDARY_INVALID"); return
+                    source = NarrativeStructureSourceFingerprintBuilder()._scene(db, scene)
+                    self._replace_feature(db, projection, scene, source)
+                    projection.built_through_sequence = scene.sequence
                     projection.status = NarrativeStructureProjectionStatus.READY
-                    projection.config_fingerprint = config_fp
-                    projection.feature_accumulator = _empty_accumulator()
-                    projection.built_through_sequence = 0
-                if _value(projection.status) != "READY" or projection.config_fingerprint != config_fp or projection.built_through_sequence != scene.sequence - 1:
+                    if revision is None:
+                        from .narrative_structure import NarrativeStructureService
+                        NarrativeStructureService().sync(db, project_id)
+                    elif not self.append_open_tail(db, project_id, revision, config):
+                        self.mark_dirty(db, project_id, scene.sequence, "TAIL_APPEND_FAILED")
+                    return
+                if (
+                    projection is None or revision is None or existing is None
+                    or not existing.active or _value(projection.status) != "READY"
+                    or projection.config_fingerprint != config_fp
+                    or projection.built_through_sequence != scene.sequence
+                    or revision.source_max_sequence != scene.sequence
+                ):
                     self.mark_dirty(db, project_id, scene.sequence, "APPEND_BOUNDARY_INVALID"); return
-                existing = db.scalar(select(NarrativeStructureSceneFeature).where(NarrativeStructureSceneFeature.project_id == project_id, NarrativeStructureSceneFeature.scene_id == scene_id))
-                if existing and existing.active: return
                 # Use the frozen structure source contract for exactly one
                 # Scene.  Phase16A is a separate accelerator whose checkpoint
                 # version handling must not alter structure semantics.
                 source = NarrativeStructureSourceFingerprintBuilder()._scene(db, scene)
-                feature = NarrativeSceneFeatureBuilder().one(source)
-                source_fp = stable_fingerprint(source, "narrative-structure-scene-source-v1")
-                row = existing or NarrativeStructureSceneFeature(project_id=project_id, scene_id=scene_id, active=True, **self._feature_values(feature, source_fp))
-                if existing is None: db.add(row)
-                else:
-                    for key, value in self._feature_values(feature, source_fp).items(): setattr(row, key, value)
-                    row.active = True
-                db.flush()
-                accumulator = _accumulate(projection.feature_accumulator, feature["feature_fingerprint"], 1)
-                source_root = _accumulator_fingerprint(accumulator)
-                projection.feature_accumulator = accumulator; projection.source_feature_fingerprint = source_root
-                projection.structure_fingerprint = revision.structure_fingerprint if revision else _structure_fingerprint(source_root, config_fp)
-                projection.active_revision_id = revision.id if revision and revision.source_max_sequence == scene.sequence else None
-                projection.built_through_sequence = scene.sequence
+                self._replace_feature(db, projection, scene, source)
+                # A serialized explicit rebuild may have produced a legacy
+                # revision immediately before this append finalizer acquired
+                # the Project lock. The complete canonical feature projection
+                # is now authoritative for the same structure rows, so record
+                # the v2 source contract atomically with its fingerprint.
+                revision.protocol_version = 2
+                revision.source_history_fingerprint = projection.source_feature_fingerprint or ""
+                revision.structure_fingerprint = _structure_fingerprint(
+                    revision.source_history_fingerprint, config_fp,
+                )
+                revision.completed_at = datetime.utcnow()
+                projection.structure_fingerprint = revision.structure_fingerprint
+                projection.active_revision_id = revision.id
                 projection.sealed_through_sequence = db.scalar(select(func.max(Chapter.end_sequence)).where(
                     Chapter.project_id == project_id, Chapter.active.is_(True),
                     Chapter.structure_status == ChapterStructureStatus.SEALED,
                 )) or 0
-                projection.tail_start_sequence = projection.sealed_through_sequence + 1; projection.status = NarrativeStructureProjectionStatus.READY
+                projection.tail_start_sequence = projection.sealed_through_sequence + 1
+                projection.status = NarrativeStructureProjectionStatus.READY
                 projection.dirty_from_sequence = None; projection.dirty_reason = None
         except Exception as exc:
             with db.begin_nested(): self.mark_dirty(db, project_id, None, f"APPEND_FAILED:{type(exc).__name__}")
@@ -406,11 +607,6 @@ class NarrativeStructureProjectionService:
             Chapter.structure_status == ChapterStructureStatus.SEALED,
         )) or 0
         projection.tail_start_sequence = projection.sealed_through_sequence + 1
-        # Chapters/Arcs/Volumes remain in the D1 formal scope.  Their tail
-        # updates are safe, but identity must be rebuilt before it can certify
-        # a subsequent StateDelta or checkpoint boundary.
-        from .formal_state import FormalStateIdentityService
-        FormalStateIdentityService().mark_dirty(db, project_id, "NARRATIVE_STRUCTURE_APPEND")
         return True
 
     def sync_after_history_change(self, db: Session, project_id: str, from_sequence: int | None = 1, reason: str = "HISTORY_CHANGED") -> None:
@@ -453,6 +649,28 @@ class NarrativeStructureProjectionService:
                     NarrativeVolume.end_sequence >= from_sequence,
                 ).order_by(NarrativeVolume.number).limit(1))
                 tail_start = volume.start_sequence if volume else from_sequence
+                affected_chapters = db.scalars(select(Chapter).where(
+                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.end_sequence >= tail_start,
+                )).all()
+                affected_arcs = db.scalars(select(NarrativeArc).where(
+                    NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True),
+                    NarrativeArc.end_sequence >= tail_start,
+                )).all()
+                affected_volumes = db.scalars(select(NarrativeVolume).where(
+                    NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True),
+                    NarrativeVolume.end_sequence >= tail_start,
+                )).all()
+                # D2 may re-form only the genuinely open tail. Replacing an
+                # already SEALED row would invalidate its stable Writer and
+                # Quality lineage, even if the preceding prefix is unchanged.
+                if (
+                    any(_value(item.structure_status) == "SEALED" for item in affected_chapters)
+                    or any(_value(item.status) == "SEALED" for item in affected_arcs)
+                    or any(_value(item.status) == "SEALED" for item in affected_volumes)
+                ):
+                    self.mark_dirty(db, project_id, tail_start, "HISTORY_REBUILD_TOUCHES_SEALED")
+                    return False
                 prefix_chapters = db.scalars(select(Chapter).where(
                     Chapter.project_id == project_id, Chapter.active.is_(True),
                     Chapter.end_sequence < tail_start,

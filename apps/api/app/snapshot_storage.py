@@ -438,7 +438,8 @@ class SceneCommitFormalMutationGuard:
         return None
 
     def assert_complete(self, *, project_id: str, items: list[Any], scene: Any,
-                        knowledge: list[Any], memories: list[Any]) -> dict[str, Any]:
+                        knowledge: list[Any], memories: list[Any],
+                        structure_chapter_ids: list[str] | None = None) -> dict[str, Any]:
         target_ids: dict[str, set[str]] = {
             "PROJECT": set(), "WORLD_ENTITY": set(), "CHARACTER": set(), "STORY_THREAD": set(),
         }
@@ -450,6 +451,9 @@ class SceneCommitFormalMutationGuard:
             "scenes": {scene.id},
             "character_knowledge": {row.id for row in knowledge},
             "character_memories": {row.id for row in memories},
+            # D2 may alter only the currently open Chapter tail before this
+            # Scene's checkpoint. The caller supplies the exact bounded set.
+            "chapters": set(structure_chapter_ids or []),
         }
         actual: dict[str, set[str]] = {}
         include_project = False
@@ -473,7 +477,9 @@ class SceneCommitFormalMutationGuard:
                     if row_id not in target_ids[expected_target_type]:
                         raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
                 elif collection in allowed_new:
-                    if not was_new or row_id not in allowed_new[collection]:
+                    if row_id not in allowed_new[collection] or (
+                        collection != "chapters" and not was_new
+                    ):
                         raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
                 else:
                     # Canon, reveal constraints, arcs, chapters, and every
@@ -485,10 +491,17 @@ class SceneCommitFormalMutationGuard:
                 "character_knowledge": {row.id for row in knowledge},
                 "character_memories": {row.id for row in memories},
             }
+            if structure_chapter_ids:
+                expected["chapters"] = set(structure_chapter_ids)
             for item in items:
                 collection = SceneCommitSnapshotDeltaBuilder.collection_by_target.get(_value(item.target_type))
                 if collection:
                     expected.setdefault(collection, set()).add(item.target_id)
+            # D2's bounded tail write is intentionally flushed before the
+            # checkpoint guard finalizes. Preserve its exact service-issued
+            # manifest even though it is no longer in Session.new/dirty.
+            if structure_chapter_ids:
+                actual.setdefault("chapters", set()).update(structure_chapter_ids)
             if {key: value for key, value in actual.items() if value} != {key: value for key, value in expected.items() if value}:
                 raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
             if include_project != bool(target_ids["PROJECT"]):
@@ -529,6 +542,8 @@ class SceneCommitSnapshotDeltaBuilder:
                 for collection, ids in (mutation_manifest.get("collections") or {}).items()
                 if ids
             }
+            for collection, ids in observed.items():
+                upsert_ids.setdefault(collection, set()).update(ids)
             expected = {collection: ids for collection, ids in upsert_ids.items() if ids}
             if observed != expected or bool(mutation_manifest.get("project")) != include_project:
                 raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")

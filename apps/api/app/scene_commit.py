@@ -416,12 +416,24 @@ class SceneCommitService:
             sibling.stop_reason = "PROPOSAL_EXECUTED"
         mutation_guard.observe()
         db.flush()
+        # D2 consumes the bounded Scene/StateDelta shape before the POST
+        # checkpoint is captured. Its contained savepoint can only mark the
+        # derived projection DIRTY; the formal Scene still commits. Any
+        # Chapter rows it does materialize are included in this exact D1
+        # manifest and therefore in the same checkpoint boundary.
+        from .narrative_structure_projection import NarrativeStructureProjectionService
+        structure_chapter_ids = NarrativeStructureProjectionService().prepare_for_scene_checkpoint(
+            db, project_id, scene, prepared.items,
+        )
+        mutation_guard.observe()
+        db.flush()
         mutation_manifest = mutation_guard.assert_complete(
             project_id=project_id,
             items=prepared.items,
             scene=scene,
             knowledge=knowledge,
             memories=memories,
+            structure_chapter_ids=structure_chapter_ids,
         )
         checkpoint, post_snapshot = SceneCheckpointService().create_normal_checkpoint(
             db, project_id, scene, pre_snapshot, items=prepared.items, knowledge=knowledge,
@@ -452,7 +464,6 @@ class SceneCommitService:
         ProjectHistoryProjectionService().sync_after_scene_commit(db, project_id, scene.id)
         # Narrative structure is a rebuildable projection.  Its bounded append
         # path never changes the authority of this committed Scene.
-        from .narrative_structure_projection import NarrativeStructureProjectionService
         NarrativeStructureProjectionService().sync_after_scene_commit(db, project_id, scene.id)
         # Phase 16C1 is a rebuildable accelerator. Its failure is contained in
         # a savepoint and can only make the next mind read use legacy recall.

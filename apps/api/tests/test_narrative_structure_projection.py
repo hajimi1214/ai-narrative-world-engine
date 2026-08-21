@@ -1,12 +1,17 @@
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base
-from app.models import Chapter, NarrativeArc, NarrativeStructureSceneFeature, Project, Scene
+from app.models import (
+    Chapter, ChapterStructureStatus, NarrativeArc, NarrativeStructureProjectionStatus,
+    NarrativeStructureRevision, NarrativeStructureSceneFeature, Project,
+    ProjectNarrativeStructureProjection, Scene,
+)
 from app.narrative_structure import NarrativeStructureService
 from app.narrative_structure import NarrativeStructureAudit
 from app.narrative_structure_projection import (
@@ -62,6 +67,42 @@ def test_incremental_append_matches_authoritative_feature_contract(session):
     assert [item.scene_id for item in rows] == [first.id, second.id]
     assert NarrativeStructureProjectionService().status(session, project.id)["built_through_sequence"] == 2
     NarrativeStructureProjectionAudit().audit(session, project.id)
+
+
+def test_explicit_scene_append_keeps_full_snapshot_out_of_projection_path(session, monkeypatch):
+    from app.versioning import WorldSnapshotBuilder
+    project = Project(name="D2"); session.add(project); session.flush()
+    first = make_scene(session, project, 1)
+    revision, _ = NarrativeStructureService().sync(session, project.id)
+    second = make_scene(session, project, 2, location="room-b", thread="thread-b")
+    ProjectHistoryProjectionService().sync_after_scene_commit(session, project.id, second.id)
+
+    def full_snapshot_forbidden(*_args, **_kwargs):
+        raise AssertionError("FULL_FORMAL_SNAPSHOT_USED")
+
+    monkeypatch.setattr(WorldSnapshotBuilder, "build", full_snapshot_forbidden)
+    NarrativeStructureProjectionService().sync_after_scene_commit(session, project.id, second.id)
+    current = NarrativeStructureService().current(session, project.id)
+    assert current["revision"]["id"] == revision.id
+    assert current["revision"]["source_max_sequence"] == 2
+
+
+def test_scene_append_failure_marks_projection_dirty_without_touching_scene(session, monkeypatch):
+    project = Project(name="D2"); session.add(project); session.flush()
+    first = make_scene(session, project, 1)
+    NarrativeStructureService().sync(session, project.id)
+    second = make_scene(session, project, 2)
+    ProjectHistoryProjectionService().sync_after_scene_commit(session, project.id, second.id)
+
+    def fail_tail(*_args, **_kwargs):
+        raise RuntimeError("simulated projection failure")
+
+    monkeypatch.setattr(NarrativeStructureProjectionService, "_append_structure", fail_tail)
+    NarrativeStructureProjectionService().sync_after_scene_commit(session, project.id, second.id)
+    status = NarrativeStructureProjectionService().status(session, project.id)
+    assert session.get(Scene, second.id).history_status == "ACTIVE"
+    assert status["status"] == "DIRTY"
+    assert status["dirty_reason"].startswith("APPEND_FAILED:")
 
 
 def test_missing_projection_after_history_marks_dirty(session):
@@ -130,7 +171,7 @@ def test_ready_projection_sync_advances_open_tail_with_full_preview_parity(sessi
     second = make_scene(session, project, 2, location="b", thread="b")
     history_then_structure(session, project, second)
     updated, existing = NarrativeStructureService().sync(session, project.id)
-    assert updated.id == revision.id and not existing and updated.protocol_version == 2
+    assert updated.id == revision.id and existing and updated.protocol_version == 2
     assert session.get(Chapter, sealed.id).active is True
     preview = NarrativeStructureService().preview(session, project.id, updated.config)
     actual = NarrativeStructureService().payload(session, updated)
@@ -156,7 +197,7 @@ def test_ready_tail_sync_does_not_build_full_source(session, monkeypatch):
 
     monkeypatch.setattr("app.narrative_structure.NarrativeStructureSourceFingerprintBuilder.build", legacy_path_used)
     updated, existing = NarrativeStructureService().sync(session, project.id)
-    assert updated.id == revision.id and not existing and updated.source_max_sequence == 2
+    assert updated.id == revision.id and existing and updated.source_max_sequence == 2
 
 
 def test_v2_sync_retry_is_idempotent_without_legacy_source_rebuild(session, monkeypatch):
@@ -167,7 +208,7 @@ def test_v2_sync_retry_is_idempotent_without_legacy_source_rebuild(session, monk
     second = make_scene(session, project, 2)
     history_then_structure(session, project, second)
     revision, changed = NarrativeStructureService().sync(session, project.id)
-    assert not changed and revision.protocol_version == 2
+    assert changed and revision.protocol_version == 2
 
     def legacy_path_used(*_args, **_kwargs):
         raise AssertionError("FULL_STRUCTURE_SOURCE_USED")
@@ -177,7 +218,7 @@ def test_v2_sync_retry_is_idempotent_without_legacy_source_rebuild(session, monk
     assert existing and retried.id == revision.id
 
 
-def test_history_suffix_rebuild_preserves_sealed_prefix_and_matches_preview(session):
+def test_history_suffix_rebuild_touching_sealed_structure_fails_closed(session):
     project = Project(name="D2", autonomy_settings={"narrative_structure": {
         "chapter_min_scenes": 1, "chapter_target_scenes": 1, "chapter_max_scenes": 2,
         "chapter_boundary_threshold": 0, "arc_min_chapters": 1, "arc_max_chapters": 2,
@@ -195,22 +236,11 @@ def test_history_suffix_rebuild_preserves_sealed_prefix_and_matches_preview(sess
     changed.location = "changed-location"; session.flush()
     service = NarrativeStructureProjectionService()
     service.sync_after_history_change(session, project.id, 3, "REPLAY_HISTORY_CHANGED")
-    assert service.rebuild_suffix_after_history_change(session, project.id, 3)
-    current = NarrativeStructureService().current(session, project.id)
-    preview = NarrativeStructureService().preview(session, project.id, current["revision"]["config"])
+    assert not service.rebuild_suffix_after_history_change(session, project.id, 3)
+    status = service.status(session, project.id)
+    assert status["status"] == "DIRTY"
+    assert status["dirty_reason"] == "HISTORY_REBUILD_TOUCHES_SEALED"
     assert session.get(Chapter, prefix.id).active is True
-    assert [(row["start_sequence"], row["end_sequence"]) for row in current["chapters"]] == [
-        (row["start_sequence"], row["end_sequence"]) for row in preview["chapters"]
-    ]
-    arcs = session.scalars(select(NarrativeArc).where(
-        NarrativeArc.project_id == project.id, NarrativeArc.active.is_(True),
-    ).order_by(NarrativeArc.number)).all()
-    from app.models import NarrativeArcChapterBinding
-    chapter_numbers = {row.id: row.number for row in session.scalars(select(Chapter).where(Chapter.project_id == project.id)).all()}
-    actual_arcs = [(row.number, row.status.value, row.start_sequence, row.end_sequence, row.dominant_thread_ids, row.supporting_thread_ids, row.structure_metadata, [chapter_numbers[item] for item in session.scalars(select(NarrativeArcChapterBinding.chapter_id).where(NarrativeArcChapterBinding.narrative_arc_id == row.id).order_by(NarrativeArcChapterBinding.ordinal)).all()], row.structure_fingerprint) for row in arcs]
-    expected_arcs = [(row["number"], row["status"], row["start_sequence"], row["end_sequence"], row["dominant_thread_ids"], row["supporting_thread_ids"], row["structure_metadata"], row["chapter_numbers"], row["structure_fingerprint"]) for row in preview["narrative_arcs"]]
-    assert actual_arcs == expected_arcs
-    NarrativeStructureAudit().audit(session, project.id)
 
 
 def test_repeated_tail_append_matches_full_formation_at_each_boundary(session):
@@ -231,7 +261,7 @@ def test_repeated_tail_append_matches_full_formation_at_each_boundary(session):
         )
         history_then_structure(session, project, item)
         revision, changed = NarrativeStructureService().sync(session, project.id)
-        assert not changed
+        assert changed
         preview = NarrativeStructureService().preview(session, project.id, revision.config)
         actual = NarrativeStructureService().payload(session, revision)
         assert [
@@ -262,3 +292,80 @@ def test_repeated_tail_append_matches_full_formation_at_each_boundary(session):
             (row["number"], row["structure_fingerprint"], revision.id) for row in preview["narrative_arcs"]
         ], sequence
         NarrativeStructureAudit().audit(session, project.id)
+
+
+@pytest.mark.parametrize("sealed_count", [10_000, 100_000])
+def test_open_tail_append_is_bounded_across_large_sealed_prefixes(session, sealed_count):
+    """A normal append may read its bounded open tail, never the sealed prefix."""
+    config_data = {
+        "chapter_min_scenes": 2, "chapter_target_scenes": 200_000,
+        "chapter_max_scenes": 200_000, "chapter_boundary_threshold": 999,
+    }
+    project = Project(name=f"D2 scale {sealed_count}", autonomy_settings={"narrative_structure": config_data})
+    session.add(project); session.flush()
+    revision = NarrativeStructureRevision(
+        project_id=project.id, active=True, protocol_version=2,
+        source_history_fingerprint="scale", source_max_sequence=sealed_count,
+        config=config_data, config_fingerprint="", rebuild_from_sequence=1,
+        structure_fingerprint="scale",
+    )
+    session.add(revision); session.flush()
+    from app.narrative_structure import NarrativeStructureConfig
+    from app.narrative_structure_projection import _config_fingerprint, _empty_accumulator
+    revision.config_fingerprint = _config_fingerprint(NarrativeStructureConfig.resolve(project))
+    projection = ProjectNarrativeStructureProjection(
+        project_id=project.id, protocol_version="narrative-structure-projection-v1",
+        status=NarrativeStructureProjectionStatus.READY,
+        config_fingerprint=revision.config_fingerprint,
+        source_feature_fingerprint="scale", feature_accumulator=_empty_accumulator(),
+        structure_fingerprint="scale", active_revision_id=revision.id,
+        built_through_sequence=sealed_count, sealed_through_sequence=sealed_count - 1,
+        tail_start_sequence=sealed_count,
+    )
+    session.add(projection)
+    prefix_rows = [{
+        "id": str(uuid4()), "project_id": project.id, "number": number,
+        "source_scene_ids": [], "word_count": 0, "quality_report": {}, "status": "DRAFT",
+        "structure_revision_id": revision.id, "active": True, "structure_status": "SEALED",
+        "start_sequence": number, "end_sequence": number,
+        "boundary_metadata": {},
+    } for number in range(1, sealed_count)]
+    session.execute(Chapter.__table__.insert(), prefix_rows)
+    prior = make_scene(session, project, sealed_count)
+    session.add(NarrativeStructureSceneFeature(
+        project_id=project.id, scene_id=prior.id, sequence=sealed_count, active=True,
+        world_time=None, location_id=prior.location, participant_ids=[], thread_ids=[],
+        primary_thread_id=None, proposal_type=None, state_change_count=0,
+        state_change_targets=[], state_change_paths=[], thread_state_event_ids=[],
+        checkpoint_fingerprint=None, source_fingerprint="scale", feature_fingerprint="scale-tail",
+    ))
+    open_chapter = Chapter(
+        project_id=project.id, number=sealed_count, source_scene_ids=[prior.id],
+        word_count=0, quality_report={}, status="DRAFT", structure_revision_id=revision.id,
+        active=True, structure_status=ChapterStructureStatus.PROVISIONAL,
+        start_sequence=sealed_count, end_sequence=sealed_count,
+        structure_fingerprint="open", boundary_metadata={},
+    )
+    session.add(open_chapter); session.flush()
+    first_sealed_id = session.scalar(select(Chapter.id).where(
+        Chapter.project_id == project.id, Chapter.number == 1,
+    ))
+    new_scene = make_scene(session, project, sealed_count + 1)
+    queries: list[str] = []
+
+    def capture(_conn, _cursor, statement, _params, _context, _executemany):
+        queries.append(statement)
+
+    event.listen(session.bind, "before_cursor_execute", capture)
+    try:
+        changed = NarrativeStructureProjectionService().prepare_for_scene_checkpoint(
+            session, project.id, new_scene, [],
+        )
+    finally:
+        event.remove(session.bind, "before_cursor_execute", capture)
+    assert changed == [open_chapter.id]
+    assert session.scalar(select(Chapter.id).where(Chapter.id == first_sealed_id)) == first_sealed_id
+    assert open_chapter.source_scene_ids == [prior.id, new_scene.id]
+    assert len(queries) < 40
+    hydrated_chapters = [row for row in session.identity_map.values() if isinstance(row, Chapter)]
+    assert len(hydrated_chapters) <= 3

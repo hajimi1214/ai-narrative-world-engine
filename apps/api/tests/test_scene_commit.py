@@ -22,6 +22,8 @@ from app.models import (
     StoryThread, ThreadStatus, WorldEntity, WorldResolution, WorldSnapshot,
 )
 from app.scene_commit import SceneCommitService
+from app.narrative_structure import NarrativeStructureAudit
+from app.narrative_structure_projection import NarrativeStructureProjectionService
 from app.historical import SceneCheckpointIntegrityValidator
 from app.snapshot_storage import CompactSnapshotAudit, ProjectWorldSnapshotHeadService, SnapshotPayloadResolver
 from app.state_delta import StateDeltaCandidateBuilder
@@ -171,6 +173,9 @@ def test_commit_scene_applies_validated_entity_delta_and_materializes_history(se
     checkpoint = session.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.scene_id == body["scene"]["id"]))
     assert checkpoint.capture_protocol_version == 4 and checkpoint.version == 1 and checkpoint.active is True
     assert checkpoint.origin == "NORMAL_COMMIT" and checkpoint.source_scene_commit_id == body["scene_commit"]["id"]
+    structure_status = NarrativeStructureProjectionService().status(session, project.id)
+    assert structure_status["status"] == "READY", repr(structure_status)
+    NarrativeStructureAudit().audit(session, project.id)
 
 
 def test_commit_scene_is_idempotent(session, monkeypatch):
@@ -181,6 +186,25 @@ def test_commit_scene_is_idempotent(session, monkeypatch):
     assert first.json()["scene"]["id"] == second.json()["scene"]["id"]
     assert second.json()["idempotent"] is True
     assert session.scalar(select(func.count(Scene.id)).where(Scene.project_id == project.id)) == 1
+
+
+def test_structure_tail_failure_marks_dirty_without_rolling_back_scene(session, monkeypatch):
+    from app.narrative_structure_projection import NarrativeStructureProjectionService
+
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, _client = prepared_commit(session, monkeypatch)
+
+    def fail_tail(*_args, **_kwargs):
+        raise RuntimeError("injected structure projection failure")
+
+    monkeypatch.setattr(NarrativeStructureProjectionService, "_append_structure", fail_tail)
+    result = SceneCommitService().commit(session, project.id, performance.id)
+    session.commit()
+
+    assert result.scene.history_status == "ACTIVE"
+    assert result.commit.status.value == "COMMITTED"
+    status = NarrativeStructureProjectionService().status(session, project.id)
+    assert status["status"] == "DIRTY"
+    assert status["dirty_reason"].startswith("TAIL_PREPARE_FAILED:")
 
 
 def test_zero_item_validated_resolution_still_commits(session, monkeypatch):
