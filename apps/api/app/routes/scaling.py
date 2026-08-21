@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from ..formal_state import FormalStateIdentityService
 from ..models import NarrativeStructureRevision
 from ..narrative_structure import NarrativeStructureService
+from ..narrative_structure_projection import NarrativeStructureProjectionService
 from ..retcon_apply import has_pending_replay
 from ..retrieval_index import CognitionRetrievalProjectionService, MemoryANNIndexStatusService, ResearchLexicalIndexService
 from ..scaling import ProjectHistoryProjectionService
@@ -21,6 +22,7 @@ def scaling_status(project_id: str, db: Session = Depends(get_db)):
         "cognition": CognitionRetrievalProjectionService().status(db, project_id),
         "research": ResearchLexicalIndexService().status(db, project_id),
         "formal_state": FormalStateIdentityService().status(db, project_id),
+        "narrative_structure": NarrativeStructureProjectionService().status(db, project_id),
     }
 
 
@@ -69,6 +71,11 @@ def _rebuild(db: Session, project_id: str, service, error_code: str):
 @router.post("/projects/{project_id}/scaling/history-index/rebuild")
 def rebuild_history_index(project_id: str, db: Session = Depends(get_db)):
     return _rebuild(db, project_id, ProjectHistoryProjectionService(), "HISTORY_PROJECTION_REBUILD_FAILED")
+
+
+@router.post("/projects/{project_id}/scaling/narrative-structure/rebuild")
+def rebuild_narrative_structure_projection(project_id: str, db: Session = Depends(get_db)):
+    return _rebuild(db, project_id, NarrativeStructureProjectionService(), "NARRATIVE_STRUCTURE_PROJECTION_REBUILD_FAILED")
 
 
 @router.post("/projects/{project_id}/scaling/cognition-index/rebuild")

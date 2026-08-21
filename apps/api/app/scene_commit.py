@@ -450,6 +450,10 @@ class SceneCommitService:
         # contains a savepoint and marks failures DIRTY, leaving this frozen
         # formal commit and its Phase 8 ledger boundary intact.
         ProjectHistoryProjectionService().sync_after_scene_commit(db, project_id, scene.id)
+        # Narrative structure is a rebuildable projection.  Its bounded append
+        # path never changes the authority of this committed Scene.
+        from .narrative_structure_projection import NarrativeStructureProjectionService
+        NarrativeStructureProjectionService().sync_after_scene_commit(db, project_id, scene.id)
         # Phase 16C1 is a rebuildable accelerator. Its failure is contained in
         # a savepoint and can only make the next mind read use legacy recall.
         try:

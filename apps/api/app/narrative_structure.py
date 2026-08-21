@@ -311,6 +311,29 @@ class NarrativeStructureService:
         if not project: raise LookupError("PROJECT_NOT_FOUND")
         pending = db.scalar(select(RetconApplication.id).where(RetconApplication.project_id == project_id, RetconApplication.status == RetconApplicationStatus.APPLIED_PENDING_REPLAY))
         if pending: raise ValueError("RETCON_REPLAY_REQUIRED")
+        # D2 fast path: only newly committed Scene feature rows are consumed.
+        # A config change, stale projection, or historical edit deliberately
+        # falls through to the authoritative full source rebuild below.
+        from .narrative_structure_projection import NarrativeStructureProjectionService
+        current = db.scalar(select(NarrativeStructureRevision).where(NarrativeStructureRevision.project_id == project_id, NarrativeStructureRevision.active.is_(True)))
+        config = NarrativeStructureConfig.resolve(project, config_data)
+        if current and current.config_fingerprint == stable_fingerprint(asdict(config), "narrative-structure-config-v1"):
+            projection = NarrativeStructureProjectionService()
+            if projection.append_open_tail(db, project_id, current, config, expected_source_fingerprint):
+                db.flush()
+                return current, False
+            status = projection.status(db, project_id)
+            if (
+                current.protocol_version >= 2
+                and status["fast_path_available"]
+                and status["active_revision_id"] == current.id
+                and status["built_through_sequence"] == current.source_max_sequence
+            ):
+                if expected_source_fingerprint and expected_source_fingerprint not in {
+                    current.source_history_fingerprint, status["source_feature_fingerprint"],
+                }:
+                    raise ValueError("NARRATIVE_STRUCTURE_SOURCE_CHANGED")
+                return current, True
         preview = self.preview(db, project_id, config_data)
         if expected_source_fingerprint and expected_source_fingerprint != preview["source_fingerprint"]: raise ValueError("NARRATIVE_STRUCTURE_SOURCE_CHANGED")
         current = db.scalar(select(NarrativeStructureRevision).where(NarrativeStructureRevision.project_id == project_id, NarrativeStructureRevision.active.is_(True)))
@@ -384,10 +407,21 @@ class NarrativeStructureService:
             db.add(volume); db.flush()
             for ordinal, number in enumerate(planned["arc_numbers"], 1): db.add(NarrativeVolumeArcBinding(volume_id=volume.id, narrative_arc_id=arcs_by_number[number].id, ordinal=ordinal))
         db.flush(); NarrativeStructureAudit().audit(db, project_id)
+        # Phase 16D2 records this full, authoritative formation as the
+        # baseline from which normal Scene commits can advance the open tail.
+        from .narrative_structure_projection import NarrativeStructureProjectionService
+        NarrativeStructureProjectionService().adopt_full_sync(db, project_id, revision)
         return revision, False
 
     def current(self, db: Session, project_id: str) -> dict[str, Any]:
         revision = db.scalar(select(NarrativeStructureRevision).where(NarrativeStructureRevision.project_id == project_id, NarrativeStructureRevision.active.is_(True)))
+        if revision and revision.protocol_version >= 2:
+            from .narrative_structure_projection import NarrativeStructureProjectionService
+            projection = NarrativeStructureProjectionService().status(db, project_id)
+            return self.payload(db, revision) | {
+                "stale": not projection["fast_path_available"] or projection["active_revision_id"] != revision.id,
+                "source_fingerprint": projection["source_feature_fingerprint"],
+            }
         source, source_fingerprint = NarrativeStructureSourceFingerprintBuilder().build(db, project_id)
         if not revision: return {"revision": None, "stale": False, "source_fingerprint": source_fingerprint, "structure_fingerprint": None, "chapters": [], "narrative_arcs": [], "volumes": []}
         return self.payload(db, revision) | {"stale": revision.source_history_fingerprint != source_fingerprint, "source_fingerprint": source_fingerprint}
@@ -413,11 +447,18 @@ class NarrativeStructureAudit:
         arcs = db.scalars(select(NarrativeArc).where(NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True)).order_by(NarrativeArc.number)).all()
         volumes = db.scalars(select(NarrativeVolume).where(NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True)).order_by(NarrativeVolume.number)).all()
         revision = revisions[0]
-        _, current_source_fingerprint = NarrativeStructureSourceFingerprintBuilder().build(db, project_id)
-        if revision.source_history_fingerprint != current_source_fingerprint:
-            raise ValueError("NARRATIVE_STRUCTURE_SOURCE_CHANGED")
+        if revision.protocol_version >= 2:
+            from .narrative_structure_projection import NarrativeStructureProjectionAudit, NarrativeStructureProjectionService
+            NarrativeStructureProjectionAudit().audit(db, project_id)
+            projection = NarrativeStructureProjectionService().status(db, project_id)
+            if projection["source_feature_fingerprint"] != revision.source_history_fingerprint or projection["active_revision_id"] != revision.id:
+                raise ValueError("NARRATIVE_STRUCTURE_SOURCE_CHANGED")
+        else:
+            _, current_source_fingerprint = NarrativeStructureSourceFingerprintBuilder().build(db, project_id)
+            if revision.source_history_fingerprint != current_source_fingerprint:
+                raise ValueError("NARRATIVE_STRUCTURE_SOURCE_CHANGED")
         expected = NarrativeStructureService().preview(db, project_id, revision.config)
-        if revision.structure_fingerprint != expected["structure_fingerprint"] or revision.config_fingerprint != expected["config_fingerprint"]:
+        if (revision.protocol_version < 2 and revision.structure_fingerprint != expected["structure_fingerprint"]) or revision.config_fingerprint != expected["config_fingerprint"]:
             raise ValueError("NARRATIVE_STRUCTURE_FINGERPRINT_INVALID")
         if [item.number for item in chapters] != list(range(1, len(chapters) + 1)) or [item.number for item in arcs] != list(range(1, len(arcs) + 1)) or [item.number for item in volumes] != list(range(1, len(volumes) + 1)): raise ValueError("NARRATIVE_STRUCTURE_NUMBERING_INVALID")
         current_scenes = db.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == "OCCURRED", Scene.history_status == "ACTIVE").order_by(Scene.sequence)).all()

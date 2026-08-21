@@ -701,6 +701,10 @@ class ReplayService:
         from .scaling import ProjectHistoryProjectionService
         earliest = min((run.original_sequence for run in runs), default=1)
         ProjectHistoryProjectionService().sync_after_replay_commit(db, session.project_id, earliest)
+        from .narrative_structure_projection import NarrativeStructureProjectionService
+        NarrativeStructureProjectionService().sync_after_history_change(
+            db, session.project_id, earliest, "REPLAY_HISTORY_CHANGED"
+        )
         from .retrieval_index import CognitionRetrievalProjectionService
         try:
             with db.begin_nested():

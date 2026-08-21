@@ -117,6 +117,12 @@ class RevisionApplyService:
         )
         from .formal_state import FormalStateIdentityService
         FormalStateIdentityService().rebuild_and_anchor(db, project_id, source_type="REVISION_APPLY_V2", source_id=revision.id, project_locked=True)
+        # Revision application can change structure-sensitive formal source.
+        # The D2 projection is non-authoritative and must never certify it.
+        from .narrative_structure_projection import NarrativeStructureProjectionService
+        NarrativeStructureProjectionService().sync_after_history_change(
+            db, project_id, 1, "REVISION_APPLY"
+        )
         application.post_snapshot_id = post.id
         application.status = RevisionApplicationStatus.APPLIED
         application.applied_change_count = len(changes)
@@ -172,4 +178,8 @@ class RevisionApplyService:
         )
         from .formal_state import FormalStateIdentityService
         FormalStateIdentityService().rebuild_and_anchor(db, project_id, source_type="REVISION_ROLLBACK_V2", source_id=revision.id, project_locked=True)
+        from .narrative_structure_projection import NarrativeStructureProjectionService
+        NarrativeStructureProjectionService().sync_after_history_change(
+            db, project_id, 1, "REVISION_ROLLBACK"
+        )
         return application

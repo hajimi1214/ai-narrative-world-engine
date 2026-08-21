@@ -82,6 +82,7 @@ class MemoryVectorSearchMode(str, enum.Enum): EXACT="EXACT"; ANN="ANN"
 class HistoryProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class RetrievalIndexStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class FormalStateIdentityStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
+class NarrativeStructureProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class SnapshotStorageMode(str, enum.Enum): LEGACY_FULL="LEGACY_FULL"; COMPACT_ANCHOR="COMPACT_ANCHOR"; COMPACT_DELTA="COMPACT_DELTA"; REFERENCE="REFERENCE"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
 class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
@@ -388,6 +389,58 @@ class NarrativeStructureRevision(Base):
     structure_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class ProjectNarrativeStructureProjection(TimestampMixin, Base):
+    """Rebuildable, append-oriented source projection for narrative structure."""
+    __tablename__ = "project_narrative_structure_projections"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, unique=True, index=True)
+    protocol_version: Mapped[str] = mapped_column(String(60), nullable=False)
+    status: Mapped[NarrativeStructureProjectionStatus] = mapped_column(
+        Enum(NarrativeStructureProjectionStatus, native_enum=False, length=20),
+        default=NarrativeStructureProjectionStatus.DIRTY,
+        nullable=False,
+    )
+    config_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    source_feature_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    feature_accumulator: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    structure_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    active_revision_id: Mapped[str | None] = mapped_column(ForeignKey("narrative_structure_revisions.id"))
+    built_through_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sealed_through_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tail_start_sequence: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    dirty_from_sequence: Mapped[int | None] = mapped_column(Integer)
+    dirty_reason: Mapped[str | None] = mapped_column(String(200))
+    last_rebuilt_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class NarrativeStructureSceneFeature(TimestampMixin, Base):
+    """One authoritative-scene-derived input row for the D2 structure projection."""
+    __tablename__ = "narrative_structure_scene_features"
+    __table_args__ = (
+        UniqueConstraint("project_id", "scene_id", name="uq_narrative_structure_feature_scene"),
+        UniqueConstraint("project_id", "sequence", name="uq_narrative_structure_feature_sequence"),
+        Index("ix_narrative_structure_feature_project_active_sequence", "project_id", "active", "sequence"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id"), nullable=False, index=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    world_time: Mapped[str | None] = mapped_column(String(80))
+    location_id: Mapped[str | None] = mapped_column(String(36))
+    participant_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    thread_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    primary_thread_id: Mapped[str | None] = mapped_column(String(36))
+    proposal_type: Mapped[str | None] = mapped_column(String(60))
+    state_change_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    state_change_targets: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    state_change_paths: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    thread_state_event_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    checkpoint_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    source_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    feature_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
 
 class ChapterSceneBinding(Base):
     __tablename__ = "chapter_scene_bindings"
