@@ -433,6 +433,33 @@ def test_phase16d3_unified_audit_matrix_is_explicit(benchmark_session, monkeypat
     assert all(item.status in {"PASS", "FAIL"} for item in results)
 
 
+def test_phase16d3_history_change_suffix_rebuild_metrics(benchmark_session, monkeypatch):
+    """Measure the bounded suffix entrypoints used by Retcon/Replay/Revision."""
+    tests_path = str(Path(__file__).resolve().parents[1] / "tests")
+    if tests_path not in sys.path:
+        sys.path.insert(0, tests_path)
+    from tests.test_scene_commit import prepared_commit
+
+    project, location, actor, _other, proposal, performance, _turn, _resolution, _batch, _client = prepared_commit(
+        benchmark_session, monkeypatch, requires_resolution=False,
+    )
+    SceneCommitService().commit(benchmark_session, project.id, performance.id)
+    benchmark_session.commit()
+    for _ in range(4):
+        _append_formal_commit(benchmark_session, project.id, actor.id, location.id, proposal.primary_thread_id)
+    operations = {
+        "retcon_suffix_history_projection": lambda: ProjectHistoryProjectionService().rebuild_from_sequence(benchmark_session, project.id, 3),
+        "replay_suffix_structure_projection": lambda: NarrativeStructureProjectionService().rebuild_suffix_after_history_change(benchmark_session, project.id, 3),
+        "revision_suffix_ledger_edges": lambda: CausalLedgerService().rebuild_temporal_edges_from_sequence(benchmark_session, project.id, 3),
+    }
+    metrics = [measure(
+        benchmark_session, name=name, scale=5, operation=operation,
+        route="HISTORY_SUFFIX_REBUILD", projection_status="READY",
+        details={"from_sequence": 3, "sealed_prefix": True},
+    ) for name, operation in operations.items()]
+    assert all(item.sql_query_count > 0 for item in metrics)
+
+
 @pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in 10k/100k continuous SceneCommit certification")
 @pytest.mark.parametrize("scene_count", [10_000, 100_000])
 def test_phase16d3_continuous_scene_commit_scale(benchmark_session, monkeypatch, scene_count, capsys):

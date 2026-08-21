@@ -212,6 +212,7 @@ class CausalLedgerService:
     def sync_after_scene_commit(self, db: Session, commit: SceneCommit) -> None:
         if _value(commit.status) != SceneCommitStatus.COMMITTED.value or not commit.scene_id:
             raise ValueError("CAUSAL_LEDGER_SCENE_COMMIT_INVALID")
+        self._acquire_project_ledger_lock(db, commit.project_id)
         self.index_scene(db, commit.project_id, commit.scene_id, verify_current_formal_state=True)
         # A normal Scene cannot complete a Retcon or Replay.  Their lineage
         # is indexed by ``sync_after_replay_commit`` and explicit backfill;
@@ -237,7 +238,21 @@ class CausalLedgerService:
         if type(self).failure_injector:
             type(self).failure_injector("AFTER_CAUSAL_LEDGER_SYNC")
 
+    @staticmethod
+    def _acquire_project_ledger_lock(db: Session, project_id: str) -> None:
+        """Serialize ledger append/rebuild work on PostgreSQL only.
+
+        SQLite has no advisory-lock primitive and keeps the existing local
+        test semantics.  Every current-history/replay ledger route enters this
+        namespace before deriving TimelineEvent rows, preventing concurrent
+        rebuilds from racing the source-key uniqueness constraint.
+        """
+        bind = db.get_bind()
+        if bind.dialect.name == "postgresql":
+            db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"causal-ledger:{project_id}"))))
+
     def index_current_history(self, db: Session, project_id: str) -> None:
+        self._acquire_project_ledger_lock(db, project_id)
         active_ids = set()
         scenes = db.scalars(select(Scene).where(Scene.project_id == project_id).order_by(Scene.sequence, Scene.id)).all()
         for scene in scenes:

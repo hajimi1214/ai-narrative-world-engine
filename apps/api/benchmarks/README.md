@@ -31,3 +31,15 @@ The opt-in suite also contains a real continuous SceneCommit certification for
 turn on one Project and goes through the production commit service. Report
 matrices remain fail-closed: an unexecuted route, audit, fault, or concurrency
 case is `PENDING`, never an implied `PASS`.
+
+Run the PostgreSQL append/rebuild certification only against the real PG
+service:
+
+```powershell
+$env:RUN_PHASE16D3 = "1"
+$env:DATABASE_URL = "postgresql+psycopg://..."
+.venv\Scripts\python.exe -m pytest apps/api/benchmarks/test_phase16d3_postgres.py -q
+```
+
+It covers concurrent formal-state, history projection, narrative projection,
+cognition, research, ledger rebuilds, plus append-vs-rebuild serialization.
