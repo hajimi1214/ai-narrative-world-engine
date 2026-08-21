@@ -14,7 +14,7 @@ from app.db import Base
 from app.director import DirectorContextBuilder
 from app.main import app
 from app.models import (
-    ActionVisibility, Chapter, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType,
+    ActionVisibility, Chapter, ChapterStructureStatus, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType,
     Character, CharacterKnowledge, CharacterMemory, EntityType, ExecutionStage, ExecutionStatus, ExecutionTrace,
     PerformanceMode, PerformanceStatus, ProposalStatus, ResolutionOutcome, ResolutionStatus,
     ResolverMode, Scene, SceneCommit, SceneExecutionBinding, ScenePerformance,
@@ -763,6 +763,109 @@ def test_two_performances_commit_to_distinct_active_scene_sequences(session, mon
     ).order_by(TimelineEvent.sequence, TimelineEvent.ordinal)).all()
     opened = [event for event in events if event.target_id == location.id and event.path == "/profile/opened"]
     assert [(event.before_value, event.after_value) for event in opened] == [(False, True), (True, False)]
+
+
+def test_second_scene_commit_tracks_sealed_and_new_structure_tail_in_formal_delta(session, monkeypatch):
+    """D2 tail writes remain bounded, identity-synced formal mutations."""
+    project, location, actor, other, proposal, performance, _turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
+    project.autonomy_settings = {
+        "narrative_structure": {
+            "chapter_min_scenes": 1,
+            "chapter_target_scenes": 1,
+            "chapter_max_scenes": 1,
+            "chapter_boundary_threshold": 0,
+        }
+    }
+    session.commit()
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    performance.proposal_context_fingerprint = proposal.context_fingerprint
+    session.commit()
+    first = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene")
+    assert first.status_code == 200, first.text
+    first_chapter = session.scalar(select(Chapter).where(
+        Chapter.project_id == project.id,
+        Chapter.active.is_(True),
+        Chapter.structure_status == ChapterStructureStatus.PROVISIONAL,
+    ))
+    assert first_chapter is not None
+    first_chapter_id = first_chapter.id
+    session.expire_all()
+    project = session.get(type(project), project.id)
+    location = session.get(type(location), location.id)
+    actor = session.get(type(actor), actor.id)
+    other = session.get(type(other), other.id)
+
+    proposal2 = type(proposal)(
+        project_id=project.id,
+        context_fingerprint="pending",
+        proposal_type=proposal.proposal_type,
+        primary_thread_id=proposal.primary_thread_id,
+        location_id=proposal.location_id,
+        proposed_location=proposal.proposed_location,
+        participants=list(proposal.participants),
+        scene_goal="Seal the open structure tail.",
+        character_motivations=copy.deepcopy(proposal.character_motivations),
+        entry_state=copy.deepcopy(proposal.entry_state),
+        planned_pressure=proposal.planned_pressure,
+        expected_progress=copy.deepcopy(proposal.expected_progress),
+        allowed_reveals=[], forbidden_reveals=[], required_canon=[],
+        possible_outcomes=[], new_entity_requests=[], risk_flags=[],
+        director_reasoning_summary="fixture", status=ProposalStatus.APPROVED,
+    )
+    session.add(proposal2); session.flush()
+    proposal2.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    performance2 = ScenePerformance(
+        project_id=project.id, scene_proposal_id=proposal2.id, take_number=1,
+        proposal_context_fingerprint=proposal2.context_fingerprint,
+        mode=PerformanceMode.HEURISTIC, status=PerformanceStatus.RUNNING,
+        participant_order=[actor.id, other.id], active_participant_ids=[actor.id, other.id],
+        max_turns=1, turn_count=0,
+    )
+    session.add(performance2); session.flush()
+    add_resolution_turn(session, project, location, proposal2, performance2, actor, 1, [effect(location.id, value=False)])
+    proposal2.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    performance2.proposal_context_fingerprint = proposal2.context_fingerprint
+    session.commit()
+
+    from app.versioning import WorldSnapshotBuilder
+    original_build = WorldSnapshotBuilder.build
+    build_calls = 0
+
+    def count_full_snapshot(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(WorldSnapshotBuilder, "build", count_full_snapshot)
+    second = client.post(f"/projects/{project.id}/performances/{performance2.id}/commit-scene")
+    assert second.status_code == 200, second.text
+    assert build_calls == 0
+
+    session.expire_all()
+    chapters = session.scalars(select(Chapter).where(
+        Chapter.project_id == project.id, Chapter.active.is_(True),
+    ).order_by(Chapter.number)).all()
+    assert len(chapters) == 2, [
+        (chapter.id, chapter.number, chapter.structure_status, chapter.source_scene_ids)
+        for chapter in chapters
+    ]
+    assert [(chapter.id, chapter.structure_status) for chapter in chapters] == [
+        (first_chapter_id, ChapterStructureStatus.SEALED),
+        (chapters[1].id, ChapterStructureStatus.PROVISIONAL),
+    ]
+    post = session.get(WorldSnapshot, second.json()["scene_commit"]["post_snapshot_id"])
+    changed_chapter_ids = {
+        row["id"]
+        for row in post.payload["collections"]["chapters"]["upsert"]
+    }
+    assert changed_chapter_ids == {chapter.id for chapter in chapters}
+    leaf_ids = set(session.scalars(select(FormalStateLeaf.resource_id).where(
+        FormalStateLeaf.project_id == project.id,
+        FormalStateLeaf.collection_name == "chapters",
+        FormalStateLeaf.resource_id.in_(changed_chapter_ids),
+    )).all())
+    assert leaf_ids == changed_chapter_ids
+    FormalStateIdentityAudit().audit(session, project.id)
 
 
 def test_scene_commit_never_calls_an_ai_provider(session, monkeypatch):
