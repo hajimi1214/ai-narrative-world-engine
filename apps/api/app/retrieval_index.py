@@ -239,22 +239,71 @@ class CognitionRetrievalProjectionService:
         db.flush()
         return state
 
-    def _refresh_usage_heads(self, db: Session, project_id: str, resource_ids: set[tuple[str, str]]) -> None:
-        for resource_type, resource_id in resource_ids:
-            relation = CausalRelationType.KNOWLEDGE_INFORMED_DECISION if resource_type == CausalResourceType.CHARACTER_KNOWLEDGE.value else CausalRelationType.MEMORY_INFORMED_DECISION
-            count, latest = db.execute(select(func.count(CausalLink.id), func.coalesce(func.max(CausalLink.sequence), -1)).where(
-                CausalLink.project_id == project_id, CausalLink.active.is_(True), CausalLink.cause_type == resource_type,
-                CausalLink.cause_id == resource_id, CausalLink.relation_type == relation,
-            )).one()
-            head = db.scalar(select(CognitionUsageHead).where(CognitionUsageHead.project_id == project_id, CognitionUsageHead.resource_type == resource_type, CognitionUsageHead.resource_id == resource_id))
-            if not count:
-                if head: db.delete(head)
-                continue
-            fingerprint = _fingerprint({"type": resource_type, "id": resource_id, "count": count, "latest": latest}, "cognition-usage-head-v1")
+    @staticmethod
+    def _usage_fingerprint(resource_type: str, resource_id: str, count: int, latest: int) -> str:
+        return _fingerprint(
+            {"type": resource_type, "id": resource_id, "count": count, "latest": latest},
+            "cognition-usage-head-v1",
+        )
+
+    def _append_usage_heads(
+        self,
+        db: Session,
+        project_id: str,
+        links: list[CausalLink],
+    ) -> int:
+        """Apply this Scene's new usage links without recounting their history.
+
+        Normal Scene commits only append active causal links.  Rebuild/replay
+        remains the explicit full-history path for any deletion or replacement,
+        so a READY index can update each touched head from the current Scene
+        alone.  The caller's sequence boundary makes this idempotent.
+        """
+        additions: dict[tuple[str, str], tuple[int, int]] = {}
+        for link in links:
+            key = (_value(link.cause_type), link.cause_id)
+            count, latest = additions.get(key, (0, -1))
+            additions[key] = (
+                count + 1,
+                max(latest, link.sequence if link.sequence is not None else -1),
+            )
+        if not additions:
+            return 0
+        heads = {
+            (row.resource_type, row.resource_id): row
+            for row in db.scalars(select(CognitionUsageHead).where(
+                CognitionUsageHead.project_id == project_id,
+                or_(*[
+                    and_(
+                        CognitionUsageHead.resource_type == resource_type,
+                        CognitionUsageHead.resource_id == resource_id,
+                    )
+                    for resource_type, resource_id in sorted(additions)
+                ]),
+            )).all()
+        }
+        created = 0
+        for (resource_type, resource_id), (increment, latest) in additions.items():
+            head = heads.get((resource_type, resource_id))
             if head is None:
-                db.add(CognitionUsageHead(project_id=project_id, resource_type=resource_type, resource_id=resource_id, usage_count=count, latest_sequence=latest, usage_fingerprint=fingerprint))
-            else:
-                head.usage_count, head.latest_sequence, head.usage_fingerprint = count, latest, fingerprint
+                count = increment
+                head = CognitionUsageHead(
+                    project_id=project_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    usage_count=count,
+                    latest_sequence=latest,
+                    usage_fingerprint=self._usage_fingerprint(resource_type, resource_id, count, latest),
+                )
+                db.add(head)
+                created += 1
+                continue
+            count = head.usage_count + increment
+            latest = max(head.latest_sequence, latest)
+            head.usage_count = count
+            head.latest_sequence = latest
+            head.usage_fingerprint = self._usage_fingerprint(resource_type, resource_id, count, latest)
+        return created
 
     def sync_after_scene_commit(self, db: Session, project_id: str, scene_id: str, sequence: int | None = None) -> None:
         """Append only current-scene cognition and causal usage projections.
@@ -276,6 +325,13 @@ class CognitionRetrievalProjectionService:
         scene = db.get(Scene, scene_id)
         if not scene or scene.project_id != project_id:
             raise ValueError("COGNITION_RETRIEVAL_INDEX_SCENE_INVALID")
+        if scene.sequence <= state.built_through_sequence:
+            # The exact Scene was already appended.  A retry may not replay
+            # its causal usage increments.
+            return
+        if scene.sequence != state.built_through_sequence + 1:
+            self.mark_dirty(db, project_id, scene.sequence)
+            return
         knowledge = db.scalars(select(CharacterKnowledge).join(Character).where(Character.project_id == project_id, CharacterKnowledge.source == scene_id)).all()
         memories = db.scalars(select(CharacterMemory).join(Character).where(Character.project_id == project_id, CharacterMemory.source_scene == scene_id)).all()
         inserted_knowledge = 0
@@ -301,30 +357,25 @@ class CognitionRetrievalProjectionService:
             db.execute(delete(CharacterMemoryCueRef).where(CharacterMemoryCueRef.memory_id == row.id))
             for cue_type, cue_value, source_kind in self._cue_rows(row, project_id, scene):
                 db.add(CharacterMemoryCueRef(project_id=project_id, character_id=row.character_id, memory_id=row.id, cue_type=cue_type, cue_value=cue_value, source=source_kind))
-        links = db.scalars(select(CausalLink).where(CausalLink.project_id == project_id, CausalLink.scene_id == scene_id, CausalLink.cause_type.in_([CausalResourceType.CHARACTER_KNOWLEDGE, CausalResourceType.CHARACTER_MEMORY]), CausalLink.relation_type.in_([CausalRelationType.KNOWLEDGE_INFORMED_DECISION, CausalRelationType.MEMORY_INFORMED_DECISION]))).all()
-        resource_ids = {(_value(link.cause_type), link.cause_id) for link in links}
-        before_heads = {
-            (row.resource_type, row.resource_id): (row.usage_count, row.latest_sequence)
-            for row in db.scalars(select(CognitionUsageHead).where(
-                CognitionUsageHead.project_id == project_id,
-                CognitionUsageHead.resource_type.in_([kind for kind, _ in resource_ids]) if resource_ids else literal(False),
-                CognitionUsageHead.resource_id.in_([ident for _, ident in resource_ids]) if resource_ids else literal(False),
-            )).all()
-        }
-        self._refresh_usage_heads(db, project_id, resource_ids)
+        links = db.scalars(select(CausalLink).where(
+            CausalLink.project_id == project_id,
+            CausalLink.scene_id == scene_id,
+            CausalLink.active.is_(True),
+            CausalLink.cause_type.in_([
+                CausalResourceType.CHARACTER_KNOWLEDGE,
+                CausalResourceType.CHARACTER_MEMORY,
+            ]),
+            CausalLink.relation_type.in_([
+                CausalRelationType.KNOWLEDGE_INFORMED_DECISION,
+                CausalRelationType.MEMORY_INFORMED_DECISION,
+            ]),
+        )).all()
+        created_usage_heads = self._append_usage_heads(db, project_id, links)
         db.flush()
         state.built_through_sequence = max(state.built_through_sequence, scene.sequence)
         state.indexed_knowledge_count += inserted_knowledge
         state.indexed_memory_count += inserted_memories
-        after_heads = {
-            (row.resource_type, row.resource_id): row
-            for row in db.scalars(select(CognitionUsageHead).where(
-                CognitionUsageHead.project_id == project_id,
-                CognitionUsageHead.resource_type.in_([kind for kind, _ in resource_ids]) if resource_ids else literal(False),
-                CognitionUsageHead.resource_id.in_([ident for _, ident in resource_ids]) if resource_ids else literal(False),
-            )).all()
-        }
-        state.usage_head_count += sum((1 if key in after_heads else 0) - (1 if key in before_heads else 0) for key in resource_ids)
+        state.usage_head_count += created_usage_heads
         # Full source hashes are intentionally rebuild/audit-only. Marking the
         # value unknown avoids advertising a stale whole-history hash after a
         # bounded append.
@@ -493,7 +544,12 @@ class CurrentCharacterCognitionFastRetriever:
 
     @staticmethod
     def _current_sequence(db: Session, project_id: str) -> int:
-        return db.scalar(select(func.max(Scene.sequence)).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE")) or 0
+        return db.scalar(
+            select(Scene.sequence)
+            .where(Scene.project_id == project_id, Scene.history_status == "ACTIVE")
+            .order_by(Scene.sequence.desc())
+            .limit(1)
+        ) or 0
 
     def knowledge(self, db: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         current_sequence = self._current_sequence(db, project_id)
@@ -567,18 +623,91 @@ class CurrentCharacterCognitionFastRetriever:
         happened_recency = case((and_(CharacterMemory.happened_at.is_not(None), project_time.is_not(None)), 1.0 / (1 + func.abs(func.extract("epoch", project_time - CharacterMemory.happened_at)) / 86400.0)), else_=0.0)
         recency = case((memory_index.source_sequence.is_not(None), 2.0 / (1 + func.greatest(0, current_sequence - memory_index.source_sequence))), else_=happened_recency)
         score = (cue + 2 * func.greatest(0.0, memory_index.importance) + func.abs(memory_index.emotional_weight) + func.greatest(0.0, memory_index.confidence) + func.least(count, 4) + recency).label("score")
-        # A window captures frozen source diversity: strong memories bypass the
-        # first-three cap but still consume their bucket position.
-        ranked = select(CharacterMemory, memory_index.source_bucket, memory_index.source_sequence, cue, count, score, func.row_number().over(partition_by=memory_index.source_bucket, order_by=(score.desc(), cue.desc(), count.desc(), sequence.desc(), CharacterMemory.happened_at.nullsfirst(), CharacterMemory.id)).label("bucket_position")).join(Character, Character.id == CharacterMemory.character_id).join(memory_index, memory_index.memory_id == CharacterMemory.id).outerjoin(usage, and_(usage.project_id == project_id, usage.resource_type == CausalResourceType.CHARACTER_MEMORY.value, usage.resource_id == CharacterMemory.id)).where(
+        filters = (
             memory_index.project_id == project_id, memory_index.character_id == character_id,
             Character.project_id == project_id,
             CharacterMemory.character_id == character_id,
             ~self._hidden(project_id, character_id, "MEMORY", CharacterMemory.id),
-        ).subquery()
-        rows = db.execute(select(ranked).where(or_(ranked.c.cue >= 4, ranked.c.bucket_position <= 3)).order_by(ranked.c.score.desc(), ranked.c.cue.desc(), ranked.c.usage_count.desc(), ranked.c.source_sequence.desc(), ranked.c.happened_at.nullsfirst(), ranked.c.id).limit(12)).mappings().all()
+        )
+        # ``memory:<formal-id>`` is the canonical bucket only for a memory
+        # with no source Scene or sequence. Those buckets are formally proven
+        # unique, so the frozen three-per-source cap is irrelevant. Detecting
+        # that common shape lets a large unsourced corpus use a simple top-k
+        # query. Any shared, missing, or suspicious bucket deliberately falls
+        # back to the exact window below.
+        # The probe intentionally stays on the bounded derived lookup.  A
+        # formal join here turns a harmless branch decision into a nested loop
+        # over every CharacterMemory at scale.  Formal ownership remains an
+        # authority filter in the ranking query and final hydration; the
+        # explicit retrieval-index audit independently proves the derived
+        # bucket contract.
+        has_shared_bucket = db.scalar(select(literal(1)).select_from(memory_index).where(
+            memory_index.project_id == project_id,
+            memory_index.character_id == character_id,
+            ~and_(
+                memory_index.source_sequence.is_(None),
+                memory_index.source_scene_id.is_(None),
+                memory_index.source_bucket.like("memory:%"),
+            ),
+        ).limit(1)) is not None
+        columns = (
+            CharacterMemory.id.label("memory_id"), memory_index.source_bucket,
+            memory_index.source_sequence, CharacterMemory.happened_at.label("happened_at"),
+            cue, count, score,
+        )
+        rank_order = (
+            score.desc(), cue.desc(), count.desc(), sequence.desc(),
+            CharacterMemory.happened_at.nullsfirst(), CharacterMemory.id,
+        )
+        if has_shared_bucket:
+            # A bounded global prefix is not equivalent for shared buckets:
+            # one source can occupy an arbitrary prefix while lower-ranked
+            # sources are still required to fill the final twelve.
+            ranked = select(
+                *columns,
+                func.row_number().over(
+                    partition_by=memory_index.source_bucket,
+                    order_by=rank_order,
+                ).label("bucket_position"),
+            ).join(Character, Character.id == CharacterMemory.character_id).join(
+                memory_index, memory_index.memory_id == CharacterMemory.id,
+            ).outerjoin(usage, and_(
+                usage.project_id == project_id,
+                usage.resource_type == CausalResourceType.CHARACTER_MEMORY.value,
+                usage.resource_id == CharacterMemory.id,
+            )).where(*filters).subquery()
+            rows = db.execute(select(ranked).where(
+                or_(ranked.c.cue >= 4, ranked.c.bucket_position <= 3),
+            ).order_by(
+                ranked.c.score.desc(), ranked.c.cue.desc(),
+                ranked.c.usage_count.desc(), ranked.c.source_sequence.desc(),
+                ranked.c.happened_at.nullsfirst(), ranked.c.memory_id,
+            ).limit(12)).mappings().all()
+        else:
+            ranked = select(*columns).join(
+                Character, Character.id == CharacterMemory.character_id,
+            ).join(memory_index, memory_index.memory_id == CharacterMemory.id).outerjoin(
+                usage, and_(
+                    usage.project_id == project_id,
+                    usage.resource_type == CausalResourceType.CHARACTER_MEMORY.value,
+                    usage.resource_id == CharacterMemory.id,
+                ),
+            ).where(*filters)
+            rows = db.execute(ranked.order_by(*rank_order).limit(12)).mappings().all()
+        formal = {
+            row.id: row
+            for row in db.scalars(select(CharacterMemory).join(Character, Character.id == CharacterMemory.character_id).where(
+                CharacterMemory.id.in_([row["memory_id"] for row in rows]),
+                CharacterMemory.character_id == character_id,
+                Character.project_id == project_id,
+            )).all()
+        } if rows else {}
         result = []
         for row in rows:
-            item = {"memory_id": row["id"], "content": row["content"], "importance": row["importance"], "emotional_weight": row["emotional_weight"], "confidence": row["confidence"], "distortion": row["distortion"] or {}, "happened_at": row["happened_at"].isoformat() if row["happened_at"] else None, "source_scene_id": row["source_scene"]}
+            memory = formal.get(row["memory_id"])
+            if memory is None:
+                continue
+            item = {"memory_id": memory.id, "content": memory.content, "importance": memory.importance, "emotional_weight": memory.emotional_weight, "confidence": memory.confidence, "distortion": memory.distortion or {}, "happened_at": memory.happened_at.isoformat() if memory.happened_at else None, "source_scene_id": memory.source_scene}
             result.append(item)
         return result
 

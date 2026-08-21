@@ -8,11 +8,13 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
 from app.models import (
-    CurrentStateChangeHead, Project, Scene, SceneHistoryFeature, SceneStateCheckpoint, SceneStatus,
+    Character, CharacterMemory, CurrentStateChangeHead, Project, Scene, SceneHistoryFeature, SceneStateCheckpoint, SceneStatus,
     SnapshotType, StoryThread, ThreadStatus, TimelineEvent, TimelineEventType, TimelineOrigin, WorldSnapshot, new_id,
 )
 from app.historical import snapshot_fingerprint
 from app.scaling import ProjectHistoryProjectionService, ProjectHistoryProjectionAudit
+from app.director import StoryGravityContextBuilder
+from app.retrieval_index import CognitionRetrievalProjectionService
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -61,6 +63,37 @@ def test_postgres_cold_start_scene_sync_creates_ready_projection():
         assert projection.last_scene_id == scene_id
         assert projection.thread_stats["__projection_meta__"]["active_character_ids"] == []
         ProjectHistoryProjectionAudit().audit(db, project_id)
+
+
+def test_postgres_story_gravity_fast_context_uses_ready_cognition_index(monkeypatch):
+    Session = _session()
+    with Session() as db:
+        project_id, scene_id = _fixture(db)
+        character = Character(project_id=project_id, name="Actor")
+        db.add(character); db.flush()
+        scene = db.get(Scene, scene_id)
+        scene.participants = [character.id]
+        memory = CharacterMemory(
+            character_id=character.id, content="indexed memory", importance=.5,
+            emotional_weight=0, confidence=1, distortion={}, source_scene=None,
+        )
+        db.add(memory); db.flush()
+        CognitionRetrievalProjectionService().rebuild(db, project_id)
+        ProjectHistoryProjectionService().rebuild(db, project_id)
+        db.commit()
+        monkeypatch.setattr(
+            "app.scaling.ActiveCharacterCognitionReader.knowledge",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("LEGACY_PATH_USED")),
+        )
+        monkeypatch.setattr(
+            "app.scaling.ActiveCharacterCognitionReader.memories",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("LEGACY_PATH_USED")),
+        )
+        builder = StoryGravityContextBuilder()
+        context = builder.build(db, project_id)
+        assert context["protocol_version"] == "story-gravity-context-v2"
+        assert builder.last_route == "FAST_HISTORY_PROJECTION"
+        assert [item["memory_id"] for item in context["memories"]] == [memory.id]
 
 
 def test_postgres_concurrent_rebuild_is_serialized():

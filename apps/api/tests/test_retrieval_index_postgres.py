@@ -4,7 +4,7 @@ import threading
 import uuid
 
 import pytest
-from sqlalchemy import event, create_engine, delete, select
+from sqlalchemy import event, create_engine, delete, select, text
 from sqlalchemy.orm import sessionmaker
 
 from app.character_mind import CharacterMindViewBuilder
@@ -15,7 +15,8 @@ from app.models import (
     ResearchChunkLexicalIndex, ResearchDocument, ResearchDocumentRevision,
     ResearchLexicalIndexState, ResearchTermPosting, ResearchTermStat, SceneProposal,
     ProjectModelConfig, MemoryRetrievalMode, MemoryVectorSearchMode, CharacterMemoryEmbedding, EmbeddingStatus,
-    RetrievalIndexStatus, ResearchSourceTier, ResearchSourceKind, WorldEntity, EntityType, Scene,
+    CausalEdgeKind, CausalLink, CausalRelationType, CausalResourceType, RetrievalIndexStatus,
+    ResearchSourceTier, ResearchSourceKind, WorldEntity, EntityType, Scene, SceneStatus,
 )
 from app.research import ResearchBM25Retriever, ResearchIngestionService, ResearchRetrievalConfig
 from app.retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService, ResearchIndexedBM25Retriever, CharacterMemoryANNSemanticRetriever, CurrentCharacterCognitionFastRetriever, MemoryANNIndexStatusService
@@ -29,7 +30,7 @@ pytestmark = pytest.mark.skipif(not DATABASE_URL.startswith("postgresql"), reaso
 def cleanup(db, project_id):
     memory_ids = select(CharacterMemory.id).join(Character).where(Character.project_id == project_id)
     knowledge_ids = select(CharacterKnowledge.id).join(Character).where(Character.project_id == project_id)
-    for model in (ResearchTermPosting, ResearchTermStat, ResearchChunkLexicalIndex, ResearchLexicalIndexState,
+    for model in (CausalLink, ResearchTermPosting, ResearchTermStat, ResearchChunkLexicalIndex, ResearchLexicalIndexState,
                   CharacterMemoryCueRef, CharacterMemorySearchIndex, CharacterKnowledgeSearchIndex,
                   CognitionUsageHead, ProjectCognitionRetrievalIndex, CharacterMemoryEmbedding, ResearchChunk,
                   ResearchDocumentRevision, ResearchDocument, ProjectModelConfig, WorldEntity, SceneProposal, Scene):
@@ -53,9 +54,13 @@ def test_postgres_cognition_fast_path_matches_legacy():
         ])
         proposal = SceneProposal(id="c1-fast-proposal", project_id=project.id, location_id="door", participants=[actor.id], entry_state={})
         CognitionRetrievalProjectionService().rebuild(db, project.id); db.commit()
-        fast = CharacterMindViewBuilder().build(db, project.id, actor.id, proposal)
+        builder = CharacterMindViewBuilder()
+        fast = builder.build(db, project.id, actor.id, proposal)
+        assert builder.last_route == "FAST_DETERMINISTIC"
         CognitionRetrievalProjectionService().mark_dirty(db, project.id); db.commit()
-        legacy = CharacterMindViewBuilder().build(db, project.id, actor.id, proposal)
+        legacy = builder.build(db, project.id, actor.id, proposal)
+        assert builder.last_route == "LEGACY_INDEX_UNAVAILABLE"
+        assert builder.last_fallback_reason == "COGNITION_RETRIEVAL_INDEX_NOT_READY"
         assert fast["knowledge"] == legacy["knowledge"]
         assert fast["memories"] == legacy["memories"]
         assert fast["belief_conflicts"] == legacy["belief_conflicts"]
@@ -81,8 +86,28 @@ def test_postgres_hybrid_current_fast_path_does_not_call_legacy_reader(monkeypat
         monkeypatch.setattr("app.character_mind.ActiveCharacterCognitionReader.knowledge", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LEGACY_PATH_USED")))
         monkeypatch.setattr("app.character_mind.ActiveCharacterCognitionReader.memories", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LEGACY_PATH_USED")))
         proposal = SceneProposal(id="hybrid-fast-proposal", project_id=project.id, location_id="room", participants=[actor.id], entry_state={})
-        result = CharacterMindViewBuilder(embedding_provider_factory=lambda _route: FakeEmbeddingProvider({"{\"location_ids\":[\"room\"],\"participant_ids\":[\"" + actor.id + "\"]}": [1.0, 0.0]})).build(db, project.id, actor.id, proposal)
+        builder = CharacterMindViewBuilder(embedding_provider_factory=lambda _route: FakeEmbeddingProvider({"{\"location_ids\":[\"room\"],\"participant_ids\":[\"" + actor.id + "\"]}": [1.0, 0.0]}))
+        result = builder.build(db, project.id, actor.id, proposal)
+        assert builder.last_route == "FAST_HYBRID"
         assert {item["memory_id"] for item in result["memories"]} == {target.id, other.id}
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_cognition_fast_failure_reports_explicit_legacy_fallback(monkeypatch):
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="cognition-fallback-route"); db.add(project); db.flush()
+        actor = Character(project_id=project.id, name="Actor"); db.add(actor); db.flush()
+        db.add(CharacterMemory(character_id=actor.id, content="fallback memory", importance=.5, emotional_weight=0, confidence=1, distortion={}))
+        proposal = SceneProposal(id="cognition-fallback-proposal", project_id=project.id, location_id="room", participants=[actor.id], entry_state={})
+        CognitionRetrievalProjectionService().rebuild(db, project.id); db.commit()
+        monkeypatch.setattr(CurrentCharacterCognitionFastRetriever, "knowledge", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fast sentinel")))
+        builder = CharacterMindViewBuilder()
+        result = builder.build(db, project.id, actor.id, proposal)
+        assert result["character_id"] == actor.id
+        assert builder.last_route == "LEGACY_FALLBACK"
+        assert builder.last_fallback_reason == "RuntimeError"
         cleanup(db, project.id)
     engine.dispose()
 
@@ -314,8 +339,25 @@ def test_postgres_ready_top_level_research_invokes_indexed_retriever(monkeypatch
             called["value"] = True
             return original(*args, **kwargs)
         monkeypatch.setattr(ResearchIndexedBM25Retriever, "search", tracked)
-        assert ResearchBM25Retriever().search(db, project.id, "steam engine")
+        retriever = ResearchBM25Retriever()
+        assert retriever.search(db, project.id, "steam engine")
         assert called["value"]
+        assert retriever.last_route == "INDEXED_FAST"
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_research_fast_failure_reports_explicit_legacy_fallback(monkeypatch):
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="research-fallback-route"); db.add(project); db.flush()
+        ResearchIngestionService().ingest(db, project.id, title="Notes", content="steam engine workshop")
+        db.commit()
+        monkeypatch.setattr(ResearchIndexedBM25Retriever, "search", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fast sentinel")))
+        retriever = ResearchBM25Retriever()
+        assert retriever.search(db, project.id, "steam engine")
+        assert retriever.last_route == "LEGACY_FALLBACK"
+        assert retriever.last_fallback_reason == "RuntimeError"
         cleanup(db, project.id)
     engine.dispose()
 
@@ -334,7 +376,15 @@ def test_postgres_fast_cognition_read_is_bounded_at_100k():
         db.execute(CharacterMemory.__table__.insert(), rows)
         db.execute(CharacterMemorySearchIndex.__table__.insert(), indexes)
         db.add(ProjectCognitionRetrievalIndex(project_id=project.id, protocol_version="character-cognition-search-v1", status=RetrievalIndexStatus.READY, indexed_knowledge_count=0, indexed_memory_count=100_000, usage_head_count=0, built_through_sequence=0, index_fingerprint="state"))
-        db.commit(); statements = []
+        db.commit()
+        # Bulk fixtures do not update PostgreSQL planner statistics.  Analyze
+        # the two touched relations so this proof measures the retrieval plan
+        # rather than a stale-statistics nested loop; cap any regression with
+        # a diagnostic timeout instead of allowing an unbounded test process.
+        db.execute(text("ANALYZE character_memories"))
+        db.execute(text("ANALYZE character_memory_search_indexes"))
+        db.execute(text("SET LOCAL statement_timeout = '30000ms'"))
+        statements = []
         def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
             statements.append(statement)
         event.listen(engine, "before_cursor_execute", capture)
@@ -343,6 +393,67 @@ def test_postgres_fast_cognition_read_is_bounded_at_100k():
         event.remove(engine, "before_cursor_execute", capture)
         assert len(result) == 12
         assert len(statements) <= 4
+        # The fixture uses the canonical one-memory-per-bucket shape.  This
+        # assertion proves the bounded fast SQL branch was used directly; a
+        # legacy window query would make the test pass for the wrong reason.
+        assert not any("row_number" in statement.lower() for statement in statements)
+        cleanup(db, project.id)
+    engine.dispose()
+
+
+def test_postgres_cognition_append_usage_does_not_aggregate_historical_links():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True); Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="cognition-usage-append-bounded"); db.add(project); db.flush()
+        actor = Character(project_id=project.id, name="Actor"); db.add(actor); db.flush()
+        memory = CharacterMemory(character_id=actor.id, content="remembered", importance=.5, emotional_weight=0, confidence=1, distortion={})
+        first = Scene(project_id=project.id, sequence=1, status=SceneStatus.OCCURRED, history_status="ACTIVE")
+        db.add_all([memory, first]); db.flush()
+        historical = [
+            {
+                "id": str(uuid.uuid4()), "project_id": project.id,
+                "cause_type": CausalResourceType.CHARACTER_MEMORY,
+                "cause_id": memory.id, "effect_type": CausalResourceType.CHARACTER_DECISION,
+                "effect_id": str(uuid.uuid4()), "edge_kind": CausalEdgeKind.CAUSAL,
+                "relation_type": CausalRelationType.MEMORY_INFORMED_DECISION,
+                "scene_id": first.id, "sequence": 1, "evidence": {}, "active": True,
+                "source_key": f"usage-prefix-{index}", "link_fingerprint": f"usage-prefix-fp-{index}",
+            }
+            for index in range(10_000)
+        ]
+        db.execute(CausalLink.__table__.insert(), historical)
+        CognitionRetrievalProjectionService().rebuild(db, project.id)
+        second = Scene(project_id=project.id, sequence=2, status=SceneStatus.OCCURRED, history_status="ACTIVE")
+        db.add(second); db.flush()
+        db.add(CausalLink(
+            project_id=project.id, cause_type=CausalResourceType.CHARACTER_MEMORY,
+            cause_id=memory.id, effect_type=CausalResourceType.CHARACTER_DECISION,
+            effect_id=str(uuid.uuid4()), edge_kind=CausalEdgeKind.CAUSAL,
+            relation_type=CausalRelationType.MEMORY_INFORMED_DECISION, scene_id=second.id,
+            sequence=2, source_key="usage-current", link_fingerprint="usage-current-fp",
+        ))
+        db.flush(); statements = []
+
+        def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement.lower())
+
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            CognitionRetrievalProjectionService().sync_after_scene_commit(db, project.id, second.id, 2)
+            db.flush()
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        usage = db.scalar(select(CognitionUsageHead).where(
+            CognitionUsageHead.project_id == project.id,
+            CognitionUsageHead.resource_id == memory.id,
+        ))
+        assert usage.usage_count == 10_001
+        causal_sql = [statement for statement in statements if "causal_links" in statement]
+        assert causal_sql
+        assert all("count(" not in statement and "max(" not in statement for statement in causal_sql)
+        assert all("scene_id" in statement for statement in causal_sql)
+        from app.retrieval_index import CognitionRetrievalIndexAudit
+        assert CognitionRetrievalIndexAudit().audit(db, project.id)["valid"]
         cleanup(db, project.id)
     engine.dispose()
 

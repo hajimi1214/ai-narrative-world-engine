@@ -146,7 +146,15 @@ class StoryGravityContext(dict):
 
 class StoryGravityContextBuilder:
     """Read-only structured current-history authority for Director scoring."""
+    def __init__(self) -> None:
+        # Ephemeral route evidence. The context protocol remains the frozen
+        # semantic contract; these fields are only for diagnostics/tests.
+        self.last_route: str = "UNSET"
+        self.last_fallback_reason: str | None = None
+
     def build(self, session: Session, project_id: str) -> dict[str, Any]:
+        self.last_route = "UNSET"
+        self.last_fallback_reason = None
         project = session.get(Project, project_id)
         if not project:
             raise ValueError("Project not found")
@@ -154,9 +162,22 @@ class StoryGravityContextBuilder:
         # read-only here; missing or dirty rows deliberately use this frozen
         # formal-history path instead of repairing data during a Director read.
         from .scaling import ProjectHistoryProjectionService
-        fast = ProjectHistoryProjectionService().fast_context(session, project_id, self)
+        projection_service = ProjectHistoryProjectionService()
+        try:
+            fast = projection_service.fast_context(session, project_id, self)
+        except Exception as exc:
+            # A corrupt/unsupported derived projection must never be mistaken
+            # for a successful fast read.  The formal-history reader remains
+            # authoritative, while only a safe code/type is exposed.
+            fast = None
+            self.last_route = "LEGACY_FALLBACK"
+            self.last_fallback_reason = self._safe_route_reason(exc)
         if fast is not None:
+            self.last_route = "FAST_HISTORY_PROJECTION"
             return StoryGravityContext(fast)
+        if self.last_route == "UNSET":
+            self.last_route = "LEGACY_FORMAL_HISTORY"
+            self.last_fallback_reason = "HISTORY_PROJECTION_UNAVAILABLE_OR_STALE"
         scenes = session.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == SceneStatus.OCCURRED, Scene.history_status == "ACTIVE").order_by(Scene.sequence, Scene.id)).all()
         current_sequence = max((scene.sequence for scene in scenes), default=0)
         characters = session.scalars(select(Character).where(Character.project_id == project_id, Character.active.is_(True)).order_by(Character.id)).all()
@@ -197,15 +218,21 @@ class StoryGravityContextBuilder:
                 valid_links.append(link)
         return StoryGravityContext({"protocol_version": "story-gravity-context-v1", "project": {"id": project.id, "story_seed": project.story_seed, "autonomy_settings": project.autonomy_settings}, "current_sequence": current_sequence, "scenes": [self._scene(scene) for scene in scenes], "recent_scene_signatures": signatures, "characters": [self._character(character, knowledge_rows_by_character.get(character.id, [])) for character in characters], "story_threads": [self._thread(thread) for thread in threads], "story_arc": self._arc(arc), "locations": [{"id": row.id, "name": row.name} for row in locations], "knowledge": sorted(knowledge, key=lambda item: (item["character_id"], item["knowledge_id"])), "memories": sorted(memories, key=lambda item: (item["character_id"], item["memory_id"])), "state_changes": state_changes, "causal_links": [{"id": link.id, "fingerprint": link.link_fingerprint, "scene_id": link.scene_id, "sequence": link.sequence} for link in valid_links], "reveals": reveal})
 
+    @staticmethod
+    def _safe_route_reason(exc: BaseException) -> str:
+        code = getattr(exc, "code", None)
+        return str(code) if isinstance(code, str) and code else type(exc).__name__
+
     def _signature(self, session, scene):
         binding = session.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
         performance = session.get(ScenePerformance, binding.performance_id) if binding else None
         proposal = session.get(SceneProposal, performance.scene_proposal_id) if performance else None
         return {"scene_id": scene.id, "sequence": scene.sequence, "proposal_type": getattr(proposal.proposal_type, "value", proposal.proposal_type) if proposal else None, "primary_thread_id": proposal.primary_thread_id if proposal else None, "participants": sorted(str(value) for value in (proposal.participants if proposal else scene.participants or [])), "location_id": proposal.location_id if proposal else scene.location}
     def _scene(self, scene): return {"id": scene.id, "sequence": scene.sequence, "location_id": scene.location, "participants": sorted(str(value) for value in scene.participants or []), "story_threads": sorted(str(value) for value in scene.story_threads or [])}
-    def _character(self, character, knowledge=None):
+    def _character(self, character, knowledge=None, conflicts=None):
         rows = list(knowledge or [])
-        _, conflicts = CharacterBeliefViewBuilder().build(rows)
+        if conflicts is None:
+            _, conflicts = CharacterBeliefViewBuilder().build(rows)
         return {"id": character.id, "narrative_relevance": (character.narrative_relevance or {}).get("score", 0), "location_id": (character.current_state or {}).get("location_id", (character.current_state or {}).get("location")), "has_goal": bool(character.goals), "goal_refs": sorted(str(key) for key in (character.goals or {}).keys()), "goals": character.goals or {}, "current_state": character.current_state or {}, "physical_state": character.physical_state or {}, "emotional_state": character.emotional_state or {}, "relationships": character.relationships or {}, "belief_conflict_count": len(conflicts), "belief_conflicts": conflicts}
     def _thread(self, thread): return {"id": thread.id, "title": thread.title, "type": thread.type, "goal": thread.goal, "weight": max(0.0, min(float(thread.weight or 0), 100.0)), "progress": max(0.0, min(float(thread.progress or 0), 1.0)), "status": getattr(thread.status, "value", thread.status), "state": thread.state or {}}
     def _arc(self, arc): return None if not arc else {"id": arc.id, "status": arc.status, "progress": arc.progress}

@@ -586,8 +586,14 @@ class ResearchBM25Retriever:
     def __init__(self, tokenizer: KnowledgeTokenizer | None = None, diversifier: ResearchDiversifier | None = None):
         self.tokenizer = tokenizer or KnowledgeTokenizer()
         self.diversifier = diversifier or ResearchDiversifier(self.tokenizer)
+        # Ephemeral route evidence; never included in KnowledgePacket or hit
+        # payloads. This makes indexed success distinct from legacy fallback.
+        self.last_route: str = "UNSET"
+        self.last_fallback_reason: str | None = None
 
     def search(self, db: Session, project_id: str, query_text: str, *, filters: dict[str, Any] | None = None, config: ResearchConfig | dict[str, Any] | None = None, browse_mode: bool = False) -> list[ResearchHit]:
+        self.last_route = "UNSET"
+        self.last_fallback_reason = None
         try:
             cfg = normalize_retrieval_config(config)
         except ResearchDomainError:
@@ -607,9 +613,19 @@ class ResearchBM25Retriever:
             try:
                 from .retrieval_index import ResearchIndexedBM25Retriever, ResearchLexicalIndexService
                 if ResearchLexicalIndexService().fast_path_available(db, project_id):
-                    return ResearchIndexedBM25Retriever().search(db, project_id, query_text, filters=filters, config=cfg)
-            except Exception:
-                pass
+                    result = ResearchIndexedBM25Retriever().search(db, project_id, query_text, filters=filters, config=cfg)
+                    self.last_route = "INDEXED_FAST"
+                    return result
+                self.last_route = "LEGACY_INDEX_UNAVAILABLE"
+                self.last_fallback_reason = "RESEARCH_LEXICAL_INDEX_NOT_READY"
+            except Exception as exc:
+                # The reference implementation remains authoritative, but
+                # the route is explicit and only a safe exception code/type is
+                # exposed to diagnostics.
+                self.last_route = "LEGACY_FALLBACK"
+                self.last_fallback_reason = self._safe_route_reason(exc)
+        elif browse_mode:
+            self.last_route = "LEGACY_BROWSE"
         docs = db.scalars(select(ResearchDocument).where(ResearchDocument.project_id == project_id, ResearchDocument.active.is_(True)).order_by(ResearchDocument.id)).all()
         rows: list[tuple[ResearchDocument, ResearchDocumentRevision, ResearchChunk]] = []
         for document in docs:
@@ -672,6 +688,11 @@ class ResearchBM25Retriever:
             document = item["document"]
             hits.append(ResearchHit(item["chunk"].id, document.id, item["revision"].id, document.title, _value(document.source_tier), _value(document.source_kind), float(item["score"]), index, content, item["content_fingerprint"], document.source_uri, _safe_metadata(document.source_metadata, reject=False), item["authority_rank"], truncated))
         return hits
+
+    @staticmethod
+    def _safe_route_reason(exc: BaseException) -> str:
+        code = getattr(exc, "code", None)
+        return str(code) if isinstance(code, str) and code else type(exc).__name__
 
     retrieve = search
 

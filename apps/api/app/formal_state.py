@@ -300,9 +300,31 @@ def _mark_formal_identity_dirty(session: Session, flush_context, instances=None)
         return
     touched: set[str] = set()
     tracked = tuple(COLLECTION_MODELS.values()) + (Project,)
-    for row in set(session.new).union(session.dirty).union(session.deleted):
+    pending = set(session.new).union(session.dirty).union(session.deleted)
+    cognition_rows: list[CharacterKnowledge | CharacterMemory] = []
+    character_owners: dict[str, str] = {}
+    for row in pending:
+        if isinstance(row, Character) and row.project_id:
+            character_owners[row.id] = row.project_id
         if type(row) in tracked and getattr(row, "project_id", None):
             touched.add(row.project_id)
+        elif isinstance(row, (CharacterKnowledge, CharacterMemory)) and row.character_id:
+            cognition_rows.append(row)
+    unresolved_character_ids = {
+        row.character_id for row in cognition_rows
+        if row.character_id not in character_owners
+    }
+    if unresolved_character_ids:
+        character_owners.update(dict(session.execute(
+            select(Character.id, Character.project_id).where(
+                Character.id.in_(unresolved_character_ids),
+            )
+        ).all()))
+    touched.update(
+        character_owners[row.character_id]
+        for row in cognition_rows
+        if row.character_id in character_owners
+    )
     for project_id in touched:
         identity = session.identity_map.get((ProjectFormalStateIdentity, (project_id,)))
         if identity is None:

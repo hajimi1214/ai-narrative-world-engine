@@ -403,8 +403,8 @@ def test_open_tail_append_is_bounded_across_large_sealed_prefixes(session):
 
     def append_counts(sealed_count):
         config_data = {
-            "chapter_min_scenes": 2, "chapter_target_scenes": 200_000,
-            "chapter_max_scenes": 200_000, "chapter_boundary_threshold": 999,
+            "chapter_min_scenes": 1, "chapter_target_scenes": 1,
+            "chapter_max_scenes": 1, "chapter_boundary_threshold": 0,
         }
         project = Project(name=f"D2 scale {sealed_count}", autonomy_settings={"narrative_structure": config_data})
         session.add(project); session.flush()
@@ -468,9 +468,14 @@ def test_open_tail_append_is_bounded_across_large_sealed_prefixes(session):
             )
         finally:
             event.remove(session.bind, "before_cursor_execute", capture)
-        assert changed == [open_chapter.id]
+        assert open_chapter.id in changed
+        assert len(changed) == 2
         assert session.scalar(select(Chapter.id).where(Chapter.id == first_sealed_id)) == first_sealed_id
-        assert open_chapter.source_scene_ids == [prior.id, new_scene.id]
+        assert open_chapter.source_scene_ids == [prior.id]
+        assert open_chapter.structure_status == ChapterStructureStatus.SEALED
+        assert projection.sealed_through_sequence == sealed_count
+        assert projection.tail_start_sequence == sealed_count + 1
+        assert not any("max(" in query.lower() for query in queries)
         hydrated_chapters = [
             row for row in session.identity_map.values()
             if isinstance(row, Chapter) and row.project_id == project.id

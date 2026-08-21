@@ -443,11 +443,25 @@ class ProjectHistoryProjectionService:
         locations = db.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True), WorldEntity.entity_type == EntityType.LOCATION).order_by(WorldEntity.id)).all()
         knowledge, knowledge_rows_by_character, memories = [], {}, []
         reader = ActiveCharacterCognitionReader()
+        fast_cognition = None
+        if db.bind and db.bind.dialect.name == "postgresql":
+            from .retrieval_index import CognitionRetrievalProjectionService, CurrentCharacterCognitionFastRetriever
+            if CognitionRetrievalProjectionService().fast_path_available(db, project_id):
+                fast_cognition = CurrentCharacterCognitionFastRetriever()
+        empty_cues = {key: () for key in ("entity_ids", "participant_ids", "thread_ids", "item_ids", "location_ids")}
+        conflicts_by_character: dict[str, list[dict[str, Any]]] = {}
         for character in characters:
-            rows = reader.knowledge(db, project_id, character.id)
-            knowledge_rows_by_character[character.id] = rows
-            knowledge.extend({"knowledge_id": row.id, "character_id": character.id, "status": _value(row.status), "confidence": row.confidence, "proposition": row.proposition, "fact_identity": row.proposition} for row in rows)
-            memories.extend({"memory_id": row.id, "character_id": character.id, "importance": row.importance, "emotional_weight": row.emotional_weight} for row in reader.memories(db, project_id, character.id))
+            if fast_cognition is None:
+                rows = reader.knowledge(db, project_id, character.id)
+                knowledge_rows_by_character[character.id] = rows
+                knowledge.extend({"knowledge_id": row.id, "character_id": character.id, "status": _value(row.status), "confidence": row.confidence, "proposition": row.proposition, "fact_identity": row.proposition} for row in rows)
+                memories.extend({"memory_id": row.id, "character_id": character.id, "importance": row.importance, "emotional_weight": row.emotional_weight} for row in reader.memories(db, project_id, character.id))
+                continue
+            recalled, conflicts = fast_cognition.knowledge(db, project_id, character.id, empty_cues)
+            knowledge_rows_by_character[character.id] = recalled
+            conflicts_by_character[character.id] = conflicts
+            knowledge.extend({"knowledge_id": row["knowledge_id"], "character_id": character.id, "status": row["status"], "confidence": row["confidence"], "proposition": row["proposition"], "fact_identity": row.get("fact_identity")} for row in recalled)
+            memories.extend({"memory_id": row["memory_id"], "character_id": character.id, "importance": row["importance"], "emotional_weight": row["emotional_weight"]} for row in fast_cognition.memories(db, project_id, character.id, empty_cues))
         reveals = [{"canon_fact_id": row.canon_fact_id, "status": RevealStatus.AVAILABLE.value,
                     "allowed_character_ids": sorted(row.allowed_character_ids or [])}
                    for row in db.scalars(select(RevealConstraint).where(RevealConstraint.project_id == project_id).order_by(RevealConstraint.id)).all()
@@ -507,7 +521,7 @@ class ProjectHistoryProjectionService:
             "current_sequence": projection.built_through_sequence, "scenes": scenes,
             "recent_scene_signatures": copy.deepcopy(projection.recent_scene_signatures or []),
             "history_stats": {"thread_stats": copy.deepcopy(projection.thread_stats or {}), "character_stats": copy.deepcopy(projection.character_stats or {}), "projection_fingerprint": projection.projection_fingerprint},
-            "characters": [builder._character(row, knowledge_rows_by_character.get(row.id, [])) for row in characters],
+            "characters": [builder._character(row, knowledge_rows_by_character.get(row.id, []), conflicts_by_character.get(row.id)) for row in characters],
             "story_threads": [builder._thread(row) for row in threads], "story_arc": builder._arc(arc),
             "locations": [{"id": row.id, "name": row.name} for row in locations],
             "knowledge": sorted(knowledge, key=lambda item: (item["character_id"], item["knowledge_id"])),

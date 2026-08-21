@@ -297,8 +297,14 @@ class CharacterMindViewBuilder:
     def __init__(self, reader: ActiveCharacterCognitionReader | None = None, embedding_provider_factory=None):
         self.reader = reader or ActiveCharacterCognitionReader(); self.cues = StructuredActorCueExtractor(); self.beliefs = CharacterBeliefViewBuilder(); self.knowledge = CharacterKnowledgeRetriever(); self.memories = CharacterMemoryRetriever()
         self.embedding_provider_factory = embedding_provider_factory
+        # Ephemeral route evidence for tests/diagnostics. It is deliberately
+        # excluded from the formal mind payload and never persisted.
+        self.last_route: str = "UNSET"
+        self.last_fallback_reason: str | None = None
 
     def build(self, session: Session, project_id: str, character_id: str, proposal: SceneProposal) -> dict[str, Any]:
+        self.last_route = "UNSET"
+        self.last_fallback_reason = None
         character = session.get(Character, character_id)
         if not character or character.project_id != project_id:
             raise ValueError("Character not found in project")
@@ -317,14 +323,20 @@ class CharacterMindViewBuilder:
                 recalled_memories = fast.memories(session, project_id, character_id, cues)
                 if config and config.embedding_enabled and config.memory_retrieval_mode == MemoryRetrievalMode.HYBRID_RRF:
                     recalled_memories = self._fast_hybrid_memories(session, project_id, character_id, cues, recalled_memories, character, proposal, config, fast)
+                else:
+                    self.last_route = "FAST_DETERMINISTIC"
                 identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
                 result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
                 result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
                 return result
-        except Exception:
+        except Exception as exc:
             # A dirty/corrupt or unsupported projection must not alter a
             # character's legal cognition. The legacy path below is exact.
-            pass
+            self.last_route = "LEGACY_FALLBACK"
+            self.last_fallback_reason = self._safe_route_reason(exc)
+        if self.last_route == "UNSET":
+            self.last_route = "LEGACY_INDEX_UNAVAILABLE"
+            self.last_fallback_reason = "COGNITION_RETRIEVAL_INDEX_NOT_READY"
         active_knowledge = self.reader.knowledge(session, project_id, character_id)
         beliefs, conflicts = self.beliefs.build(active_knowledge)
         recalled_knowledge = self.knowledge.retrieve(session, project_id, active_knowledge, cues, beliefs)
@@ -352,14 +364,28 @@ class CharacterMindViewBuilder:
             route = EmbeddingRouter().resolve(session, project_id, get_settings())
             query = self._semantic_query(session, project_id, character, proposal, cues, resolve_current_context=True)
             if not route.enabled or not query:
+                self.last_route = "FAST_DETERMINISTIC"
+                self.last_fallback_reason = "EMBEDDING_ROUTE_UNAVAILABLE"
                 return deterministic
             provider = self.embedding_provider_factory(route) if self.embedding_provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
             embedding = provider.embed([query], route.model)
             if embedding.dimension != route.dimension:
+                self.last_route = "FAST_DETERMINISTIC"
+                self.last_fallback_reason = "EMBEDDING_DIMENSION_MISMATCH"
                 return deterministic
+            self.last_route = "FAST_HYBRID"
             return fast.hybrid_memories(session, project_id, character_id, cues, embedding.vectors[0], route.embedding_config_fingerprint, config)
-        except Exception:
+        except Exception as exc:
+            self.last_route = "FAST_DETERMINISTIC"
+            self.last_fallback_reason = self._safe_route_reason(exc)
             return deterministic
+
+    @staticmethod
+    def _safe_route_reason(exc: BaseException | type[BaseException]) -> str:
+        if isinstance(exc, type):
+            return exc.__name__
+        code = getattr(exc, "code", None)
+        return str(code) if isinstance(code, str) and code else type(exc).__name__
 
     def _semantic_query(self, session: Session, project_id: str, character: Character, proposal: SceneProposal, cues: dict[str, tuple[str, ...]], *, location: Any = None, participants: list[Any] | None = None, resolve_current_context: bool = False) -> str:
         """Build the one Phase15A semantic-query contract for every path."""

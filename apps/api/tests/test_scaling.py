@@ -100,15 +100,28 @@ def test_rebuild_creates_projection_features_and_heads(session):
     SceneHistoryFeatureAudit().audit(session, world.project.id)
 
 
-def test_fast_gravity_matches_legacy_semantics(session):
+def test_fast_gravity_matches_legacy_semantics(session, monkeypatch):
     world = make_history(session)
-    legacy_context = StoryGravityContextBuilder().build(session, world.project.id)
+    legacy_builder = StoryGravityContextBuilder()
+    legacy_context = legacy_builder.build(session, world.project.id)
+    assert legacy_builder.last_route == "LEGACY_FORMAL_HISTORY"
     legacy_report = StoryGravityEngine().build(legacy_context)
     ProjectHistoryProjectionService().rebuild(session, world.project.id)
     session.commit()
-    fast_context = StoryGravityContextBuilder().build(session, world.project.id)
+    calls = {"count": 0}
+    original_fast_context = ProjectHistoryProjectionService.fast_context
+
+    def tracked_fast_context(*args, **kwargs):
+        calls["count"] += 1
+        return original_fast_context(*args, **kwargs)
+
+    monkeypatch.setattr(ProjectHistoryProjectionService, "fast_context", tracked_fast_context)
+    fast_builder = StoryGravityContextBuilder()
+    fast_context = fast_builder.build(session, world.project.id)
     fast_report = StoryGravityEngine().build(fast_context)
     assert fast_context["protocol_version"] == "story-gravity-context-v2"
+    assert fast_builder.last_route == "FAST_HISTORY_PROJECTION"
+    assert calls["count"] == 1
     assert [(row["thread_id"], row["thread_gravity_score"]) for row in fast_report.thread_gravity] == [(row["thread_id"], row["thread_gravity_score"]) for row in legacy_report.thread_gravity]
     assert [(row["character_id"], row["character_gravity_score"]) for row in fast_report.character_gravity] == [(row["character_id"], row["character_gravity_score"]) for row in legacy_report.character_gravity]
     assert [candidate.candidate_key for candidate in DirectorCandidateEngine().generate(fast_context, fast_report)] == [candidate.candidate_key for candidate in DirectorCandidateEngine().generate(legacy_context, legacy_report)]
@@ -121,10 +134,29 @@ def test_dirty_projection_falls_back_without_rebuilding(session):
     projection = session.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == world.project.id))
     projection.status = "DIRTY"
     session.commit()
-    context = StoryGravityContextBuilder().build(session, world.project.id)
+    builder = StoryGravityContextBuilder()
+    context = builder.build(session, world.project.id)
     assert context["protocol_version"] == "story-gravity-context-v1"
+    assert builder.last_route == "LEGACY_FORMAL_HISTORY"
+    assert builder.last_fallback_reason == "HISTORY_PROJECTION_UNAVAILABLE_OR_STALE"
     persisted = session.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == world.project.id))
     assert getattr(persisted.status, "value", persisted.status) == "DIRTY"
+
+
+def test_projection_exception_reports_explicit_legacy_fallback(session, monkeypatch):
+    world = make_history(session)
+    ProjectHistoryProjectionService().rebuild(session, world.project.id)
+    session.commit()
+
+    def fail_fast(*_args, **_kwargs):
+        raise RuntimeError("projection sentinel")
+
+    monkeypatch.setattr(ProjectHistoryProjectionService, "fast_context", fail_fast)
+    builder = StoryGravityContextBuilder()
+    context = builder.build(session, world.project.id)
+    assert context["protocol_version"] == "story-gravity-context-v1"
+    assert builder.last_route == "LEGACY_FALLBACK"
+    assert builder.last_fallback_reason == "RuntimeError"
 
 
 def test_incremental_append_preserves_prefix_and_bounds_recent_signatures(session):

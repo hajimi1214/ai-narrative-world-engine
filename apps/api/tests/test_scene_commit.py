@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -743,9 +743,19 @@ def test_two_performances_commit_to_distinct_active_scene_sequences(session, mon
         return original_build(*args, **kwargs)
 
     monkeypatch.setattr(WorldSnapshotBuilder, "build", count_full_snapshot)
-    second = client.post(f"/projects/{project.id}/performances/{performance2.id}/commit-scene")
+    statements = []
+
+    def capture(_conn, _cursor, statement, _params, _context, _executemany):
+        statements.append(statement.lower())
+
+    event.listen(session.bind, "before_cursor_execute", capture)
+    try:
+        second = client.post(f"/projects/{project.id}/performances/{performance2.id}/commit-scene")
+    finally:
+        event.remove(session.bind, "before_cursor_execute", capture)
     assert second.status_code == 200, second.text
     assert build_calls == 0
+    assert not any("max(" in statement and "scenes" in statement for statement in statements)
     active = session.scalars(select(Scene).where(
         Scene.project_id == project.id, Scene.history_status == "ACTIVE"
     ).order_by(Scene.sequence)).all()

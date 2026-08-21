@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.db import Base
 from app.formal_state import FormalStateIdentityAudit, FormalStateIdentityService, formal_world_state_v2_fingerprint
-from app.models import CreationMode, EntityType, Project, WorldEntity
+from app.models import Character, CharacterKnowledge, CharacterMemory, CreationMode, EntityType, Project, WorldEntity
 
 
 def _session():
@@ -47,4 +47,17 @@ def test_direct_formal_write_marks_identity_dirty():
     service = FormalStateIdentityService(); service.rebuild(db, project.id); db.commit()
     db.add(WorldEntity(project_id=project.id, entity_type=EntityType.CUSTOM, name="untracked", profile={}))
     db.commit()
+    assert service.status(db, project.id)["status"] == "DIRTY"
+
+
+def test_direct_cognition_write_marks_identity_dirty():
+    db = _session()
+    project = Project(name="identity", status="DRAFT", creation_mode=CreationMode.AUTONOMOUS)
+    db.add(project); db.flush()
+    character = Character(project_id=project.id, name="Actor")
+    db.add(character); db.commit()
+    service = FormalStateIdentityService(); service.rebuild(db, project.id); db.commit()
+    knowledge = CharacterKnowledge(character_id=character.id, proposition="ENTITY door: open = true", status="KNOWN")
+    memory = CharacterMemory(character_id=character.id, content="the door was open", distortion={})
+    db.add_all([knowledge, memory]); db.commit()
     assert service.status(db, project.id)["status"] == "DIRTY"

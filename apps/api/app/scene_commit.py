@@ -19,7 +19,7 @@ from .models import (
     SceneExecutionBinding, ScenePerformance, ScenePerformanceTurn, SceneProposal,
     SceneStateCheckpoint, SceneStatus, SnapshotType, StateDeltaBatch,
     StateDeltaBatchStatus, StateDeltaDomain, StateDeltaItem, StateDeltaTargetType,
-    StoryThread, ThreadStatus, WorldResolution,
+    StoryThread, ThreadStatus, WorldResolution, ProjectWorldSnapshotHead,
 )
 from .retcon_apply import RetconPendingReplayGuard
 from .revision import _pointer
@@ -383,7 +383,22 @@ class SceneCommitService:
             self.apply_verifier(db, prepared)
             mutation_guard.observe()
             self.apply_engine.verify(db, project_id, prepared.items)
-        sequence = (db.scalar(select(func.max(Scene.sequence)).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE")) or 0) + 1
+        # The current snapshot head is committed under the same Project lock
+        # and records the latest active Scene sequence.  Prefer that bounded
+        # temporal boundary over an aggregate across all historical Scenes.
+        # A legacy/cold project can have an anchor without a sequence, where
+        # the frozen aggregate remains the one-time compatibility fallback.
+        snapshot = ProjectWorldSnapshotHeadService().current_fast(db, project_id)
+        head_sequence = db.scalar(select(ProjectWorldSnapshotHead.sequence).where(
+            ProjectWorldSnapshotHead.project_id == project_id,
+        )) if snapshot is not None else None
+        if head_sequence is not None:
+            sequence = head_sequence + 1
+        else:
+            sequence = (db.scalar(select(func.max(Scene.sequence)).where(
+                Scene.project_id == project_id,
+                Scene.history_status == "ACTIVE",
+            )) or 0) + 1
         resolutions_by_turn = {resolution.performance_turn_id: resolution for resolution in prepared.resolutions}
         facts = [
             fact
