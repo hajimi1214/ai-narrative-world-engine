@@ -24,7 +24,7 @@ from .models import (
     ProjectNarrativeStructureProjection, Scene,
 )
 from .narrative_structure import (
-    ChapterBoundaryScorer, NarrativeArcFormationEngine, NarrativeSceneFeatureBuilder,
+    ChapterBoundaryScorer, ChapterFormationEngine, NarrativeArcFormationEngine, NarrativeSceneFeatureBuilder,
     NarrativeStructureConfig, NarrativeStructureSourceFingerprintBuilder,
     NarrativeVolumeFormationEngine, _thread_ranking,
 )
@@ -415,6 +415,186 @@ class NarrativeStructureProjectionService:
 
     def sync_after_history_change(self, db: Session, project_id: str, from_sequence: int | None = 1, reason: str = "HISTORY_CHANGED") -> None:
         with db.begin_nested(): self.mark_dirty(db, project_id, from_sequence, reason)
+
+    def rebuild_suffix_after_history_change(
+        self,
+        db: Session,
+        project_id: str,
+        from_sequence: int,
+        *,
+        project_locked: bool = False,
+    ) -> bool:
+        """Rebuild only the affected open/containing Volume suffix.
+
+        Historical changes can invalidate boundaries, so the safe unit is the
+        Volume containing the first changed Scene.  Earlier SEALED volumes,
+        arcs, and chapters retain their row identity and bindings.
+        """
+        try:
+            with db.begin_nested():
+                project_statement = select(Project).where(Project.id == project_id)
+                if not project_locked:
+                    project_statement = project_statement.with_for_update()
+                project = db.scalar(project_statement)
+                revision = db.scalar(select(NarrativeStructureRevision).where(
+                    NarrativeStructureRevision.project_id == project_id,
+                    NarrativeStructureRevision.active.is_(True),
+                ))
+                if not project or not revision:
+                    self.mark_dirty(db, project_id, from_sequence, "HISTORY_REBUILD_BASELINE_MISSING")
+                    return False
+                config = NarrativeStructureConfig.resolve(project)
+                if revision.config_fingerprint != _config_fingerprint(config):
+                    self.mark_dirty(db, project_id, 1, "NARRATIVE_STRUCTURE_CONFIG_CHANGED")
+                    return False
+                volume = db.scalar(select(NarrativeVolume).where(
+                    NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True),
+                    NarrativeVolume.start_sequence <= from_sequence,
+                    NarrativeVolume.end_sequence >= from_sequence,
+                ).order_by(NarrativeVolume.number).limit(1))
+                tail_start = volume.start_sequence if volume else from_sequence
+                prefix_chapters = db.scalars(select(Chapter).where(
+                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.end_sequence < tail_start,
+                ).order_by(Chapter.number)).all()
+                prefix_arcs = db.scalars(select(NarrativeArc).where(
+                    NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True),
+                    NarrativeArc.end_sequence < tail_start,
+                ).order_by(NarrativeArc.number)).all()
+                prefix_volumes = db.scalars(select(NarrativeVolume).where(
+                    NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True),
+                    NarrativeVolume.end_sequence < tail_start,
+                ).order_by(NarrativeVolume.number)).all()
+                if any(_value(item.structure_status) != "SEALED" for item in prefix_chapters) or any(_value(item.status) != "SEALED" for item in prefix_arcs + prefix_volumes):
+                    self.mark_dirty(db, project_id, tail_start, "HISTORY_REBUILD_PREFIX_NOT_SEALED")
+                    return False
+
+                scenes = db.scalars(select(Scene).where(
+                    Scene.project_id == project_id, Scene.status == "OCCURRED",
+                    Scene.history_status == "ACTIVE", Scene.sequence >= tail_start,
+                ).order_by(Scene.sequence, Scene.id)).all()
+                if not scenes:
+                    self.mark_dirty(db, project_id, tail_start, "HISTORY_REBUILD_SOURCE_GAP")
+                    return False
+                expected_sequences = list(range(tail_start, scenes[-1].sequence + 1))
+                if [scene.sequence for scene in scenes] != expected_sequences:
+                    self.mark_dirty(db, project_id, tail_start, "HISTORY_REBUILD_SOURCE_GAP")
+                    return False
+                existing = {row.scene_id: row for row in db.scalars(select(NarrativeStructureSceneFeature).where(
+                    NarrativeStructureSceneFeature.project_id == project_id,
+                    NarrativeStructureSceneFeature.sequence >= tail_start,
+                )).all()}
+                features: list[dict[str, Any]] = []
+                accumulator = dict((self._projection(db, project_id).feature_accumulator or _empty_accumulator()))
+                for scene in scenes:
+                    source = NarrativeStructureSourceFingerprintBuilder()._scene(db, scene)
+                    feature = NarrativeSceneFeatureBuilder().one(source)
+                    prior = existing.pop(scene.id, None)
+                    if prior and prior.active:
+                        accumulator = _accumulate(accumulator, prior.feature_fingerprint, -1)
+                    source_fp = stable_fingerprint(source, "narrative-structure-scene-source-v1")
+                    values = self._feature_values(feature, source_fp)
+                    row = prior or NarrativeStructureSceneFeature(project_id=project_id, scene_id=scene.id, active=True, **values)
+                    if prior is None:
+                        db.add(row)
+                    else:
+                        for key, value in values.items(): setattr(row, key, value)
+                        row.active = True
+                    accumulator = _accumulate(accumulator, feature["feature_fingerprint"], 1)
+                    features.append(feature)
+                for row in existing.values():
+                    if row.active:
+                        accumulator = _accumulate(accumulator, row.feature_fingerprint, -1)
+                    row.active = False
+                db.flush()
+
+                chapter_plans = ChapterFormationEngine().form(features, config)
+                prior_feature = db.scalar(select(NarrativeStructureSceneFeature).where(
+                    NarrativeStructureSceneFeature.project_id == project_id,
+                    NarrativeStructureSceneFeature.active.is_(True),
+                    NarrativeStructureSceneFeature.sequence == tail_start - 1,
+                ))
+                if prior_feature and chapter_plans:
+                    previous_chapter = prefix_chapters[-1] if prefix_chapters else None
+                    size = len(previous_chapter.source_scene_ids or []) if previous_chapter else 0
+                    boundary = ChapterBoundaryScorer().score(self._feature_payload(prior_feature), chapter_plans[0]["features"][0], size, config)
+                    if previous_chapter and size >= config.chapter_max_scenes and "HARD_MAX_SCENES" not in boundary["reason_codes"]:
+                        boundary["reason_codes"] = sorted([*boundary["reason_codes"], "HARD_MAX_SCENES"])
+                    chapter_plans[0]["boundary_metadata"] = boundary
+                chapter_offset = len(prefix_chapters)
+                for index, plan in enumerate(chapter_plans, 1):
+                    plan["number"] = chapter_offset + index
+                    plan["structure_fingerprint"] = stable_fingerprint({key: plan[key] for key in ("number", "status", "start_sequence", "end_sequence", "scene_ids", "boundary_metadata")}, "narrative-chapter-v1")
+                arc_plans = NarrativeArcFormationEngine().form(chapter_plans, config)
+                arc_offset = len(prefix_arcs)
+                for index, plan in enumerate(arc_plans, 1):
+                    plan["number"] = arc_offset + index
+                    plan["structure_fingerprint"] = stable_fingerprint(
+                        {key: value for key, value in plan.items() if key != "structure_fingerprint"},
+                        "narrative-arc-v1",
+                    )
+                volume_plans = NarrativeVolumeFormationEngine().form(arc_plans, config)
+                volume_offset = len(prefix_volumes)
+                for index, plan in enumerate(volume_plans, 1):
+                    plan["number"] = volume_offset + index
+                    plan["structure_fingerprint"] = stable_fingerprint(
+                        {key: value for key, value in plan.items() if key != "structure_fingerprint"},
+                        "narrative-volume-v1",
+                    )
+
+                old_chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.start_sequence >= tail_start)).all()
+                old_arcs = db.scalars(select(NarrativeArc).where(NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True), NarrativeArc.start_sequence >= tail_start)).all()
+                old_volumes = db.scalars(select(NarrativeVolume).where(NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True), NarrativeVolume.start_sequence >= tail_start)).all()
+                for row in old_chapters: row.active = False; row.structure_status = ChapterStructureStatus.SUPERSEDED
+                for row in old_arcs: row.active = False; row.status = NarrativeArcStatus.SUPERSEDED
+                for row in old_volumes: row.active = False; row.status = NarrativeVolumeStatus.SUPERSEDED
+                revision.active = False; db.flush()
+                source_root = _accumulator_fingerprint(accumulator)
+                next_revision = NarrativeStructureRevision(
+                    project_id=project_id, active=True, protocol_version=2,
+                    source_history_fingerprint=source_root, source_max_sequence=scenes[-1].sequence,
+                    config=asdict(config), config_fingerprint=_config_fingerprint(config),
+                    rebuild_from_sequence=tail_start,
+                    structure_fingerprint=_structure_fingerprint(source_root, _config_fingerprint(config)),
+                    completed_at=datetime.utcnow(),
+                )
+                db.add(next_revision); db.flush()
+                chapters_by_number: dict[int, Chapter] = {}
+                previous_by_number = {row.number: row for row in old_chapters}
+                for plan in chapter_plans:
+                    chapter = Chapter(project_id=project_id, number=plan["number"], title=None, source_scene_ids=plan["scene_ids"], content=None, word_count=0, quality_report={}, status="DRAFT", structure_revision_id=next_revision.id, active=True, structure_status=plan["status"], start_sequence=plan["start_sequence"], end_sequence=plan["end_sequence"], structure_fingerprint=plan["structure_fingerprint"], boundary_metadata=plan["boundary_metadata"], supersedes_chapter_id=previous_by_number.get(plan["number"]).id if previous_by_number.get(plan["number"]) else None)
+                    db.add(chapter); db.flush()
+                    for ordinal, feature in enumerate(plan["features"], 1):
+                        db.add(ChapterSceneBinding(chapter_id=chapter.id, scene_id=feature["scene_id"], ordinal=ordinal, scene_sequence=feature["sequence"]))
+                    chapters_by_number[plan["number"]] = chapter
+                for chapter in prefix_chapters: chapters_by_number[chapter.number] = chapter
+                arcs_by_number: dict[int, NarrativeArc] = {}
+                previous_arcs = {row.number: row for row in old_arcs}
+                for plan in arc_plans:
+                    arc = NarrativeArc(project_id=project_id, structure_revision_id=next_revision.id, number=plan["number"], active=True, status=plan["status"], start_sequence=plan["start_sequence"], end_sequence=plan["end_sequence"], dominant_thread_ids=plan["dominant_thread_ids"], supporting_thread_ids=plan["supporting_thread_ids"], structure_metadata=plan["structure_metadata"], structure_fingerprint=plan["structure_fingerprint"], supersedes_arc_id=previous_arcs.get(plan["number"]).id if previous_arcs.get(plan["number"]) else None)
+                    db.add(arc); db.flush()
+                    for ordinal, number in enumerate(plan["chapter_numbers"], 1): db.add(NarrativeArcChapterBinding(narrative_arc_id=arc.id, chapter_id=chapters_by_number[number].id, ordinal=ordinal))
+                    arcs_by_number[plan["number"]] = arc
+                for arc in prefix_arcs: arcs_by_number[arc.number] = arc
+                previous_volumes = {row.number: row for row in old_volumes}
+                for plan in volume_plans:
+                    volume_row = NarrativeVolume(project_id=project_id, structure_revision_id=next_revision.id, number=plan["number"], title=None, active=True, status=plan["status"], start_sequence=plan["start_sequence"], end_sequence=plan["end_sequence"], dominant_thread_ids=plan["dominant_thread_ids"], structure_metadata=plan["structure_metadata"], structure_fingerprint=plan["structure_fingerprint"], supersedes_volume_id=previous_volumes.get(plan["number"]).id if previous_volumes.get(plan["number"]) else None)
+                    db.add(volume_row); db.flush()
+                    for ordinal, number in enumerate(plan["arc_numbers"], 1): db.add(NarrativeVolumeArcBinding(volume_id=volume_row.id, narrative_arc_id=arcs_by_number[number].id, ordinal=ordinal))
+                projection = self._ensure_projection(db, project_id)
+                projection.status = NarrativeStructureProjectionStatus.READY
+                projection.feature_accumulator = accumulator; projection.source_feature_fingerprint = source_root
+                projection.config_fingerprint = _config_fingerprint(config); projection.structure_fingerprint = next_revision.structure_fingerprint
+                projection.active_revision_id = next_revision.id; projection.built_through_sequence = scenes[-1].sequence
+                projection.sealed_through_sequence = db.scalar(select(func.max(Chapter.end_sequence)).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.structure_status == ChapterStructureStatus.SEALED)) or 0
+                projection.tail_start_sequence = projection.sealed_through_sequence + 1
+                projection.dirty_from_sequence = None; projection.dirty_reason = None; projection.last_rebuilt_at = datetime.utcnow()
+                from .formal_state import FormalStateIdentityService
+                FormalStateIdentityService().mark_dirty(db, project_id, "NARRATIVE_STRUCTURE_SUFFIX_REBUILD")
+                return True
+        except Exception:
+            with db.begin_nested(): self.mark_dirty(db, project_id, from_sequence, "HISTORY_SUFFIX_REBUILD_FAILED")
+            return False
 
     def status(self, db: Session, project_id: str) -> dict[str, Any]:
         projection = self._projection(db, project_id)

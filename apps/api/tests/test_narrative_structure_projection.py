@@ -177,6 +177,42 @@ def test_v2_sync_retry_is_idempotent_without_legacy_source_rebuild(session, monk
     assert existing and retried.id == revision.id
 
 
+def test_history_suffix_rebuild_preserves_sealed_prefix_and_matches_preview(session):
+    project = Project(name="D2", autonomy_settings={"narrative_structure": {
+        "chapter_min_scenes": 1, "chapter_target_scenes": 1, "chapter_max_scenes": 2,
+        "chapter_boundary_threshold": 0, "arc_min_chapters": 1, "arc_max_chapters": 2,
+        "arc_boundary_threshold": 0, "volume_min_arcs": 1, "volume_max_arcs": 2,
+        "volume_boundary_threshold": 0,
+    }})
+    session.add(project); session.flush()
+    for sequence in range(1, 7):
+        make_scene(session, project, sequence, location="a" if sequence % 2 else "b", thread="a" if sequence % 2 else "b")
+    revision, _ = NarrativeStructureService().sync(session, project.id)
+    prefix = session.scalar(select(Chapter).where(
+        Chapter.project_id == project.id, Chapter.active.is_(True), Chapter.end_sequence == 2,
+    ))
+    changed = session.scalar(select(Scene).where(Scene.project_id == project.id, Scene.sequence == 3))
+    changed.location = "changed-location"; session.flush()
+    service = NarrativeStructureProjectionService()
+    service.sync_after_history_change(session, project.id, 3, "REPLAY_HISTORY_CHANGED")
+    assert service.rebuild_suffix_after_history_change(session, project.id, 3)
+    current = NarrativeStructureService().current(session, project.id)
+    preview = NarrativeStructureService().preview(session, project.id, current["revision"]["config"])
+    assert session.get(Chapter, prefix.id).active is True
+    assert [(row["start_sequence"], row["end_sequence"]) for row in current["chapters"]] == [
+        (row["start_sequence"], row["end_sequence"]) for row in preview["chapters"]
+    ]
+    arcs = session.scalars(select(NarrativeArc).where(
+        NarrativeArc.project_id == project.id, NarrativeArc.active.is_(True),
+    ).order_by(NarrativeArc.number)).all()
+    from app.models import NarrativeArcChapterBinding
+    chapter_numbers = {row.id: row.number for row in session.scalars(select(Chapter).where(Chapter.project_id == project.id)).all()}
+    actual_arcs = [(row.number, row.status.value, row.start_sequence, row.end_sequence, row.dominant_thread_ids, row.supporting_thread_ids, row.structure_metadata, [chapter_numbers[item] for item in session.scalars(select(NarrativeArcChapterBinding.chapter_id).where(NarrativeArcChapterBinding.narrative_arc_id == row.id).order_by(NarrativeArcChapterBinding.ordinal)).all()], row.structure_fingerprint) for row in arcs]
+    expected_arcs = [(row["number"], row["status"], row["start_sequence"], row["end_sequence"], row["dominant_thread_ids"], row["supporting_thread_ids"], row["structure_metadata"], row["chapter_numbers"], row["structure_fingerprint"]) for row in preview["narrative_arcs"]]
+    assert actual_arcs == expected_arcs
+    NarrativeStructureAudit().audit(session, project.id)
+
+
 def test_repeated_tail_append_matches_full_formation_at_each_boundary(session):
     project = Project(name="D2", autonomy_settings={"narrative_structure": {
         "chapter_min_scenes": 1, "chapter_target_scenes": 2, "chapter_max_scenes": 3,

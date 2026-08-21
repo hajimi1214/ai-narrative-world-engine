@@ -481,8 +481,12 @@ class NarrativeStructureAudit:
         if bound != [scene.id for scene in current_scenes]: raise ValueError("NARRATIVE_STRUCTURE_SCENE_COVERAGE_INVALID")
         chapter_ids = [item.id for item in chapters]
         expected_arcs = {item["number"]: item for item in expected["narrative_arcs"]}
-        if any(item.structure_revision_id != revision.id or not item.structure_fingerprint or item.structure_fingerprint != expected_arcs[item.number]["structure_fingerprint"] for item in arcs):
-            raise ValueError("NARRATIVE_STRUCTURE_ARC_INVALID")
+        for arc in arcs:
+            creation_revision = db.get(NarrativeStructureRevision, arc.structure_revision_id)
+            if not creation_revision or creation_revision.project_id != project_id or not arc.structure_fingerprint or arc.structure_fingerprint != expected_arcs[arc.number]["structure_fingerprint"]:
+                raise ValueError("NARRATIVE_STRUCTURE_ARC_INVALID")
+            if revision.protocol_version < 2 and arc.structure_revision_id != revision.id:
+                raise ValueError("NARRATIVE_STRUCTURE_ARC_INVALID")
         for arc in arcs:
             if arc.supersedes_arc_id:
                 superseded = db.get(NarrativeArc, arc.supersedes_arc_id)
@@ -492,8 +496,12 @@ class NarrativeStructureAudit:
         if arc_bound != chapter_ids: raise ValueError("NARRATIVE_STRUCTURE_ARC_COVERAGE_INVALID")
         arc_ids = [item.id for item in arcs]
         expected_volumes = {item["number"]: item for item in expected["volumes"]}
-        if any(item.structure_revision_id != revision.id or not item.structure_fingerprint or item.structure_fingerprint != expected_volumes[item.number]["structure_fingerprint"] for item in volumes):
-            raise ValueError("NARRATIVE_STRUCTURE_VOLUME_INVALID")
+        for volume in volumes:
+            creation_revision = db.get(NarrativeStructureRevision, volume.structure_revision_id)
+            if not creation_revision or creation_revision.project_id != project_id or not volume.structure_fingerprint or volume.structure_fingerprint != expected_volumes[volume.number]["structure_fingerprint"]:
+                raise ValueError("NARRATIVE_STRUCTURE_VOLUME_INVALID")
+            if revision.protocol_version < 2 and volume.structure_revision_id != revision.id:
+                raise ValueError("NARRATIVE_STRUCTURE_VOLUME_INVALID")
         for volume in volumes:
             if volume.supersedes_volume_id:
                 superseded = db.get(NarrativeVolume, volume.supersedes_volume_id)
