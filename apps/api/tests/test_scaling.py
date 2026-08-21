@@ -575,6 +575,18 @@ def test_missing_state_head_accumulator_explicitly_falls_back_to_legacy(session)
     assert service.status(session, world.project.id)["fast_path_available"] is False
 
 
+def test_tampered_live_state_head_explicitly_falls_back_to_legacy(session):
+    world = make_history(session, 3)
+    ProjectHistoryProjectionService().rebuild(session, world.project.id)
+    session.commit()
+    head = session.scalar(select(CurrentStateChangeHead).where(
+        CurrentStateChangeHead.project_id == world.project.id,
+    ))
+    head.event_fingerprint = "tampered-head-fingerprint"
+    session.commit()
+    assert StoryGravityContextBuilder().build(session, world.project.id)["protocol_version"] == "story-gravity-context-v1"
+
+
 def test_10000_scene_projection_fast_path_stays_bounded(session):
     project = Project(name="Ten Thousand Scenes")
     session.add(project); session.flush()
