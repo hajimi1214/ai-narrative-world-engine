@@ -7,6 +7,8 @@ current Scene, checkpoint, and TimelineEvent authority.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from datetime import datetime
 from typing import Any
 
@@ -28,6 +30,10 @@ from .models import (
 RECENT_SCENE_LIMIT = 10
 PROJECTION_PROTOCOL = "project-history-projection-v1"
 THREAD_STATS_META_KEY = "__projection_meta__"
+STATE_HEAD_ACCUMULATOR_KEY = "state_head_accumulator"
+STATE_HEAD_ACCUMULATOR_PROTOCOL = "project-history-state-head-accumulator-v1"
+SOURCE_FINGERPRINT_PROTOCOL = "project-history-source-v2"
+_ACCUMULATOR_MODULUS = 1 << 256
 
 
 def _value(value: Any) -> Any:
@@ -44,13 +50,20 @@ def _canonical(value: Any) -> Any:
     return value
 
 
-def empty_thread_stats(active_character_ids: set[str] | list[str] | tuple[str, ...]) -> dict[str, Any]:
+def empty_thread_stats(
+    active_character_ids: set[str] | list[str] | tuple[str, ...],
+    state_head_accumulator: dict[str, int] | None = None,
+) -> dict[str, Any]:
     """Canonical bounded metadata carried by every thread-stat projection."""
-    return {
-        THREAD_STATS_META_KEY: {
-            "active_character_ids": sorted(str(value) for value in active_character_ids),
-        },
+    meta: dict[str, Any] = {
+        "active_character_ids": sorted(str(value) for value in active_character_ids),
     }
+    if state_head_accumulator is not None:
+        meta[STATE_HEAD_ACCUMULATOR_KEY] = {
+            key: int(state_head_accumulator.get(key, 0))
+            for key in ("count", "xor", "sum")
+        }
+    return {THREAD_STATS_META_KEY: meta}
 
 
 class HistoryProjectionFingerprintBuilder:
@@ -130,17 +143,67 @@ class ProjectHistoryProjectionService:
     feature_builder = SceneHistoryFeatureBuilder()
     fingerprint_builder = HistoryProjectionFingerprintBuilder()
 
-    def _project_lock(self, db: Session, project_id: str) -> Project:
-        project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
-        if not project:
-            raise ValueError("SCALING_PROJECTION_PROJECT_NOT_FOUND")
-        return project
+    @staticmethod
+    def _head_identity(head: CurrentStateChangeHead, event: TimelineEvent | None) -> str:
+        return stable_fingerprint({
+            "target_type": head.target_type,
+            "target_id": head.target_id,
+            "path": head.path,
+            "timeline_event_id": head.timeline_event_id,
+            "active": bool(event and event.active),
+            "event_fingerprint": event.event_fingerprint if event else None,
+        }, STATE_HEAD_ACCUMULATOR_PROTOCOL)
 
-    def _projection(self, db: Session, project_id: str) -> ProjectHistoryProjection | None:
-        return db.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == project_id))
+    @staticmethod
+    def _head_digest(fingerprint: str) -> int:
+        return int(fingerprint.split(":", 1)[-1], 16)
 
-    def current_source_fingerprint(self, db: Session, project_id: str) -> str:
-        """Read only the current Gravity inputs, never the full event/scene history."""
+    @staticmethod
+    def _empty_head_accumulator() -> dict[str, int]:
+        return {"count": 0, "xor": 0, "sum": 0}
+
+    def _head_accumulator(self, db: Session, project_id: str) -> dict[str, int]:
+        heads = db.scalars(select(CurrentStateChangeHead).where(
+            CurrentStateChangeHead.project_id == project_id,
+        )).all()
+        events = {
+            row.id: row for row in db.scalars(select(TimelineEvent).where(
+                TimelineEvent.id.in_([head.timeline_event_id for head in heads]),
+            )).all()
+        } if heads else {}
+        accumulator = self._empty_head_accumulator()
+        for head in heads:
+            value = self._head_digest(self._head_identity(head, events.get(head.timeline_event_id)))
+            accumulator["count"] += 1
+            accumulator["xor"] ^= value
+            accumulator["sum"] = (accumulator["sum"] + value) % _ACCUMULATOR_MODULUS
+        return accumulator
+
+    @staticmethod
+    def _head_accumulator_fingerprint(accumulator: dict[str, int]) -> str:
+        value = {key: int(accumulator.get(key, 0)) for key in ("count", "xor", "sum")}
+        return STATE_HEAD_ACCUMULATOR_PROTOCOL + ":" + hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _stored_head_accumulator(projection: ProjectHistoryProjection) -> dict[str, int] | None:
+        value = (projection.thread_stats or {}).get(THREAD_STATS_META_KEY, {}).get(STATE_HEAD_ACCUMULATOR_KEY)
+        if not isinstance(value, dict) or set(value) != {"count", "xor", "sum"}:
+            return None
+        try:
+            return {key: int(value[key]) for key in ("count", "xor", "sum")}
+        except (TypeError, ValueError):
+            return None
+
+    def _source_fingerprint(
+        self,
+        db: Session,
+        project_id: str,
+        *,
+        state_head_accumulator: dict[str, int] | None = None,
+    ) -> str:
+        """Fingerprint bounded live inputs plus a precomputed state-head set."""
         project = db.get(Project, project_id)
         if not project:
             raise ValueError("SCALING_PROJECTION_PROJECT_NOT_FOUND")
@@ -156,33 +219,36 @@ class ProjectHistoryProjectionService:
                 SceneStateCheckpoint.active.is_(True),
             ).order_by(SceneStateCheckpoint.version.desc()).limit(1))
             checkpoint_fingerprint = checkpoint.checkpoint_fingerprint if checkpoint else None
-        heads = db.scalars(select(CurrentStateChangeHead).where(
-            CurrentStateChangeHead.project_id == project_id,
-        ).order_by(CurrentStateChangeHead.target_type, CurrentStateChangeHead.target_id, CurrentStateChangeHead.path)).all()
-        head_events = {}
-        if heads:
-            head_events = {row.id: row for row in db.scalars(select(TimelineEvent).where(
-                TimelineEvent.id.in_([head.timeline_event_id for head in heads]),
-            )).all()}
         active_character_ids = list(db.scalars(select(Character.id).where(
             Character.project_id == project_id, Character.active.is_(True),
         ).order_by(Character.id)).all())
         return stable_fingerprint(_canonical({
-            "protocol": PROJECTION_PROTOCOL,
+            "protocol": SOURCE_FINGERPRINT_PROTOCOL,
             "latest": {"id": latest.id if latest else None, "sequence": latest.sequence if latest else 0,
                        "checkpoint": checkpoint_fingerprint,
                        "location": latest.location if latest else None,
                        "participants": sorted(latest.participants or []) if latest else [],
                        "story_threads": sorted(latest.story_threads or []) if latest else []},
-            "state_heads": [{"target_type": head.target_type, "target_id": head.target_id, "path": head.path,
-                             "timeline_event_id": head.timeline_event_id,
-                             "active": bool(head_events.get(head.timeline_event_id) and head_events[head.timeline_event_id].active),
-                             "event_fingerprint": head_events.get(head.timeline_event_id).event_fingerprint if head_events.get(head.timeline_event_id) else None}
-                            for head in heads],
-            # Thread alignment is projected against the *current* active set.
-            # Other Gravity inputs are live reads and must not stale history.
+            "state_head_accumulator": self._head_accumulator_fingerprint(
+                state_head_accumulator or self._empty_head_accumulator(),
+            ),
             "active_character_ids": active_character_ids,
-        }), "project-history-source-v1")
+        }), SOURCE_FINGERPRINT_PROTOCOL)
+
+    def _project_lock(self, db: Session, project_id: str) -> Project:
+        project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+        if not project:
+            raise ValueError("SCALING_PROJECTION_PROJECT_NOT_FOUND")
+        return project
+
+    def _projection(self, db: Session, project_id: str) -> ProjectHistoryProjection | None:
+        return db.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == project_id))
+
+    def current_source_fingerprint(self, db: Session, project_id: str) -> str:
+        """Explicit audit/rebuild source identity; scanning heads is allowed here."""
+        return self._source_fingerprint(
+            db, project_id, state_head_accumulator=self._head_accumulator(db, project_id),
+        )
 
     def rebuild(self, db: Session, project_id: str, *, project_locked: bool = False) -> ProjectHistoryProjection:
         if project_locked:
@@ -223,11 +289,16 @@ class ProjectHistoryProjectionService:
         db.flush()
         self._rebuild_heads(db, project_id)
         active_character_ids = self._active_character_ids(db, project_id)
-        self._assign_projection(db, projection, features, active_character_ids)
+        self._assign_projection(
+            db, projection, features, active_character_ids,
+            self._head_accumulator(db, project_id),
+        )
         projection.status = HistoryProjectionStatus.READY
         projection.dirty_from_sequence = None
         projection.last_rebuilt_at = datetime.utcnow()
-        projection.source_history_fingerprint = self.current_source_fingerprint(db, project_id)
+        projection.source_history_fingerprint = self._source_fingerprint(
+            db, project_id, state_head_accumulator=self._stored_head_accumulator(projection),
+        )
         db.flush()
         return projection
 
@@ -260,7 +331,10 @@ class ProjectHistoryProjectionService:
             projection = ProjectHistoryProjection(project_id=project_id, protocol_version=PROJECTION_PROTOCOL,
                                                    status=HistoryProjectionStatus.DIRTY,
                                                    recent_scene_signatures=[],
-                                                   thread_stats=empty_thread_stats(active_character_ids),
+                                                   thread_stats=empty_thread_stats(
+                                                       active_character_ids,
+                                                       self._empty_head_accumulator(),
+                                                   ),
                                                    character_stats={})
             db.add(projection)
             db.flush()
@@ -287,9 +361,13 @@ class ProjectHistoryProjectionService:
         else:
             self._assign_feature(feature, values)
         db.flush()
-        self._upsert_heads_for_scene(db, project_id, scene.id)
-        self._append_projection(db, projection, feature, active_character_ids)
-        projection.source_history_fingerprint = self.current_source_fingerprint(db, project_id)
+        head_accumulator = self._upsert_heads_for_scene(
+            db, project_id, scene.id, self._stored_head_accumulator(projection),
+        )
+        self._append_projection(db, projection, feature, active_character_ids, head_accumulator)
+        projection.source_history_fingerprint = self._source_fingerprint(
+            db, project_id, state_head_accumulator=head_accumulator,
+        )
         projection.status = HistoryProjectionStatus.READY
         projection.dirty_from_sequence = None
         db.flush()
@@ -337,7 +415,13 @@ class ProjectHistoryProjectionService:
             "scene_feature_count": feature_count, "current_state_head_count": head_count,
             "dirty_from_sequence": projection.dirty_from_sequence if projection else None,
             "projection_fingerprint": projection.projection_fingerprint if projection else None,
-            "fast_path_available": bool(projection and _value(projection.status) == HistoryProjectionStatus.READY.value and projection.source_history_fingerprint == self.current_source_fingerprint(db, project_id)),
+            "fast_path_available": bool(
+                projection and _value(projection.status) == HistoryProjectionStatus.READY.value
+                and self._stored_head_accumulator(projection) is not None
+                and projection.source_history_fingerprint == self._source_fingerprint(
+                    db, project_id, state_head_accumulator=self._stored_head_accumulator(projection),
+                )
+            ),
             "protocol_version": projection.protocol_version if projection else PROJECTION_PROTOCOL,
         }
 
@@ -345,7 +429,10 @@ class ProjectHistoryProjectionService:
         projection = self._projection(db, project_id)
         if not projection or _value(projection.status) != HistoryProjectionStatus.READY.value:
             return None
-        if projection.source_history_fingerprint != self.current_source_fingerprint(db, project_id):
+        head_accumulator = self._stored_head_accumulator(projection)
+        if head_accumulator is None or projection.source_history_fingerprint != self._source_fingerprint(
+            db, project_id, state_head_accumulator=head_accumulator,
+        ):
             return None
         project = db.get(Project, project_id)
         if not project:
@@ -372,6 +459,8 @@ class ProjectHistoryProjectionService:
         heads = db.scalars(select(CurrentStateChangeHead).where(CurrentStateChangeHead.project_id == project_id).order_by(
             CurrentStateChangeHead.sequence, CurrentStateChangeHead.ordinal, CurrentStateChangeHead.target_type,
             CurrentStateChangeHead.target_id, CurrentStateChangeHead.path)).all()
+        if len(heads) != head_accumulator["count"]:
+            return None
         head_scene_ids = sorted({head.scene_id for head in heads if head.scene_id})
         feature_by_scene = {}
         if head_scene_ids:
@@ -386,10 +475,21 @@ class ProjectHistoryProjectionService:
                 TimelineEvent.id.in_([head.timeline_event_id for head in heads]),
             )).all()}
         changes = []
+        observed_head_accumulator = self._empty_head_accumulator()
         for head in heads:
             event = events.get(head.timeline_event_id)
-            if not event or not event.active:
+            if (
+                not event or not event.active or event.project_id != project_id
+                or event.target_type != head.target_type or event.target_id != head.target_id
+                or event.path != head.path or event.event_fingerprint != head.event_fingerprint
+            ):
                 return None
+            head_value = self._head_digest(self._head_identity(head, event))
+            observed_head_accumulator["count"] += 1
+            observed_head_accumulator["xor"] ^= head_value
+            observed_head_accumulator["sum"] = (
+                observed_head_accumulator["sum"] + head_value
+            ) % _ACCUMULATOR_MODULUS
             feature = feature_by_scene.get(event.scene_id)
             changes.append({"id": event.id, "sequence": event.sequence, "ordinal": event.ordinal,
                             "scene_id": event.scene_id, "target_type": event.target_type,
@@ -397,6 +497,8 @@ class ProjectHistoryProjectionService:
                             "before_value": event.before_value, "after_value": event.after_value,
                             "event_fingerprint": event.event_fingerprint,
                             "thread_ids": list(feature.thread_ids or []) if feature else []})
+        if observed_head_accumulator != head_accumulator:
+            return None
         scenes = [{"id": row.scene_id, "sequence": row.sequence, "location_id": row.location_id,
                    "participants": sorted(row.participant_ids or []), "story_threads": sorted(row.thread_ids or [])}
                   for row in features]
@@ -453,19 +555,23 @@ class ProjectHistoryProjectionService:
         return self.feature_builder.signature(scene, self._proposal_for_scene(db, project_id, scene.id))
 
     def _assign_projection(self, db: Session, projection: ProjectHistoryProjection,
-                           features: list[SceneHistoryFeature], active_character_ids: set[str]) -> None:
+                           features: list[SceneHistoryFeature], active_character_ids: set[str],
+                           state_head_accumulator: dict[str, int]) -> None:
         features = sorted(features, key=lambda row: (row.sequence, row.scene_id))
         projection.protocol_version = PROJECTION_PROTOCOL
         projection.built_through_sequence = features[-1].sequence if features else 0
         projection.active_scene_count = len(features)
         projection.last_scene_id = features[-1].scene_id if features else None
         projection.recent_scene_signatures = [self._signature(db, projection.project_id, row) for row in features[-RECENT_SCENE_LIMIT:]]
-        projection.thread_stats = self._thread_stats(features, active_character_ids)
+        projection.thread_stats = self._thread_stats(
+            features, active_character_ids, state_head_accumulator,
+        )
         projection.character_stats = self._character_stats(features)
         projection.projection_fingerprint = self.fingerprint_builder.build(features)
 
     def _append_projection(self, db: Session, projection: ProjectHistoryProjection,
-                           feature: SceneHistoryFeature, active_character_ids: set[str]) -> None:
+                           feature: SceneHistoryFeature, active_character_ids: set[str],
+                           state_head_accumulator: dict[str, int]) -> None:
         projection.protocol_version = PROJECTION_PROTOCOL
         projection.built_through_sequence = feature.sequence
         projection.active_scene_count += 1
@@ -473,7 +579,9 @@ class ProjectHistoryProjectionService:
         signatures = list(projection.recent_scene_signatures or []) + [self._signature(db, projection.project_id, feature)]
         projection.recent_scene_signatures = signatures[-RECENT_SCENE_LIMIT:]
         thread_stats = copy.deepcopy(projection.thread_stats or {})
-        thread_stats[THREAD_STATS_META_KEY] = empty_thread_stats(active_character_ids)[THREAD_STATS_META_KEY]
+        thread_stats[THREAD_STATS_META_KEY] = empty_thread_stats(
+            active_character_ids, state_head_accumulator,
+        )[THREAD_STATS_META_KEY]
         for thread_id in feature.thread_ids or []:
             row = thread_stats.setdefault(thread_id, {"last_touched_sequence": None, "scene_count": 0, "aligned_participant_ids": [], "scene_alignment_count": 0})
             row["last_touched_sequence"] = feature.sequence
@@ -489,8 +597,11 @@ class ProjectHistoryProjectionService:
         projection.projection_fingerprint = self.fingerprint_builder.extend(projection.projection_fingerprint, feature.feature_fingerprint)
 
     @staticmethod
-    def _thread_stats(features: list[SceneHistoryFeature], active_character_ids: set[str]) -> dict[str, Any]:
-        stats: dict[str, Any] = empty_thread_stats(active_character_ids)
+    def _thread_stats(
+        features: list[SceneHistoryFeature], active_character_ids: set[str],
+        state_head_accumulator: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        stats: dict[str, Any] = empty_thread_stats(active_character_ids, state_head_accumulator)
         for feature in features:
             for thread_id in feature.thread_ids or []:
                 row = stats.setdefault(thread_id, {"last_touched_sequence": None, "scene_count": 0, "aligned_participant_ids": [], "scene_alignment_count": 0})
@@ -523,7 +634,17 @@ class ProjectHistoryProjectionService:
         for event in current.values():
             db.add(self._head(event, project_id))
 
-    def _upsert_heads_for_scene(self, db: Session, project_id: str, scene_id: str) -> None:
+    def _upsert_heads_for_scene(
+        self,
+        db: Session,
+        project_id: str,
+        scene_id: str,
+        accumulator: dict[str, int] | None,
+    ) -> dict[str, int]:
+        """Update the current-head set and its identity from one Scene only."""
+        if accumulator is None:
+            raise ValueError("SCALING_PROJECTION_HEAD_ACCUMULATOR_MISSING")
+        result = {key: int(accumulator.get(key, 0)) for key in ("count", "xor", "sum")}
         events = db.scalars(select(TimelineEvent).where(
             TimelineEvent.project_id == project_id, TimelineEvent.scene_id == scene_id,
             TimelineEvent.active.is_(True), TimelineEvent.event_type == TimelineEventType.STATE_CHANGE,
@@ -538,9 +659,22 @@ class ProjectHistoryProjectionService:
                 CurrentStateChangeHead.path == event.path,
             ))
             if head is None:
-                db.add(self._head(event, project_id))
+                head = self._head(event, project_id)
+                db.add(head)
+                value = self._head_digest(self._head_identity(head, event))
+                result["count"] += 1
+                result["xor"] ^= value
+                result["sum"] = (result["sum"] + value) % _ACCUMULATOR_MODULUS
             elif (head.sequence or -1, head.ordinal or -1, head.timeline_event_id) <= (event.sequence or -1, event.ordinal or -1, event.id):
+                old_event = db.get(TimelineEvent, head.timeline_event_id)
+                old_value = self._head_digest(self._head_identity(head, old_event))
+                result["xor"] ^= old_value
+                result["sum"] = (result["sum"] - old_value) % _ACCUMULATOR_MODULUS
                 self._assign_head(head, event)
+                new_value = self._head_digest(self._head_identity(head, event))
+                result["xor"] ^= new_value
+                result["sum"] = (result["sum"] + new_value) % _ACCUMULATOR_MODULUS
+        return result
 
     @staticmethod
     def _head(event: TimelineEvent, project_id: str) -> CurrentStateChangeHead:
@@ -586,7 +720,9 @@ class ProjectHistoryProjectionAudit:
         expected_recent = [service._signature(db, project_id, row) for row in features[-RECENT_SCENE_LIMIT:]]
         if (
             projection.projection_fingerprint != expected_fingerprint
-            or projection.thread_stats != service._thread_stats(features, active_character_ids)
+            or projection.thread_stats != service._thread_stats(
+                features, active_character_ids, service._head_accumulator(db, project_id),
+            )
             or projection.character_stats != service._character_stats(features)
             or projection.recent_scene_signatures != expected_recent
             or projection.active_scene_count != len(features)

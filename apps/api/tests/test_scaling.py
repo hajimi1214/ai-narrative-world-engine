@@ -20,6 +20,7 @@ from app.causal_ledger import CausalLedgerService
 from app.scaling import (
     HistoryProjectionFingerprintBuilder, ProjectHistoryProjectionAudit,
     ProjectHistoryProjectionService, SceneHistoryFeatureAudit, THREAD_STATS_META_KEY,
+    empty_thread_stats,
 )
 
 
@@ -147,6 +148,106 @@ def test_incremental_append_preserves_prefix_and_bounds_recent_signatures(sessio
     assert projection.built_through_sequence == 11 and len(projection.recent_scene_signatures) == 10
 
 
+def test_incremental_append_does_not_rescan_existing_state_heads(session):
+    """Normal append work is independent of the number of current paths."""
+
+    def append_query_count(head_count):
+        world = make_history(session, 1)
+        event_rows = []
+        head_rows = []
+        for index in range(head_count):
+            event_id = new_id()
+            event_rows.append({
+                "id": event_id, "project_id": world.project.id,
+                "event_type": TimelineEventType.STATE_CHANGE,
+                "source_type": "SCENE", "source_id": world.scenes[0].id,
+                "source_key": f"seed-state:{head_count}:{index}",
+                "scene_id": world.scenes[0].id, "sequence": 1, "ordinal": index + 1,
+                "origin": TimelineOrigin.LEGACY_BACKFILL, "active": True,
+                "target_type": "CHARACTER", "target_id": f"target-{index}",
+                "path": "/current_state/value", "before_value": None,
+                "after_value": index, "structured_payload": {},
+                "event_fingerprint": f"seed-event:{head_count}:{index}",
+            })
+            head_rows.append({
+                "id": new_id(), "project_id": world.project.id,
+                "timeline_event_id": event_id, "scene_id": world.scenes[0].id,
+                "sequence": 1, "ordinal": index + 1,
+                "target_type": "CHARACTER", "target_id": f"target-{index}",
+                "path": "/current_state/value",
+                "event_fingerprint": f"seed-event:{head_count}:{index}",
+            })
+        session.execute(TimelineEvent.__table__.insert(), event_rows)
+        session.execute(CurrentStateChangeHead.__table__.insert(), head_rows)
+        service = ProjectHistoryProjectionService()
+        service.rebuild(session, world.project.id)
+        scene = Scene(
+            project_id=world.project.id, sequence=2, status=SceneStatus.OCCURRED,
+            history_status="ACTIVE", location="loc", participants=[world.character.id],
+            story_threads=[world.thread.id],
+        )
+        session.add(scene); session.flush()
+        add_checkpoint(session, world.project.id, scene, f"append-{head_count}")
+        statements = []
+
+        def capture(_conn, _cursor, statement, _params, _context, _executemany):
+            statements.append(statement.lower())
+
+        event.listen(session.bind, "before_cursor_execute", capture)
+        try:
+            service.sync_after_scene_commit(session, world.project.id, scene.id)
+        finally:
+            event.remove(session.bind, "before_cursor_execute", capture)
+        assert not any("from current_state_change_heads" in statement for statement in statements)
+        assert not any(
+            "from timeline_events" in statement and "timeline_events.scene_id" not in statement
+            for statement in statements
+        )
+        ProjectHistoryProjectionAudit().audit(session, world.project.id)
+        return len(statements)
+
+    assert append_query_count(100) == append_query_count(10_000)
+
+
+def test_incremental_append_replaces_state_head_accumulator_exactly(session):
+    world = make_history(session, 1)
+    service = ProjectHistoryProjectionService()
+    service.rebuild(session, world.project.id)
+    session.commit()
+    original = session.scalar(select(CurrentStateChangeHead).where(
+        CurrentStateChangeHead.project_id == world.project.id,
+    ))
+    scene = Scene(
+        project_id=world.project.id, sequence=2, status=SceneStatus.OCCURRED,
+        history_status="ACTIVE", location="loc", participants=[world.character.id],
+        story_threads=[world.thread.id],
+    )
+    session.add(scene); session.flush()
+    add_checkpoint(session, world.project.id, scene, "replace-head")
+    replacement = TimelineEvent(
+        project_id=world.project.id, event_type=TimelineEventType.STATE_CHANGE,
+        source_type="SCENE", source_id=scene.id, source_key=f"replace-head:{scene.id}",
+        scene_id=scene.id, sequence=2, ordinal=1,
+        origin=TimelineOrigin.LEGACY_BACKFILL, active=True,
+        target_type=original.target_type, target_id=original.target_id, path=original.path,
+        before_value=True, after_value=False, structured_payload={}, event_fingerprint="replacement-head",
+    )
+    session.add(replacement); session.flush()
+    service.sync_after_scene_commit(session, world.project.id, scene.id)
+    session.commit()
+    head = session.scalar(select(CurrentStateChangeHead).where(
+        CurrentStateChangeHead.project_id == world.project.id,
+    ))
+    projection = session.scalar(select(ProjectHistoryProjection).where(
+        ProjectHistoryProjection.project_id == world.project.id,
+    ))
+    assert head.timeline_event_id == replacement.id
+    assert projection.thread_stats[THREAD_STATS_META_KEY]["state_head_accumulator"] == service._head_accumulator(
+        session, world.project.id,
+    )
+    ProjectHistoryProjectionAudit().audit(session, world.project.id)
+
+
 def test_cold_start_first_scene_with_active_characters_is_ready_and_fast(session):
     world = make_cold_scene(session, active_characters=2)
     service = ProjectHistoryProjectionService()
@@ -171,7 +272,10 @@ def test_cold_start_first_scene_with_no_active_characters_is_ready(session):
     session.commit()
     projection = session.scalar(select(ProjectHistoryProjection).where(ProjectHistoryProjection.project_id == world.project.id))
     assert getattr(projection.status, "value", projection.status) == "READY"
-    assert projection.thread_stats == {THREAD_STATS_META_KEY: {"active_character_ids": []}, world.thread.id: {
+    assert projection.thread_stats == {THREAD_STATS_META_KEY: {
+        "active_character_ids": [],
+        "state_head_accumulator": {"count": 0, "xor": 0, "sum": 0},
+    }, world.thread.id: {
         "last_touched_sequence": 1, "scene_count": 1, "aligned_participant_ids": [], "scene_alignment_count": 0,
     }}
     ProjectHistoryProjectionAudit().audit(session, world.project.id)
@@ -436,6 +540,41 @@ def test_large_fast_path_loads_bounded_scene_features(session):
     assert all("from timeline_events" not in item or "timeline_events.id in" in item for item in statements)
 
 
+def test_fast_context_uses_stored_state_head_identity_without_duplicate_head_scan(session):
+    """The context needs heads for pressure, but freshness must not read them twice."""
+    world = make_history(session, 3)
+    service = ProjectHistoryProjectionService()
+    service.rebuild(session, world.project.id)
+    session.commit()
+    statements = []
+
+    def receive(_conn, _cursor, statement, _params, _context, _executemany):
+        statements.append(statement.lower())
+
+    event.listen(session.bind, "before_cursor_execute", receive)
+    try:
+        context = StoryGravityContextBuilder().build(session, world.project.id)
+    finally:
+        event.remove(session.bind, "before_cursor_execute", receive)
+    assert context["protocol_version"] == "story-gravity-context-v2"
+    head_queries = [statement for statement in statements if "from current_state_change_heads" in statement]
+    assert len(head_queries) == 1
+
+
+def test_missing_state_head_accumulator_explicitly_falls_back_to_legacy(session):
+    world = make_history(session, 3)
+    service = ProjectHistoryProjectionService()
+    service.rebuild(session, world.project.id)
+    session.commit()
+    projection = session.scalar(select(ProjectHistoryProjection).where(
+        ProjectHistoryProjection.project_id == world.project.id,
+    ))
+    projection.thread_stats[THREAD_STATS_META_KEY].pop("state_head_accumulator")
+    session.commit()
+    assert StoryGravityContextBuilder().build(session, world.project.id)["protocol_version"] == "story-gravity-context-v1"
+    assert service.status(session, world.project.id)["fast_path_available"] is False
+
+
 def test_10000_scene_projection_fast_path_stays_bounded(session):
     project = Project(name="Ten Thousand Scenes")
     session.add(project); session.flush()
@@ -444,7 +583,7 @@ def test_10000_scene_projection_fast_path_stays_bounded(session):
     features = [SceneHistoryFeature(id=new_id(), project_id=project.id, scene_id=scene.id, sequence=scene.sequence, active=True, participant_ids=[], thread_ids=[], state_change_targets=[], state_change_paths=[], thread_state_event_ids=[], state_change_count=0, feature_fingerprint=f"synthetic-{scene.sequence}") for scene in scenes]
     session.bulk_save_objects(features)
     service = ProjectHistoryProjectionService()
-    projection = ProjectHistoryProjection(project_id=project.id, protocol_version="project-history-projection-v1", status=HistoryProjectionStatus.READY, built_through_sequence=10000, active_scene_count=10000, last_scene_id=scenes[-1].id, recent_scene_signatures=[service.feature_builder.signature(scene, None) for scene in scenes[-10:]], thread_stats={}, character_stats={}, projection_fingerprint="synthetic")
+    projection = ProjectHistoryProjection(project_id=project.id, protocol_version="project-history-projection-v1", status=HistoryProjectionStatus.READY, built_through_sequence=10000, active_scene_count=10000, last_scene_id=scenes[-1].id, recent_scene_signatures=[service.feature_builder.signature(scene, None) for scene in scenes[-10:]], thread_stats=empty_thread_stats([], service._empty_head_accumulator()), character_stats={}, projection_fingerprint="synthetic")
     session.add(projection); session.flush()
     projection.source_history_fingerprint = service.current_source_fingerprint(session, project.id)
     session.commit()
