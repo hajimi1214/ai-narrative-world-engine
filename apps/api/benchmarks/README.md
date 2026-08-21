@@ -25,3 +25,9 @@ operation records its route, SQL count, hydration count, and sequence proof.
 PostgreSQL concurrency and full audit suites remain separate PG-only jobs and
 must be run with `DATABASE_URL` set to PostgreSQL; SQLite is never used as a
 concurrency substitute.
+
+The opt-in suite also contains a real continuous SceneCommit certification for
+10,000 and 100,000 scenes. Each scene creates a new proposal, performance and
+turn on one Project and goes through the production commit service. Report
+matrices remain fail-closed: an unexecuted route, audit, fault, or concurrency
+case is `PENDING`, never an implied `PASS`.

@@ -61,6 +61,19 @@ class BenchmarkMetrics:
         return asdict(self)
 
 
+@dataclass
+class MatrixResult:
+    """One explicit certification case; unexecuted cases stay pending."""
+
+    name: str
+    status: str = "PENDING"
+    reason: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class SQLAndHydrationProbe:
     """Capture SQL executions and ORM instances for one measured operation."""
 
@@ -152,14 +165,34 @@ def certification_report(
     metrics: list[BenchmarkMetrics],
     route_evidence: dict[str, dict[str, Any]] | None = None,
     checks: dict[str, dict[str, Any]] | None = None,
+    audit_matrix: list[MatrixResult] | None = None,
+    fault_matrix: list[MatrixResult] | None = None,
+    concurrency_matrix: list[MatrixResult] | None = None,
 ) -> dict[str, Any]:
     """Build the D3 report without filling unexecuted checks with PASS."""
     return {
         "metrics": [item.as_dict() for item in metrics],
         "route_evidence": route_evidence_report(route_evidence or {}),
         "checks": checks or {},
+        "audit_matrix": [item.as_dict() for item in (audit_matrix or [])],
+        "fault_matrix": [item.as_dict() for item in (fault_matrix or [])],
+        "concurrency_matrix": [item.as_dict() for item in (concurrency_matrix or [])],
         "acceptance": "PENDING",
     }
+
+
+def run_matrix(cases: dict[str, Callable[[], Any]]) -> list[MatrixResult]:
+    """Execute named certification cases without converting failures to PASS."""
+    results: list[MatrixResult] = []
+    for name, operation in cases.items():
+        try:
+            value = operation()
+            details = value if isinstance(value, dict) else {}
+            results.append(MatrixResult(name=name, status="PASS", details=details))
+        except Exception as exc:  # noqa: BLE001 - report safe case status
+            code = getattr(exc, "code", None) or str(exc).split(":", 1)[0]
+            results.append(MatrixResult(name=name, status="FAIL", reason=str(code)))
+    return results
 
 
 def route_evidence_report(routes: dict[str, dict[str, Any]]) -> dict[str, Any]:

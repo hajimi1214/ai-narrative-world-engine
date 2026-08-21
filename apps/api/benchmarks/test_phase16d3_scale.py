@@ -25,19 +25,36 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base
 from app.models import (
+    ActionVisibility,
     Character,
+    CharacterDecision,
+    CharacterDecisionStatus,
     CharacterKnowledge,
     CharacterMemory,
     KnowledgeStatus,
+    PerformanceMode,
     Project,
+    ProposalStatus,
+    ProposalType,
     Scene,
+    ScenePerformance,
+    ScenePerformanceTurn,
+    SceneProposal,
     SceneStatus,
     StoryThread,
     ThreadStatus,
 )
+from app.director import DirectorContextBuilder
 from app.narrative_structure_projection import NarrativeStructureProjectionService
 from app.scaling import ProjectHistoryProjectionService
 from app.scene_commit import SceneCommitService
+from app.causal_ledger import CausalLedgerService
+from app.causal_ledger import CurrentCausalLedgerAudit
+from app.formal_state import FormalStateIdentityAudit
+from app.historical import CurrentHistoryCheckpointAudit
+from app.narrative_structure_projection import NarrativeStructureProjectionAudit
+from app.retrieval_index import CognitionRetrievalIndexAudit
+from app.snapshot_storage import CompactSnapshotAudit
 
 from benchmarks.phase16d3_runner import (
     D3_FALLBACK_EVIDENCE_KEYS,
@@ -45,6 +62,7 @@ from benchmarks.phase16d3_runner import (
     certification_report,
     measure,
     report_json,
+    run_matrix,
     route_evidence_report,
     scene_sequence_is_continuous,
 )
@@ -142,6 +160,83 @@ def _append_scene(db, project: Project, sequence: int) -> Scene:
     return scene
 
 
+def _append_formal_commit(db, project_id: str, actor_id: str, location_id: str, thread_id: str):
+    """Create one new formal execution lineage and commit it through production code."""
+    context = DirectorContextBuilder().build(db, project_id)
+    proposal = SceneProposal(
+        project_id=project_id,
+        context_fingerprint=context["fingerprint"],
+        proposal_type=ProposalType.CONTINUE_THREAD,
+        primary_thread_id=thread_id,
+        location_id=location_id,
+        participants=[actor_id],
+        scene_goal="Continue deterministic benchmark scene",
+        character_motivations={actor_id: {}},
+        entry_state={},
+        planned_pressure=None,
+        expected_progress={"benchmark": True},
+        allowed_reveals=[], forbidden_reveals=[], required_canon=[],
+        possible_outcomes=[], new_entity_requests=[], risk_flags=[],
+        director_reasoning_summary="Benchmark-only deterministic proposal",
+        status=ProposalStatus.APPROVED,
+    )
+    db.add(proposal)
+    db.flush()
+    performance = ScenePerformance(
+        project_id=project_id,
+        scene_proposal_id=proposal.id,
+        take_number=1,
+        proposal_context_fingerprint=context["fingerprint"],
+        mode=PerformanceMode.HEURISTIC,
+        status="RUNNING",
+        participant_order=[actor_id],
+        active_participant_ids=[actor_id],
+        max_turns=1,
+        turn_count=1,
+    )
+    db.add(performance)
+    db.flush()
+    decision = CharacterDecision(
+        project_id=project_id,
+        scene_proposal_id=proposal.id,
+        character_id=actor_id,
+        context_fingerprint=context["fingerprint"],
+        decision_type="WAIT",
+        intent="wait",
+        chosen_action="wait",
+        motivation="benchmark",
+        goal_refs=[], knowledge_used=[], memory_refs=[], ability_refs=[], inventory_refs=[],
+        relationship_factors={}, perceived_risk=None, accepted_cost=None,
+        expected_personal_result=None, uncertainties=[], refused_options=[],
+        boundary_override_reason=None, decision_summary="Wait for the next deterministic step.",
+        status=CharacterDecisionStatus.VALID,
+    )
+    db.add(decision)
+    db.flush()
+    turn = ScenePerformanceTurn(
+        project_id=project_id,
+        performance_id=performance.id,
+        sequence=1,
+        actor_character_id=actor_id,
+        actor_context_fingerprint=context["fingerprint"],
+        character_decision_id=decision.id,
+        action_visibility=ActionVisibility.PUBLIC,
+        observable_action="wait",
+        spoken_content=None,
+        recipient_character_ids=[],
+        requires_world_resolution=False,
+        world_resolution_request=None,
+        validation_result={},
+    )
+    db.add(turn)
+    db.flush()
+    performance.stop_reason = "QUIESCENT"
+    performance.status = "PAUSED"
+    result = SceneCommitService().commit(db, project_id, performance.id)
+    db.commit()
+    return result
+
+
 def test_phase16d3_smoke_emits_metrics_and_sequence_proof(benchmark_session, capsys):
     project, _ = _fixture(benchmark_session, 100)
     sequences = list(benchmark_session.scalars(
@@ -174,6 +269,15 @@ def test_phase16d3_route_report_is_fail_closed():
     final = certification_report(metrics=[], route_evidence={"COGNITION_FAST": {"status": "proven"}})
     assert final["acceptance"] == "PENDING"
     assert final["route_evidence"]["fast_path"]["COGNITION_FAST"]["status"] == "proven"
+
+
+def test_phase16d3_matrix_runner_is_fail_closed():
+    results = run_matrix({
+        "known-pass": lambda: {"evidence": "fixture"},
+        "known-fail": lambda: (_ for _ in ()).throw(RuntimeError("SAFE_FAILURE_CODE")),
+    })
+    assert [item.status for item in results] == ["PASS", "FAIL"]
+    assert results[1].reason == "SAFE_FAILURE_CODE"
 
 
 def test_phase16d3_real_incremental_append_boundary_is_bounded(benchmark_session):
@@ -235,6 +339,138 @@ def test_phase16d3_scene_commit_full_chain_is_measured(benchmark_session, monkey
     assert metrics_holder["commit_id"]
     assert metrics.sql_query_count > 0
     assert metrics.orm_object_hydration_count >= 0
+
+
+def test_phase16d3_continuous_scene_commit_smoke(benchmark_session, monkeypatch):
+    """A small continuous run proves the harness does not switch to row inserts."""
+    tests_path = str(Path(__file__).resolve().parents[1] / "tests")
+    if tests_path not in sys.path:
+        sys.path.insert(0, tests_path)
+    from tests.test_scene_commit import prepared_commit
+
+    project, location, actor, _other, _proposal, performance, _turn, _resolution, _batch, _client = prepared_commit(
+        benchmark_session, monkeypatch, requires_resolution=False,
+    )
+
+    def operation():
+        SceneCommitService().commit(benchmark_session, project.id, performance.id)
+        benchmark_session.commit()
+        for _ in range(2):
+            _append_formal_commit(benchmark_session, project.id, actor.id, location.id, _proposal.primary_thread_id)
+
+    metrics = measure(
+        benchmark_session,
+        name="continuous_scene_commit_smoke",
+        scale=3,
+        operation=operation,
+        route="FORMAL_SCENE_COMMIT",
+        projection_status="READY_OR_DIRTY",
+        scene_sequence_continuous=True,
+        details={"full_chain": True, "projection": True, "checkpoint": True, "ledger": True},
+    )
+    sequences = list(benchmark_session.scalars(select(Scene.sequence).where(Scene.project_id == project.id).order_by(Scene.sequence)))
+    assert len(sequences) == 3
+    assert scene_sequence_is_continuous(sequences)
+    assert metrics.sql_query_count > 0
+
+
+def test_phase16d3_suffix_rebuild_metrics(benchmark_session, monkeypatch):
+    tests_path = str(Path(__file__).resolve().parents[1] / "tests")
+    if tests_path not in sys.path:
+        sys.path.insert(0, tests_path)
+    from tests.test_scene_commit import prepared_commit
+
+    project, location, actor, _other, proposal, performance, _turn, _resolution, _batch, _client = prepared_commit(
+        benchmark_session, monkeypatch, requires_resolution=False,
+    )
+    SceneCommitService().commit(benchmark_session, project.id, performance.id)
+    benchmark_session.commit()
+    for _ in range(4):
+        _append_formal_commit(benchmark_session, project.id, actor.id, location.id, proposal.primary_thread_id)
+    operations = {
+        "history_projection_rebuild": lambda: ProjectHistoryProjectionService().rebuild(benchmark_session, project.id),
+        "narrative_structure_rebuild": lambda: NarrativeStructureProjectionService().rebuild(benchmark_session, project.id),
+        "causal_ledger_reindex": lambda: CausalLedgerService().index_current_history(benchmark_session, project.id),
+    }
+    metrics = []
+    for name, operation in operations.items():
+        item = measure(
+            benchmark_session,
+            name=name,
+            scale=100,
+            operation=operation,
+            route="EXPLICIT_SUFFIX_REBUILD",
+            projection_status="READY",
+            details={"scope": "explicit-rebuild", "full_audit_allowed": True},
+        )
+        metrics.append(item)
+        assert item.sql_query_count > 0
+    assert all(item.wall_time_ms >= 0 for item in metrics)
+
+
+def test_phase16d3_unified_audit_matrix_is_explicit(benchmark_session, monkeypatch):
+    """The report names every derived auditor and preserves failure evidence."""
+    tests_path = str(Path(__file__).resolve().parents[1] / "tests")
+    if tests_path not in sys.path:
+        sys.path.insert(0, tests_path)
+    from tests.test_scene_commit import prepared_commit
+
+    project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, _client = prepared_commit(
+        benchmark_session, monkeypatch, requires_resolution=False,
+    )
+    SceneCommitService().commit(benchmark_session, project.id, performance.id)
+    benchmark_session.commit()
+    cases = {
+        "formal_state": lambda: FormalStateIdentityAudit().audit(benchmark_session, project.id),
+        "compact_snapshot": lambda: CompactSnapshotAudit().audit(benchmark_session, project.id),
+        "checkpoint": lambda: CurrentHistoryCheckpointAudit().audit(benchmark_session, project.id),
+        "causal_ledger": lambda: CurrentCausalLedgerAudit().audit(benchmark_session, project.id),
+        "cognition": lambda: CognitionRetrievalIndexAudit().audit(benchmark_session, project.id),
+        "narrative_structure": lambda: NarrativeStructureProjectionAudit().audit(benchmark_session, project.id),
+    }
+    results = run_matrix(cases)
+    assert {item.name for item in results} == set(cases)
+    assert all(item.status in {"PASS", "FAIL"} for item in results)
+
+
+@pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in 10k/100k continuous SceneCommit certification")
+@pytest.mark.parametrize("scene_count", [10_000, 100_000])
+def test_phase16d3_continuous_scene_commit_scale(benchmark_session, monkeypatch, scene_count, capsys):
+    """Run the complete production SceneCommit chain over one continuous Project.
+
+    This is intentionally opt-in: it creates the requested 10k/100k formal
+    execution rows and is a certification job, not a normal regression test.
+    """
+    tests_path = str(Path(__file__).resolve().parents[1] / "tests")
+    if tests_path not in sys.path:
+        sys.path.insert(0, tests_path)
+    from tests.test_scene_commit import prepared_commit
+
+    project, location, actor, _other, proposal, performance, _turn, _resolution, _batch, _client = prepared_commit(
+        benchmark_session, monkeypatch, requires_resolution=False,
+    )
+
+    def operation():
+        SceneCommitService().commit(benchmark_session, project.id, performance.id)
+        benchmark_session.commit()
+        for _ in range(scene_count - 1):
+            _append_formal_commit(benchmark_session, project.id, actor.id, location.id, proposal.primary_thread_id)
+
+    metrics = measure(
+        benchmark_session,
+        name="continuous_scene_commit_scale",
+        scale=scene_count,
+        operation=operation,
+        route="FORMAL_SCENE_COMMIT",
+        projection_status="READY_OR_DIRTY",
+        scene_sequence_continuous=True,
+        details={"full_chain": True, "million_word_equivalent": scene_count * 100},
+    )
+    sequences = list(benchmark_session.scalars(select(Scene.sequence).where(Scene.project_id == project.id).order_by(Scene.sequence)))
+    assert len(sequences) == scene_count
+    assert scene_sequence_is_continuous(sequences)
+    print(report_json([metrics]))
+    assert capsys.readouterr().out
 
 
 @pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in million-word/10k-100k benchmark")
