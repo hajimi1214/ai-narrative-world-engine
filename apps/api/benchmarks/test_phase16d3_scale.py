@@ -118,6 +118,26 @@ def _bounded_read(db, project_id: str) -> dict[str, object]:
     return {"projection": projection, "structure": structure, "latest": latest}
 
 
+def _append_scene(db, project: Project, sequence: int) -> Scene:
+    scene = Scene(
+        project_id=project.id,
+        sequence=sequence,
+        location="benchmark-room",
+        participants=[],
+        facts=[],
+        result={"text": "x" * 100},
+        story_threads=[],
+        status=SceneStatus.OCCURRED.value,
+        history_status="ACTIVE",
+    )
+    db.add(scene)
+    db.flush()
+    ProjectHistoryProjectionService().sync_after_scene_commit(db, project.id, scene.id)
+    NarrativeStructureProjectionService().sync_after_scene_commit(db, project.id, scene.id)
+    db.flush()
+    return scene
+
+
 def test_phase16d3_smoke_emits_metrics_and_sequence_proof(benchmark_session, capsys):
     project, _ = _fixture(benchmark_session, 100)
     sequences = list(benchmark_session.scalars(
@@ -147,6 +167,31 @@ def test_phase16d3_route_report_is_fail_closed():
     assert report["fast_path"]["COGNITION_FAST"]["status"] == "proven"
     assert all(report["fast_path"][key]["status"] == "pending" for key in D3_ROUTE_EVIDENCE_KEYS if key != "COGNITION_FAST")
     assert all(report["fallback"][key]["status"] == "pending" for key in D3_FALLBACK_EVIDENCE_KEYS)
+
+
+def test_phase16d3_real_incremental_append_boundary_is_bounded(benchmark_session):
+    project = Project(name=f"phase16d3-append-{uuid4()}")
+    benchmark_session.add(project)
+    benchmark_session.flush()
+    for sequence in range(1, 11):
+        _append_scene(benchmark_session, project, sequence)
+    latest = benchmark_session.scalar(select(Scene.id).where(
+        Scene.project_id == project.id, Scene.sequence == 11,
+    ))
+    # The measured operation is the same post-commit derived append boundary;
+    # the fixture's prior ten scenes are already READY and are not rebuilt.
+    metrics = measure(
+        benchmark_session,
+        name="incremental_projection_append",
+        scale=10,
+        operation=lambda: _append_scene(benchmark_session, project, 11),
+        route="NARRATIVE_STRUCTURE_INCREMENTAL",
+        projection_status="READY",
+        scene_sequence_continuous=True,
+        details={"history_prefix": 10, "full_rebuild": False, "scene_id_before": latest},
+    )
+    assert metrics.sql_query_count < 80
+    assert metrics.orm_object_hydration_count < 40
 
 
 @pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in million-word/10k-100k benchmark")
