@@ -54,6 +54,7 @@ class ResearchConfig(BaseModel):
     chunk_overlap_chars: int = Field(default=120, ge=0)
     top_k: int = Field(default=8, gt=0, le=100)
     max_context_chars: int = Field(default=8000, gt=0, le=1000000)
+    max_context_tokens: int = Field(default=4000, gt=0, le=500000)
     per_document_limit: int = Field(default=3, gt=0, le=100)
     bm25_k1: float = Field(default=1.2, gt=0, le=3)
     bm25_b: float = Field(default=0.75, ge=0, le=1)
@@ -66,7 +67,7 @@ class ResearchConfig(BaseModel):
 
 
 RETRIEVAL_CONFIG_FIELDS = (
-    "top_k", "max_context_chars", "per_document_limit", "bm25_k1", "bm25_b",
+    "top_k", "max_context_chars", "max_context_tokens", "per_document_limit", "bm25_k1", "bm25_b",
     "diversity_lambda", "deduplicate_exact",
 )
 
@@ -87,6 +88,7 @@ class ResearchRetrievalConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     top_k: int = Field(default=8, gt=0, le=100)
     max_context_chars: int = Field(default=8000, gt=0, le=1000000)
+    max_context_tokens: int = Field(default=4000, gt=0, le=500000)
     per_document_limit: int = Field(default=3, gt=0, le=100)
     bm25_k1: float = Field(default=1.2, gt=0, le=3)
     bm25_b: float = Field(default=0.75, ge=0, le=1)
@@ -224,6 +226,19 @@ class KnowledgeTokenizer:
 
     def fingerprint(self, text: str) -> str:
         return research_fingerprint(self.tokenize(text), self.protocol)
+
+    def bounded_prefix(self, text: str, max_chars: int, max_tokens: int) -> tuple[str, bool]:
+        limit = min(len(text), max_chars)
+        if len(self.tokenize(text[:limit])) <= max_tokens:
+            return text[:limit], limit < len(text)
+        low, high = 0, limit
+        while low < high:
+            middle = (low + high + 1) // 2
+            if len(self.tokenize(text[:middle])) <= max_tokens:
+                low = middle
+            else:
+                high = middle - 1
+        return text[:low], True
 
 
 @dataclass(frozen=True)
@@ -541,9 +556,33 @@ class ResearchHit:
     source_metadata: dict[str, Any] = field(default_factory=dict)
     authority_rank: int = 0
     truncated: bool = False
+    retrieval_channels: tuple[str, ...] = ("LEXICAL_BM25",)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"chunk_id": self.chunk_id, "document_id": self.document_id, "revision_id": self.revision_id, "title": self.title, "source_tier": self.source_tier, "source_kind": self.source_kind, "score": self.score, "rank": self.rank, "content": self.content, "content_fingerprint": self.content_fingerprint, "source_uri": self.source_uri, "source_metadata": _safe_metadata(self.source_metadata, reject=False), "authority_rank": self.authority_rank, "untrusted_external": self.source_kind in {ResearchSourceKind.PUBLIC_KB_IMPORT.value, ResearchSourceKind.WEB_SNAPSHOT.value}, "truncated": self.truncated}
+        return {"chunk_id": self.chunk_id, "document_id": self.document_id, "revision_id": self.revision_id, "title": self.title, "source_tier": self.source_tier, "source_kind": self.source_kind, "score": self.score, "rank": self.rank, "content": self.content, "content_fingerprint": self.content_fingerprint, "source_uri": self.source_uri, "source_locator": {"document_id": self.document_id, "revision_id": self.revision_id, "chunk_id": self.chunk_id, "title": self.title}, "source_metadata": _safe_metadata(self.source_metadata, reject=False), "authority_rank": self.authority_rank, "retrieval_channels": list(self.retrieval_channels), "untrusted_external": self.source_kind in {ResearchSourceKind.PUBLIC_KB_IMPORT.value, ResearchSourceKind.WEB_SNAPSHOT.value}, "truncated": self.truncated}
+
+
+class ResearchHybridRRF:
+    """Fuse lexical and semantic ResearchHit lists without mixing scores."""
+
+    def merge(self, lexical: list[ResearchHit], semantic: list[ResearchHit], *, top_k: int = 8, rrf_k: int = 60) -> list[ResearchHit]:
+        by_id = {item.chunk_id: item for item in lexical + semantic}
+        ranks: dict[str, float] = {}
+        channels: dict[str, set[str]] = {}
+        for channel, rows in (("LEXICAL_BM25", lexical), ("SEMANTIC_VECTOR", semantic)):
+            for rank, item in enumerate(rows, 1):
+                ranks[item.chunk_id] = ranks.get(item.chunk_id, 0.0) + 1 / (rrf_k + rank)
+                channels.setdefault(item.chunk_id, set()).add(channel)
+        ordered = sorted(by_id, key=lambda chunk_id: (-ranks[chunk_id], by_id[chunk_id].authority_rank, chunk_id))[:top_k]
+        return [ResearchHit(
+            chunk_id=by_id[item].chunk_id, document_id=by_id[item].document_id,
+            revision_id=by_id[item].revision_id, title=by_id[item].title,
+            source_tier=by_id[item].source_tier, source_kind=by_id[item].source_kind,
+            score=ranks[item], rank=index, content=by_id[item].content,
+            content_fingerprint=by_id[item].content_fingerprint, source_uri=by_id[item].source_uri,
+            source_metadata=by_id[item].source_metadata, authority_rank=by_id[item].authority_rank,
+            truncated=by_id[item].truncated, retrieval_channels=tuple(sorted(channels[item])),
+        ) for index, item in enumerate(ordered, 1)]
 
 
 class ResearchDiversifier:
@@ -676,14 +715,17 @@ class ResearchBM25Retriever:
         selected = self.diversifier.select(candidates, cfg)
         hits: list[ResearchHit] = []
         total = 0
+        total_tokens = 0
         for index, item in enumerate(selected, 1):
             content = item["content"]
             truncated = False
             remaining = cfg.max_context_chars - total
-            if remaining <= 0:
+            remaining_tokens = cfg.max_context_tokens - total_tokens
+            if remaining <= 0 or remaining_tokens <= 0:
                 break
-            if len(content) > remaining:
-                content, truncated = content[:remaining], True
+            content_tokens = self.tokenizer.tokenize(content)
+            content, truncated = self.tokenizer.bounded_prefix(content, remaining, remaining_tokens)
+            total_tokens += len(self.tokenizer.tokenize(content))
             total += len(content)
             document = item["document"]
             hits.append(ResearchHit(item["chunk"].id, document.id, item["revision"].id, document.title, _value(document.source_tier), _value(document.source_kind), float(item["score"]), index, content, item["content_fingerprint"], document.source_uri, _safe_metadata(document.source_metadata, reject=False), item["authority_rank"], truncated))

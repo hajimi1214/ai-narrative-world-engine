@@ -28,6 +28,7 @@ class PerformanceActionPayload(BaseModel):
     requires_world_resolution: bool
     world_resolution_request: WorldResolutionRequest | None
     disclosure_knowledge_ids: list[str]
+    scene_beat_refs: list[str] = Field(default_factory=list)
     target_character_id: str | None = None
 
 
@@ -39,7 +40,7 @@ class CharacterPerformancePayload(BaseModel):
 
 def performance_contract() -> dict[str, Any]:
     schema = CharacterPerformancePayload.model_json_schema()
-    return {"required_fields": schema["required"], "decision": build_character_decision_contract(), "action": {"required_fields": ["visibility", "observable_action", "spoken_content", "requires_world_resolution", "world_resolution_request", "disclosure_knowledge_ids", "target_character_id"], "visibility_values": [item.value for item in ActionVisibility], "fields": {"visibility": "enum string", "observable_action": "string | null", "spoken_content": "string | null", "requires_world_resolution": "boolean", "world_resolution_request": {"kind": ["INTERACT", "INSPECT", "MOVE", "USE_ABILITY", "USE_ITEM", "ENVIRONMENT", "OTHER"], "description": "string", "target_entity_id": "string | null", "target_character_id": "string | null"}, "disclosure_knowledge_ids": "string[]", "target_character_id": "string | null"}, "rules": ["world_resolution_request must be null when requires_world_resolution is false", "world_resolution_request must be present when requires_world_resolution is true"]}}
+    return {"required_fields": schema["required"], "decision": build_character_decision_contract(), "action": {"required_fields": ["visibility", "observable_action", "spoken_content", "requires_world_resolution", "world_resolution_request", "disclosure_knowledge_ids", "scene_beat_refs", "target_character_id"], "visibility_values": [item.value for item in ActionVisibility], "fields": {"visibility": "enum string", "observable_action": "string | null", "spoken_content": "string | null", "requires_world_resolution": "boolean", "world_resolution_request": {"kind": ["INTERACT", "INSPECT", "MOVE", "USE_ABILITY", "USE_ITEM", "ENVIRONMENT", "OTHER"], "description": "string", "target_entity_id": "string | null", "target_character_id": "string | null"}, "disclosure_knowledge_ids": "string[]", "scene_beat_refs": "string[] from PLANNING_TASK.scene_beats", "target_character_id": "string | null"}, "rules": ["world_resolution_request must be null when requires_world_resolution is false", "world_resolution_request must be present when requires_world_resolution is true", "scene_beat_refs must cite only the current chapter task scene beats"]}}
 
 
 def _parse_performance(content: str) -> CharacterPerformancePayload:
@@ -66,9 +67,9 @@ class HeuristicCharacterPerformer:
         decision.update({"target_character_id": None, "target_entity_id": None})
         affordance = next(iter(context.get("scene", {}).get("world_affordances", []) or []), None)
         if affordance:
-            action = {"visibility": ActionVisibility.PUBLIC.value, "observable_action": affordance.get("description"), "spoken_content": None, "requires_world_resolution": True, "world_resolution_request": affordance, "disclosure_knowledge_ids": [], "target_character_id": None}
+            action = {"visibility": ActionVisibility.PUBLIC.value, "observable_action": affordance.get("description"), "spoken_content": None, "requires_world_resolution": True, "world_resolution_request": affordance, "disclosure_knowledge_ids": [], "scene_beat_refs": (context.get("planning_task") or {}).get("scene_beats", [])[:1], "target_character_id": None}
         else:
-            action = {"visibility": ActionVisibility.PUBLIC.value, "observable_action": decision["chosen_action"], "spoken_content": None, "requires_world_resolution": False, "world_resolution_request": None, "disclosure_knowledge_ids": [], "target_character_id": None}
+            action = {"visibility": ActionVisibility.PUBLIC.value, "observable_action": decision["chosen_action"], "spoken_content": None, "requires_world_resolution": False, "world_resolution_request": None, "disclosure_knowledge_ids": [], "scene_beat_refs": (context.get("planning_task") or {}).get("scene_beats", [])[:1], "target_character_id": None}
         return {"decision": decision, "action": action}, None
 
 
@@ -143,6 +144,14 @@ class PerformanceActionConstraintChecker:
         issues: list[PerformanceIssue] = []
         def add(code, message, ids=None): issues.append(PerformanceIssue(code, "BLOCKING", message, ids or [], "Correct the performance action and try the turn again."))
         participants = set(active_participant_ids or ({item["id"] for item in context["scene"]["other_participants"]} | {context["character"]["id"]}))
+        task = context.get("planning_task") or {}
+        planned_beats = {str(item) for item in task.get("scene_beats", []) if str(item).strip()}
+        beat_refs = {str(item) for item in (action.scene_beat_refs or [])}
+        if planned_beats and not beat_refs:
+            add("SCENE_BEAT_REFERENCE_MISSING", "Character action must declare which current planning scene beat it attempts.")
+        invalid_beats = sorted(beat_refs - planned_beats)
+        if invalid_beats:
+            add("SCENE_BEAT_REFERENCE_INVALID", "Character action cites a scene beat outside the locked planning task.", invalid_beats)
         if action.target_character_id != decision.target_character_id: add("TARGET_MISMATCH", "Action and CharacterDecision target_character_id must match.", [item for item in (action.target_character_id, decision.target_character_id) if item])
         if action.visibility == ActionVisibility.TARGETED and (not action.target_character_id or action.target_character_id not in participants or action.target_character_id == decision.character_id): add("INVALID_TARGET", "TARGETED action must name another active Scene participant.")
         if action.visibility in {ActionVisibility.COVERT, ActionVisibility.PRIVATE} and action.target_character_id: add("INVALID_TARGET", "COVERT and PRIVATE actions cannot route to a recipient.", [action.target_character_id])

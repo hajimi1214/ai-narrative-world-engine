@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Bot, CheckCircle2, Pause, Play, PlayCircle, RotateCcw, XCircle } from "lucide-react";
+import Link from "next/link";
+import { Bot, CheckCircle2, ClipboardList, Pause, Play, PlayCircle, RotateCcw, XCircle } from "lucide-react";
 import { api } from "../../../lib";
 import { DeveloperData, EmptyState, ErrorState, PageHeader, SectionCard, StatusBadge } from "../../../../components/ui/primitives";
 
@@ -10,13 +11,14 @@ type AutonomyRun = { id: string; status: string; scene_budget: number; committed
 
 export default function DirectorPage({ params }: { params: { id: string } }) {
   const [overview, setOverview] = useState<any>();
+  const [nextChapter, setNextChapter] = useState<any>();
   const [run, setRun] = useState<Run>();
   const [characterId, setCharacterId] = useState("");
   const [characterRun, setCharacterRun] = useState<any>();
   const [performance, setPerformance] = useState<any>();
   const [message, setMessage] = useState(""); const [autonomy, setAutonomy] = useState<AutonomyRun>(); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
 
-  useEffect(() => { void api(`/projects/${params.id}/snapshot`).then(setOverview); void api(`/projects/${params.id}/autonomy/runs`).then((items) => { const active = (items as AutonomyRun[]).find((item) => item.active || ["RUNNING", "PAUSED"].includes(item.status)); if (active) setAutonomy(active); }).catch(() => undefined); }, [params.id]);
+  useEffect(() => { void api(`/projects/${params.id}/snapshot`).then(setOverview); void api(`/projects/${params.id}/long-form/next`).then(setNextChapter).catch(() => undefined); void api(`/projects/${params.id}/autonomy/runs`).then((items) => { const active = (items as AutonomyRun[]).find((item) => item.active || ["RUNNING", "PAUSED"].includes(item.status)); if (active) setAutonomy(active); }).catch(() => undefined); }, [params.id]);
   async function dryRun() { const result = await api(`/projects/${params.id}/director/dry-run`, { method: "POST" }) as Run; setRun(result); setCharacterId(result.proposal.participants[0] || ""); setCharacterRun(undefined); }
   async function simulate(ai: boolean) { if (run && characterId) setCharacterRun(await api(`/projects/${params.id}/director/proposals/${run.proposal.id}/characters/${characterId}/${ai ? "ai-dry-run" : "dry-run"}`, { method: "POST" })); }
   async function transition(action: "approve" | "reject") { if (!run) return; const result = await api(`/projects/${params.id}/director/proposals/${run.proposal.id}/${action}`, { method: "POST", body: action === "reject" ? JSON.stringify({ reason: "由导演台拒绝。" }) : undefined }); setMessage(action === "approve" ? `提案已批准：${result.proposal.status}` : `提案已拒绝：${result.status}`); if (action === "approve") setRun({ ...run, proposal: result.proposal, validation_report: result.validation_report }); }
@@ -27,10 +29,14 @@ export default function DirectorPage({ params }: { params: { id: string } }) {
   async function advanceAutonomy() { if (!autonomy) return; setBusy(true); try { const result = await api(`/projects/${params.id}/autonomy/runs/${autonomy.id}/advance`, { method: "POST", body: JSON.stringify({ max_scenes: 1, idempotency_key: `ui-${autonomy.id}` }) }) as { run: AutonomyRun; steps: unknown[] }; setAutonomy(result.run); setMessage(`本次请求复用了 ${result.steps.length} 个步骤；运行状态已更新。`); } catch (reason) { setError(reason instanceof Error ? reason.message : "推进失败。"); } finally { setBusy(false); } }
   async function pauseAutonomy() { if (!autonomy) return; setBusy(true); try { setAutonomy(await api(`/projects/${params.id}/autonomy/runs/${autonomy.id}/pause`, { method: "POST", body: JSON.stringify({ reason: "USER_PAUSED" }) }) as AutonomyRun); setMessage("自治运行已暂停。"); } catch (reason) { setError(reason instanceof Error ? reason.message : "暂停失败。"); } finally { setBusy(false); } }
   async function resumeAutonomy() { if (!autonomy) return; setBusy(true); try { setAutonomy(await api(`/projects/${params.id}/autonomy/runs/${autonomy.id}/resume`, { method: "POST" }) as AutonomyRun); setMessage("自治运行已恢复。"); } catch (reason) { setError(reason instanceof Error ? reason.message : "恢复失败。"); } finally { setBusy(false); } }
+  const characterName = (id: string) => overview?.active_characters?.find((item: any) => item.id === id)?.name || id;
 
   return <main className="stack">
     <PageHeader title="导演台" description="推演下一场的候选方案。这里不会创建正式场景，也不会直接改写世界。" action={<button onClick={dryRun}><Play size={15} /> 推演下一场</button>} />
     {error && <ErrorState message={error} />}{message && <SectionCard><p>{message}</p></SectionCard>}
+    <SectionCard title="下一章任务边界" description="导演候选必须服务于已审批并锁定的章节任务；角色 Agent 只能在这条边界内做决定。" aside={<Link className="text-action" href={`/projects/${params.id}/chapters`}>章节工作台 →</Link>}>
+      {!nextChapter?.task ? <div className="compact-empty"><ClipboardList size={18} /><strong>{nextChapter?.status === "PLAN_COMPLETE" ? "整本规划已完成" : "还没有可执行的章节任务"}</strong><p>{nextChapter?.blocked_reasons?.join("、") || "先审批整本规划并锁定下一章任务。"}</p></div> : <div className="director-task"><div><small>当前章节</small><strong>第 {nextChapter.task.number} 章 · {nextChapter.task.title}</strong></div><div><small>章节目标</small><p>{nextChapter.task.objective || "未填写"}</p></div><div><small>核心冲突</small><p>{nextChapter.task.conflict || "未填写"}</p></div><div><small>必须事件</small><p>{(nextChapter.task.must_events || []).join("；") || "无"}</p></div><div><small>禁止事件</small><p>{(nextChapter.task.forbidden_events || []).join("；") || "无"}</p></div><StatusBadge value={nextChapter.task.locked ? "任务已锁定" : "任务待锁定"} /></div>}
+    </SectionCard>
     <SectionCard title="自治运行" description="规则模式不会调用真实 LLM；每次推进最多提交一场正式 Scene。" aside={<StatusBadge value={autonomy?.status || "未启动"} />}>
       {!autonomy ? <div className="row"><button onClick={startAutonomy} disabled={busy}><PlayCircle size={16} /> 创建自治运行</button><span className="muted">准备好人物和剧情线程后即可开始。</span></div> : <div className="run-control"><div><strong>{autonomy.committed_scene_count || 0} / {autonomy.scene_budget} 场</strong><small>{autonomy.stop_reason || "运行边界由正式验证控制"}</small></div><div className="row"><button onClick={advanceAutonomy} disabled={busy || autonomy.status !== "RUNNING"}><Play size={15} /> 推进一场</button>{autonomy.status === "RUNNING" ? <button className="secondary" onClick={pauseAutonomy} disabled={busy}><Pause size={15} /> 暂停</button> : autonomy.status === "PAUSED" && <button className="secondary" onClick={resumeAutonomy} disabled={busy}><RotateCcw size={15} /> 恢复</button>}</div></div>}
     </SectionCard>
@@ -38,12 +44,12 @@ export default function DirectorPage({ params }: { params: { id: string } }) {
     {run && <section className="stack">
       <SectionCard title="候选场景" aside={<StatusBadge value={run.proposal.status} />}>
         <p><strong>{run.proposal.title || "未命名场景提案"}</strong></p>
-        <p className="muted">参与人物：{run.proposal.participants.length || "未指定"} 位</p>
+        <p className="muted">参与人物：{run.proposal.participants.length || "未指定"} 位 · {run.proposal.participants.map(characterName).join("、") || "未指定"}</p>
         <div className="row"><button disabled={!run.validation_report.valid || run.proposal.status === "APPROVED"} onClick={() => transition("approve")}><CheckCircle2 size={15} /> 批准提案</button><button className="secondary" onClick={() => transition("reject")}><XCircle size={15} /> 拒绝提案</button></div>
         <DeveloperData value={run.proposal} label="提案原始数据" />
       </SectionCard>
       <SectionCard title="角色选择模拟" description="使用已批准的场景提案检查角色下一步的候选行动。">
-        <div className="row"><select value={characterId} onChange={(event) => setCharacterId(event.target.value)}>{run.proposal.participants.map((id) => <option key={id} value={id}>{id}</option>)}</select><button className="secondary" disabled={!characterId} onClick={() => simulate(false)}>规则模拟</button><button disabled={!characterId} onClick={() => simulate(true)}><Bot size={15} /> AI 模拟</button></div>
+        <div className="row"><select value={characterId} onChange={(event) => setCharacterId(event.target.value)}>{run.proposal.participants.map((id) => <option key={id} value={id}>{characterName(id)}</option>)}</select><button className="secondary" disabled={!characterId} onClick={() => simulate(false)}>规则模拟</button><button disabled={!characterId} onClick={() => simulate(true)}><Bot size={15} /> AI 模拟</button></div>
         {characterRun && <DeveloperData value={characterRun} label="角色模拟数据" />}
       </SectionCard>
       <SectionCard title="场景排演" description="排演属于临时工作区；有效候选不会直接成为正式世界历史。">

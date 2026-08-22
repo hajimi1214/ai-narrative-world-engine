@@ -32,6 +32,7 @@ from .models import (
 )
 from .narrative_structure import NarrativeStructureAudit
 from .retcon_apply import has_pending_replay
+from .planning import chapter_task_context, validate_task_output
 
 
 class WriterDomainError(ValueError):
@@ -54,6 +55,8 @@ class WriterOutputPayload(BaseModel):
     scene_coverage: list[str]
     source_refs: list[WriterSourceRef]
     pov_character_id: str | None
+    task_coverage: list[str] = []
+    task_forbidden_hits: list[str] = []
 
 
 def _value(value: Any) -> Any:
@@ -196,6 +199,7 @@ class WriterContextFingerprintBuilder:
             "rendering_contract": context.get("rendering_contract"),
             "source_manifest": context.get("source_manifest"),
             "renderable_source_refs": context.get("renderable_source_refs"),
+            "planning_task": context.get("planning_task"),
             "fingerprints": context.get("fingerprints"),
         }
         return _fp(semantic, self.protocol)
@@ -282,8 +286,9 @@ class WriterChapterSourceBuilder:
             turn_rows = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence, ScenePerformanceTurn.id)).all()
             for turn in turn_rows:
                 decision = db.get(CharacterDecision, turn.character_decision_id)
-                turns.append({"id": turn.id, "sequence": turn.sequence, "actor_character_id": turn.actor_character_id, "visibility": _value(turn.action_visibility), "observable_action": turn.observable_action, "spoken_content": turn.spoken_content, "recipient_character_ids": _ids(turn.recipient_character_ids), "decision": self._decision(decision) if decision else None})
                 resolution = db.scalar(select(WorldResolution).where(WorldResolution.performance_turn_id == turn.id, WorldResolution.status == ResolutionStatus.VALID))
+                turn_row = {"id": turn.id, "sequence": turn.sequence, "actor_character_id": turn.actor_character_id, "visibility": _value(turn.action_visibility), "observable_action": turn.observable_action, "spoken_content": turn.spoken_content, "recipient_character_ids": _ids(turn.recipient_character_ids), "scene_beat_refs": list(turn.scene_beat_refs or []), "requires_world_resolution": turn.requires_world_resolution, "resolution_id": resolution.id if resolution else None, "decision": self._decision(decision) if decision else None}
+                turns.append(turn_row)
                 if resolution:
                     resolutions.append({"id": resolution.id, "turn_id": turn.id, "actor_character_id": turn.actor_character_id, "recipient_character_ids": _ids(resolution.recipient_character_ids), "objective_facts": resolution.objective_facts or [], "actor_observation": resolution.actor_observation, "public_observation": resolution.public_observation})
         batches = db.scalars(select(StateDeltaBatch).where(StateDeltaBatch.project_id == scene.project_id, StateDeltaBatch.applied_scene_id == scene.id, StateDeltaBatch.status == StateDeltaBatchStatus.APPLIED).order_by(StateDeltaBatch.id)).all()
@@ -321,6 +326,10 @@ class WriterContextBuilder:
         config = WriterRenderConfigResolver().resolve(project, request)
         allowed_reveals: list[str] = []
         safe_scenes = WriterVisibilityProjector().project(source["scenes"], mode, pov_character_id)
+        try:
+            planning_task = chapter_task_context(db, chapter.project_id, chapter.number, required=True)
+        except ValueError as exc:
+            raise WriterDomainError(str(exc)) from exc
         manifest = dict(source["manifest"])
         manifest["scenes"] = safe_scenes
         manifest["rendering_config"] = {**config, "pov_mode": mode.value, "pov_character_id": pov_character_id}
@@ -329,6 +338,7 @@ class WriterContextBuilder:
             "chapter": {"id": chapter.id, "number": chapter.number, "title": chapter.title, "structure_status": _value(chapter.structure_status)},
             "formal_history": {"scenes": safe_scenes},
             "pov_subjective_context": self._subjective(db, safe_scenes, pov_character_id, mode, chapter.project_id, set(allowed_reveals)),
+            "planning_task": planning_task,
             "entity_labels": self._labels(db, safe_scenes),
             "rendering_contract": {"pov_mode": mode.value, "pov_character_id": pov_character_id, "grounding": "structured references only", "allowed_reveal_ids": [], "no_formal_mutation": True, "visibility_protocol": config["visibility_protocol"], "secret_policy": config["secret_policy"]},
             "source_manifest": manifest,
@@ -469,7 +479,7 @@ class WriterProjectionService:
         project = db.get(__import__("app.models", fromlist=["Project"]).Project, source["chapter"].project_id)
         config = context["source_manifest"]["rendering_config"]
         prompt_fingerprint = self.prompt_fingerprint(context)
-        return {"chapter_id": chapter_id, "chapter_number": source["chapter"].number, "structure_status": _value(source["chapter"].structure_status), "source_scene_ids": source["source_scene_ids"], "chapter_source_fingerprint": source["source_fingerprint"], "writer_context_fingerprint": context["writer_context_fingerprint"], "writing_bible": {"id": context["writing_bible"].id, "version": context["writing_bible"].version, "fingerprint": context["fingerprints"]["writing_bible"]} if context.get("writing_bible") else {"id": None, "version": None, "fingerprint": "writer-default-v1"}, "pov_mode": context["pov_mode"].value, "pov_character_id": context["pov_character_id"], "target_words": config["target_words"], "min_words": config["min_words"], "max_words": config["max_words"], "rendering_config": config, "source_counts": {"scenes": len(source["scenes"]), "refs": len(context["renderable_source_refs"])}, "visibility": {"renderable_ref_count": len(context["renderable_source_refs"])}, "prompt_fingerprint": prompt_fingerprint, "request_fingerprint": self.request_fingerprint(request or {}, context)}
+        return {"chapter_id": chapter_id, "chapter_number": source["chapter"].number, "structure_status": _value(source["chapter"].structure_status), "source_scene_ids": source["source_scene_ids"], "chapter_source_fingerprint": source["source_fingerprint"], "writer_context_fingerprint": context["writer_context_fingerprint"], "planning_task": context.get("planning_task"), "writing_bible": {"id": context["writing_bible"].id, "version": context["writing_bible"].version, "fingerprint": context["fingerprints"]["writing_bible"]} if context.get("writing_bible") else {"id": None, "version": None, "fingerprint": "writer-default-v1"}, "pov_mode": context["pov_mode"].value, "pov_character_id": context["pov_character_id"], "target_words": config["target_words"], "min_words": config["min_words"], "max_words": config["max_words"], "rendering_config": config, "source_counts": {"scenes": len(source["scenes"]), "refs": len(context["renderable_source_refs"])}, "visibility": {"renderable_ref_count": len(context["renderable_source_refs"])}, "prompt_fingerprint": prompt_fingerprint, "request_fingerprint": self.request_fingerprint(request or {}, context)}
 
     @staticmethod
     def request_fingerprint(request: dict[str, Any], context: dict[str, Any] | None = None) -> str:
@@ -518,9 +528,16 @@ class WriterProjectionService:
             result = route_provider.generate(WriterPromptBuilder().build(context), route_model)
             parsed = self._parse(result.content)
             report = WriterGroundingValidator().validate(parsed, context)
+            task_issues = validate_task_output(parsed, context.get("planning_task"))
+            if task_issues:
+                report["issues"].extend(task_issues)
+                report["valid"] = False
+            report["task_coverage"] = parsed.get("task_coverage", [])
+            report["task_forbidden_hits"] = parsed.get("task_forbidden_hits", [])
             draft.provider = result.provider; draft.model = result.model; draft.model_request_id = result.request_id; draft.prompt_fingerprint = self.prompt_fingerprint(context); draft.title_candidate = parsed.get("chapter_title"); draft.content = parsed.get("prose", "")
             draft.content_fingerprint = _fp(draft.content, "writer-content-v1"); draft.word_count = WriterWordCounter().count(draft.content); draft.scene_coverage = parsed.get("scene_coverage", []); draft.source_refs = parsed.get("source_refs", [])
             draft.validation_report = report; draft.completed_at = datetime.utcnow()
+            draft.source_manifest = {**(draft.source_manifest or {}), "planning_task": context.get("planning_task")}
             if not report["valid"]:
                 draft.status = WriterDraftStatus.REJECTED
                 ExecutionTraceRecorder().block(trace, report["issues"][0]["code"], validation_report=report, request_id=result.request_id)
@@ -627,6 +644,6 @@ class WriterPromptBuilder:
     def build(self, context: dict[str, Any]) -> list[dict[str, str]]:
         safe = {key: value for key, value in context.items() if key not in {"writing_bible", "pov_mode", "pov_character_id"}}
         return [
-            {"role": "system", "content": "You are a prose renderer, not a plot planner. FORMAL_HISTORY is factual authority. SUBJECTIVE_POV may be mistaken. WRITING_RULES are style only. RENDERING_FREEDOM applies only to prose expression. Do not invent events, outcomes, decisions, knowledge, secrets, items, injuries, locations, relationships, or causal facts. Do not reveal information outside the POV visibility contract. Return exactly one JSON object matching the output contract."},
-            {"role": "user", "content": _canonical({"context": safe, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene id array", "source_refs": "visible structured source references", "pov_character_id": "string|null"}})},
+            {"role": "system", "content": "You are a prose renderer, not a plot planner. FORMAL_HISTORY is factual authority. SUBJECTIVE_POV may be mistaken. PLANNING_TASK is a binding chapter contract: fulfill its objective, start/end state, scene beats, mandatory events, reveal limits, and consequences without inventing facts. Each prose scene must be grounded in the recorded character actions that cite the corresponding scene beat; do not invent a beat completion that is absent from formal turns. WRITING_RULES are style only. RENDERING_FREEDOM applies only to prose expression. Do not invent events, outcomes, decisions, knowledge, secrets, items, injuries, locations, relationships, or causal facts. Do not reveal information outside the POV visibility contract. Avoid formulaic AI phrasing, generic summary, symmetrical slogans, and empty transitions. Return exactly one JSON object matching the output contract."},
+            {"role": "user", "content": _canonical({"context": safe, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene id array", "source_refs": "visible structured source references", "pov_character_id": "string|null", "task_coverage": "exact list of completed mandatory task event labels", "task_forbidden_hits": "list of forbidden task event labels that appeared"}})},
         ]

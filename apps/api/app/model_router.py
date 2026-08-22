@@ -11,6 +11,8 @@ class ProjectModelConfigPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider: str | None = None
     base_url: str | None = None
+    single_model_mode: bool = True
+    shared_model: str | None = None
     character_model: str | None = None
     world_model: str | None = None
     director_model: str | None = None
@@ -20,6 +22,9 @@ class ProjectModelConfigPayload(BaseModel):
     fallback_model: str | None = None
     auto_failover: bool = False
     max_repair_attempts: int = Field(default=1, ge=0, le=3)
+    request_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
+    max_retries: int = Field(default=1, ge=0, le=3)
+    rate_limit_per_minute: int = Field(default=0, ge=0, le=10000)
     embedding_enabled: bool = False
     embedding_use_main_connection: bool = True
     embedding_provider: str | None = None
@@ -93,7 +98,10 @@ class ModelRouter:
             raise ValueError("UNKNOWN_MODEL_ROLE")
         config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
         field = self.FIELDS[role]
-        model = getattr(config, field) if config and getattr(config, field) else getattr(settings, self.DEFAULTS[role])
+        if config and config.single_model_mode and (config.shared_model or config.writer_model):
+            model = config.shared_model or config.writer_model
+        else:
+            model = getattr(config, field) if config and getattr(config, field) else getattr(settings, self.DEFAULTS[role])
         return ModelRoute(config.provider if config and config.provider else settings.ai_provider, config.base_url if config and config.base_url else settings.ai_base_url, model)
 
 

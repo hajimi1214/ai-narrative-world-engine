@@ -6,8 +6,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from .models import AntiAIBible, CanonFact, CanonType, Character, CharacterKnowledge, CharacterMemory, EntityType, KnowledgeStatus, Project, ProposalStatus, ProposalType, RevealConstraint, RevealStatus, Scene, SceneProposal, SceneStatus, SceneExecutionBinding, ScenePerformance, StoryArc, StoryThread, ThreadStatus, TimelineEvent, TimelineEventType, CausalLink, CausalResourceType, CausalRelationType, WorldEntity, WritingBible
+from .models import AntiAIBible, CanonFact, CanonType, Character, CharacterKnowledge, CharacterMemory, Chapter, EntityType, KnowledgeStatus, Project, ProposalStatus, ProposalType, RevealConstraint, RevealStatus, Scene, SceneProposal, SceneStatus, SceneExecutionBinding, ScenePerformance, StoryArc, StoryThread, ThreadStatus, TimelineEvent, TimelineEventType, CausalLink, CausalResourceType, CausalRelationType, WorldEntity, WritingBible, StoryPlanChapter
 from .character_mind import ActiveCharacterCognitionReader, CharacterBeliefViewBuilder
+from .planning import approved_plan, next_chapter_task_context
 
 RECENT_SCENE_LIMIT = 10
 
@@ -416,7 +417,8 @@ class DirectorProposalFactory:
         participant_ids = list(candidate.participant_ids)
         meta = {"protocol": "story-gravity-v1", "gravity_fingerprint": gravity.gravity_fingerprint, "candidate_key": candidate.candidate_key, "reason_codes": list(candidate.reason_codes), "score_components": candidate.score_components, "focus_type": candidate.focus_type, "focus_ids": list(candidate.focus_ids), "pressure_kind": candidate.pressure_kind, "evidence": candidate.evidence}
         motivations = {character_id: {"reason": "The current situation creates a structured opportunity for an autonomous choice."} for character_id in participant_ids}
-        return {"proposal_type": candidate.proposal_type, "primary_thread_id": candidate.primary_thread_id, "location_id": candidate.location_id, "proposed_location": None, "participants": participant_ids, "scene_goal": "Create an opportunity to respond to the current pressure.", "character_motivations": motivations, "entry_state": {"director_meta": meta}, "planned_pressure": "A structured external pressure creates multiple plausible responses.", "expected_progress": candidate.expected_progress, "allowed_reveals": list(candidate.reveal_ids), "forbidden_reveals": [], "required_canon": [], "possible_outcomes": ["The pressure is refused, delayed, or investigated.", "The situation changes through an autonomous character choice."], "new_entity_requests": [], "risk_flags": list(candidate.reason_codes), "director_reasoning_summary": "Selected a structured situation; character decisions remain autonomous."}
+        task = (context.get("planning_chapter_tasks") or [None])[0]
+        return {"proposal_type": candidate.proposal_type, "primary_thread_id": candidate.primary_thread_id, "location_id": candidate.location_id, "proposed_location": None, "participants": participant_ids, "scene_goal": (task or {}).get("objective") or "Create an opportunity to respond to the current pressure.", "character_motivations": motivations, "entry_state": {"director_meta": meta, "planning_task": task}, "planned_pressure": (task or {}).get("conflict") or "A structured external pressure creates multiple plausible responses.", "expected_progress": candidate.expected_progress, "allowed_reveals": list(candidate.reveal_ids), "forbidden_reveals": (task or {}).get("forbidden_reveals", []), "required_canon": [], "possible_outcomes": ["The pressure is refused, delayed, or investigated.", "The situation changes through an autonomous character choice."], "new_entity_requests": [], "risk_flags": list(candidate.reason_codes), "director_reasoning_summary": "Selected a structured situation; character decisions remain autonomous."}
 
 
 class DirectorCandidatePayload(BaseModel):
@@ -536,6 +538,12 @@ class DirectorContextBuilder:
             "writing_constraints": self._writing_constraints(writing.rules if writing else {}),
             "anti_ai_constraints": {"avoid_repeated_conclusions": True, "avoid_static_delay": True, "principles": (anti_ai.writing_principles[:3] if anti_ai else [])},
         }
+        plan = approved_plan(session, project_id)
+        if plan:
+            # Planning is advisory to the Director candidate; formal scene and character validators remain authoritative.
+            context["planning_plan"] = {"plan_id": plan.id, "version": plan.version, "premise": plan.premise, "macro_plan": plan.macro_plan, "style_guide": plan.style_guide, "anti_ai_rules": plan.anti_ai_rules}
+            next_task = next_chapter_task_context(session, project_id)
+            context["planning_chapter_tasks"] = [next_task] if next_task else []
         gravity_context = StoryGravityContextBuilder().build(session, project_id)
         gravity_report = StoryGravityEngine().build(gravity_context)
         context["current_sequence"] = gravity_context["current_sequence"]

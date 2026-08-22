@@ -5,10 +5,11 @@ from typing import Any
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..model_router import ProviderCredentialResolver
-from ..models import Project
+from ..models import Project, ProjectModelConfig
 
 
 class Payload(BaseModel):
@@ -56,8 +57,12 @@ def routed_provider(settings, route, db: Session | None = None, project_id: str 
     from .. import api
 
     key = ProviderCredentialResolver().generation_key(db, project_id, settings) if db is not None and project_id else None
+    config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id)) if db is not None and project_id else None
+    timeout = config.request_timeout_seconds if config else None
+    retries = config.max_retries if config else 0
+    rate_limit = config.rate_limit_per_minute if config else 0
     try:
-        return api.get_model_provider(settings, route.provider, route.base_url, key)
+        return api.get_model_provider(settings, route.provider, route.base_url, key, timeout_seconds=timeout, max_retries=retries, rate_limit_per_minute=rate_limit)
     except TypeError as exc:
         # Existing fake factories from frozen phases accept three arguments.
         if "positional" not in str(exc) and "argument" not in str(exc):

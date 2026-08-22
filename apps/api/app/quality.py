@@ -9,8 +9,10 @@ import hashlib
 import json
 import re
 import unicodedata
+from copy import deepcopy
 from collections import Counter
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -26,12 +28,14 @@ from .models import (
     ChapterWriterDraft, Project, ProjectModelConfig, QualityAssessmentStatus,
     QualityFindingSeverity, QualityFindingSource, ExecutionTrace, WriterDraftOrigin,
     WriterDraftStatus,
+    CharacterKnowledge,
 )
 from .writer import (
     WriterChapterSourceBuilder, WriterContextBuilder, WriterDomainError,
     WriterGroundingValidator, WriterOutputPayload, WriterProjectionAudit,
     WriterProjectionService, WriterWordCounter, WriterContextFingerprintBuilder,
 )
+from .planning import validate_task_output
 
 
 QUALITY_CATEGORIES = {
@@ -147,7 +151,27 @@ def _assessment_explicit_overrides(value: dict[str, Any]) -> dict[str, Any]:
 class AntiAIBibleResolver:
     DEFAULT = {
         "disabled_expressions": [], "warning_expressions": [],
-        "frequency_limits": {}, "writing_principles": [], "future_risk_labels": [],
+        "frequency_limits": {
+            "expressions": {}, "punctuation": {},
+            "repeated_sentence_prefix": 3, "repeated_paragraph_opening": 3,
+            "repeated_exact_sentence": 3,
+            # These are heuristics, not a vocabulary blacklist. A single
+            # occurrence of a literary word is fine; abnormal density is not.
+            "rare_words": {
+                "攥": {"max_per_1000": 2, "severity": "MINOR"},
+                "眸": {"max_per_1000": 2, "severity": "MINOR"},
+                "喉结": {"max_per_1000": 1, "severity": "MINOR"},
+                "唇角": {"max_per_1000": 2, "severity": "MINOR"},
+                "身形": {"max_per_1000": 2, "severity": "MINOR"},
+            },
+            "scenery": {"max_consecutive_sentences": 3, "max_ratio": 0.35},
+            "dialogue": {"max_similarity": 0.86, "max_recap_count": 2},
+            "emotion_explanation": {"max_per_1000": 4},
+            "cognitive_explanation": {"max_per_1000": 6},
+            "template_structures": {"max_per_1000": 3},
+            "abstract_summary": {"max_per_1000": 2},
+        },
+        "writing_principles": [], "future_risk_labels": [],
     }
 
     def resolve(self, db: Session, project_id: str) -> dict[str, Any]:
@@ -155,13 +179,20 @@ class AntiAIBibleResolver:
         if len(rows) > 1:
             raise QualityDomainError("ANTI_AI_BIBLE_AMBIGUOUS")
         row = rows[0] if rows else None
-        rules = self.DEFAULT.copy() if row is None else {
-            "disabled_expressions": list(row.disabled_expressions or []),
-            "warning_expressions": list(row.warning_expressions or []),
-            "frequency_limits": dict(row.frequency_limits or {}),
-            "writing_principles": list(row.writing_principles or []),
-            "future_risk_labels": list(row.future_risk_labels or []),
-        }
+        rules = deepcopy(self.DEFAULT)
+        if row is not None:
+            rules.update({
+                "disabled_expressions": list(row.disabled_expressions or []),
+                "warning_expressions": list(row.warning_expressions or []),
+                "writing_principles": list(row.writing_principles or []),
+                "future_risk_labels": list(row.future_risk_labels or []),
+            })
+            supplied_limits = dict(row.frequency_limits or {})
+            for key, value in supplied_limits.items():
+                if isinstance(value, dict) and isinstance(rules["frequency_limits"].get(key), dict):
+                    rules["frequency_limits"][key] = {**rules["frequency_limits"][key], **value}
+                else:
+                    rules["frequency_limits"][key] = value
         self.validate(rules)
         semantic = {"version": row.version if row else 1, **rules}
         return {"row": row, "id": row.id if row else None, "version": row.version if row else None, "rules": rules, "fingerprint": _fp(semantic, "anti-ai-bible-v1") if row else _fp(semantic, "anti-ai-default-v1")}
@@ -172,7 +203,8 @@ class AntiAIBibleResolver:
             if not isinstance(rules.get(key), list) or not all(isinstance(item, str) and item for item in rules[key]):
                 raise QualityDomainError("ANTI_AI_BIBLE_INVALID", {"field": key})
         limits = rules.get("frequency_limits")
-        if not isinstance(limits, dict) or set(limits) - {"expressions", "punctuation", "repeated_sentence_prefix", "repeated_paragraph_opening", "repeated_exact_sentence"}:
+        allowed = {"expressions", "punctuation", "repeated_sentence_prefix", "repeated_paragraph_opening", "repeated_exact_sentence", "rare_words", "scenery", "dialogue", "emotion_explanation", "cognitive_explanation", "template_structures", "abstract_summary"}
+        if not isinstance(limits, dict) or set(limits) - allowed:
             raise QualityDomainError("ANTI_AI_BIBLE_INVALID", {"field": "frequency_limits"})
         for key in ("expressions", "punctuation"):
             value = limits.get(key, {})
@@ -181,6 +213,16 @@ class AntiAIBibleResolver:
         for key in ("repeated_sentence_prefix", "repeated_paragraph_opening", "repeated_exact_sentence"):
             if key in limits and (not isinstance(limits[key], int) or limits[key] < 1):
                 raise QualityDomainError("ANTI_AI_BIBLE_INVALID", {"field": key})
+        rare_words = limits.get("rare_words", {})
+        if not isinstance(rare_words, dict) or any(not isinstance(word, str) or not word or not isinstance(value, dict) or not isinstance(value.get("max_per_1000"), (int, float)) or value["max_per_1000"] < 0 for word, value in rare_words.items()):
+            raise QualityDomainError("ANTI_AI_BIBLE_INVALID", {"field": "rare_words"})
+        for key in ("scenery", "dialogue", "emotion_explanation", "cognitive_explanation", "template_structures", "abstract_summary"):
+            value = limits.get(key, {})
+            if not isinstance(value, dict):
+                raise QualityDomainError("ANTI_AI_BIBLE_INVALID", {"field": key})
+            for name, item in value.items():
+                if name.startswith("max_") and (not isinstance(item, (int, float)) or item < 0):
+                    raise QualityDomainError("ANTI_AI_BIBLE_INVALID", {"field": key})
 
 
 def _normalized_with_offsets(value: str) -> tuple[str, list[int]]:
@@ -257,6 +299,95 @@ class NarrativeRepetitionDetector:
         return findings, {"repeated_exact_sentences": sum(1 for value in sentence_counts.values() if value >= exact_limit), "repeated_paragraph_openings": sum(1 for value in openings.values() if value >= opening_limit), "repeated_sentence_prefixes": sum(1 for value in prefixes.values() if value >= prefix_limit)}
 
 
+class ChineseStyleStatistics:
+    """Deterministic Chinese prose signals used to catch AI-like density.
+
+    The detector intentionally reports distributions and repeated patterns, not
+    an authorship verdict. Literary vocabulary remains valid when used sparingly
+    and in a character-appropriate voice.
+    """
+
+    sentence_splitter = NarrativeRepetitionDetector.sentence_splitter
+    scenery_terms = re.compile(r"天空|云|月色|月光|阳光|晨光|暮色|夜色|风|雨|雪|雾|雷|街道|树|花|草|河|山|湖|窗外|灯光|影子|落叶|远处|天边|地面|空气")
+    action_terms = re.compile(r"走|跑|停|转身|抬|低|看|听|说|问|答|拿|放|推|拉|抓|握|打开|关上|坐|站|笑|哭|喘|退|靠|冲|躲|递|写|拔|挥")
+    emotion_terms = re.compile(r"感到|觉得|意识到|明白|察觉到|不禁|仿佛|似乎|显然|意味深长|心中(?:充满|一阵)|(?:愤怒|悲伤|紧张|害怕|绝望|欣喜|高兴|痛苦|焦虑|震惊|羞愧|恐惧|激动|失望|不安|委屈)(?:地|的)?")
+    template_terms = re.compile(r"不仅[^。！？]{0,35}而且|不是[^。！？]{0,35}而是|既[^。！？]{0,35}又|一方面[^。！？]{0,35}另一方面")
+    abstract_summary = re.compile(r"(?:这|那|此)(?:一刻|一切|一切的一切)?(?:意味着|说明了|证明了|宣告着)|命运的(?:齿轮|长河)|从此以后|在某种意义上|归根结底|最终(?:明白|意识到)")
+
+    @staticmethod
+    def _sentences(prose: str) -> list[str]:
+        return [item.strip() for item in ChineseStyleStatistics.sentence_splitter.split(prose) if item.strip()]
+
+    @staticmethod
+    def _per_thousand(count: int, char_count: int) -> float:
+        return round(count * 1000 / max(1, char_count), 3)
+
+    def analyze(self, prose: str, limits: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        sentences = self._sentences(prose)
+        char_count = len(prose)
+        scenery_flags = [bool(self.scenery_terms.search(sentence)) for sentence in sentences]
+        scenery_count = sum(scenery_flags)
+        scenery_action_count = sum(bool(self.scenery_terms.search(sentence) and self.action_terms.search(sentence)) for sentence in sentences)
+        emotion_count = len(self.emotion_terms.findall(prose))
+        cognitive_count = len(re.findall(r"意识到|明白|察觉到|感到|觉得|不禁|仿佛|似乎|显然|意味深长", prose))
+        template_count = len(self.template_terms.findall(prose))
+        summary_count = len(self.abstract_summary.findall(prose))
+        dialogue = [m.group(1).strip() for m in re.finditer(r"[\"“](.*?)[\"”]", prose, re.S) if m.group(1).strip()]
+        normalized_dialogue = [re.sub(r"[\s，。！？；：、,.!?;:'\"“”]+", "", item) for item in dialogue]
+        duplicate_dialogue_pairs = 0
+        for previous, current in zip(normalized_dialogue, normalized_dialogue[1:]):
+            if len(previous) >= 4 and len(current) >= 4 and SequenceMatcher(None, previous, current).ratio() >= float(limits.get("dialogue", {}).get("max_similarity", 0.86)):
+                duplicate_dialogue_pairs += 1
+        rare_counts = {word: prose.count(word) for word in (limits.get("rare_words", {}) or {}) if prose.count(word)}
+        metrics = {
+            "scenery_sentence_count": scenery_count,
+            "scenery_ratio": round(scenery_count / max(1, len(sentences)), 6),
+            "scenery_with_action_ratio": round(scenery_action_count / max(1, scenery_count), 6),
+            "explicit_emotion_count": emotion_count,
+            "explicit_emotion_per_1000": self._per_thousand(emotion_count, char_count),
+            "cognitive_explanation_count": cognitive_count,
+            "cognitive_explanation_per_1000": self._per_thousand(cognitive_count, char_count),
+            "template_structure_count": template_count,
+            "template_structure_per_1000": self._per_thousand(template_count, char_count),
+            "abstract_summary_count": summary_count,
+            "abstract_summary_per_1000": self._per_thousand(summary_count, char_count),
+            "dialogue_turn_count": len(dialogue),
+            "dialogue_information_repeat_pairs": duplicate_dialogue_pairs,
+            "rare_word_counts": rare_counts,
+        }
+        findings: list[dict[str, Any]] = []
+        scenery_rules = limits.get("scenery", {}) or {}
+        max_run = int(scenery_rules.get("max_consecutive_sentences", 3))
+        run = 0
+        for index, is_scenery in enumerate(scenery_flags):
+            run = run + 1 if is_scenery else 0
+            if run >= max_run and not self.action_terms.search(sentences[index]):
+                findings.append(_finding(source="DETERMINISTIC", category="LANGUAGE_QUALITY", severity="MINOR", rule_code="LOW_INFORMATION_SCENERY", message="连续景物描写没有带来角色行动或状态变化。", excerpt=sentences[index], metadata={"run": run, "limit": max_run}))
+                break
+        if metrics["scenery_ratio"] > float(scenery_rules.get("max_ratio", 0.35)) and metrics["scenery_with_action_ratio"] < 0.5:
+            findings.append(_finding(source="DETERMINISTIC", category="PACING", severity="MAJOR", rule_code="SCENERY_OVERLOAD", message="景物描写占比过高且与行动脱钩。", metadata={"ratio": metrics["scenery_ratio"], "limit": scenery_rules.get("max_ratio", 0.35)}))
+        rare_rules = limits.get("rare_words", {}) or {}
+        for word, count in sorted(rare_counts.items()):
+            maximum = max(1.0, float(rare_rules[word].get("max_per_1000", 0)) * max(1, char_count) / 1000)
+            if count > maximum:
+                findings.append(_finding(source="DETERMINISTIC", category="STYLE_CONSISTENCY", severity=rare_rules[word].get("severity", "MINOR"), rule_code="RARE_WORD_FREQUENCY_ANOMALY", message="罕见动作或身体词在本章密度异常，需核对是否为作者有意的词汇选择。", excerpt=word, metadata={"word": word, "count": count, "max_per_1000": rare_rules[word].get("max_per_1000")}))
+        if duplicate_dialogue_pairs > int((limits.get("dialogue", {}) or {}).get("max_recap_count", 2)):
+            findings.append(_finding(source="DETERMINISTIC", category="REPETITION", severity="MAJOR", rule_code="DIALOGUE_INFORMATION_REPEAT", message="相邻对白高度重复，未推进新的信息或关系变化。", metadata={"pairs": duplicate_dialogue_pairs}))
+        emotion_rules = limits.get("emotion_explanation", {}) or {}
+        if metrics["explicit_emotion_per_1000"] > float(emotion_rules.get("max_per_1000", 4)):
+            findings.append(_finding(source="DETERMINISTIC", category="LANGUAGE_QUALITY", severity="MAJOR", rule_code="EXPLICIT_EMOTION_EXPLANATION", message="直接命名情绪或解释心理的密度过高，应优先用行动、感官和对白呈现。", metadata={"per_1000": metrics["explicit_emotion_per_1000"], "limit": emotion_rules.get("max_per_1000", 4)}))
+        cognitive_rules = limits.get("cognitive_explanation", {}) or {}
+        if metrics["cognitive_explanation_per_1000"] > float(cognitive_rules.get("max_per_1000", 6)):
+            findings.append(_finding(source="DETERMINISTIC", category="ANTI_AI_EXPRESSION", severity="MINOR", rule_code="COGNITIVE_EXPLANATION_OVERUSE", message="‘意识到/明白/仿佛’等解释性认知词过密。", metadata={"per_1000": metrics["cognitive_explanation_per_1000"], "limit": cognitive_rules.get("max_per_1000", 6)}))
+        template_rules = limits.get("template_structures", {}) or {}
+        if metrics["template_structure_per_1000"] > float(template_rules.get("max_per_1000", 3)):
+            findings.append(_finding(source="DETERMINISTIC", category="STYLE_CONSISTENCY", severity="MINOR", rule_code="SYMMETRICAL_PARALLELISM_OVERUSE", message="对称排比句式过密，段落结构可能呈现模板化。", metadata={"per_1000": metrics["template_structure_per_1000"], "limit": template_rules.get("max_per_1000", 3)}))
+        summary_rules = limits.get("abstract_summary", {}) or {}
+        if metrics["abstract_summary_per_1000"] > float(summary_rules.get("max_per_1000", 2)):
+            findings.append(_finding(source="DETERMINISTIC", category="LANGUAGE_QUALITY", severity="MINOR", rule_code="ABSTRACT_SUMMARY_CLICHE", message="段尾抽象总结或升华过密，可能替代了具体叙事。", metadata={"per_1000": metrics["abstract_summary_per_1000"], "limit": summary_rules.get("max_per_1000", 2)}))
+        return findings, metrics
+
+
 class AntiAIStyleRuleEngine:
     def evaluate(self, prose: str, rules: dict[str, Any]) -> dict[str, Any]:
         AntiAIBibleResolver.validate(rules)
@@ -283,12 +414,102 @@ class AntiAIStyleRuleEngine:
                 findings.append(_finding(source="DETERMINISTIC", category="FORMAT", severity="MAJOR", rule_code="ANTI_AI_PUNCTUATION_FREQUENCY", message="Punctuation exceeds its frequency limit.", metadata={"punctuation": mark, "count": count, "limit": maximum}))
         repetition, repeat_metrics = NarrativeRepetitionDetector().detect(prose, limits)
         findings.extend(repetition)
+        style_findings, style_metrics = ChineseStyleStatistics().analyze(prose, limits)
+        findings.extend(style_findings)
         paragraphs = [item for item in re.split(r"\n\s*\n|\n", prose) if item.strip()]
         sentences = [item for item in NarrativeRepetitionDetector.sentence_splitter.split(prose) if item.strip()]
         dialogue_chars = sum(len(match.group(0)) for match in re.finditer(r"[\"“][^\"”]*[\"”]", prose))
-        metrics = {"char_count": len(prose), "word_count": WriterWordCounter().count(prose), "paragraph_count": len(paragraphs), "sentence_count": len(sentences), "dialogue_ratio": round(dialogue_chars / max(1, len(prose)), 6), "punctuation_counts": punctuation_counts, "disabled_hit_count": disabled_hits, "warning_hit_count": warning_hits, **repeat_metrics}
+        metrics = {"char_count": len(prose), "word_count": WriterWordCounter().count(prose), "paragraph_count": len(paragraphs), "sentence_count": len(sentences), "dialogue_ratio": round(dialogue_chars / max(1, len(prose)), 6), "punctuation_counts": punctuation_counts, "disabled_hit_count": disabled_hits, "warning_hit_count": warning_hits, **repeat_metrics, **style_metrics}
         findings.sort(key=lambda item: (item["start_offset"] is None, item["start_offset"] or 0, item["rule_code"], item["finding_fingerprint"]))
         return {"protocol": "anti-ai-style-rules-v1", "metrics": metrics, "findings": findings}
+
+
+class NovelContinuityQualityChecker:
+    """Deterministic continuity checks that complement prose/style analysis."""
+
+    protocol = "novel-continuity-v1"
+
+    def evaluate(self, db: Session, context: dict[str, Any]) -> dict[str, Any]:
+        chapter = context["chapter"]
+        task = context.get("writer_safe_context", {}).get("planning_task")
+        if not task:
+            return {"protocol": self.protocol, "enabled": False, "metrics": {}, "findings": []}
+        prose = context.get("prose", "")
+        draft = context.get("writer_draft")
+        validation = (draft.validation_report or {}) if draft else {}
+        findings: list[dict[str, Any]] = []
+        coverage = {str(item) for item in validation.get("task_coverage", [])}
+        planned_beats = {str(item) for item in (task.get("scene_beats") or []) if str(item).strip()}
+        executed_beats = {str(beat) for scene in ((context.get("writer_safe_context", {}).get("source_manifest") or {}).get("scenes") or []) for turn in (scene.get("turns") or []) for beat in (turn.get("scene_beat_refs") or [])}
+        for beat in sorted(planned_beats - executed_beats):
+            findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="SCENE_BEAT_NOT_EXECUTED", message="章节规划中的场景节拍没有对应的角色行动记录。", metadata={"scene_beat": beat, "chapter_number": chapter.number}))
+        for beat in (sorted(executed_beats - planned_beats) if planned_beats else []):
+            findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="SCENE_BEAT_REFERENCE_INVALID", message="角色行动引用了当前章节任务之外的场景节拍。", metadata={"scene_beat": beat, "chapter_number": chapter.number}))
+        for event in task.get("must_events", []):
+            if str(event) not in coverage:
+                findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="PLAN_REQUIRED_EVENT_MISSING", message="Chapter task sheet mandatory event was not declared complete.", metadata={"event": event, "chapter_number": chapter.number}))
+        for payoff in task.get("foreshadow_payoff", []) or []:
+            if str(payoff) not in coverage:
+                findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="MAJOR", rule_code="FORESHADOWING_PAYOFF_MISSING", message="本章规划要求回收的伏笔没有被声明完成。", metadata={"foreshadowing": payoff, "chapter_number": chapter.number}))
+        forbidden_hits = {str(item) for item in validation.get("task_forbidden_hits", [])}
+        for event in task.get("forbidden_events", []):
+            if str(event) in forbidden_hits:
+                findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="PLAN_FORBIDDEN_EVENT_PRESENT", message="Chapter task sheet forbidden event was reported by Writer.", metadata={"event": event, "chapter_number": chapter.number}))
+        for phrase in task.get("forbidden_reveals", []) or []:
+            if isinstance(phrase, str) and phrase and phrase in prose:
+                findings.append(_finding(source="DETERMINISTIC", category="REVEAL_SAFETY", severity="BLOCKING", rule_code="PLAN_FORBIDDEN_REVEAL_PRESENT", message="正文出现了章节任务禁止揭示的内容。", excerpt=phrase, metadata={"reveal": phrase}))
+
+        scenes = ((context.get("writer_safe_context", {}).get("source_manifest") or {}).get("scenes") or [])
+        previous_time = None
+        previous_sequence = None
+        seen_sequences: set[int] = set()
+        seen_scene_ids: set[str] = set()
+        timeline_errors = 0
+        location_conflicts = 0
+        for scene in scenes:
+            scene_id = str(scene.get("scene_id") or "")
+            sequence = scene.get("sequence")
+            if not scene_id or scene_id in seen_scene_ids:
+                findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="SCENE_ID_DUPLICATE", message="章节来源场景缺少唯一稳定 ID。", source_refs=[{"source_type": "SCENE", "source_id": scene_id}]))
+            seen_scene_ids.add(scene_id)
+            if not isinstance(sequence, int) or sequence in seen_sequences or (previous_sequence is not None and sequence <= previous_sequence):
+                timeline_errors += 1
+                findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="TIMELINE_SEQUENCE_INVALID", message="章节来源场景的正式序号不唯一或未严格递增。", source_refs=[{"source_type": "SCENE", "source_id": scene_id}], metadata={"sequence": sequence, "previous_sequence": previous_sequence}))
+            if isinstance(sequence, int):
+                seen_sequences.add(sequence); previous_sequence = sequence
+            raw_time = scene.get("world_time")
+            if raw_time:
+                try:
+                    from datetime import datetime as _datetime
+                    current_time = _datetime.fromisoformat(raw_time)
+                    if previous_time is not None and current_time < previous_time:
+                        timeline_errors += 1
+                        findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="TIMELINE_ORDER_INVALID", message="章节来源场景的世界时间顺序倒退。", source_refs=[{"source_type": "SCENE", "source_id": scene.get("scene_id")}], metadata={"world_time": raw_time}))
+                    previous_time = current_time
+                except (TypeError, ValueError):
+                    findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="TIMELINE_TIMESTAMP_INVALID", message="章节来源场景包含无法解析的世界时间。", source_refs=[{"source_type": "SCENE", "source_id": scene.get("scene_id")}]))
+            participants = set(scene.get("participants") or [])
+            if any(not isinstance(item, str) or not item for item in participants):
+                findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="PARTICIPANT_REFERENCE_INVALID", message="场景包含无效角色引用。", source_refs=[{"source_type": "SCENE", "source_id": scene_id}]))
+            if scenes and scene is not scenes[0]:
+                prior = scenes[scenes.index(scene) - 1]
+                if scene.get("world_time") and scene.get("world_time") == prior.get("world_time") and participants.intersection(prior.get("participants") or set()) and scene.get("location") != prior.get("location"):
+                    location_conflicts += 1
+                    findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="LOCATION_CONFLICT", message="同一角色在同一时刻出现在不同地点。", source_refs=[{"source_type": "SCENE", "source_id": scene.get("scene_id")}]))
+            for turn in scene.get("turns", []) or []:
+                if not turn.get("id") or not (turn.get("decision") or {}).get("id"):
+                    findings.append(_finding(source="DETERMINISTIC", category="CAUSAL_GROUNDING", severity="BLOCKING", rule_code="TURN_DECISION_LINEAGE_MISSING", message="角色行动缺少可追溯的决策记录。", source_refs=[{"source_type": "SCENE", "source_id": scene_id}]))
+                if turn.get("requires_world_resolution") and not turn.get("resolution_id") and not turn.get("resolution"):
+                    findings.append(_finding(source="DETERMINISTIC", category="CAUSAL_GROUNDING", severity="BLOCKING", rule_code="WORLD_RESOLUTION_LINEAGE_MISSING", message="角色行动声明需要世界裁决，但来源场景没有对应裁决记录。", source_refs=[{"source_type": "TURN", "source_id": str(turn.get("id"))}]))
+                decision = turn.get("decision") or {}
+                character_id = decision.get("character_id") or turn.get("actor_character_id")
+                for reference in decision.get("knowledge_used", []) or []:
+                    knowledge_id = reference.get("knowledge_id") if isinstance(reference, dict) else reference
+                    row = db.get(CharacterKnowledge, knowledge_id) if isinstance(knowledge_id, str) else None
+                    if not row or row.character_id != character_id or row.status.value not in set(reference.get("accepted_statuses", [row.status.value]) if isinstance(reference, dict) and row else [row.status.value] if row else []):
+                        findings.append(_finding(source="DETERMINISTIC", category="FACTUAL_GROUNDING", severity="BLOCKING", rule_code="KNOWLEDGE_LEAK", message="角色使用了不属于其认知范围的知识。", source_refs=[{"source_type": "CHARACTER_KNOWLEDGE", "source_id": str(knowledge_id)}], metadata={"character_id": character_id}))
+        findings.sort(key=lambda item: (item["rule_code"], item["finding_fingerprint"]))
+        return {"protocol": self.protocol, "enabled": True, "metrics": {"scene_count": len(scenes), "timeline_errors": timeline_errors, "location_conflicts": location_conflicts, "mandatory_event_count": len(task.get("must_events", [])), "declared_task_coverage": len(coverage), "planned_scene_beat_count": len(planned_beats), "executed_scene_beat_count": len(executed_beats)}, "findings": findings}
 
 
 class CriticScores(BaseModel):
@@ -449,19 +670,24 @@ class QualityDecisionEngine:
 
 def _assessment_bible_rules(db: Session, assessment: ChapterQualityAssessment) -> dict[str, Any]:
     if assessment.anti_ai_bible_id is None:
-        rules = AntiAIBibleResolver.DEFAULT.copy()
+        rules = deepcopy(AntiAIBibleResolver.DEFAULT)
         expected = _fp({"version": 1, **rules}, "anti-ai-default-v1")
     else:
         bible = db.get(AntiAIBible, assessment.anti_ai_bible_id)
         if not bible or bible.project_id != assessment.project_id or bible.version != assessment.anti_ai_bible_version:
             raise QualityDomainError("QUALITY_ASSESSMENT_INTEGRITY_INVALID")
-        rules = {
+        rules = deepcopy(AntiAIBibleResolver.DEFAULT)
+        rules.update({
             "disabled_expressions": list(bible.disabled_expressions or []),
             "warning_expressions": list(bible.warning_expressions or []),
-            "frequency_limits": dict(bible.frequency_limits or {}),
             "writing_principles": list(bible.writing_principles or []),
             "future_risk_labels": list(bible.future_risk_labels or []),
-        }
+        })
+        for key, value in dict(bible.frequency_limits or {}).items():
+            if isinstance(value, dict) and isinstance(rules["frequency_limits"].get(key), dict):
+                rules["frequency_limits"][key] = {**rules["frequency_limits"][key], **value}
+            else:
+                rules["frequency_limits"][key] = value
         expected = _fp({"version": bible.version, **rules}, "anti-ai-bible-v1")
     AntiAIBibleResolver.validate(rules)
     if assessment.anti_ai_bible_fingerprint != expected:
@@ -548,7 +774,10 @@ class QualityAssessmentAudit:
             values.append(value)
         rules = _assessment_bible_rules(db, assessment)
         deterministic = AntiAIStyleRuleEngine().evaluate(draft.content or "", rules)
-        expected_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"])}
+        continuity = NovelContinuityQualityChecker().evaluate(db, {"chapter": chapter, "writer_draft": draft, "prose": draft.content or "", "writer_safe_context": {"planning_task": (draft.source_manifest or {}).get("planning_task"), "source_manifest": draft.source_manifest or {}}})
+        deterministic["findings"].extend(continuity["findings"])
+        deterministic["findings"].sort(key=lambda item: (item["rule_code"], item["finding_fingerprint"]))
+        expected_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"]), **({"continuity": {key: continuity[key] for key in ("protocol", "enabled", "metrics")}} if continuity["enabled"] else {})}
         deterministic_rows = [item["finding_fingerprint"] for item in values if item["source"] == "DETERMINISTIC"]
         if assessment.deterministic_report != expected_report or sorted(deterministic_rows) != sorted(item["finding_fingerprint"] for item in deterministic["findings"]):
             raise QualityDomainError("QUALITY_DETERMINISTIC_REPORT_INVALID")
@@ -588,7 +817,8 @@ class QualityGateService:
     def preview(self, db: Session, chapter_id: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
         context = QualityContextBuilder().build(db, chapter_id, request, critic_provider="preview", critic_model="preview")
         report = AntiAIStyleRuleEngine().evaluate(context["prose"], context["anti_ai_rules"])
-        return {"chapter_id": chapter_id, "content_fingerprint": context["writer_draft"].content_fingerprint, "anti_ai_bible": {"id": context["anti_ai_bible"]["id"], "version": context["anti_ai_bible"]["version"], "fingerprint": context["anti_ai_bible"]["fingerprint"]}, "deterministic_report": report, "quality_config": context["resolved_quality_config"], "quality_context_fingerprint": context["quality_context_fingerprint"]}
+        continuity = NovelContinuityQualityChecker().evaluate(db, context)
+        return {"chapter_id": chapter_id, "content_fingerprint": context["writer_draft"].content_fingerprint, "anti_ai_bible": {"id": context["anti_ai_bible"]["id"], "version": context["anti_ai_bible"]["version"], "fingerprint": context["anti_ai_bible"]["fingerprint"]}, "deterministic_report": report, "continuity_report": continuity, "quality_config": context["resolved_quality_config"], "quality_context_fingerprint": context["quality_context_fingerprint"]}
 
     def assess(self, db: Session, chapter_id: str, request: dict[str, Any] | None = None, *, provider=None, model: str | None = None, settings=None, draft: ChapterWriterDraft | None = None, require_current: bool = True) -> ChapterQualityAssessment:
         request = dict(request or {})
@@ -624,7 +854,10 @@ class QualityGateService:
         assessment = ChapterQualityAssessment(project_id=chapter.project_id, chapter_id=chapter.id, writer_draft_id=context["writer_draft"].id, version=version, status=QualityAssessmentStatus.RUNNING, active=False, client_request_id=key, request_fingerprint=request_fp, content_fingerprint=context["writer_draft"].content_fingerprint, writer_context_fingerprint=context["writer_draft"].writer_context_fingerprint, chapter_source_fingerprint=context["writer_draft"].chapter_source_fingerprint, anti_ai_bible_id=anti_ai["id"], anti_ai_bible_version=anti_ai["version"], anti_ai_bible_fingerprint=anti_ai["fingerprint"], writing_bible_fingerprint=context["writer_draft"].writing_bible_fingerprint, quality_config=context["quality_config"], quality_config_fingerprint=context["quality_config_fingerprint"], quality_context_fingerprint=context["quality_context_fingerprint"], deterministic_report={}, critic_report={}, decision_reason_codes=[], critic_provider=provider_name, critic_model=route_model)
         db.add(assessment); db.flush()
         deterministic = AntiAIStyleRuleEngine().evaluate(context["prose"], context["anti_ai_rules"])
-        assessment.deterministic_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"])}
+        continuity = NovelContinuityQualityChecker().evaluate(db, context)
+        deterministic["findings"].extend(continuity["findings"])
+        deterministic["findings"].sort(key=lambda item: (item["rule_code"], item["finding_fingerprint"]))
+        assessment.deterministic_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"]), **({"continuity": {key: continuity[key] for key in ("protocol", "enabled", "metrics")}} if continuity["enabled"] else {})}
         trace = None
         critic: dict[str, Any] | None = None
         if context["resolved_quality_config"]["require_critic"]:
@@ -705,7 +938,7 @@ class QualityGateService:
 class QualityRepairPromptBuilder:
     def build(self, context: dict[str, Any], findings: list[dict[str, Any]]) -> list[dict[str, str]]:
         safe = {key: value for key, value in context.items() if key not in {"anti_ai_bible", "writer_draft", "chapter"}}
-        return [{"role": "system", "content": "You are a REPAIR prose editor. Correct only the listed prose defects. WRITER_SAFE_CONTEXT is absolute authority. Do not add events, facts, knowledge, secrets, outcomes, or source references. Return the exact Writer five-field JSON contract."}, {"role": "user", "content": _canonical({"quality_context": safe, "findings": findings, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene ids", "source_refs": "safe refs only", "pov_character_id": "string|null"}})}]
+        return [{"role": "system", "content": "You are a REPAIR prose editor. Correct only the listed prose defects. WRITER_SAFE_CONTEXT is absolute authority. Do not add events, facts, knowledge, secrets, outcomes, or source references. Preserve the chapter planning task and return exact task coverage fields."}, {"role": "user", "content": _canonical({"quality_context": safe, "findings": findings, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene ids", "source_refs": "safe refs only", "pov_character_id": "string|null", "task_coverage": "completed mandatory task labels", "task_forbidden_hits": "forbidden task labels present"}})}]
 
 
 class QualityRepairService:
@@ -819,6 +1052,12 @@ class QualityRepairService:
             except ValidationError as exc:
                 raise QualityDomainError(MODEL_OUTPUT_INVALID) from exc
             report = WriterGroundingValidator().validate(parsed, context["writer_safe_context"])
+            task_issues = validate_task_output(parsed, context["writer_safe_context"].get("planning_task"))
+            if task_issues:
+                report["issues"].extend(task_issues)
+                report["valid"] = False
+            report["task_coverage"] = parsed.get("task_coverage", [])
+            report["task_forbidden_hits"] = parsed.get("task_forbidden_hits", [])
             draft.provider = result.provider; draft.model = result.model; draft.model_request_id = result.request_id
             draft.title_candidate = parsed["chapter_title"]; draft.content = parsed["prose"]
             draft.content_fingerprint = _fp(parsed["prose"], "writer-content-v1")
@@ -891,7 +1130,8 @@ class QualityRepairService:
 
 
 def assessment_payload(db: Session, assessment: ChapterQualityAssessment, *, include_findings: bool = False) -> dict[str, Any]:
-    value = {"id": assessment.id, "project_id": assessment.project_id, "chapter_id": assessment.chapter_id, "writer_draft_id": assessment.writer_draft_id, "version": assessment.version, "status": _value(assessment.status), "active": assessment.active, "client_request_id": assessment.client_request_id, "content_fingerprint": assessment.content_fingerprint, "writer_context_fingerprint": assessment.writer_context_fingerprint, "chapter_source_fingerprint": assessment.chapter_source_fingerprint, "anti_ai_bible_id": assessment.anti_ai_bible_id, "anti_ai_bible_version": assessment.anti_ai_bible_version, "anti_ai_bible_fingerprint": assessment.anti_ai_bible_fingerprint, "writing_bible_fingerprint": assessment.writing_bible_fingerprint, "quality_config": assessment.quality_config, "resolved_quality_config": _resolved_quality_config(assessment.quality_config), "quality_config_fingerprint": assessment.quality_config_fingerprint, "quality_context_fingerprint": assessment.quality_context_fingerprint, "deterministic_report": assessment.deterministic_report, "critic_report": assessment.critic_report, "overall_score": assessment.overall_score, "decision_reason_codes": assessment.decision_reason_codes, "critic_provider": assessment.critic_provider, "critic_model": assessment.critic_model, "critic_request_id": assessment.critic_request_id, "critic_prompt_fingerprint": assessment.critic_prompt_fingerprint, "created_at": assessment.created_at.isoformat() if assessment.created_at else None, "completed_at": assessment.completed_at.isoformat() if assessment.completed_at else None, "stale_at": assessment.stale_at.isoformat() if assessment.stale_at else None, "approved_at": assessment.approved_at.isoformat() if assessment.approved_at else None}
+    deterministic = assessment.deterministic_report or {}
+    value = {"id": assessment.id, "project_id": assessment.project_id, "chapter_id": assessment.chapter_id, "writer_draft_id": assessment.writer_draft_id, "version": assessment.version, "status": _value(assessment.status), "active": assessment.active, "client_request_id": assessment.client_request_id, "content_fingerprint": assessment.content_fingerprint, "writer_context_fingerprint": assessment.writer_context_fingerprint, "chapter_source_fingerprint": assessment.chapter_source_fingerprint, "anti_ai_bible_id": assessment.anti_ai_bible_id, "anti_ai_bible_version": assessment.anti_ai_bible_version, "anti_ai_bible_fingerprint": assessment.anti_ai_bible_fingerprint, "writing_bible_fingerprint": assessment.writing_bible_fingerprint, "quality_config": assessment.quality_config, "resolved_quality_config": _resolved_quality_config(assessment.quality_config), "quality_config_fingerprint": assessment.quality_config_fingerprint, "quality_context_fingerprint": assessment.quality_context_fingerprint, "deterministic_report": deterministic, "continuity_report": deterministic.get("continuity", {"enabled": False}), "critic_report": assessment.critic_report, "overall_score": assessment.overall_score, "decision_reason_codes": assessment.decision_reason_codes, "critic_provider": assessment.critic_provider, "critic_model": assessment.critic_model, "critic_request_id": assessment.critic_request_id, "critic_prompt_fingerprint": assessment.critic_prompt_fingerprint, "created_at": assessment.created_at.isoformat() if assessment.created_at else None, "completed_at": assessment.completed_at.isoformat() if assessment.completed_at else None, "stale_at": assessment.stale_at.isoformat() if assessment.stale_at else None, "approved_at": assessment.approved_at.isoformat() if assessment.approved_at else None}
     if include_findings:
         rows = db.scalars(select(ChapterQualityFinding).where(ChapterQualityFinding.assessment_id == assessment.id).order_by(ChapterQualityFinding.ordinal)).all()
         value["findings"] = [{"id": item.id, "ordinal": item.ordinal, "source": _value(item.source), "category": item.category, "severity": _value(item.severity), "rule_code": item.rule_code, "message": item.message, "start_offset": item.start_offset, "end_offset": item.end_offset, "excerpt": item.excerpt, "source_refs": item.source_refs, "metadata": item.finding_metadata, "finding_fingerprint": item.finding_fingerprint} for item in rows]

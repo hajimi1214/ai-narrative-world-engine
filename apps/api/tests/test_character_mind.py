@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from app.character_mind import CharacterContextBuilder, CharacterDecisionConstraintChecker, HeuristicCharacterActor, MAX_CHARACTER_MEMORIES
+from app.character_mind import CharacterContextBuilder, CharacterDecisionConstraintChecker, ContextBudgetController, HeuristicCharacterActor, MAX_CHARACTER_MEMORIES
 from app.db import Base
 from app.director import DirectorContextBuilder
 from app.main import app
@@ -35,6 +35,22 @@ def seed(session):
     after_context = DirectorContextBuilder().build(session, project.id)
     assert before_context == after_context, [key for key in before_context if before_context[key] != after_context[key]]
     return project, location, actor, other, outsider, proposal
+
+
+def test_context_budget_reports_and_drops_lower_ranked_rows(session):
+    project, location, actor, other, outsider, proposal = seed(session)
+    for index in range(6):
+        session.add(CharacterMemory(character_id=actor.id, content="x" * 500 + str(index), importance=10 - index, emotional_weight=0, confidence=1, distortion={}))
+    session.commit()
+    context = CharacterContextBuilder(budget={"max_chars": 900, "max_tokens": 900, "max_knowledge_items": 32, "max_memory_items": 6}).build(session, project.id, actor.id, proposal)
+    assert context["context_budget"]["dropped_memory_items"] > 0
+    assert context["context_budget"]["used_chars"] <= 900
+    assert context["retrieval_evidence"]["sources"]
+
+
+def test_context_budget_token_estimator_is_deterministic():
+    controller = ContextBudgetController()
+    assert controller.estimate_tokens({"text": "中文 novel 123"}) == controller.estimate_tokens({"text": "中文 novel 123"})
 
 def context(session, project, actor, proposal): return CharacterContextBuilder().build(session, project.id, actor.id, proposal)
 
@@ -147,3 +163,46 @@ def test_heuristic_decision_uses_actor_view_only(session):
     generated = CharacterDecision(project_id=project.id, scene_proposal_id=proposal.id, character_id=actor.id, context_fingerprint=ctx["fingerprint"], **HeuristicCharacterActor().decide(ctx))
     assert generated.decision_type == CharacterDecisionType.INVESTIGATE
     assert "Director" not in generated.motivation
+
+
+def test_each_character_has_an_independent_agent_profile_and_unknowns_are_opaque(session, monkeypatch):
+    project, _, actor, _, _, proposal = seed(session)
+    actor.agent_profile = {"role": "谨慎的档案修复师", "private_rules": ["先验证再行动"], "voice": "短句，少用比喻"}
+    session.add(actor)
+    canon = __import__("app.models", fromlist=["CanonFact"]).CanonFact(project_id=project.id, fact_type="SECRET_CANON", proposition="秘密档案属于敌人")
+    session.add(canon); session.commit()
+    view = CharacterContextBuilder().build(session, project.id, actor.id, proposal)
+    assert view["character"]["agent_id"] == actor.id
+    assert view["character"]["agent_profile"]["role"] == "谨慎的档案修复师"
+    assert any(item["canon_fact_id"] == canon.id for item in view["knowledge"]["UNKNOWN"])
+    blocked = decision(project, actor, proposal, view, knowledge_used=[{"knowledge_id": canon.id, "proposition": canon.proposition, "accepted_statuses": ["KNOWN"]}])
+    assert any(issue.code == "KNOWLEDGE_UNKNOWN" for issue in CharacterDecisionConstraintChecker().validate(session, view, blocked).issues)
+
+
+def test_agent_profile_endpoint_and_disabled_agent_block_simulation(session, monkeypatch):
+    project, _, actor, _, _, proposal = seed(session)
+    client = client_for(session, monkeypatch)
+    profile = client.patch(f"/projects/{project.id}/characters/{actor.id}/agent", json={"enabled": True, "profile": {"role": "调查者", "voice": "克制"}})
+    assert profile.status_code == 200
+    assert profile.json()["agent_id"] == actor.id
+    assert profile.json()["model_route"] == "CHARACTER"
+    actor.agent_enabled = False; session.add(actor); session.commit()
+    blocked = client.post(f"/projects/{project.id}/director/proposals/{proposal.id}/characters/{actor.id}/dry-run")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "CHARACTER_AGENT_DISABLED"
+
+
+def test_agent_context_endpoint_is_redacted_and_fingerprinted(session, monkeypatch):
+    project, _, actor, _, _, proposal = seed(session)
+    actor.secrets = ["未公开身份"]; session.add(actor); session.commit()
+    client = client_for(session, monkeypatch)
+    proposal.context_fingerprint = DirectorContextBuilder().build(session, project.id)["fingerprint"]
+    session.add(proposal); session.commit()
+    response = client.get(f"/projects/{project.id}/characters/{actor.id}/agent/context", params={"proposal_id": proposal.id})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agent_id"] == actor.id
+    assert body["context_fingerprint"]
+    rendered = json.dumps(body["actor_view"], ensure_ascii=False)
+    assert "未公开身份" not in rendered
+    assert body["redaction_policy"]["world_mutation"] == "forbidden"

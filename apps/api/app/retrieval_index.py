@@ -1036,14 +1036,15 @@ class ResearchIndexedBM25Retriever:
                     scored.append((mmr, item["score"], item["authority_rank"], item["content_fingerprint"], item["document_id"], item["ordinal"], item))
                 best = min(scored, key=lambda row: (-row[0], -row[1], row[2], "" if row[3] is None else row[3], row[4], row[5]))[-1]
             selected.append(best); remaining.remove(best); per_document[best["document_id"]] = per_document.get(best["document_id"], 0) + 1
-        hits, total_chars = [], 0
+        hits, total_chars, total_tokens = [], 0, 0
+        tokenizer = KnowledgeTokenizer()
         for rank, item in enumerate(selected, 1):
             remaining = config.max_context_chars - total_chars
-            if remaining <= 0:
+            remaining_tokens = config.max_context_tokens - total_tokens
+            if remaining <= 0 or remaining_tokens <= 0:
                 break
             content, truncated = item["content"], False
-            if len(content) > remaining:
-                content, truncated = content[:remaining], True
-            total_chars += len(content); document, revision, chunk = item["document"], item["revision"], item["chunk"]
+            content, truncated = tokenizer.bounded_prefix(content, remaining, remaining_tokens)
+            total_chars += len(content); total_tokens += len(tokenizer.tokenize(content)); document, revision, chunk = item["document"], item["revision"], item["chunk"]
             hits.append(ResearchHit(chunk.id, document.id, revision.id, document.title, _value(document.source_tier), _value(document.source_kind), float(item["score"]), rank, content, item["content_fingerprint"], document.source_uri, _safe_metadata(document.source_metadata, reject=False), item["authority_rank"], truncated))
         return hits

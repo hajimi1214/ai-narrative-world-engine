@@ -122,16 +122,21 @@ def measure(
     derived_fingerprint: str | None = None,
     scene_sequence_continuous: bool | None = None,
     details: dict[str, Any] | None = None,
+    trace_memory: bool = True,
 ) -> BenchmarkMetrics:
     """Measure one operation without mutating its result or formal payload."""
     probe = SQLAndHydrationProbe(session)
-    tracemalloc.start()
+    if trace_memory:
+        tracemalloc.start()
     started = time.perf_counter()
     with probe:
         operation()
     elapsed = time.perf_counter() - started
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+    if trace_memory:
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+    else:
+        peak = 0
     return BenchmarkMetrics(
         name=name,
         scale=scale,

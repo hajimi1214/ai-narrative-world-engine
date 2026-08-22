@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .models import (
     CausalLink, CausalRelationType, CausalResourceType, Character,
     CharacterDecision, CharacterDecisionType, CharacterKnowledge, CharacterMemory,
-    KnowledgeStatus, Project, RetconCognitionInvalidation,
+    KnowledgeStatus, CanonFact, Project, RetconCognitionInvalidation,
     RetconCognitionInvalidationStatus, Scene, SceneProposal, WorldEntity,
     MemoryRetrievalMode, ProjectModelConfig,
 )
@@ -19,6 +19,78 @@ from .models import (
 MAX_CHARACTER_KNOWLEDGE = 32
 MAX_CHARACTER_MEMORIES = 12
 MIND_RETRIEVAL_PROTOCOL_VERSION = "character-mind-v1"
+
+
+@dataclass(frozen=True)
+class ContextBudgetConfig:
+    """Hard limits for model-facing cognition context.
+
+    Item limits protect normal operation; character/token limits protect long
+    histories where a few large memories would otherwise exhaust the model
+    window. The controller never invents text and only drops lower-ranked rows.
+    """
+
+    max_chars: int = 24000
+    max_tokens: int = 6000
+    max_knowledge_items: int = MAX_CHARACTER_KNOWLEDGE
+    max_memory_items: int = MAX_CHARACTER_MEMORIES
+
+    def __post_init__(self):
+        if any(value <= 0 for value in (self.max_chars, self.max_tokens, self.max_knowledge_items, self.max_memory_items)):
+            raise ValueError("CONTEXT_BUDGET_INVALID")
+
+
+class ContextBudgetController:
+    """Deterministically trim retrieved rows while retaining source identity."""
+
+    _token = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[A-Za-z0-9_]+|[^\s]")
+
+    @classmethod
+    def estimate_tokens(cls, value: Any) -> int:
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return len(cls._token.findall(rendered))
+
+    def apply(self, knowledge: dict[str, list[dict[str, Any]]], memories: list[dict[str, Any]], config: ContextBudgetConfig | dict[str, Any] | None = None) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], dict[str, Any]]:
+        cfg = config if isinstance(config, ContextBudgetConfig) else ContextBudgetConfig(**(config or {}))
+        retained_knowledge: dict[str, list[dict[str, Any]]] = {key: [] for key in knowledge}
+        retained_memories: list[dict[str, Any]] = []
+        used_chars = used_tokens = 0
+        knowledge_count = memory_count = 0
+
+        def take(kind: str, item: dict[str, Any]) -> bool:
+            nonlocal used_chars, used_tokens, knowledge_count, memory_count
+            if kind == "knowledge" and knowledge_count >= cfg.max_knowledge_items:
+                return False
+            if kind == "memory" and memory_count >= cfg.max_memory_items:
+                return False
+            chars = len(json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str))
+            tokens = self.estimate_tokens(item)
+            if used_chars + chars > cfg.max_chars or used_tokens + tokens > cfg.max_tokens:
+                return False
+            if kind == "knowledge":
+                knowledge_count += 1
+            else:
+                memory_count += 1
+            used_chars += chars; used_tokens += tokens
+            return True
+
+        # Keep the ranked order from retrieval. Knowledge statuses are already
+        # ordered by salience, so iterating in status order is stable and safe.
+        for status in ("KNOWN", "SUSPECTED", "FALSE_BELIEF", "UNKNOWN"):
+            for item in knowledge.get(status, []) or []:
+                if take("knowledge", item):
+                    retained_knowledge.setdefault(status, []).append(item)
+        for item in memories or []:
+            if take("memory", item):
+                retained_memories.append(item)
+        report = {
+            "max_chars": cfg.max_chars, "max_tokens": cfg.max_tokens,
+            "used_chars": used_chars, "used_tokens": used_tokens,
+            "knowledge_items": knowledge_count, "memory_items": memory_count,
+            "dropped_knowledge_items": sum(len(items or []) for items in knowledge.values()) - knowledge_count,
+            "dropped_memory_items": len(memories or []) - memory_count,
+        }
+        return retained_knowledge, retained_memories, report
 _FACT_PROPOSITION = re.compile(r"^(?P<subject_type>[A-Z_]+)\s+(?P<subject_id>[^:]+):\s*(?P<predicate>[^=]+?)\s*=\s*(?P<value>.+)$")
 _CUE_FIELDS = {
     "entity_id", "entity_ids", "character_id", "character_ids", "participant_ids",
@@ -302,6 +374,20 @@ class CharacterMindViewBuilder:
         self.last_route: str = "UNSET"
         self.last_fallback_reason: str | None = None
 
+    @staticmethod
+    def _retrieval_evidence(route: str, knowledge: list[dict[str, Any]], memories: list[dict[str, Any]], fallback_reason: str | None = None) -> dict[str, Any]:
+        channels = ["DETERMINISTIC", "SEMANTIC_VECTOR"] if "HYBRID" in route else ["DETERMINISTIC"]
+        sources = []
+        for rank, item in enumerate(knowledge, 1):
+            source_id = context_knowledge_id(item)
+            if source_id:
+                sources.append({"source_type": "CHARACTER_KNOWLEDGE", "source_id": source_id, "rank": rank, "status": item.get("status"), "retrieval_channels": channels})
+        for rank, item in enumerate(memories, 1):
+            source_id = item.get("memory_id")
+            if source_id:
+                sources.append({"source_type": "CHARACTER_MEMORY", "source_id": source_id, "source_scene_id": item.get("source_scene_id"), "rank": rank, "retrieval_channels": channels})
+        return {"route": route, "fallback_reason": fallback_reason, "sources": sources}
+
     def build(self, session: Session, project_id: str, character_id: str, proposal: SceneProposal) -> dict[str, Any]:
         self.last_route = "UNSET"
         self.last_fallback_reason = None
@@ -326,7 +412,9 @@ class CharacterMindViewBuilder:
                 else:
                     self.last_route = "FAST_DETERMINISTIC"
                 identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
-                result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
+                identity["agent_id"] = character.id; identity["agent_enabled"] = character.agent_enabled; identity["agent_profile"] = character.agent_profile or {}
+                result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "unknown_facts": self._unknown_facts(session, project_id, character_id), "memories": recalled_memories, "belief_conflicts": conflicts}
+                result["retrieval_evidence"] = self._retrieval_evidence(self.last_route, recalled_knowledge, recalled_memories, self.last_fallback_reason)
                 result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
                 return result
         except Exception as exc:
@@ -347,9 +435,17 @@ class CharacterMindViewBuilder:
         participants = session.scalars(select(Character).where(Character.project_id == project_id, Character.id.in_(proposal.participants or [])).order_by(Character.id)).all() if proposal.participants else []
         recalled_memories = self._hybrid_memories(session, project_id, character_id, cues, memory_records, memory_entries, recalled_memories, character, proposal, location, participants)
         identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
-        result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "memories": recalled_memories, "belief_conflicts": conflicts}
+        identity["agent_id"] = character.id; identity["agent_enabled"] = character.agent_enabled; identity["agent_profile"] = character.agent_profile or {}
+        result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "unknown_facts": self._unknown_facts(session, project_id, character_id), "memories": recalled_memories, "belief_conflicts": conflicts}
+        result["retrieval_evidence"] = self._retrieval_evidence(self.last_route, recalled_knowledge, recalled_memories, self.last_fallback_reason)
         result["mind_fingerprint"] = _stable_fingerprint("character-mind-v1", result)
         return result
+
+    def _unknown_facts(self, session: Session, project_id: str, character_id: str) -> list[dict[str, Any]]:
+        """Expose unknowns as opaque fact IDs, never as hidden canon text."""
+        known_propositions = set(session.scalars(select(CharacterKnowledge.proposition).where(CharacterKnowledge.character_id == character_id, CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF]))).all())
+        facts = session.scalars(select(CanonFact).where(CanonFact.project_id == project_id).order_by(CanonFact.id)).all()
+        return [{"canon_fact_id": fact.id, "status": KnowledgeStatus.UNKNOWN.value, "fact_type": _enum(fact.fact_type)} for fact in facts if fact.proposition not in known_propositions][:64]
 
     def _fast_hybrid_memories(self, session: Session, project_id: str, character_id: str, cues: dict[str, tuple[str, ...]], deterministic: list[dict[str, Any]], character: Any, proposal: SceneProposal, config: ProjectModelConfig, fast) -> list[dict[str, Any]]:
         """Run current-only vector eligibility and RRF in PostgreSQL.
@@ -416,19 +512,28 @@ class CharacterMindViewBuilder:
             route = EmbeddingRouter().resolve(session, project_id, get_settings())
             query = self._semantic_query(session, project_id, character, scene, cues, location=location, participants=participants)
             if not route.enabled or not query:
+                self.last_route = "LEGACY_DETERMINISTIC"
+                self.last_fallback_reason = "EMBEDDING_ROUTE_UNAVAILABLE"
                 return deterministic
             provider = self.embedding_provider_factory(route) if self.embedding_provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
             embedding = provider.embed([query], route.model)
             if embedding.dimension != route.dimension:
+                self.last_route = "LEGACY_DETERMINISTIC"
+                self.last_fallback_reason = "EMBEDDING_DIMENSION_MISMATCH"
                 return deterministic
             semantic = CharacterMemorySemanticRetriever().retrieve(session, project_id, character_id, embedding.vectors[0], route.embedding_config_fingerprint, [memory.id for memory in records], config.memory_vector_top_k, config.memory_semantic_min_similarity)
             if not semantic:
+                self.last_route = "LEGACY_DETERMINISTIC"
+                self.last_fallback_reason = "SEMANTIC_CANDIDATES_EMPTY"
                 return deterministic
             full_items = {entry[6]["memory_id"]: entry[6] for entry in entries}
             deterministic_ids = [entry[6]["memory_id"] for entry in entries]
             strong_ids = {entry[6]["memory_id"] for entry in entries if entry[5]}
+            self.last_route = "HYBRID_RRF"
             return CharacterMemoryHybridRetriever().merge(full_items, deterministic_ids, semantic, MAX_CHARACTER_MEMORIES, config.memory_rrf_k, strong_ids)
-        except Exception:
+        except Exception as exc:
+            self.last_route = "LEGACY_DETERMINISTIC"
+            self.last_fallback_reason = self._safe_route_reason(exc)
             return deterministic
 
 
@@ -555,14 +660,15 @@ class ReplayCharacterMindViewBuilder:
                 source = metadata.by_sequence_value(next((getattr(row, "source_sequence", None) for row in cognition["memories"] if row.id == item.get("memory_id")), None))
             if source:
                 item["source_scene_sequence"] = source["sequence"]
-        result = {"character_id": character_id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": {key: character.get(key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}, "proposal_id": proposal.id, "cues": cues, "knowledge": knowledge, "memories": memories, "belief_conflicts": conflicts}
+        result = {"character_id": character_id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": {key: character.get(key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory", "agent_id", "agent_enabled", "agent_profile")}, "proposal_id": proposal.id, "cues": cues, "knowledge": knowledge, "memories": memories, "belief_conflicts": conflicts}
         result["mind_fingerprint"] = _stable_fingerprint("replay-character-mind-v1", result)
         return result
 
 
 class CharacterContextBuilder:
-    def __init__(self, mind_builder: CharacterMindViewBuilder | None = None):
+    def __init__(self, mind_builder: CharacterMindViewBuilder | None = None, budget: ContextBudgetConfig | dict[str, Any] | None = None):
         self.mind_builder = mind_builder or CharacterMindViewBuilder()
+        self.budget = budget
 
     def build(self, session: Session, project_id: str, character_id: str, proposal: SceneProposal) -> dict[str, Any]:
         mind = self.mind_builder.build(session, project_id, character_id, proposal); character = session.get(Character, character_id)
@@ -572,10 +678,17 @@ class CharacterContextBuilder:
         knowledge = {"KNOWN": [], "SUSPECTED": [], "FALSE_BELIEF": []}
         for row in mind["knowledge"]:
             knowledge[row["status"]].append(row)
+        knowledge[KnowledgeStatus.UNKNOWN.value] = mind.get("unknown_facts", [])
+        budget = self.budget
+        if budget is None:
+            project = session.get(Project, project_id)
+            stored = (project.autonomy_settings or {}).get("context_budget") if project else None
+            budget = stored if isinstance(stored, dict) else None
+        knowledge, memories, budget_report = ContextBudgetController().apply(knowledge, mind["memories"], budget)
         context = {
-            "character": {key: mind["character"][key] for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state")},
+            "character": {key: mind["character"][key] for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "agent_id", "agent_enabled", "agent_profile")},
             "scene": {"proposal_id": proposal.id, "location": {"id": location.id, "name": location.name} if location else None, "other_participants": others, "visible_context": (proposal.entry_state or {}).get("visible_context", {}), "actor_visible_context": ((proposal.entry_state or {}).get("actor_visible_context", {}) or {}).get(character.id, {})},
-            "knowledge": knowledge, "memories": mind["memories"], "belief_conflicts": mind["belief_conflicts"], "relationships": {row["id"]: character.relationships.get(row["id"], {}) for row in others}, "abilities": self._abilities(character.abilities), "inventory": character.inventory, "mind_fingerprint": mind["mind_fingerprint"],
+            "knowledge": knowledge, "memories": memories, "belief_conflicts": mind["belief_conflicts"], "retrieval_evidence": mind.get("retrieval_evidence", {}), "context_budget": budget_report, "relationships": {row["id"]: character.relationships.get(row["id"], {}) for row in others}, "abilities": self._abilities(character.abilities), "inventory": character.inventory, "planning_task": (proposal.entry_state or {}).get("planning_task"), "agent_protocol": "character-agent-v1", "mind_fingerprint": mind["mind_fingerprint"],
         }
         context["fingerprint"] = character_context_fingerprint(context); context["version"] = context["fingerprint"]
         return context
@@ -588,7 +701,7 @@ class ActorPerceptionSanitizer:
     """White-list the only data an external character model may receive."""
     def sanitize(self, context: dict[str, Any]) -> dict[str, Any]:
         character, scene = context["character"], context["scene"]
-        return {"character": {key: self._visible(character.get(key)) for key in ("name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state")}, "scene": {key: self._visible(scene.get(key, [] if key.endswith("s") else {})) for key in ("location", "other_participants", "visible_context", "actor_visible_context", "performance_observations", "self_turn_history", "active_participant_ids", "world_observations")}, "knowledge": self._visible(context.get("knowledge", {})), "memories": self._visible(context.get("memories", [])), "belief_conflicts": self._visible(context.get("belief_conflicts", [])), "relationships": self._visible(context.get("relationships", {})), "abilities": self._visible(context.get("abilities", [])), "inventory": self._visible(context.get("inventory", []))}
+        return {"character": {key: self._visible(character.get(key)) for key in ("name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "agent_id", "agent_enabled", "agent_profile")}, "scene": {key: self._visible(scene.get(key, [] if key.endswith("s") else {})) for key in ("location", "other_participants", "visible_context", "actor_visible_context", "performance_observations", "self_turn_history", "active_participant_ids", "world_observations")}, "knowledge": self._visible(context.get("knowledge", {})), "memories": self._visible(context.get("memories", [])), "belief_conflicts": self._visible(context.get("belief_conflicts", [])), "relationships": self._visible(context.get("relationships", {})), "abilities": self._visible(context.get("abilities", [])), "inventory": self._visible(context.get("inventory", [])), "planning_task": self._visible(context.get("planning_task"))}
 
     def _visible(self, value: Any) -> Any:
         if isinstance(value, dict):
@@ -642,6 +755,7 @@ class CharacterDecisionConstraintChecker:
             for item in values
             if isinstance(item, dict) and isinstance(item.get("knowledge_id"), str)
         }
+        unknown_ids = {item.get("canon_fact_id") for item in context.get("knowledge", {}).get(KnowledgeStatus.UNKNOWN.value, []) if isinstance(item, dict)}
         for reference in decision.knowledge_used or []:
             if not isinstance(reference, dict) or not isinstance(reference.get("knowledge_id"), str):
                 proposition = reference if isinstance(reference, str) else reference.get("proposition") if isinstance(reference, dict) else None
@@ -651,6 +765,9 @@ class CharacterDecisionConstraintChecker:
                     add("LEGACY_KNOWLEDGE_REFERENCE_UNATTRIBUTED", "WARNING", "Historical proposition-only knowledge reference has no explicit resource provenance.", [decision.character_id], "Use a recalled knowledge_id in new decisions.")
                 else:
                     add("KNOWLEDGE_NOT_RECALLED", "BLOCKING", "Decision knowledge must match a recalled subjective belief.", [decision.character_id], "Use an exact recalled knowledge reference and status.")
+                continue
+            if reference["knowledge_id"] in unknown_ids:
+                add("KNOWLEDGE_UNKNOWN", "BLOCKING", "Decision cites a canon fact explicitly marked unknown to this character.", [reference["knowledge_id"]], "Use only KNOWN, SUSPECTED, or FALSE_BELIEF knowledge recalled by the character.")
                 continue
             row, statuses = recalled.get(reference["knowledge_id"]), reference.get("accepted_statuses")
             if not row or reference.get("proposition") != row["proposition"] or not isinstance(statuses, list) or row["status"] not in {_enum(value) for value in statuses}:

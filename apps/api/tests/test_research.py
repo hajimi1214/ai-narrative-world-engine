@@ -12,7 +12,7 @@ from app.db import Base
 from app.main import app
 from app.models import CanonFact, CanonType, CharacterKnowledge, CharacterMemory, EntityType, Project, ResearchChunk, ResearchDocument, ResearchDocumentRevision, WorldEntity
 from app.research import (
-    KnowledgeAuthorityResolver, KnowledgeAuthorityTier, KnowledgePacketBuilder,
+    KnowledgeAuthorityResolver, KnowledgeAuthorityTier, KnowledgePacketBuilder, ResearchHit, ResearchHybridRRF,
     KnowledgeTokenizer, ResearchBM25Retriever, ResearchChunker, ResearchConfig,
     ResearchConfigResolver, ResearchCorpusAudit, ResearchCorpusFingerprintBuilder,
     ResearchDomainError, ResearchIngestionService, ResearchRevisionAudit,
@@ -33,6 +33,22 @@ def project(session):
     value = Project(name="Research", research_settings={})
     session.add(value); session.flush()
     return value
+
+
+def test_research_token_budget_and_source_locator():
+    hit = ResearchHit("chunk", "doc", "rev", "Archive", "PROJECT_RESEARCH", "MANUAL_TEXT", 1.0, 1, "text", "fp", None)
+    payload = hit.as_dict()
+    assert payload["source_locator"] == {"document_id": "doc", "revision_id": "rev", "chunk_id": "chunk", "title": "Archive"}
+    assert payload["retrieval_channels"] == ["LEXICAL_BM25"]
+    assert ResearchConfig().max_context_tokens > 0
+
+
+def test_research_hybrid_rrf_preserves_channel_provenance():
+    lexical = ResearchHit("a", "doc", "rev", "A", "PROJECT_RESEARCH", "MANUAL_TEXT", 4.0, 1, "alpha", "a-fp", None)
+    semantic = ResearchHit("b", "doc", "rev", "A", "PROJECT_RESEARCH", "MANUAL_TEXT", 0.9, 1, "beta", "b-fp", None, retrieval_channels=("SEMANTIC_VECTOR",))
+    merged = ResearchHybridRRF().merge([lexical], [semantic], top_k=2, rrf_k=1)
+    assert {item.chunk_id for item in merged} == {"a", "b"}
+    assert all(set(item.retrieval_channels) for item in merged)
 
 
 def ingest(session, project, title="Notes", content="The steam engine drives a workshop.", **kwargs):

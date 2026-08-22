@@ -96,6 +96,11 @@ class PerformanceRuntimeService:
             performance.status = PerformanceStatus.PAUSED
             performance.stop_reason = "INSUFFICIENT_ACTIVE_PARTICIPANTS"
             return {"performance": performance, "turn": None, "decision": None, "paused": True}
+        actor = db.get(Character, actor_id)
+        if not actor or not actor.agent_enabled:
+            performance.status = PerformanceStatus.PAUSED
+            performance.stop_reason = "CHARACTER_AGENT_DISABLED"
+            raise RuntimeFailure("CHARACTER_AGENT_DISABLED", {"character_id": actor_id})
         context = PerformanceCharacterContextBuilder().build(db, project_id, actor_id, proposal, performance.id, turns)
         trace = ExecutionTraceRecorder().start(
             db, project_id=project_id, stage=ExecutionStage.CHARACTER_ACTOR,
@@ -144,6 +149,7 @@ class PerformanceRuntimeService:
             recipient_character_ids=recipients if valid else [],
             requires_world_resolution=action.requires_world_resolution if valid else False,
             world_resolution_request=action.world_resolution_request.model_dump(mode="json") if valid and action.world_resolution_request else None,
+            scene_beat_refs=action.scene_beat_refs if valid else [],
             validation_result=report,
         )
         db.add(turn)

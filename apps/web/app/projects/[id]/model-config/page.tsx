@@ -1,15 +1,15 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { Check, Database, RotateCcw, Save, Zap } from "lucide-react";
+import { Activity, Check, Database, RotateCcw, Save, Zap, WandSparkles } from "lucide-react";
 import { api } from "../../../lib";
 import { ErrorState, LoadingState, PageHeader, SectionCard } from "../../../../components/ui/primitives";
 import styles from "./model-config.module.css";
 
 type Config = Record<string, any>;
 const editableConfigFields = [
-  "provider", "base_url", "character_model", "world_model", "director_model", "writer_model", "critic_model", "repair_model", "fallback_model",
-  "auto_failover", "max_repair_attempts", "embedding_enabled", "embedding_use_main_connection", "embedding_provider", "embedding_base_url", "embedding_model", "embedding_dimension",
+  "provider", "base_url", "single_model_mode", "shared_model", "character_model", "world_model", "director_model", "writer_model", "critic_model", "repair_model", "fallback_model",
+  "auto_failover", "max_repair_attempts", "request_timeout_seconds", "max_retries", "rate_limit_per_minute", "embedding_enabled", "embedding_use_main_connection", "embedding_provider", "embedding_base_url", "embedding_model", "embedding_dimension",
   "memory_retrieval_mode", "memory_vector_top_k", "memory_rrf_k", "memory_semantic_min_similarity",
   "memory_vector_search_mode", "memory_ann_ef_search", "memory_ann_candidate_multiplier",
 ] as const;
@@ -26,20 +26,24 @@ function buildModelConfigWritePayload(config: Config, generationKey: string, emb
 }
 
 const defaults: Config = {
-  provider: "disabled", base_url: "", character_model: "", world_model: "", director_model: "", writer_model: "", critic_model: "", repair_model: "",
-  auto_failover: false, max_repair_attempts: 1,
-  embedding_enabled: false, embedding_use_main_connection: true, embedding_provider: "openai_compatible", embedding_base_url: "", embedding_model: "", embedding_dimension: "",
+  provider: "openai_compatible", base_url: "https://tokenrhythm.studio/v1", character_model: "deepseek-v4-pro", world_model: "deepseek-v4-pro", director_model: "deepseek-v4-pro", writer_model: "deepseek-v4-pro", critic_model: "deepseek-v4-pro", repair_model: "deepseek-v4-pro",
+  single_model_mode: true, shared_model: "deepseek-v4-pro", auto_failover: false, max_repair_attempts: 1, request_timeout_seconds: 120, max_retries: 1, rate_limit_per_minute: 0,
+  embedding_enabled: false, embedding_use_main_connection: false, embedding_provider: "openai_compatible", embedding_base_url: "https://ws-oxezbfm22jwh5t89.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", embedding_model: "text-embedding-v4", embedding_dimension: 1024,
   memory_retrieval_mode: "DETERMINISTIC", memory_vector_top_k: 12, memory_rrf_k: 60, memory_semantic_min_similarity: "",
   memory_vector_search_mode: "EXACT", memory_ann_ef_search: 200, memory_ann_candidate_multiplier: 8,
 };
 
 export default function ModelConfigPage({ params }: { params: { id: string } }) {
   const [config, setConfig] = useState<Config>(defaults); const [generationKey, setGenerationKey] = useState(""); const [embeddingKey, setEmbeddingKey] = useState("");
-  const [indexStatus, setIndexStatus] = useState<Config | null>(null);
+  const [indexStatus, setIndexStatus] = useState<Config | null>(null); const [usage, setUsage] = useState<Config | null>(null);
   const [loading, setLoading] = useState(true); const [saving, setSaving] = useState(false); const [message, setMessage] = useState(""); const [error, setError] = useState("");
-  const load = () => { setLoading(true); setError(""); void Promise.all([api(`/projects/${params.id}/model-config`), api(`/projects/${params.id}/memory-embeddings/status`).catch(() => null)]).then(([value, status]) => { setConfig({ ...defaults, ...(value || {}) }); setIndexStatus(status as Config | null); }).catch(() => setError("无法读取模型配置。" )).finally(() => setLoading(false)); };
+  const load = () => { setLoading(true); setError(""); void Promise.all([api(`/projects/${params.id}/model-config`), api(`/projects/${params.id}/memory-embeddings/status`).catch(() => null), api(`/projects/${params.id}/model-config/usage`).catch(() => null)]).then(([value, status, telemetry]) => { setConfig({ ...defaults, ...(value || {}) }); setIndexStatus(status as Config | null); setUsage(telemetry as Config | null); }).catch(() => setError("无法读取模型配置。" )).finally(() => setLoading(false)); };
   useEffect(load, [params.id]);
   const update = (name: string, value: unknown) => setConfig((current) => ({ ...current, [name]: value }));
+  function applyOneModel() {
+    setConfig((current) => ({ ...current, provider: "openai_compatible", base_url: current.base_url || "https://tokenrhythm.studio/v1", single_model_mode: true, shared_model: "deepseek-v4-pro", character_model: "deepseek-v4-pro", world_model: "deepseek-v4-pro", director_model: "deepseek-v4-pro", writer_model: "deepseek-v4-pro", critic_model: "deepseek-v4-pro", repair_model: "deepseek-v4-pro" }));
+    setMessage("已将 DeepSeek 应用到角色、世界、导演、写作、审核和修复任务。");
+  }
   async function save(event: FormEvent) {
     event.preventDefault(); setSaving(true); setError(""); setMessage("");
     try {
@@ -53,6 +57,13 @@ export default function ModelConfigPage({ params }: { params: { id: string } }) 
     try { const result = await api(`/projects/${params.id}/model-config/test-embedding`, { method: "POST", body: JSON.stringify({ embedding_use_main_connection: Boolean(config.embedding_use_main_connection), provider: config.embedding_use_main_connection ? config.provider : config.embedding_provider, base_url: config.embedding_use_main_connection ? config.base_url : config.embedding_base_url, model: config.embedding_model, dimension: config.embedding_dimension || undefined, api_key: (config.embedding_use_main_connection ? generationKey : embeddingKey) || undefined, test_text: "embedding connectivity test" }) }) as any; update("embedding_dimension", result.dimension); setMessage(`嵌入连接可用：${result.model}，${result.dimension} 维。`); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "嵌入连接测试失败。"); } finally { setSaving(false); }
   }
+  async function testGeneration() {
+    setSaving(true); setError(""); setMessage("");
+    try {
+      const result = await api(`/projects/${params.id}/model-config/test-generation`, { method: "POST", body: JSON.stringify({ provider: config.provider, base_url: config.base_url, model: config.shared_model || config.writer_model, api_key: generationKey || undefined, test_prompt: '{"phase":"model_gateway","ok":true}' }) }) as any;
+      setMessage(`生成连接可用：${result.model}，响应 ${result.chars} 字符，耗时 ${result.latency_ms}ms。`);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "生成连接测试失败。"); } finally { setSaving(false); }
+  }
   async function indexMemories(rebuild = false) {
     setSaving(true); setError("");
     try { const result = await api(`/projects/${params.id}/memory-embeddings/${rebuild ? "rebuild" : "index-missing"}`, { method: "POST" }) as any; setMessage(`索引完成：${result.indexed || 0} 条更新，${result.skipped || 0} 条跳过。`); setIndexStatus(await api(`/projects/${params.id}/memory-embeddings/status`) as Config); }
@@ -61,9 +72,11 @@ export default function ModelConfigPage({ params }: { params: { id: string } }) 
   if (loading) return <LoadingState />;
   return <form className="form" onSubmit={save}><PageHeader title="模型与记忆检索" description="项目级模型连接与角色记忆召回策略。密钥仅作为写入值处理。" action={<button className="button" disabled={saving}><Save size={16} />保存</button>} />
     {error && <ErrorState message={error} retry={load} />}{message && <div className="success-state"><Check size={18} />{message}</div>}
-    <div className={styles.columns}><SectionCard title="生成模型" description="角色、世界裁定、导演与写作角色共享此连接配置。"><div className="form-grid">
+    <div className={styles.columns}><SectionCard title="生成模型" description="默认使用 tokenrhythm 的 DeepSeek；所有任务可以共享同一个模型。"><div className="form-grid">
       <label className="field"><span>提供方</span><select value={config.provider} onChange={(e) => update("provider", e.target.value)}><option value="disabled">禁用</option><option value="openai_compatible">OpenAI 兼容</option></select></label>
       <label className="field"><span>Base URL</span><input value={config.base_url || ""} onChange={(e) => update("base_url", e.target.value)} placeholder="https://provider.example/v1" /></label>
+      <label className="field"><span>统一模型模式</span><select value={String(config.single_model_mode)} onChange={(e) => update("single_model_mode", e.target.value === "true")}><option value="true">所有任务使用同一模型</option><option value="false">按任务分别配置</option></select></label>
+      <label className="field"><span>共享模型名称</span><input value={config.shared_model || ""} onChange={(e) => update("shared_model", e.target.value)} placeholder="deepseek-v4-pro" /></label>
       <label className="field"><span>角色模型</span><input value={config.character_model || ""} onChange={(e) => update("character_model", e.target.value)} /></label>
       <label className="field"><span>世界模型</span><input value={config.world_model || ""} onChange={(e) => update("world_model", e.target.value)} /></label>
       <label className="field"><span>导演模型</span><input value={config.director_model || ""} onChange={(e) => update("director_model", e.target.value)} /></label>
@@ -71,7 +84,10 @@ export default function ModelConfigPage({ params }: { params: { id: string } }) 
       <label className="field"><span>批评模型</span><input value={config.critic_model || ""} onChange={(e) => update("critic_model", e.target.value)} /></label>
       <label className="field"><span>修复模型</span><input value={config.repair_model || ""} onChange={(e) => update("repair_model", e.target.value)} /></label>
       <label className="field"><span>新生成密钥</span><input type="password" autoComplete="new-password" value={generationKey} onChange={(e) => setGenerationKey(e.target.value)} placeholder={config.credentials?.GENERATION?.configured ? `已配置 ${config.credentials.GENERATION.hint}` : "仅写入，不会回显"} /></label>
-    </div></SectionCard>
+      <label className="field"><span>请求超时（秒）</span><input type="number" min="1" max="600" value={config.request_timeout_seconds} onChange={(e) => update("request_timeout_seconds", Number(e.target.value))} /></label>
+      <label className="field"><span>失败重试次数</span><input type="number" min="0" max="3" value={config.max_retries} onChange={(e) => update("max_retries", Number(e.target.value))} /></label>
+      <label className="field"><span>每分钟限流（0 为不限）</span><input type="number" min="0" value={config.rate_limit_per_minute} onChange={(e) => update("rate_limit_per_minute", Number(e.target.value))} /></label>
+    </div><div className="button-row"><button className="button secondary" type="button" disabled={saving} onClick={applyOneModel}><WandSparkles size={16} />统一使用 DeepSeek</button><button className="button secondary" type="button" disabled={saving} onClick={testGeneration}><Zap size={16} />测试生成连接</button></div>{usage && <div className="gateway-usage"><div className="section-heading"><h3><Activity size={15} />模型调用统计</h3><span className="muted">仅显示调用元数据，不显示密钥和正文</span></div><div className="metric-grid">{Object.entries(usage.summary || {}).map(([role, item]: [string, any]) => <div key={role}><strong>{item.calls}</strong><span>{role} · 成功 {item.succeeded} · 失败 {item.failed + item.blocked} · 平均 {item.latency_ms_avg}ms</span></div>)}</div></div>}</SectionCard>
     <SectionCard title="角色记忆向量检索" description="默认保持确定性召回；启用混合模式后，向量结果只作为 RRF 候选排序。"><div className="form-grid">
       <label className="field"><span>记忆模式</span><select value={config.memory_retrieval_mode} onChange={(e) => update("memory_retrieval_mode", e.target.value)}><option value="DETERMINISTIC">确定性</option><option value="HYBRID_RRF">混合 RRF</option></select></label>
       <label className="field"><span>启用嵌入</span><select value={String(config.embedding_enabled)} onChange={(e) => update("embedding_enabled", e.target.value === "true")}><option value="false">否</option><option value="true">是</option></select></label>

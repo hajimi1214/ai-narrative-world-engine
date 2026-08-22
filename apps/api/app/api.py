@@ -38,6 +38,10 @@ from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionSe
 from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
 from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider, embedding_error_code
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
+from .planning import ChapterPlanPatchPayload, PlanCreatePayload, PlanFraming, PlanPatchPayload, chapter_task_context, generate_plan, persist_plan, plan_payload, validate_plan_references
+from .long_form import LongFormEvaluationService, LongFormWorkflowError
+from .creation import generate_creation_directions
+from .models import StoryPlan, StoryPlanArc, StoryPlanChapter, StoryPlanStatus, StoryPlanVolume
 from .scaling import ProjectHistoryProjectionService
 from .formal_state import FormalStateIdentityService
 from .retrieval_index import CognitionRetrievalProjectionService, ResearchLexicalIndexService, MemoryANNIndexStatusService
@@ -54,6 +58,26 @@ router.include_router(writer_routes.router)
 
 class Payload(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+class PlanningScopeRegeneratePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    instruction: str | None = Field(default=None, max_length=4000)
+
+class PlanningNodePatchPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = None
+    summary: str | None = None
+    theme: str | None = None
+    core_question: str | None = None
+    major_conflict: str | None = None
+    start_state: dict[str, Any] | None = None
+    end_state: dict[str, Any] | None = None
+    main_thread: str | None = None
+    ending_turn: str | None = None
+    foreshadowing: list[Any] | None = None
+    goal: str | None = None
+    turning_points: list[Any] | None = None
+    thread_refs: list[Any] | None = None
 
 class AutonomousRunCreatePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -317,8 +341,12 @@ def abort_replay_session(project_id: str, session_id: str, db: Session = Depends
 
 def routed_provider(settings, route, db=None, project_id=None):
     key = ProviderCredentialResolver().generation_key(db, project_id, settings) if db is not None and project_id else None
+    config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id)) if db is not None and project_id else None
+    timeout = config.request_timeout_seconds if config else None
+    retries = config.max_retries if config else 0
+    rate_limit = config.rate_limit_per_minute if config else 0
     try:
-        return get_model_provider(settings, route.provider, route.base_url, key)
+        return get_model_provider(settings, route.provider, route.base_url, key, timeout_seconds=timeout, max_retries=retries, rate_limit_per_minute=rate_limit)
     except TypeError as exc:
         # Preserve compatibility with injected test/fake factories from the
         # frozen phases, whose contract has three positional arguments.
@@ -512,6 +540,17 @@ def list_projects(db: Session = Depends(get_db)):
 def create_project(payload: Payload, db: Session = Depends(get_db)):
     return record_dict(create_record(db, Project, payload.model_dump()))
 
+@router.post("/projects/{project_id}/creation-directions")
+def creation_directions(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        result, model_result = generate_creation_directions(db, project_id, payload.model_dump())
+        return result
+    except ModelProviderError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": str(exc)}) from exc
+
 @router.get("/projects/{project_id}")
 def get_project(project_id: str, db: Session = Depends(get_db)):
     return record_dict(require_project(db, project_id))
@@ -522,6 +561,203 @@ def patch_project(project_id: str, payload: Payload, db: Session = Depends(get_d
     if "current_world_time" in values:
         ensure_replay_not_pending(db, project_id)
     return record_dict(update_record(db, require_project(db, project_id), values))
+
+
+@router.get("/projects/{project_id}/planning/plans")
+def list_story_plans(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [plan_payload(db, item) for item in db.scalars(select(StoryPlan).where(StoryPlan.project_id == project_id).order_by(StoryPlan.version.desc())).all()]
+
+
+@router.get("/projects/{project_id}/planning/plan")
+def get_story_plan(project_id: str, version: int | None = Query(default=None, ge=1), db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    query = select(StoryPlan).where(StoryPlan.project_id == project_id)
+    plan = db.scalar(query.where(StoryPlan.version == version) if version else query.order_by(StoryPlan.version.desc()))
+    if not plan:
+        return {"plan": None}
+    return plan_payload(db, plan)
+
+
+@router.post("/projects/{project_id}/planning/plans", status_code=status.HTTP_201_CREATED)
+def create_story_plan(project_id: str, payload: PlanCreatePayload, db: Session = Depends(get_db)):
+    project = require_project(db, project_id)
+    plan = persist_plan(db, project, payload.model_dump())
+    db.commit(); db.refresh(plan)
+    return plan_payload(db, plan)
+
+
+@router.post("/projects/{project_id}/planning/generate", status_code=status.HTTP_201_CREATED)
+def generate_story_plan(project_id: str, payload: PlanCreatePayload, db: Session = Depends(get_db)):
+    project = require_project(db, project_id)
+    values = payload.model_dump()
+    try:
+        generated, result = generate_plan(db, project, values["framing"], values.get("premise"), values.get("style_guide") or {}, values.get("anti_ai_rules") or {})
+        generated.setdefault("framing", values["framing"]); generated.setdefault("premise", values.get("premise")); generated.setdefault("style_guide", values.get("style_guide") or {}); generated.setdefault("anti_ai_rules", values.get("anti_ai_rules") or {})
+        generated["framing"] = values["framing"] | (generated.get("framing") or {})
+        errors = validate_plan_references(db, project_id, generated)
+        if errors:
+            raise HTTPException(status_code=422, detail={"code": "PLAN_REFERENCE_INVALID", "errors": errors})
+        plan = persist_plan(db, project, generated, provider=result.provider, model=result.model, request_id=result.request_id, report={"latency_ms": result.latency_ms, "direction_options": generated.get("direction_options", [])})
+        db.commit(); db.refresh(plan)
+        return plan_payload(db, plan)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        code = getattr(exc, "code", None) or getattr(exc, "error_code", None) or "PLAN_GENERATION_FAILED"
+        raise HTTPException(status_code=502, detail={"code": code, "message": str(exc)}) from exc
+
+
+@router.patch("/projects/{project_id}/planning/plans/{plan_id}")
+def patch_story_plan(project_id: str, plan_id: str, payload: PlanPatchPayload, db: Session = Depends(get_db)):
+    plan = db.get(StoryPlan, plan_id)
+    if not plan or plan.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Story plan not found")
+    if plan.status in (StoryPlanStatus.ARCHIVED, StoryPlanStatus.APPROVED):
+        raise HTTPException(status_code=409, detail={"code": "PLAN_IMMUTABLE"})
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        if value is not None:
+            setattr(plan, key, value)
+    db.commit(); db.refresh(plan)
+    return plan_payload(db, plan)
+
+
+@router.patch("/projects/{project_id}/planning/plans/{plan_id}/volumes/{volume_number}")
+def patch_story_plan_volume(project_id: str, plan_id: str, volume_number: int, payload: PlanningNodePatchPayload, db: Session = Depends(get_db)):
+    plan = db.get(StoryPlan, plan_id)
+    if not plan or plan.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Story plan not found")
+    if plan.status in (StoryPlanStatus.ARCHIVED, StoryPlanStatus.APPROVED):
+        raise HTTPException(status_code=409, detail={"code": "PLAN_IMMUTABLE", "message": "已审批规划不可直接修改，请从该版本局部重做"})
+    volume = db.scalar(select(StoryPlanVolume).where(StoryPlanVolume.plan_id == plan_id, StoryPlanVolume.number == volume_number))
+    if not volume:
+        raise HTTPException(status_code=404, detail="Volume plan not found")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        if value is not None:
+            setattr(volume, key, value)
+    db.commit(); db.refresh(volume)
+    return plan_payload(db, plan)
+
+
+@router.patch("/projects/{project_id}/planning/plans/{plan_id}/arcs/{arc_number}")
+def patch_story_plan_arc(project_id: str, plan_id: str, arc_number: int, payload: PlanningNodePatchPayload, db: Session = Depends(get_db)):
+    plan = db.get(StoryPlan, plan_id)
+    if not plan or plan.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Story plan not found")
+    if plan.status in (StoryPlanStatus.ARCHIVED, StoryPlanStatus.APPROVED):
+        raise HTTPException(status_code=409, detail={"code": "PLAN_IMMUTABLE", "message": "已审批规划不可直接修改，请从该版本局部重做"})
+    arc = db.scalar(select(StoryPlanArc).where(StoryPlanArc.plan_id == plan_id, StoryPlanArc.number == arc_number))
+    if not arc:
+        raise HTTPException(status_code=404, detail="Arc plan not found")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        if value is not None:
+            setattr(arc, key, value)
+    db.commit(); db.refresh(arc)
+    return plan_payload(db, plan)
+
+
+@router.post("/projects/{project_id}/planning/plans/{plan_id}/volumes/{volume_number}/regenerate", status_code=status.HTTP_201_CREATED)
+def regenerate_story_plan_volume(project_id: str, plan_id: str, volume_number: int, payload: PlanningScopeRegeneratePayload | None = None, db: Session = Depends(get_db)):
+    return _regenerate_story_plan_scope(project_id, plan_id, db, volume_number=volume_number, instruction=(payload.instruction if payload else None))
+
+
+@router.post("/projects/{project_id}/planning/plans/{plan_id}/chapters/{chapter_id}/regenerate", status_code=status.HTTP_201_CREATED)
+def regenerate_story_plan_chapter(project_id: str, plan_id: str, chapter_id: str, payload: PlanningScopeRegeneratePayload | None = None, db: Session = Depends(get_db)):
+    chapter = db.get(StoryPlanChapter, chapter_id)
+    if not chapter or chapter.project_id != project_id or chapter.plan_id != plan_id:
+        raise HTTPException(status_code=404, detail="Chapter plan not found")
+    return _regenerate_story_plan_scope(project_id, plan_id, db, chapter_number=chapter.number, instruction=(payload.instruction if payload else None))
+
+
+def _regenerate_story_plan_scope(project_id: str, plan_id: str, db: Session, *, volume_number: int | None = None, chapter_number: int | None = None, instruction: str | None = None):
+    source = db.get(StoryPlan, plan_id)
+    project = require_project(db, project_id)
+    if not source or source.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Story plan not found")
+    source_data = plan_payload(db, source)
+    target_chapters = [item for item in source_data["chapters"] if (volume_number is None or item["volume_number"] == volume_number) and (chapter_number is None or item["number"] == chapter_number)]
+    if not target_chapters:
+        raise HTTPException(status_code=404, detail="Planning scope not found")
+    if any(item.get("locked") for item in target_chapters):
+        raise HTTPException(status_code=409, detail={"code": "PLANNING_SCOPE_LOCKED", "chapters": [item["number"] for item in target_chapters if item.get("locked")]})
+    try:
+        generated, result = generate_plan(db, project, source.framing or {}, source.premise, source.style_guide or {}, source.anti_ai_rules or {})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"code": "PLAN_SCOPE_GENERATION_FAILED", "message": str(exc)}) from exc
+    merged = {"framing": source_data.get("framing") or {}, "premise": source_data.get("premise"), "macro_plan": source_data.get("macro_plan") or {}, "style_guide": source_data.get("style_guide") or {}, "anti_ai_rules": source_data.get("anti_ai_rules") or {}, "volumes": source_data.get("volumes") or [], "arcs": source_data.get("arcs") or [], "chapters": source_data.get("chapters") or []}
+    if volume_number is not None:
+        generated_volumes = {item.get("number"): item for item in generated.get("volumes", [])}
+        if volume_number in generated_volumes:
+            merged["volumes"] = [generated_volumes.get(item.get("number"), item) if item.get("number") == volume_number else item for item in merged["volumes"]]
+        generated_arcs = {item.get("number"): item for item in generated.get("arcs", []) if item.get("volume_number") == volume_number}
+        merged["arcs"] = [generated_arcs.get(item.get("number"), item) if item.get("volume_number") == volume_number else item for item in merged["arcs"]]
+    generated_chapters = {item.get("number"): item for item in generated.get("chapters", [])}
+    selected_numbers = {item["number"] for item in target_chapters}
+    merged["chapters"] = [generated_chapters.get(item.get("number"), item) if item.get("number") in selected_numbers and not item.get("locked") else item for item in merged["chapters"]]
+    if instruction:
+        merged["generation_instruction"] = instruction
+    new_plan = persist_plan(db, project, merged, provider=getattr(result, "provider", None), model=getattr(result, "model", None), request_id=getattr(result, "request_id", None), report={"scope": "volume" if volume_number is not None else "chapter", "source_plan_id": source.id, "instruction": instruction})
+    db.commit(); db.refresh(new_plan)
+    affected = sorted({item["number"] for item in merged["chapters"] if item["number"] in selected_numbers or (volume_number is not None and item["volume_number"] == volume_number and item["number"] >= min(selected_numbers))})
+    return {"plan": plan_payload(db, new_plan), "impact": {"source_plan_id": source.id, "new_plan_id": new_plan.id, "scope": "volume" if volume_number is not None else "chapter", "affected_chapters": affected, "affected_volumes": [volume_number] if volume_number is not None else sorted({item["volume_number"] for item in target_chapters}), "affected_foreshadowing": sorted({str(value) for item in target_chapters for value in (item.get("foreshadow_create") or []) + (item.get("foreshadow_payoff") or [])}), "affected_threads": sorted({str(value) for item in source_data.get("arcs", []) if volume_number is None or item.get("volume_number") == volume_number for value in item.get("thread_refs", [])})}}
+
+
+@router.patch("/projects/{project_id}/planning/plans/{plan_id}/chapters/{chapter_id}")
+def patch_story_plan_chapter(project_id: str, plan_id: str, chapter_id: str, payload: ChapterPlanPatchPayload, db: Session = Depends(get_db)):
+    chapter = db.get(StoryPlanChapter, chapter_id)
+    if not chapter or chapter.project_id != project_id or chapter.plan_id != plan_id:
+        raise HTTPException(status_code=404, detail="Chapter plan not found")
+    if chapter.locked or db.get(StoryPlan, plan_id).status == StoryPlanStatus.APPROVED:
+        raise HTTPException(status_code=409, detail={"code": "CHAPTER_PLAN_LOCKED" if chapter.locked else "PLAN_IMMUTABLE"})
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        if value is not None:
+            setattr(chapter, key, value)
+    db.commit(); db.refresh(chapter)
+    return {column.name: getattr(chapter, column.name).value if hasattr(getattr(chapter, column.name), "value") else getattr(chapter, column.name) for column in chapter.__table__.columns}
+
+
+@router.post("/projects/{project_id}/planning/plans/{plan_id}/approve")
+def approve_story_plan(project_id: str, plan_id: str, db: Session = Depends(get_db)):
+    plan = db.get(StoryPlan, plan_id)
+    if not plan or plan.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Story plan not found")
+    chapters = db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id).order_by(StoryPlanChapter.number)).all()
+    if not chapters:
+        raise HTTPException(status_code=409, detail={"code": "PLAN_HAS_NO_CHAPTERS"})
+    missing = [chapter.number for chapter in chapters if not chapter.objective or not chapter.conflict or not chapter.end_state]
+    if missing:
+        raise HTTPException(status_code=409, detail={"code": "CHAPTER_TASK_INCOMPLETE", "chapters": missing})
+    beat_missing = [chapter.number for chapter in chapters if not 3 <= len(chapter.scene_beats or []) <= 6]
+    if beat_missing:
+        raise HTTPException(status_code=409, detail={"code": "SCENE_BEATS_INCOMPLETE", "chapters": beat_missing, "required": "3-6"})
+    plan.status = StoryPlanStatus.APPROVED
+    db.commit(); db.refresh(plan)
+    return plan_payload(db, plan)
+
+
+@router.get("/projects/{project_id}/chapters/{chapter_id}/planning-task")
+def get_chapter_planning_task(project_id: str, chapter_id: str, db: Session = Depends(get_db)):
+    chapter = db.get(Chapter, chapter_id)
+    if not chapter or chapter.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    return {"chapter_id": chapter.id, "chapter_number": chapter.number, "task": chapter_task_context(db, project_id, chapter.number)}
+
+
+@router.get("/projects/{project_id}/long-form/next")
+def long_form_next_chapter(project_id: str, db: Session = Depends(get_db)):
+    try:
+        return LongFormEvaluationService().next_chapter(db, project_id)
+    except LongFormWorkflowError as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "detail": exc.detail}) from exc
+
+
+@router.get("/projects/{project_id}/long-form/evaluation")
+def long_form_evaluation(project_id: str, db: Session = Depends(get_db)):
+    try:
+        return LongFormEvaluationService().evaluate(db, project_id)
+    except LongFormWorkflowError as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "detail": exc.detail}) from exc
 
 @router.get("/projects/{project_id}/snapshot")
 def project_snapshot(project_id: str, db: Session = Depends(get_db)):
@@ -652,6 +888,31 @@ def create_character_memory(character_id: str, payload: Payload, db: Session = D
     if not character: raise HTTPException(status_code=404, detail="Character not found")
     ensure_replay_not_pending(db, character.project_id)
     return record_dict(create_record(db, CharacterMemory, payload.model_dump() | {"character_id": character_id}))
+
+
+@router.get("/projects/{project_id}/characters/{character_id}/agent")
+def character_agent_profile(project_id: str, character_id: str, db: Session = Depends(get_db)):
+    character = db.get(Character, character_id)
+    if not character or character.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Character not found")
+    return {"agent_id": character.id, "character_id": character.id, "enabled": character.agent_enabled, "protocol_version": "character-agent-v1", "profile": character.agent_profile or {}, "model_route": "CHARACTER", "model_policy": "project unified generation model"}
+
+
+@router.patch("/projects/{project_id}/characters/{character_id}/agent")
+def patch_character_agent_profile(project_id: str, character_id: str, payload: Payload, db: Session = Depends(get_db)):
+    character = db.get(Character, character_id)
+    if not character or character.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Character not found")
+    ensure_replay_not_pending(db, project_id)
+    values = payload.model_dump()
+    if "enabled" in values:
+        character.agent_enabled = bool(values["enabled"])
+    if "profile" in values:
+        if not isinstance(values["profile"], dict):
+            raise HTTPException(status_code=422, detail={"code": "AGENT_PROFILE_INVALID"})
+        character.agent_profile = values["profile"]
+    db.add(character); db.commit(); db.refresh(character)
+    return {"agent_id": character.id, "character_id": character.id, "enabled": character.agent_enabled, "protocol_version": "character-agent-v1", "profile": character.agent_profile or {}, "model_route": "CHARACTER", "model_policy": "project unified generation model"}
 
 @router.get("/projects/{project_id}/characters/{character_id}/mind")
 def character_mind_view(project_id: str, character_id: str, proposal_id: str | None = Query(default=None), db: Session = Depends(get_db)):
@@ -885,10 +1146,20 @@ def require_character_simulation_inputs(db: Session, project_id: str, proposal_i
     character = db.get(Character, character_id)
     if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Scene Proposal not found")
     if not character or character.project_id != project_id: raise HTTPException(status_code=404, detail="Character not found")
+    if not character.agent_enabled: raise HTTPException(status_code=409, detail={"code": "CHARACTER_AGENT_DISABLED", "message": "This character's independent Agent is disabled."})
     if character_id not in proposal.participants: raise HTTPException(status_code=409, detail={"code": "NOT_SCENE_PARTICIPANT", "message": "Character is not a participant in this Scene Proposal."})
     director_context = DirectorContextBuilder().build(db, project_id)
     if proposal.context_fingerprint != director_context["fingerprint"]: raise HTTPException(status_code=409, detail={"code": "STALE_SCENE_PROPOSAL", "message": "Scene Proposal is stale. Run Director again."})
     return proposal, character
+
+
+@router.get("/projects/{project_id}/characters/{character_id}/agent/context")
+def character_agent_context(project_id: str, character_id: str, proposal_id: str, db: Session = Depends(get_db)):
+    """Return exactly the redacted view that the character Agent may receive."""
+    proposal, character = require_character_simulation_inputs(db, project_id, proposal_id, character_id)
+    context = CharacterContextBuilder().build(db, project_id, character_id, proposal)
+    actor_view = ActorPerceptionSanitizer().sanitize(context)
+    return {"agent_id": character.id, "proposal_id": proposal.id, "context_fingerprint": context["fingerprint"], "actor_view": actor_view, "redaction_policy": {"director_only": "removed", "secrets": "never included", "unknown_canon": "opaque IDs only", "world_mutation": "forbidden"}}
 
 @router.post("/projects/{project_id}/director/proposals/{proposal_id}/characters/{character_id}/dry-run", status_code=status.HTTP_201_CREATED)
 def character_dry_run(project_id: str, proposal_id: str, character_id: str, db: Session = Depends(get_db)):
@@ -1047,6 +1318,26 @@ def rollback_revision(project_id:str,application_id:str,db:Session=Depends(get_d
 @router.get("/projects/{project_id}/model-config")
 def get_model_config(project_id:str,db:Session=Depends(get_db)):
     require_project(db,project_id); item=db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id==project_id)); return _model_config_payload(db, item)
+
+@router.get("/projects/{project_id}/model-config/usage")
+def get_model_config_usage(project_id: str, limit: int = Query(default=40, ge=1, le=200), db: Session = Depends(get_db)):
+    """Return safe, aggregate model-call telemetry without credentials or prompt content."""
+    require_project(db, project_id)
+    rows = db.scalars(select(ExecutionTrace).where(ExecutionTrace.project_id == project_id).order_by(ExecutionTrace.created_at.desc(), ExecutionTrace.id.desc()).limit(limit)).all()
+    by_role: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        role = str(row.stage.value if hasattr(row.stage, "value") else row.stage)
+        bucket = by_role.setdefault(role, {"calls": 0, "succeeded": 0, "failed": 0, "blocked": 0, "latency_ms_total": 0, "last_error": None})
+        bucket["calls"] += 1
+        status_value = str(row.status.value if hasattr(row.status, "value") else row.status)
+        if status_value == "SUCCEEDED": bucket["succeeded"] += 1
+        elif status_value == "FAILED": bucket["failed"] += 1
+        elif status_value == "BLOCKED": bucket["blocked"] += 1
+        bucket["latency_ms_total"] += row.latency_ms or 0
+        if row.error_code and bucket["last_error"] is None: bucket["last_error"] = row.error_code
+    for bucket in by_role.values():
+        bucket["latency_ms_avg"] = round(bucket["latency_ms_total"] / max(1, bucket["calls"]))
+    return {"summary": by_role, "recent": [_trace_payload(row, db) for row in rows]}
 @router.put("/projects/{project_id}/model-config")
 def put_model_config(project_id:str,payload:Payload,db:Session=Depends(get_db)):
     require_project(db,project_id)
@@ -1136,6 +1427,37 @@ def test_embedding_config(project_id: str, payload: Payload, db: Session = Depen
         code = embedding_error_code(exc, "EMBEDDING_TEST_FAILED")
         safe_codes = {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_CONFIG_INCOMPLETE", "EMBEDDING_DIMENSION_MISMATCH", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID", "EMBEDDING_TEST_FAILED"}
         if code not in safe_codes: code = "EMBEDDING_TEST_FAILED"
+        raise HTTPException(status_code=409, detail={"code": code}) from exc
+
+
+@router.post("/projects/{project_id}/model-config/test-generation")
+def test_generation_config(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    """Test one OpenAI-compatible generation route without mutating project state."""
+    require_project(db, project_id)
+    values = payload.model_dump()
+    settings = get_settings()
+    provider_name = values.get("provider") or settings.ai_provider
+    base_url = values.get("base_url") or settings.ai_base_url
+    model = values.get("model") or values.get("writer_model") or settings.ai_writer_model
+    api_key = values.get("api_key") or ProviderCredentialResolver().generation_key(db, project_id, settings)
+    try:
+        if not provider_name or not base_url or not model or not api_key:
+            raise ValueError("MODEL_PROVIDER_NOT_CONFIGURED")
+        provider = get_model_provider(settings, provider_name, base_url, api_key)
+        result = provider.generate(
+            [
+                {"role": "system", "content": "Return only a compact JSON object with the key ok set to true."},
+                {"role": "user", "content": values.get("test_prompt") or '{"phase":"model_gateway","ok":true}'},
+            ],
+            model,
+        )
+        return {"ok": True, "provider": result.provider, "model": result.model, "chars": len(result.content), "latency_ms": result.latency_ms, "request_id": result.request_id}
+    except ModelProviderError as exc:
+        safe_codes = {MODEL_TIMEOUT, MODEL_RATE_LIMITED, MODEL_AUTH_FAILED, "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_UPSTREAM_ERROR", MODEL_OUTPUT_INVALID}
+        code = exc.code if exc.code in safe_codes else "MODEL_UPSTREAM_ERROR"
+        raise HTTPException(status_code=409, detail={"code": code}) from exc
+    except ValueError as exc:
+        code = str(exc) if str(exc) in {"MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED"} else "MODEL_PROVIDER_NOT_CONFIGURED"
         raise HTTPException(status_code=409, detail={"code": code}) from exc
 
 
@@ -1433,7 +1755,7 @@ def performance_step(project_id: str, performance_id: str, db: Session = Depends
     decision.status = CharacterDecisionStatus.VALID if valid else CharacterDecisionStatus.REJECTED
     db.add(decision); db.flush()
     recipients = PerformanceObservationRouter().recipients(action.visibility, [item for item in performance.participant_order if item in performance.active_participant_ids], actor_id, action.target_character_id)
-    turn = ScenePerformanceTurn(project_id=project_id, performance_id=performance.id, sequence=performance.turn_count + 1, actor_character_id=actor_id, actor_context_fingerprint=context["fingerprint"], character_decision_id=decision.id, action_visibility=action.visibility, observable_action=action.observable_action if valid else None, spoken_content=action.spoken_content if valid else None, recipient_character_ids=recipients if valid else [], requires_world_resolution=action.requires_world_resolution if valid else False, world_resolution_request=action.world_resolution_request.model_dump(mode="json") if valid and action.world_resolution_request else None, validation_result={"decision": decision_report.as_dict(), "action": action_report.as_dict()})
+    turn = ScenePerformanceTurn(project_id=project_id, performance_id=performance.id, sequence=performance.turn_count + 1, actor_character_id=actor_id, actor_context_fingerprint=context["fingerprint"], character_decision_id=decision.id, action_visibility=action.visibility, observable_action=action.observable_action if valid else None, spoken_content=action.spoken_content if valid else None, recipient_character_ids=recipients if valid else [], requires_world_resolution=action.requires_world_resolution if valid else False, world_resolution_request=action.world_resolution_request.model_dump(mode="json") if valid and action.world_resolution_request else None, scene_beat_refs=action.scene_beat_refs if valid else [], validation_result={"decision": decision_report.as_dict(), "action": action_report.as_dict()})
     db.add(turn); db.flush()
     if trace and not valid:
         code, report_data = recovery_performance_data

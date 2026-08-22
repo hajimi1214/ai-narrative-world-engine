@@ -5,6 +5,9 @@
   align-items: start;
 }
 
+.gateway-usage { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.gateway-usage h3 { display: flex; align-items: center; gap: 6px; font-size: 14px; }
+
 @media (max-width: 900px) {
   .columns {
     grid-template-columns: 1fr;

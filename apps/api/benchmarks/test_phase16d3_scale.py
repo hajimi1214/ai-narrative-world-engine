@@ -484,7 +484,14 @@ def test_phase16d3_large_suffix_rebuild_scale(benchmark_session, scene_count, ca
 
 
 @pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in 10k/100k continuous SceneCommit certification")
-@pytest.mark.parametrize("scene_count", [10_000, 100_000])
+def _commit_scene_counts() -> list[int]:
+    raw = os.getenv("PHASE16D3_COMMIT_SCENE_COUNTS")
+    if raw:
+        return [int(value.strip()) for value in raw.split(",") if value.strip()]
+    return [10_000, 100_000]
+
+
+@pytest.mark.parametrize("scene_count", _commit_scene_counts())
 def test_phase16d3_continuous_scene_commit_scale(benchmark_session, monkeypatch, scene_count, capsys):
     """Run the complete production SceneCommit chain over one continuous Project.
 
@@ -500,11 +507,16 @@ def test_phase16d3_continuous_scene_commit_scale(benchmark_session, monkeypatch,
         benchmark_session, monkeypatch, requires_resolution=False,
     )
 
+    progress_every = max(1, int(os.getenv("PHASE16D3_COMMIT_PROGRESS_EVERY", "1000")))
+    block_metrics = []
+
     def operation():
         SceneCommitService().commit(benchmark_session, project.id, performance.id)
         benchmark_session.commit()
-        for _ in range(scene_count - 1):
+        for index in range(scene_count - 1):
             _append_formal_commit(benchmark_session, project.id, actor.id, location.id, proposal.primary_thread_id)
+            if (index + 2) % progress_every == 0:
+                block_metrics.append({"through_sequence": index + 2})
 
     metrics = measure(
         benchmark_session,
@@ -514,7 +526,8 @@ def test_phase16d3_continuous_scene_commit_scale(benchmark_session, monkeypatch,
         route="FORMAL_SCENE_COMMIT",
         projection_status="READY_OR_DIRTY",
         scene_sequence_continuous=True,
-        details={"full_chain": True, "million_word_equivalent": scene_count * 100},
+        details={"full_chain": True, "million_word_equivalent": scene_count * 100, "progress_blocks": block_metrics},
+        trace_memory=False,
     )
     sequences = list(benchmark_session.scalars(select(Scene.sequence).where(Scene.project_id == project.id).order_by(Scene.sequence)))
     assert len(sequences) == scene_count

@@ -3,14 +3,14 @@ from .openai_compatible import OpenAICompatibleProvider
 from ..settings import Settings
 
 
-def get_model_provider(settings: Settings, provider: str | None = None, base_url: str | None = None, api_key: str | None = None):
+def get_model_provider(settings: Settings, provider: str | None = None, base_url: str | None = None, api_key: str | None = None, timeout_seconds: float | None = None, max_retries: int = 0, rate_limit_per_minute: int = 0):
     selected_provider = provider or settings.ai_provider
     selected_base_url = base_url or settings.ai_base_url
     if selected_provider == "openai_compatible":
         key = api_key or (settings.ai_api_key.get_secret_value() if settings.ai_api_key else None)
         if not key:
             raise ModelProviderError(MODEL_PROVIDER_NOT_CONFIGURED)
-        return OpenAICompatibleProvider(selected_base_url, key, settings.ai_timeout_seconds)
+        return OpenAICompatibleProvider(selected_base_url, key, timeout_seconds or settings.ai_timeout_seconds, max_retries=max_retries, rate_limit_per_minute=rate_limit_per_minute)
     if selected_provider == "disabled":
         raise ModelProviderError(MODEL_PROVIDER_NOT_CONFIGURED)
     raise ModelProviderError(MODEL_PROVIDER_UNSUPPORTED)

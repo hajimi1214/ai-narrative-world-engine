@@ -155,6 +155,38 @@ def test_prose_statistics_are_reported():
     assert metrics["char_count"] > 0 and metrics["word_count"] == 2 and metrics["paragraph_count"] == 2 and metrics["sentence_count"] == 2
 
 
+def test_single_rare_word_is_not_misclassified():
+    report = AntiAIStyleRuleEngine().evaluate("他攥紧刀柄，跨过门槛。", AntiAIBibleResolver.DEFAULT)
+    assert not any(item["rule_code"] == "RARE_WORD_FREQUENCY_ANOMALY" for item in report["findings"])
+
+
+def test_rare_word_overuse_is_reported():
+    prose = "攥住绳头。再次攥住刀柄。她又攥紧衣角。最后还在攥着门闩。"
+    report = AntiAIStyleRuleEngine().evaluate(prose, AntiAIBibleResolver.DEFAULT)
+    assert any(item["rule_code"] == "RARE_WORD_FREQUENCY_ANOMALY" for item in report["findings"])
+
+
+def test_low_information_scenery_is_reported_but_actionable_scene_passes():
+    empty = "夜色沉沉，风吹过树梢。月光落在屋檐，远处的灯影摇晃。雾气漫过街道，雨丝斜斜落下。"
+    assert any(item["rule_code"] == "LOW_INFORMATION_SCENERY" for item in AntiAIStyleRuleEngine().evaluate(empty, AntiAIBibleResolver.DEFAULT)["findings"])
+    meaningful = "夜色压下来，风吹过树梢。林越踩灭火星，推门冲进雨里。月光落在屋檐，他抬头看见旗杆上的血。"
+    assert not any(item["rule_code"] == "LOW_INFORMATION_SCENERY" for item in AntiAIStyleRuleEngine().evaluate(meaningful, AntiAIBibleResolver.DEFAULT)["findings"])
+
+
+def test_repeated_dialogue_information_is_reported():
+    rules = {**AntiAIBibleResolver.DEFAULT, "frequency_limits": {"dialogue": {"max_similarity": 0.8, "max_recap_count": 0}}}
+    report = AntiAIStyleRuleEngine().evaluate('“你要走吗？”\n“你要走吗？”\n“我现在就走。”', rules)
+    assert any(item["rule_code"] == "DIALOGUE_INFORMATION_REPEAT" for item in report["findings"])
+
+
+def test_ai_style_density_metrics_and_rules_are_reported():
+    prose = "他意识到自己很紧张，仿佛一切都失去了意义。这一刻意味着命运的齿轮开始转动。既然如此而且如此，不是退缩而是前进。"
+    report = AntiAIStyleRuleEngine().evaluate(prose, AntiAIBibleResolver.DEFAULT)
+    codes = {item["rule_code"] for item in report["findings"]}
+    assert "EXPLICIT_EMOTION_EXPLANATION" in codes or "COGNITIVE_EXPLANATION_OVERUSE" in codes
+    assert report["metrics"]["cognitive_explanation_count"] >= 2
+
+
 def test_finding_fingerprint_ignores_random_identity():
     base = {"source": "DETERMINISTIC", "category": "FORMAT", "severity": "MINOR", "rule_code": "X", "message": "m", "start_offset": None, "end_offset": None, "excerpt": None, "source_refs": [], "metadata": {}}
     assert finding_fingerprint(base | {"id": "one"}) == finding_fingerprint(base | {"id": "two"})

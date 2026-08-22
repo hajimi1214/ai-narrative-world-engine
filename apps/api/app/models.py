@@ -84,6 +84,8 @@ class RetrievalIndexStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUIL
 class FormalStateIdentityStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class NarrativeStructureProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="DIRTY"; REBUILDING="REBUILDING"
 class SnapshotStorageMode(str, enum.Enum): LEGACY_FULL="LEGACY_FULL"; COMPACT_ANCHOR="COMPACT_ANCHOR"; COMPACT_DELTA="COMPACT_DELTA"; REFERENCE="REFERENCE"
+class StoryPlanStatus(str, enum.Enum): DRAFT="DRAFT"; GENERATED="GENERATED"; APPROVED="APPROVED"; ARCHIVED="ARCHIVED"
+class PlanChapterStatus(str, enum.Enum): DRAFT="DRAFT"; READY="READY"; LOCKED="LOCKED"; SUPERSEDED="SUPERSEDED"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
 class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
 
@@ -174,6 +176,8 @@ class Character(TimestampMixin, Base):
     inventory: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     secrets: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     narrative_relevance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    agent_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    agent_profile: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 class CharacterKnowledge(Base):
@@ -503,6 +507,100 @@ class NarrativeVolumeArcBinding(Base):
     narrative_arc_id: Mapped[str] = mapped_column(ForeignKey("narrative_arcs.id"), nullable=False, index=True)
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
 
+
+class StoryPlan(TimestampMixin, Base):
+    """Versioned whole-book plan. It is planning state, never formal story history."""
+    __tablename__ = "story_plans"
+    __table_args__ = (UniqueConstraint("project_id", "version", name="uq_story_plan_project_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[StoryPlanStatus] = mapped_column(Enum(StoryPlanStatus, native_enum=False, length=20), default=StoryPlanStatus.DRAFT, nullable=False, index=True)
+    framing: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    premise: Mapped[str | None] = mapped_column(Text)
+    macro_plan: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    style_guide: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    anti_ai_rules: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(100))
+    model: Mapped[str | None] = mapped_column(String(200))
+    request_id: Mapped[str | None] = mapped_column(String(200))
+    generation_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class StoryPlanVolume(Base):
+    __tablename__ = "story_plan_volumes"
+    __table_args__ = (UniqueConstraint("plan_id", "number", name="uq_story_plan_volume_number"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("story_plans.id"), nullable=False, index=True)
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    start_chapter: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_chapter: Mapped[int] = mapped_column(Integer, nullable=False)
+    arc_numbers: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    turning_points: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    theme: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    core_question: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    major_conflict: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    start_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    end_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    main_thread: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    ending_turn: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    foreshadowing: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+
+
+class StoryPlanArc(Base):
+    __tablename__ = "story_plan_arcs"
+    __table_args__ = (UniqueConstraint("plan_id", "number", name="uq_story_plan_arc_number"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("story_plans.id"), nullable=False, index=True)
+    volume_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    turning_points: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    thread_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    core_question: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    start_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    end_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class StoryPlanChapter(TimestampMixin, Base):
+    __tablename__ = "story_plan_chapters"
+    __table_args__ = (UniqueConstraint("plan_id", "number", name="uq_story_plan_chapter_number"), Index("ix_story_plan_chapter_plan_number", "plan_id", "number"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("story_plans.id"), nullable=False, index=True)
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    volume_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    arc_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    pov_mode: Mapped[str] = mapped_column(String(40), nullable=False, default="THIRD_PERSON_LIMITED")
+    pov_character_ref: Mapped[str | None] = mapped_column(String(200))
+    cast_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    location: Mapped[str | None] = mapped_column(String(200))
+    time_anchor: Mapped[str | None] = mapped_column(String(200))
+    start_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    end_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    objective: Mapped[str] = mapped_column(Text, nullable=False)
+    conflict: Mapped[str] = mapped_column(Text, nullable=False)
+    must_events: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    forbidden_events: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    allowed_reveals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    forbidden_reveals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    foreshadow_create: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    foreshadow_payoff: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    character_changes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    consequences: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    scene_beats: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    target_words: Mapped[int] = mapped_column(Integer, default=3000, nullable=False)
+    pace: Mapped[str] = mapped_column(String(30), default="MEDIUM", nullable=False)
+    status: Mapped[PlanChapterStatus] = mapped_column(Enum(PlanChapterStatus, native_enum=False, length=20), default=PlanChapterStatus.DRAFT, nullable=False)
+    locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
 class RevealConstraint(TimestampMixin, Base):
     __tablename__ = "reveal_constraints"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -611,6 +709,7 @@ class ScenePerformanceTurn(Base):
     recipient_character_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     requires_world_resolution: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     world_resolution_request: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    scene_beat_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     validation_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     replay_session_id: Mapped[str | None] = mapped_column(String(36))
@@ -1058,7 +1157,7 @@ class RevisionApplication(Base):
     status: Mapped[RevisionApplicationStatus]=mapped_column(String(30),default=RevisionApplicationStatus.PENDING,nullable=False); pre_snapshot_id: Mapped[str]=mapped_column(ForeignKey("world_snapshots.id"),nullable=False); post_snapshot_id: Mapped[str|None]=mapped_column(ForeignKey("world_snapshots.id")); expected_base_fingerprint: Mapped[str]=mapped_column(String(100),nullable=False); actual_base_fingerprint: Mapped[str]=mapped_column(String(100),nullable=False); author_override: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); author_override_reason: Mapped[str|None]=mapped_column(Text); applied_change_count: Mapped[int]=mapped_column(Integer,default=0,nullable=False); error_code: Mapped[str|None]=mapped_column(String(100)); error_summary: Mapped[str|None]=mapped_column(Text); created_at: Mapped[datetime]=mapped_column(DateTime,server_default=func.now(),nullable=False); completed_at: Mapped[datetime|None]=mapped_column(DateTime)
 class ProjectModelConfig(TimestampMixin, Base):
     __tablename__="project_model_configs"; __table_args__=(UniqueConstraint("project_id"),)
-    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); provider: Mapped[str|None]=mapped_column(String(100)); base_url: Mapped[str|None]=mapped_column(String(500)); character_model: Mapped[str|None]=mapped_column(String(200)); world_model: Mapped[str|None]=mapped_column(String(200)); director_model: Mapped[str|None]=mapped_column(String(200)); repair_model: Mapped[str|None]=mapped_column(String(200)); writer_model: Mapped[str|None]=mapped_column(String(200)); critic_model: Mapped[str|None]=mapped_column(String(200)); fallback_model: Mapped[str|None]=mapped_column(String(200)); auto_failover: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); max_repair_attempts: Mapped[int]=mapped_column(Integer,default=1,nullable=False)
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=new_id); project_id: Mapped[str]=mapped_column(ForeignKey("projects.id"),nullable=False); provider: Mapped[str|None]=mapped_column(String(100)); base_url: Mapped[str|None]=mapped_column(String(500)); single_model_mode: Mapped[bool]=mapped_column(Boolean,default=True,nullable=False); shared_model: Mapped[str|None]=mapped_column(String(200)); character_model: Mapped[str|None]=mapped_column(String(200)); world_model: Mapped[str|None]=mapped_column(String(200)); director_model: Mapped[str|None]=mapped_column(String(200)); repair_model: Mapped[str|None]=mapped_column(String(200)); writer_model: Mapped[str|None]=mapped_column(String(200)); critic_model: Mapped[str|None]=mapped_column(String(200)); fallback_model: Mapped[str|None]=mapped_column(String(200)); auto_failover: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False); max_repair_attempts: Mapped[int]=mapped_column(Integer,default=1,nullable=False); request_timeout_seconds: Mapped[float]=mapped_column(Float,default=120.0,nullable=False); max_retries: Mapped[int]=mapped_column(Integer,default=1,nullable=False); rate_limit_per_minute: Mapped[int]=mapped_column(Integer,default=0,nullable=False)
     embedding_enabled: Mapped[bool]=mapped_column(Boolean,default=False,nullable=False)
     embedding_use_main_connection: Mapped[bool]=mapped_column(Boolean,default=True,nullable=False)
     embedding_provider: Mapped[str|None]=mapped_column(String(100))
