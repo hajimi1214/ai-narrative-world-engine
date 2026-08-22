@@ -460,6 +460,29 @@ def test_phase16d3_history_change_suffix_rebuild_metrics(benchmark_session, monk
     assert all(item.sql_query_count > 0 for item in metrics)
 
 
+@pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in large suffix rebuild certification")
+@pytest.mark.parametrize("scene_count", [10_000, 100_000])
+def test_phase16d3_large_suffix_rebuild_scale(benchmark_session, scene_count, capsys):
+    """Stress the open-tail suffix rebuild at the requested history sizes."""
+    project, _ = _fixture(benchmark_session, scene_count)
+    NarrativeStructureProjectionService().rebuild(benchmark_session, project.id)
+    benchmark_session.commit()
+    metrics = measure(
+        benchmark_session,
+        name="large_narrative_suffix_rebuild",
+        scale=scene_count,
+        operation=lambda: NarrativeStructureProjectionService().rebuild_suffix_after_history_change(
+            benchmark_session, project.id, scene_count // 2,
+        ),
+        route="HISTORY_SUFFIX_REBUILD",
+        projection_status="READY",
+        details={"retcon_replay_revision_boundary": scene_count // 2, "full_prefix_rebuild": False},
+    )
+    assert metrics.sql_query_count > 0
+    print(report_json([metrics]))
+    assert capsys.readouterr().out
+
+
 @pytest.mark.skipif(os.getenv("RUN_PHASE16D3") != "1", reason="opt-in 10k/100k continuous SceneCommit certification")
 @pytest.mark.parametrize("scene_count", [10_000, 100_000])
 def test_phase16d3_continuous_scene_commit_scale(benchmark_session, monkeypatch, scene_count, capsys):
