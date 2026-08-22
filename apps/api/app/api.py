@@ -14,7 +14,7 @@ from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MOD
 from .ai.factory import get_model_provider
 from .llm_actor import LLMCharacterActor, _extract_single_json_object
 from .settings import get_settings
-from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, ChapterQualityAssessment, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision, ResearchDocument, ResearchDocumentRevision, ProjectProviderCredential, ProviderCredentialPurpose, CharacterMemoryEmbedding
+from .models import ActionVisibility, AntiAIBible, CanonFact, Character, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory, Chapter, ChapterWriterDraft, ChapterQualityAssessment, WriterDraftStatus, WriterPOVMode, DecisionType, DirectorDecisionLog, PerformanceMode, PerformanceStatus, Project, ProjectTemplate, ProposalStatus, RevealConstraint, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, SceneCommit, SceneStateCheckpoint, StoryArc, StoryThread, WorldEntity, WritingBible, WorldResolution, ResolutionStatus, ResolutionOutcome, ResolverMode, WorldRevision, RevisionStatus, WorldSnapshot, SnapshotType, RevisionApplication, ProjectModelConfig, ProjectWorldSnapshotHead, ExecutionTrace, ExecutionStage, ExecutionStatus, RecoveryCandidate, RecoveryCandidateVersion, RecoveryCandidateStatus, RecoveryCandidateType, RecoveryVersionOrigin, RetconRequest, RetconImpactPlan, RetconImpactItem, RetconApplication, RetconApplicationStatus, RetconCognitionInvalidation, RetconCognitionInvalidationStatus, RetconReplaySession, ReplaySceneRun, ReplaySessionStatus, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent, TimelineEventType, AutonomousWorldRun, AutonomousWorldStep, NarrativeStructureRevision, ResearchDocument, ResearchDocumentRevision, ProjectProviderCredential, ProviderCredentialPurpose, CharacterMemoryEmbedding
 from .performance import CharacterPerformancePayload, HeuristicCharacterPerformer, LLMCharacterPerformer, PerformanceActionConstraintChecker, PerformanceCharacterContextBuilder, PerformanceObservationRouter, PerformancePostTurnStateResolver, TurnScheduler, is_quiescent_cycle
 from .world_resolution import HeuristicWorldResolver, LLMWorldResolver, WorldResolutionContextBuilder, WorldResolutionConstraintChecker, WorldObservationRouter, WorldResolutionPayload
 from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionImpactAnalyzer, RevisionStateFingerprintBuilder, target_fingerprint
@@ -37,6 +37,7 @@ from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionR
 from .writer import WriterDomainError, WriterProjectionAudit, WriterProjectionService
 from .quality import QualityAssessmentFreshnessChecker, QualityDomainError, QualityGateService, QualityRepairService, assessment_payload
 from .embeddings import CredentialVault, EmbeddingRoute, EmbeddingRouter, MemoryEmbeddingIndexService, OpenAICompatibleEmbeddingProvider, embedding_error_code
+from .backup import ProjectBackupService, MAX_ARCHIVE_BYTES
 from .research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
 from .planning import ChapterPlanPatchPayload, PlanCreatePayload, PlanFraming, PlanPatchPayload, chapter_task_context, generate_plan, persist_plan, plan_payload, validate_plan_references
 from .long_form import LongFormEvaluationService, LongFormWorkflowError
@@ -535,6 +536,45 @@ def quality_repair_adopt(project_id: str, chapter_id: str, draft_id: str, db: Se
 @router.get("/projects")
 def list_projects(db: Session = Depends(get_db)):
     return [record_dict(item) for item in db.scalars(select(Project).order_by(Project.created_at.desc())).all()]
+
+@router.get("/projects/{project_id}/backup/export")
+def export_project_backup(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    archive = ProjectBackupService().export(db, project_id)
+    body = json.dumps(archive, ensure_ascii=False, separators=(",", ":"))
+    return Response(content=body, media_type="application/json", headers={
+        "Content-Disposition": f'attachment; filename="novel-backup-{project_id}.json"',
+        "X-Backup-Fingerprint": archive["fingerprint"],
+    })
+
+@router.get("/projects/{project_id}/backup/status")
+def project_backup_status(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    snapshots = db.scalars(select(WorldSnapshot).where(WorldSnapshot.project_id == project_id).order_by(WorldSnapshot.created_at.desc(), WorldSnapshot.id.desc()).limit(10)).all()
+    snapshot_count = db.scalar(select(func.count(WorldSnapshot.id)).where(WorldSnapshot.project_id == project_id)) or 0
+    head = db.scalar(select(ProjectWorldSnapshotHead).where(ProjectWorldSnapshotHead.project_id == project_id))
+    return {"safe": True, "snapshot_count": int(snapshot_count), "last_snapshot_at": serialize(snapshots[0].created_at) if snapshots else None, "current_checkpoint": bool(head), "message": "作品数据保存在本机，导出备份后可随时恢复副本。"}
+
+def _restore_archive(values: dict[str, Any], db: Session):
+    archive = values.get("archive") if isinstance(values.get("archive"), dict) else values
+    if len(json.dumps(archive, ensure_ascii=False, default=str)) > MAX_ARCHIVE_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "BACKUP_TOO_LARGE"})
+    try:
+        project = ProjectBackupService().restore(db, archive, name=values.get("name"))
+        db.commit(); db.refresh(project)
+        return {"project": record_dict(project), "message": "已创建恢复副本，原小说未被覆盖。"}
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+
+@router.post("/projects/import", status_code=status.HTTP_201_CREATED)
+def import_project_backup(payload: Payload, db: Session = Depends(get_db)):
+    return _restore_archive(payload.model_dump(), db)
+
+@router.post("/projects/{project_id}/backup/restore", status_code=status.HTTP_201_CREATED)
+def restore_project_backup(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return _restore_archive(payload.model_dump(), db)
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)
 def create_project(payload: Payload, db: Session = Depends(get_db)):

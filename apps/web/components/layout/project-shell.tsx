@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState, type ComponentType, type ReactNode } from "react";
-import { BookOpen, BrainCircuit, ChevronLeft, ChevronRight, CircleDot, Compass, FileText, Landmark, Menu, PlayCircle, Settings, ShieldAlert, Sparkles, Users, Workflow, Wrench, History, PenLine } from "lucide-react";
+import { Archive, BookOpen, BrainCircuit, ChevronLeft, ChevronRight, CircleDot, Compass, FileText, Landmark, Menu, PlayCircle, Settings, ShieldAlert, Sparkles, Users, Workflow, Wrench, History, PenLine } from "lucide-react";
 import { api } from "../../app/lib";
 import { displayStatus } from "../../app/terminology";
 
@@ -14,7 +14,7 @@ const groups: readonly NavGroup[] = [
   { label: "人物", items: [["人物档案", "characters", Users]] },
   { label: "剧情", items: [["整本规划", "planning", BookOpen], ["剧情线程", "story-threads", Workflow], ["导演台", "director", Sparkles], ["世界运行", "director?mode=autonomy", PlayCircle]] },
   { label: "写作", items: [["章节工作台", "chapters", PenLine], ["写作手册", "writing-bibles", FileText], ["反 AI 规则", "anti-ai-bibles", ShieldAlert]] },
-  { label: "运行与调试", items: [["恢复中心", "recovery-candidates", Wrench], ["历史改写", "retcon", History]] },
+  { label: "作品安全", items: [["小说安全", "safety", Archive], ["异常修复", "recovery-candidates", Wrench], ["历史改写", "retcon", History]] },
   { label: "设置", items: [["模型配置", "model-config", Settings]] },
 ] as const;
 

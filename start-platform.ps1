@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $apiPort = 8000
 $webPort = 3000
-$databaseUrl = if ($env:DATABASE_URL) { $env:DATABASE_URL } else { "postgresql+psycopg://narrative:narrative@localhost:5432/narrative" }
+$databaseUrl = if ($env:DATABASE_URL) { $env:DATABASE_URL } else { "sqlite:///./narrative.db" }
 
 function Test-PortListening([int] $port) {
   return [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
@@ -31,7 +31,7 @@ if (-not (Test-PortListening $apiPort)) {
 if (-not (Test-PortListening $webPort)) {
   Start-Process powershell -WorkingDirectory (Join-Path $projectRoot "apps\web") -ArgumentList @(
     "-NoExit", "-ExecutionPolicy", "Bypass", "-Command",
-    "pnpm start --hostname 127.0.0.1 --port $webPort"
+    "pnpm dev --hostname 127.0.0.1 --port $webPort"
   ) | Out-Null
 } else {
   Write-Host "Web already listening on http://127.0.0.1:$webPort" -ForegroundColor DarkGreen
