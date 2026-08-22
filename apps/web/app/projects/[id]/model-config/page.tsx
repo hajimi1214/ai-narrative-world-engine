@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { Activity, Check, Database, RotateCcw, Save, Zap, WandSparkles } from "lucide-react";
+import { Activity, Check, CheckCircle2, CircleAlert, Database, LoaderCircle, RotateCcw, Save, Zap, WandSparkles } from "lucide-react";
 import { api } from "../../../lib";
 import { ErrorState, LoadingState, PageHeader, SectionCard } from "../../../../components/ui/primitives";
 import styles from "./model-config.module.css";
@@ -36,8 +36,8 @@ const defaults: Config = {
 export default function ModelConfigPage({ params }: { params: { id: string } }) {
   const [config, setConfig] = useState<Config>(defaults); const [generationKey, setGenerationKey] = useState(""); const [embeddingKey, setEmbeddingKey] = useState("");
   const [indexStatus, setIndexStatus] = useState<Config | null>(null); const [usage, setUsage] = useState<Config | null>(null);
-  const [loading, setLoading] = useState(true); const [saving, setSaving] = useState(false); const [message, setMessage] = useState(""); const [error, setError] = useState("");
-  const load = () => { setLoading(true); setError(""); void Promise.all([api(`/projects/${params.id}/model-config`), api(`/projects/${params.id}/memory-embeddings/status`).catch(() => null), api(`/projects/${params.id}/model-config/usage`).catch(() => null)]).then(([value, status, telemetry]) => { setConfig({ ...defaults, ...(value || {}) }); setIndexStatus(status as Config | null); setUsage(telemetry as Config | null); }).catch(() => setError("无法读取模型配置。" )).finally(() => setLoading(false)); };
+  const [loading, setLoading] = useState(true); const [saving, setSaving] = useState(false); const [message, setMessage] = useState(""); const [error, setError] = useState(""); const [connection, setConnection] = useState<"checking" | "ready" | "missing" | "error">("checking"); const [connectionMessage, setConnectionMessage] = useState("");
+  const load = () => { setLoading(true); setError(""); setConnection("checking"); void Promise.all([api(`/projects/${params.id}/model-config`), api(`/projects/${params.id}/memory-embeddings/status`).catch(() => null), api(`/projects/${params.id}/model-config/usage`).catch(() => null)]).then(async ([value, status, telemetry]) => { const next = { ...defaults, ...(value || {}) }; setConfig(next); setIndexStatus(status as Config | null); setUsage(telemetry as Config | null); if (!next.credentials?.GENERATION?.configured && !next.base_url) { setConnection("missing"); setConnectionMessage("先填写模型服务地址和密钥"); return; } try { const result = await api(`/projects/${params.id}/model-config/test-generation`, { method: "POST", body: JSON.stringify({ provider: next.provider, base_url: next.base_url, model: next.shared_model || next.writer_model }) }) as any; setConnection("ready"); setConnectionMessage(`连接正常 · ${result.model} · ${result.latency_ms}ms`); } catch (reason) { setConnection("error"); setConnectionMessage(reason instanceof Error ? reason.message : "暂时无法连接，请检查配置"); } }).catch(() => { setConnection("error"); setConnectionMessage("无法读取模型配置"); setError("无法读取模型配置。" ); }).finally(() => setLoading(false)); };
   useEffect(load, [params.id]);
   const update = (name: string, value: unknown) => setConfig((current) => ({ ...current, [name]: value }));
   function applyOneModel() {
@@ -58,11 +58,11 @@ export default function ModelConfigPage({ params }: { params: { id: string } }) 
     catch (reason) { setError(reason instanceof Error ? reason.message : "嵌入连接测试失败。"); } finally { setSaving(false); }
   }
   async function testGeneration() {
-    setSaving(true); setError(""); setMessage("");
+    setSaving(true); setError(""); setMessage(""); setConnection("checking");
     try {
       const result = await api(`/projects/${params.id}/model-config/test-generation`, { method: "POST", body: JSON.stringify({ provider: config.provider, base_url: config.base_url, model: config.shared_model || config.writer_model, api_key: generationKey || undefined, test_prompt: '{"phase":"model_gateway","ok":true}' }) }) as any;
-      setMessage(`生成连接可用：${result.model}，响应 ${result.chars} 字符，耗时 ${result.latency_ms}ms。`);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "生成连接测试失败。"); } finally { setSaving(false); }
+      setConnection("ready"); setConnectionMessage(`连接正常 · ${result.model} · ${result.latency_ms}ms`); setMessage(`生成连接可用：${result.model}，响应 ${result.chars} 字符。`);
+    } catch (reason) { setConnection("error"); setConnectionMessage(reason instanceof Error ? reason.message : "生成连接测试失败"); setError(reason instanceof Error ? reason.message : "生成连接测试失败。"); } finally { setSaving(false); }
   }
   async function indexMemories(rebuild = false) {
     setSaving(true); setError("");
@@ -70,8 +70,9 @@ export default function ModelConfigPage({ params }: { params: { id: string } }) 
     catch (reason) { setError(reason instanceof Error ? reason.message : "索引失败。"); } finally { setSaving(false); }
   }
   if (loading) return <LoadingState />;
-  return <form className="form" onSubmit={save}><PageHeader title="模型与记忆检索" description="项目级模型连接与角色记忆召回策略。密钥仅作为写入值处理。" action={<button className="button" disabled={saving}><Save size={16} />保存</button>} />
+  return <form className="form" onSubmit={save}><PageHeader title="模型与记忆检索" description="先把模型连接好，再开始整本规划。保存后平台会自动检查连接状态。" action={<button className="button" disabled={saving}><Save size={16} />保存</button>} />
     {error && <ErrorState message={error} retry={load} />}{message && <div className="success-state"><Check size={18} />{message}</div>}
+    <section className={`model-connection-banner model-connection-${connection}`}><div className="model-connection-icon">{connection === "checking" ? <LoaderCircle size={18} className="model-check-spin" /> : connection === "ready" ? <CheckCircle2 size={18} /> : <CircleAlert size={18} />}</div><div><strong>{connection === "checking" ? "正在自动测试模型连接…" : connection === "ready" ? "模型连接正常，可以开始写作" : connection === "missing" ? "还没有完成模型设置" : "模型连接需要检查"}</strong><p>{connectionMessage || "进入此页面时会自动发送一次极短测试请求，不会生成小说正文。"}</p></div>{connection !== "checking" && <button type="button" className="button secondary" onClick={testGeneration} disabled={saving}><Zap size={15} />重新测试</button>}</section>
     <div className={styles.columns}><SectionCard title="生成模型" description="默认使用 tokenrhythm 的 DeepSeek；所有任务可以共享同一个模型。"><div className="form-grid">
       <label className="field"><span>提供方</span><select value={config.provider} onChange={(e) => update("provider", e.target.value)}><option value="disabled">禁用</option><option value="openai_compatible">OpenAI 兼容</option></select></label>
       <label className="field"><span>Base URL</span><input value={config.base_url || ""} onChange={(e) => update("base_url", e.target.value)} placeholder="https://provider.example/v1" /></label>

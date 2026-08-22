@@ -1496,6 +1496,32 @@ def test_generation_config(project_id: str, payload: Payload, db: Session = Depe
         safe_codes = {MODEL_TIMEOUT, MODEL_RATE_LIMITED, MODEL_AUTH_FAILED, "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_UPSTREAM_ERROR", MODEL_OUTPUT_INVALID}
         code = exc.code if exc.code in safe_codes else "MODEL_UPSTREAM_ERROR"
         raise HTTPException(status_code=409, detail={"code": code}) from exc
+
+@router.post("/model-config/test-generation")
+def test_generation_config_preview(payload: Payload):
+    """Test a model connection before an author creates a project."""
+    values = payload.model_dump()
+    settings = get_settings()
+    provider_name = values.get("provider") or settings.ai_provider
+    base_url = values.get("base_url") or settings.ai_base_url
+    model = values.get("model") or settings.ai_writer_model
+    api_key = values.get("api_key") or (settings.ai_api_key.get_secret_value() if settings.ai_api_key else None)
+    try:
+        if not provider_name or not base_url or not model or not api_key:
+            raise ValueError("MODEL_PROVIDER_NOT_CONFIGURED")
+        provider = get_model_provider(settings, provider_name, base_url, api_key)
+        result = provider.generate(
+            [
+                {"role": "system", "content": "Return only a compact JSON object with the key ok set to true."},
+                {"role": "user", "content": values.get("test_prompt") or '{"phase":"model_gateway_preview","ok":true}'},
+            ],
+            model,
+        )
+        return {"ok": True, "provider": result.provider, "model": result.model, "chars": len(result.content), "latency_ms": result.latency_ms, "request_id": result.request_id}
+    except ModelProviderError as exc:
+        safe_codes = {MODEL_TIMEOUT, MODEL_RATE_LIMITED, MODEL_AUTH_FAILED, "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_UPSTREAM_ERROR", MODEL_OUTPUT_INVALID}
+        code = exc.code if exc.code in safe_codes else "MODEL_UPSTREAM_ERROR"
+        raise HTTPException(status_code=409, detail={"code": code}) from exc
     except ValueError as exc:
         code = str(exc) if str(exc) in {"MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED"} else "MODEL_PROVIDER_NOT_CONFIGURED"
         raise HTTPException(status_code=409, detail={"code": code}) from exc

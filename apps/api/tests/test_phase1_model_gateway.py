@@ -60,3 +60,12 @@ def test_generation_connection_test_is_read_only(session, monkeypatch):
     assert response.json()["model"] == "deepseek-v4-pro"
     assert fake.calls == 1
     assert session.query(ProjectModelConfig).count() == 0
+
+
+def test_generation_preview_can_run_before_project_creation(monkeypatch):
+    fake = FakeModelProvider('{"ok":true}')
+    monkeypatch.setattr(api_module, "get_model_provider", lambda *args, **kwargs: fake)
+    response = TestClient(app).post("/model-config/test-generation", json={"provider": "openai_compatible", "base_url": "https://tokenrhythm.studio/v1", "model": "deepseek-v4-pro", "api_key": "temporary-key"})
+    assert response.status_code == 200
+    assert response.json()["model"] == "deepseek-v4-pro"
+    assert fake.calls == 1
