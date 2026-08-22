@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..research import KnowledgePacketBuilder, ResearchCorpusFingerprintBuilder, ResearchDomainError, ResearchIngestionService
+from ..embeddings import ResearchChunkEmbeddingIndexService
 from ..models import ResearchDocument, ResearchDocumentRevision
 from .common import Payload, get_db, require_project, serialize
 
@@ -149,3 +150,37 @@ def search_research(project_id: str, payload: Payload, db: Session = Depends(get
 def preview_knowledge(project_id: str, payload: Payload, db: Session = Depends(get_db)):
     values = payload.model_dump()
     return _packet(db, project_id, payload, values.get("mode", "AUTHOR")).as_dict()
+
+
+@router.get("/projects/{project_id}/research/embeddings/status")
+def research_embedding_status(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    try:
+        return ResearchChunkEmbeddingIndexService().status(db, project_id)
+    except ValueError as exc:
+        code = str(exc)
+        if code.startswith("EMBEDDING_") or code.startswith("MODEL_"):
+            return {"embedding_enabled": False, "status": "UNAVAILABLE", "error_code": code}
+        raise HTTPException(status_code=409, detail={"code": "RESEARCH_EMBEDDING_STATUS_FAILED"}) from exc
+
+
+@router.post("/projects/{project_id}/research/embeddings/index")
+def index_research_embeddings(project_id: str, payload: Payload, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    values = payload.model_dump()
+    chunk_ids = values.get("chunk_ids")
+    if chunk_ids is not None and (not isinstance(chunk_ids, list) or any(not isinstance(item, str) or not item.strip() for item in chunk_ids)):
+        raise HTTPException(status_code=400, detail={"code": "RESEARCH_EMBEDDING_CHUNK_IDS_INVALID"})
+    try:
+        result = ResearchChunkEmbeddingIndexService().index_chunks(db, project_id, chunk_ids=chunk_ids, rebuild=bool(values.get("rebuild", False)))
+        db.commit()
+        return result | {"status": "READY" if not result.get("failed") else "PARTIAL_FAILURE"}
+    except ValueError as exc:
+        db.rollback()
+        code = str(exc)
+        if code in {"EMBEDDING_CONFIG_INCOMPLETE", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID"}:
+            raise HTTPException(status_code=409, detail={"code": code}) from exc
+        raise HTTPException(status_code=409, detail={"code": "RESEARCH_EMBEDDING_INDEX_FAILED"}) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "RESEARCH_EMBEDDING_INDEX_FAILED"}) from exc

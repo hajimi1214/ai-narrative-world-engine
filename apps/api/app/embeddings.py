@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .ai.errors import MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MODEL_UPSTREAM_ERROR, ModelProviderError
-from .models import Character, CharacterMemory, CharacterMemoryEmbedding, EmbeddingStatus, MemoryRetrievalMode, ProjectModelConfig, ProjectProviderCredential, ProviderCredentialPurpose
+from .models import Character, CharacterMemory, CharacterMemoryEmbedding, EmbeddingStatus, MemoryRetrievalMode, ProjectModelConfig, ProjectProviderCredential, ProviderCredentialPurpose, ResearchChunk, ResearchChunkEmbedding, ResearchDocument, ResearchDocumentRevision
 
 
 def _fingerprint(value: object, protocol: str) -> str:
@@ -136,9 +136,9 @@ class EmbeddingRoute:
 
 
 class EmbeddingRouter:
-    def resolve(self, db: Session, project_id: str, settings) -> EmbeddingRoute:
+    def _resolve(self, db: Session, project_id: str, settings, *, require_memory_hybrid: bool) -> EmbeddingRoute:
         config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
-        if not config or not config.embedding_enabled or config.memory_retrieval_mode != MemoryRetrievalMode.HYBRID_RRF:
+        if not config or not config.embedding_enabled or (require_memory_hybrid and config.memory_retrieval_mode != MemoryRetrievalMode.HYBRID_RRF):
             return EmbeddingRoute(False, "disabled", "", "", 0, None, "NONE", "")
         if config.embedding_use_main_connection:
             provider, base_url = config.provider or settings.ai_provider, config.base_url or settings.ai_base_url
@@ -157,6 +157,17 @@ class EmbeddingRouter:
             raise ValueError("EMBEDDING_CONFIG_INCOMPLETE")
         identity = (provider, (base_url or "").rstrip("/").casefold(), config.embedding_model, config.embedding_dimension, "character-memory-embedding-v1")
         return EmbeddingRoute(True, provider, base_url, config.embedding_model, config.embedding_dimension, key, source, _fingerprint(identity, "character-memory-embedding-config-v1"))
+
+    def resolve(self, db: Session, project_id: str, settings) -> EmbeddingRoute:
+        return self._resolve(db, project_id, settings, require_memory_hybrid=True)
+
+    def resolve_research(self, db: Session, project_id: str, settings) -> EmbeddingRoute:
+        """Resolve the independent vector connection for research chunks."""
+        route = self._resolve(db, project_id, settings, require_memory_hybrid=False)
+        if not route.enabled:
+            return route
+        identity = (route.provider, route.base_url.rstrip("/").casefold(), route.model, route.dimension, "research-chunk-embedding-v1")
+        return EmbeddingRoute(route.enabled, route.provider, route.base_url, route.model, route.dimension, route.api_key, route.credential_source, _fingerprint(identity, "research-chunk-embedding-config-v1"))
 
 
 class MemoryEmbeddingIndexService:
@@ -217,6 +228,126 @@ class MemoryEmbeddingIndexService:
         ready = sum(row.status == EmbeddingStatus.READY and row.content_fingerprint == memory_content_fingerprint(next(memory.content for memory in current if memory.id == row.memory_id)) for row in current_rows)
         failed = sum(row.status == EmbeddingStatus.FAILED for row in current_rows)
         return {"embedding_enabled": route.enabled, "memory_retrieval_mode": getattr(route, "mode", None), "provider": route.provider, "model": route.model, "dimension": route.dimension, "embedding_config_fingerprint": route.embedding_config_fingerprint, "current_valid_memory_count": len(current), "ready_count": ready, "missing_count": max(0, len(current) - len(current_rows)), "failed_count": failed, "stale_count": sum(row.status == EmbeddingStatus.READY and row.content_fingerprint != memory_content_fingerprint(next(memory.content for memory in current if memory.id == row.memory_id)) for row in current_rows), "coverage_ratio": ready / len(current) if current else 1.0}
+
+
+class ResearchChunkEmbeddingIndexService:
+    """Persist vectors for the active revision of each research document."""
+
+    def __init__(self, provider_factory=None):
+        self.provider_factory = provider_factory
+
+    def _provider(self, route: EmbeddingRoute):
+        if not route.api_key:
+            raise ValueError("EMBEDDING_CONFIG_INCOMPLETE")
+        return self.provider_factory(route) if self.provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key)
+
+    @staticmethod
+    def _content_fingerprint(content: str) -> str:
+        return _fingerprint(content, "research-chunk-content-v1")
+
+    def index_chunks(self, db: Session, project_id: str, chunk_ids: list[str] | None = None, *, rebuild: bool = False, settings=None) -> dict[str, Any]:
+        from .settings import get_settings
+        route = EmbeddingRouter().resolve_research(db, project_id, settings or get_settings())
+        if not route.enabled:
+            raise ValueError("EMBEDDING_CONFIG_INCOMPLETE")
+        query = select(ResearchChunk).join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id).join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id).where(
+            ResearchChunk.project_id == project_id, ResearchChunk.active.is_(True), ResearchDocument.active.is_(True), ResearchDocumentRevision.active.is_(True),
+        ).order_by(ResearchChunk.id)
+        if chunk_ids:
+            query = query.where(ResearchChunk.id.in_(chunk_ids))
+        chunks = db.scalars(query.with_for_update()).all()
+        candidates = []
+        for chunk in chunks:
+            fp = self._content_fingerprint(chunk.content)
+            existing = db.scalar(select(ResearchChunkEmbedding).where(ResearchChunkEmbedding.chunk_id == chunk.id, ResearchChunkEmbedding.embedding_config_fingerprint == route.embedding_config_fingerprint))
+            if existing and not rebuild and existing.status == EmbeddingStatus.READY and existing.content_fingerprint == fp:
+                continue
+            candidates.append((chunk, existing, fp))
+        if not candidates:
+            return {"indexed": 0, "failed": 0, "skipped": len(chunks), "config_fingerprint": route.embedding_config_fingerprint}
+        rows = []
+        for chunk, existing, fp in candidates:
+            row = existing or ResearchChunkEmbedding(project_id=project_id, document_id=chunk.document_id, revision_id=chunk.revision_id, chunk_id=chunk.id, embedding_config_fingerprint=route.embedding_config_fingerprint, provider=route.provider, model=route.model, dimension=route.dimension, content_fingerprint=fp)
+            row.status = EmbeddingStatus.PENDING; row.attempt_count = (row.attempt_count or 0) + 1; row.last_error_code = None; row.embedding = None
+            if not existing:
+                db.add(row)
+            rows.append(row)
+        db.flush()
+        try:
+            result = self._provider(route).embed([chunk.content for chunk, _, _ in candidates], route.model)
+            if result.dimension != route.dimension or any(len(vector) != route.dimension for vector in result.vectors):
+                raise ValueError("EMBEDDING_DIMENSION_MISMATCH")
+            if len(result.vectors) != len(candidates) or any(
+                any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in vector)
+                for vector in result.vectors
+            ):
+                raise ValueError("EMBEDDING_OUTPUT_INVALID")
+        except Exception as exc:
+            safe_code = embedding_error_code(exc, "EMBEDDING_OUTPUT_INVALID")
+            for row in rows:
+                row.status = EmbeddingStatus.FAILED; row.last_error_code = safe_code
+            db.flush()
+            return {"indexed": 0, "failed": len(rows), "skipped": len(chunks) - len(candidates), "config_fingerprint": route.embedding_config_fingerprint, "error_code": safe_code}
+        for (chunk, _, fp), vector in zip(candidates, result.vectors):
+            row = next(item for item in rows if item.chunk_id == chunk.id)
+            row.provider, row.model, row.dimension, row.content_fingerprint = route.provider, route.model, route.dimension, fp
+            row.embedding, row.status, row.last_error_code, row.request_id, row.latency_ms, row.indexed_at = vector, EmbeddingStatus.READY, None, result.request_id, result.latency_ms, datetime.now(UTC)
+        db.flush()
+        return {"indexed": len(candidates), "failed": 0, "skipped": len(chunks) - len(candidates), "config_fingerprint": route.embedding_config_fingerprint}
+
+    def status(self, db: Session, project_id: str, settings=None) -> dict[str, Any]:
+        from .settings import get_settings
+        route = EmbeddingRouter().resolve_research(db, project_id, settings or get_settings())
+        chunks = db.scalars(select(ResearchChunk).join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id).join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id).where(ResearchChunk.project_id == project_id, ResearchChunk.active.is_(True), ResearchDocument.active.is_(True), ResearchDocumentRevision.active.is_(True))).all()
+        rows = db.scalars(select(ResearchChunkEmbedding).where(ResearchChunkEmbedding.project_id == project_id, ResearchChunkEmbedding.embedding_config_fingerprint == route.embedding_config_fingerprint)).all()
+        by_chunk = {row.chunk_id: row for row in rows}
+        ready = sum(1 for chunk in chunks if (row := by_chunk.get(chunk.id)) and row.status == EmbeddingStatus.READY and row.content_fingerprint == self._content_fingerprint(chunk.content))
+        return {"embedding_enabled": route.enabled, "provider": route.provider, "model": route.model, "dimension": route.dimension, "embedding_config_fingerprint": route.embedding_config_fingerprint, "active_chunk_count": len(chunks), "ready_count": ready, "missing_count": max(0, len(chunks) - len(by_chunk)), "failed_count": sum(row.status == EmbeddingStatus.FAILED for row in rows), "coverage_ratio": ready / len(chunks) if chunks else 1.0}
+
+
+class ResearchChunkEmbeddingAudit:
+    def audit(self, db: Session, embedding_id: str) -> dict[str, Any]:
+        row = db.get(ResearchChunkEmbedding, embedding_id); chunk = db.get(ResearchChunk, row.chunk_id) if row else None
+        if not row or not chunk or row.project_id != chunk.project_id or row.document_id != chunk.document_id or row.revision_id != chunk.revision_id or row.content_fingerprint != ResearchChunkEmbeddingIndexService._content_fingerprint(chunk.content):
+            raise ValueError("RESEARCH_CHUNK_EMBEDDING_INTEGRITY_INVALID")
+        vector = row.embedding or []
+        if row.status == EmbeddingStatus.READY and (not vector or len(vector) != row.dimension or any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in vector)):
+            raise ValueError("RESEARCH_CHUNK_EMBEDDING_INTEGRITY_INVALID")
+        return {"valid": True, "embedding_id": row.id, "chunk_id": chunk.id}
+
+
+class ResearchChunkSemanticRetriever:
+    def retrieve(self, db: Session, project_id: str, query_vector: list[float], config_fingerprint: str, top_k: int = 12, filters: dict[str, Any] | None = None) -> list[tuple[str, float]]:
+        filters = filters or {}
+        clauses = [ResearchChunkEmbedding.project_id == project_id, ResearchChunkEmbedding.embedding_config_fingerprint == config_fingerprint, ResearchChunkEmbedding.status == EmbeddingStatus.READY, ResearchChunkEmbedding.dimension == len(query_vector), ResearchChunk.active.is_(True), ResearchDocument.active.is_(True), ResearchDocumentRevision.active.is_(True)]
+        if filters.get("document_ids"):
+            clauses.append(ResearchChunk.document_id.in_(filters["document_ids"]))
+        if filters.get("source_tiers"):
+            clauses.append(ResearchDocument.source_tier.in_(filters["source_tiers"]))
+        if filters.get("source_kinds"):
+            clauses.append(ResearchDocument.source_kind.in_(filters["source_kinds"]))
+        base = select(ResearchChunkEmbedding).join(ResearchChunk, ResearchChunk.id == ResearchChunkEmbedding.chunk_id).join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id).join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id).where(*clauses)
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            distance = cast(ResearchChunkEmbedding.embedding.op("<=>")(query_vector), Float).label("distance")
+            rows = db.execute(select(ResearchChunkEmbedding, distance).select_from(ResearchChunkEmbedding).join(ResearchChunk, ResearchChunk.id == ResearchChunkEmbedding.chunk_id).join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id).join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id).where(*clauses).order_by(distance, ResearchChunkEmbedding.chunk_id).limit(top_k)).all()
+            values = []
+            for row, distance_value in rows:
+                chunk = db.get(ResearchChunk, row.chunk_id)
+                if not chunk or row.content_fingerprint != ResearchChunkEmbeddingIndexService._content_fingerprint(chunk.content):
+                    continue
+                values.append((row.chunk_id, 1.0 - float(distance_value)))
+            return values
+        rows = db.scalars(base).all()
+        values = []
+        for row in rows:
+            chunk = db.get(ResearchChunk, row.chunk_id)
+            if not chunk or row.content_fingerprint != ResearchChunkEmbeddingIndexService._content_fingerprint(chunk.content):
+                continue
+            vector = row.embedding or []
+            denom = math.sqrt(sum(value * value for value in query_vector)) * math.sqrt(sum(value * value for value in vector))
+            similarity = sum(left * right for left, right in zip(query_vector, vector)) / denom if denom else 0.0
+            values.append((row.chunk_id, similarity))
+        return sorted(values, key=lambda item: (-item[1], item[0]))[:top_k]
 
 
 class CharacterMemoryEmbeddingAudit:

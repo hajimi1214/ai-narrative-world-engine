@@ -622,9 +622,10 @@ class ResearchDiversifier:
 
 class ResearchBM25Retriever:
 
-    def __init__(self, tokenizer: KnowledgeTokenizer | None = None, diversifier: ResearchDiversifier | None = None):
+    def __init__(self, tokenizer: KnowledgeTokenizer | None = None, diversifier: ResearchDiversifier | None = None, embedding_provider_factory=None):
         self.tokenizer = tokenizer or KnowledgeTokenizer()
         self.diversifier = diversifier or ResearchDiversifier(self.tokenizer)
+        self.embedding_provider_factory = embedding_provider_factory
         # Ephemeral route evidence; never included in KnowledgePacket or hit
         # payloads. This makes indexed success distinct from legacy fallback.
         self.last_route: str = "UNSET"
@@ -652,9 +653,8 @@ class ResearchBM25Retriever:
             try:
                 from .retrieval_index import ResearchIndexedBM25Retriever, ResearchLexicalIndexService
                 if ResearchLexicalIndexService().fast_path_available(db, project_id):
-                    result = ResearchIndexedBM25Retriever().search(db, project_id, query_text, filters=filters, config=cfg)
-                    self.last_route = "INDEXED_FAST"
-                    return result
+                    lexical_hits = ResearchIndexedBM25Retriever().search(db, project_id, query_text, filters=filters, config=cfg)
+                    return self._hybrid(db, project_id, query_text, lexical_hits, filters, cfg, browse_mode=False)
                 self.last_route = "LEGACY_INDEX_UNAVAILABLE"
                 self.last_fallback_reason = "RESEARCH_LEXICAL_INDEX_NOT_READY"
             except Exception as exc:
@@ -729,7 +729,104 @@ class ResearchBM25Retriever:
             total += len(content)
             document = item["document"]
             hits.append(ResearchHit(item["chunk"].id, document.id, item["revision"].id, document.title, _value(document.source_tier), _value(document.source_kind), float(item["score"]), index, content, item["content_fingerprint"], document.source_uri, _safe_metadata(document.source_metadata, reject=False), item["authority_rank"], truncated))
-        return hits
+        return self._hybrid(db, project_id, query_text, hits, filters, cfg, browse_mode=browse_mode)
+
+    def _hybrid(self, db: Session, project_id: str, query_text: str, lexical_hits: list[ResearchHit], filters: dict[str, Any], config: ResearchConfig, *, browse_mode: bool) -> list[ResearchHit]:
+        """Add semantic recall when configured, then fuse by rank only.
+
+        Provider/configuration failures are deliberately invisible to callers
+        except for the diagnostic fields on this retriever; BM25 remains the
+        authoritative fallback.
+        """
+        if browse_mode or not query_text.strip():
+            if self.last_route == "UNSET":
+                self.last_route = "LEXICAL_ONLY"
+            return lexical_hits
+        try:
+            from .embeddings import EmbeddingRouter, OpenAICompatibleEmbeddingProvider, ResearchChunkSemanticRetriever
+            from .settings import get_settings
+            route = EmbeddingRouter().resolve_research(db, project_id, get_settings())
+            if not route.enabled:
+                self.last_route = "LEXICAL_ONLY"
+                return lexical_hits
+            provider = self.embedding_provider_factory(route) if self.embedding_provider_factory else OpenAICompatibleEmbeddingProvider(route.base_url, route.api_key or "")
+            result = provider.embed([query_text], route.model)
+            if len(result.vectors) != 1 or result.dimension != route.dimension:
+                raise ValueError("EMBEDDING_DIMENSION_MISMATCH")
+            semantic_ids = ResearchChunkSemanticRetriever().retrieve(
+                db, project_id, result.vectors[0], route.embedding_config_fingerprint,
+                top_k=max(config.top_k * 4, config.top_k), filters=filters,
+            )
+            if not semantic_ids:
+                self.last_route = "LEXICAL_ONLY"
+                self.last_fallback_reason = "RESEARCH_SEMANTIC_INDEX_EMPTY"
+                return lexical_hits
+            from .models import ResearchChunk, ResearchDocument, ResearchDocumentRevision
+            rows = db.execute(
+                select(ResearchDocument, ResearchDocumentRevision, ResearchChunk)
+                .join(ResearchDocumentRevision, ResearchDocumentRevision.id == ResearchChunk.revision_id)
+                .join(ResearchDocument, ResearchDocument.id == ResearchChunk.document_id)
+                .where(ResearchChunk.id.in_([item[0] for item in semantic_ids]))
+            ).all()
+            by_id = {chunk.id: (document, revision, chunk) for document, revision, chunk in rows}
+            semantic_hits: list[ResearchHit] = []
+            requested_tags = set(filters.get("tags") or ())
+            for rank, (chunk_id, similarity) in enumerate(semantic_ids, 1):
+                item = by_id.get(chunk_id)
+                if item is None:
+                    continue
+                document, revision, chunk = item
+                tags = set(document.source_metadata.get("tags", []) if isinstance(document.source_metadata, dict) else []) | set(chunk.chunk_metadata.get("tags", []) if isinstance(chunk.chunk_metadata, dict) else [])
+                if requested_tags and not tags.intersection(requested_tags):
+                    continue
+                ResearchSourcePolicy().validate(document.source_tier, document.source_kind)
+                _safe_source_uri(document.source_uri); _safe_metadata(document.source_metadata)
+                semantic_hits.append(ResearchHit(
+                    chunk.id, document.id, revision.id, document.title, _value(document.source_tier),
+                    _value(document.source_kind), float(similarity), rank, chunk.content,
+                    chunk.content_fingerprint, document.source_uri,
+                    _safe_metadata(document.source_metadata, reject=False),
+                    KnowledgeAuthorityResolver().rank(KnowledgeAuthorityResolver().for_research(document.source_tier)),
+                    retrieval_channels=("SEMANTIC_VECTOR",),
+                ))
+            if not semantic_hits:
+                self.last_route = "LEXICAL_ONLY"
+                self.last_fallback_reason = "RESEARCH_SEMANTIC_FILTER_EMPTY"
+                return lexical_hits
+            fused = ResearchHybridRRF().merge(lexical_hits, semantic_hits, top_k=max(config.top_k * 4, config.top_k))
+            result_hits: list[ResearchHit] = []
+            seen_fingerprints: set[str] = set()
+            per_document: dict[str, int] = {}
+            total_chars = total_tokens = 0
+            for item in fused:
+                if config.deduplicate_exact and item.content_fingerprint in seen_fingerprints:
+                    continue
+                if per_document.get(item.document_id, 0) >= config.per_document_limit:
+                    continue
+                remaining_chars = config.max_context_chars - total_chars
+                remaining_tokens = config.max_context_tokens - total_tokens
+                if remaining_chars <= 0 or remaining_tokens <= 0:
+                    break
+                content, truncated = self.tokenizer.bounded_prefix(item.content, remaining_chars, remaining_tokens)
+                total_chars += len(content); total_tokens += len(self.tokenizer.tokenize(content))
+                if config.deduplicate_exact:
+                    seen_fingerprints.add(item.content_fingerprint)
+                per_document[item.document_id] = per_document.get(item.document_id, 0) + 1
+                result_hits.append(ResearchHit(
+                    item.chunk_id, item.document_id, item.revision_id, item.title, item.source_tier,
+                    item.source_kind, item.score, len(result_hits) + 1, content, item.content_fingerprint,
+                    item.source_uri, item.source_metadata, item.authority_rank, truncated,
+                    item.retrieval_channels,
+                ))
+                if len(result_hits) >= config.top_k:
+                    break
+            self.last_route = "HYBRID_RRF"
+            self.last_fallback_reason = None
+            return result_hits
+        except Exception as exc:
+            self.last_route = "LEXICAL_FALLBACK" if lexical_hits else "LEXICAL_ONLY"
+            self.last_fallback_reason = self._safe_route_reason(exc)
+            return lexical_hits
 
     @staticmethod
     def _safe_route_reason(exc: BaseException) -> str:

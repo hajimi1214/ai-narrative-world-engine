@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..formal_state import FormalStateIdentityService
+from ..embeddings import ResearchChunkEmbeddingIndexService
 from ..models import NarrativeStructureRevision
 from ..narrative_structure import NarrativeStructureService
 from ..narrative_structure_projection import NarrativeStructureProjectionService
@@ -20,7 +21,7 @@ def scaling_status(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
     return ProjectHistoryProjectionService().status(db, project_id) | {
         "cognition": CognitionRetrievalProjectionService().status(db, project_id),
-        "research": ResearchLexicalIndexService().status(db, project_id),
+        "research": ResearchLexicalIndexService().status(db, project_id) | {"embeddings": ResearchChunkEmbeddingIndexService().status(db, project_id)},
         "formal_state": FormalStateIdentityService().status(db, project_id),
         "narrative_structure": NarrativeStructureProjectionService().status(db, project_id),
     }
@@ -49,7 +50,7 @@ def retrieval_status(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
     return {
         "cognition": CognitionRetrievalProjectionService().status(db, project_id),
-        "research": ResearchLexicalIndexService().status(db, project_id),
+        "research": ResearchLexicalIndexService().status(db, project_id) | {"embeddings": ResearchChunkEmbeddingIndexService().status(db, project_id)},
         "ann": MemoryANNIndexStatusService().status(db, project_id),
     }
 

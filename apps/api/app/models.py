@@ -1382,6 +1382,32 @@ class ResearchChunk(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
+class ResearchChunkEmbedding(TimestampMixin, Base):
+    """Derived semantic vectors for active research chunks."""
+    __tablename__ = "research_chunk_embeddings"
+    __table_args__ = (
+        UniqueConstraint("chunk_id", "embedding_config_fingerprint", name="uq_research_chunk_embedding_config"),
+        Index("ix_research_chunk_embedding_project_config_status", "project_id", "embedding_config_fingerprint", "status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("research_documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    revision_id: Mapped[str] = mapped_column(ForeignKey("research_document_revisions.id", ondelete="CASCADE"), nullable=False, index=True)
+    chunk_id: Mapped[str] = mapped_column(ForeignKey("research_chunks.id", ondelete="CASCADE"), nullable=False, index=True)
+    embedding_config_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    dimension: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[EmbeddingStatus] = mapped_column(Enum(EmbeddingStatus, native_enum=False, length=20), default=EmbeddingStatus.PENDING, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(MemoryEmbeddingVector())
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error_code: Mapped[str | None] = mapped_column(String(120))
+    request_id: Mapped[str | None] = mapped_column(String(200))
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 # Phase 16C1 derived retrieval projections.  These tables deliberately carry
 # only searchable projections; the formal cognition and research rows remain
 # the sole authority for payloads and eligibility.
