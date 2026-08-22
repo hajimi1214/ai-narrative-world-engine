@@ -12,7 +12,10 @@ performance_status = sa.Enum("READY", "RUNNING", "AWAITING_WORLD", "PAUSED", "CO
 action_visibility = sa.Enum("PUBLIC", "TARGETED", "COVERT", "PRIVATE", name="actionvisibility")
 
 def upgrade() -> None:
-    op.alter_column("alembic_version", "version_num", type_=sa.String(64), existing_type=sa.String(32), existing_nullable=False)
+    # SQLite does not support ALTER COLUMN TYPE, and its VARCHAR length is not
+    # enforced. PostgreSQL still needs the wider revision column.
+    if op.get_bind().dialect.name != "sqlite":
+        op.alter_column("alembic_version", "version_num", type_=sa.String(64), existing_type=sa.String(32), existing_nullable=False)
     op.create_table("scene_performances",
         sa.Column("id", sa.String(36), primary_key=True), sa.Column("project_id", sa.String(36), sa.ForeignKey("projects.id"), nullable=False),
         sa.Column("scene_proposal_id", sa.String(36), sa.ForeignKey("scene_proposals.id"), nullable=False), sa.Column("take_number", sa.Integer(), nullable=False),

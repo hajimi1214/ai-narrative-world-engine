@@ -7,11 +7,9 @@ branch_labels = None
 depends_on = None
 
 def upgrade():
-    op.create_unique_constraint(
-        "uq_retcon_impact_plan_request_version",
-        "retcon_impact_plans",
-        ["retcon_request_id", "version"],
-    )
+    with op.batch_alter_table("retcon_impact_plans") as batch:
+        batch.create_unique_constraint("uq_retcon_impact_plan_request_version", ["retcon_request_id", "version"])
 
 def downgrade():
-    op.drop_constraint("uq_retcon_impact_plan_request_version", "retcon_impact_plans", type_="unique")
+    with op.batch_alter_table("retcon_impact_plans") as batch:
+        batch.drop_constraint("uq_retcon_impact_plan_request_version", type_="unique")

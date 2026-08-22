@@ -3,7 +3,10 @@ from alembic import op
 import sqlalchemy as sa
 revision="0007_world_version_execution_foundation"; down_revision="0006_world_revision_foundation"; branch_labels=None; depends_on=None
 def upgrade():
-    for value in ("APPLIED","ROLLED_BACK"): op.execute(f"ALTER TYPE revisionstatus ADD VALUE IF NOT EXISTS '{value}'")
+    # SQLite stores SQLAlchemy enums as regular VARCHAR columns; PostgreSQL
+    # needs the enum values added explicitly.
+    if op.get_bind().dialect.name == "postgresql":
+        for value in ("APPLIED","ROLLED_BACK"): op.execute(f"ALTER TYPE revisionstatus ADD VALUE IF NOT EXISTS '{value}'")
     op.create_table("world_snapshots",sa.Column("id",sa.String(36),primary_key=True),sa.Column("project_id",sa.String(36),sa.ForeignKey("projects.id"),nullable=False),sa.Column("snapshot_type",sa.String(30),nullable=False),sa.Column("schema_version",sa.Integer(),nullable=False),sa.Column("state_fingerprint",sa.String(100),nullable=False),sa.Column("payload",sa.JSON(),nullable=False),sa.Column("source_revision_id",sa.String(36),sa.ForeignKey("world_revisions.id")),sa.Column("created_at",sa.DateTime(),server_default=sa.text("now()"),nullable=False)); op.create_index("ix_world_snapshots_project_id","world_snapshots",["project_id"])
     op.create_table("revision_applications",sa.Column("id",sa.String(36),primary_key=True),sa.Column("project_id",sa.String(36),sa.ForeignKey("projects.id"),nullable=False),sa.Column("revision_id",sa.String(36),sa.ForeignKey("world_revisions.id"),nullable=False),sa.Column("status",sa.String(30),nullable=False),sa.Column("pre_snapshot_id",sa.String(36),sa.ForeignKey("world_snapshots.id"),nullable=False),sa.Column("post_snapshot_id",sa.String(36),sa.ForeignKey("world_snapshots.id")),sa.Column("expected_base_fingerprint",sa.String(100),nullable=False),sa.Column("actual_base_fingerprint",sa.String(100),nullable=False),sa.Column("author_override",sa.Boolean(),nullable=False),sa.Column("author_override_reason",sa.Text()),sa.Column("applied_change_count",sa.Integer(),nullable=False),sa.Column("error_code",sa.String(100)),sa.Column("error_summary",sa.Text()),sa.Column("created_at",sa.DateTime(),server_default=sa.text("now()"),nullable=False),sa.Column("completed_at",sa.DateTime())); op.create_index("ix_revision_applications_project_id","revision_applications",["project_id"])
     op.create_table("project_model_configs",sa.Column("id",sa.String(36),primary_key=True),sa.Column("project_id",sa.String(36),sa.ForeignKey("projects.id"),nullable=False,unique=True),sa.Column("provider",sa.String(100)),sa.Column("base_url",sa.String(500)),sa.Column("character_model",sa.String(200)),sa.Column("world_model",sa.String(200)),sa.Column("director_model",sa.String(200)),sa.Column("repair_model",sa.String(200)),sa.Column("writer_model",sa.String(200)),sa.Column("critic_model",sa.String(200)),sa.Column("fallback_model",sa.String(200)),sa.Column("auto_failover",sa.Boolean(),nullable=False),sa.Column("max_repair_attempts",sa.Integer(),nullable=False),sa.Column("created_at",sa.DateTime(),server_default=sa.text("now()"),nullable=False),sa.Column("updated_at",sa.DateTime(),server_default=sa.text("now()"),nullable=False))
@@ -12,6 +15,8 @@ def downgrade():
     for table,index in (("execution_traces","ix_execution_traces_project_id"),("project_model_configs",None),("revision_applications","ix_revision_applications_project_id"),("world_snapshots","ix_world_snapshots_project_id")):
         if index: op.drop_index(index,table_name=table)
         op.drop_table(table)
+    if op.get_bind().dialect.name == "sqlite":
+        return
     # PostgreSQL ENUM values cannot be removed in place. Map the two 0007-only
     # states to PREVIEWED, then recreate the exact 0006 enum definition.
     op.execute("UPDATE world_revisions SET status = 'PREVIEWED' WHERE status IN ('APPLIED', 'ROLLED_BACK')")
