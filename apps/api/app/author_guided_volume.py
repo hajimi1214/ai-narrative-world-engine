@@ -187,19 +187,26 @@ class AuthorGuidedVolumeService:
         return [item.id for item in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id)).all()]
 
     def progress(self, db: Session, volume: VolumeContract) -> dict[str, Any]:
-        chapters = db.scalars(select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.number >= (volume.actual_chapter_start or 1), Chapter.active.is_(True)).order_by(Chapter.number)).all()
+        start = volume.actual_chapter_start or volume.estimated_chapter_start or 1
+        end = volume.actual_chapter_end
+        query = select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.number >= start, Chapter.active.is_(True))
+        if end is not None:
+            query = query.where(Chapter.number <= end)
+        chapters = db.scalars(query.order_by(Chapter.number)).all()
         adopted = [item for item in chapters if item.status in {"QUALITY_APPROVED", "ADOPTED"} and item.content]
+        incomplete = [item.number for item in chapters if not item.content or item.status not in {"QUALITY_APPROVED", "ADOPTED"}]
         required = list(volume.required_events or [])
         completed = [event for event in required if any(str(event) in (item.content or "") for item in adopted)]
+        conditions = list(volume.completion_conditions or [])
+        conditions_met = all(any(str(condition) in (item.content or "") for item in adopted) for condition in conditions)
         target_reached = bool(volume.target_closing_state) and bool(adopted)
-        conditions_met = not volume.completion_conditions or len(completed) >= len(volume.completion_conditions)
-        ready = bool(adopted) and conditions_met and target_reached
-        return {"volume_goal_progress": min(1.0, len(adopted) / max(1, len(adopted) + 1)), "protagonist_arc_progress": 1.0 if adopted else 0.0, "conflict_progress": 1.0 if adopted else 0.0, "required_events_completed": completed, "unresolved_threads": volume.unresolved_threads or [], "pending_foreshadowings": [], "target_closing_state_reached": target_reached, "should_extend_volume": not ready, "should_prepare_seal": ready, "should_start_next_volume": False, "reason": "本卷仍需继续推进。" if not ready else "本卷完成条件已满足，等待作者确认封存。"}
+        ready = bool(adopted) and not incomplete and conditions_met and target_reached
+        return {"volume_goal_progress": 1.0 if ready else min(0.99, len(adopted) / max(1, len(adopted) + len(incomplete) + 1)), "protagonist_arc_progress": 1.0 if ready else (0.5 if adopted else 0.0), "conflict_progress": 1.0 if ready else (0.5 if adopted else 0.0), "required_events_completed": completed, "incomplete_chapters": incomplete, "unresolved_threads": volume.unresolved_threads or [], "pending_foreshadowings": [], "target_closing_state_reached": target_reached, "should_extend_volume": not ready, "should_prepare_seal": ready, "should_start_next_volume": False, "reason": "本卷仍需继续推进，未满足剧情目标或仍有未通过质量门的章节。" if not ready else "本卷完成条件已满足，等待作者确认封存。"}
 
     def create_snapshot(self, db: Session, volume: VolumeContract) -> VolumeContinuitySnapshot:
         if volume.status != VolumeContractStatus.READY_TO_SEAL:
             raise AuthorGuidedVolumeError("VOLUME_NOT_READY_TO_SEAL")
-        existing = db.scalar(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == volume.id))
+        existing = db.scalar(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == volume.id).order_by(VolumeContinuitySnapshot.snapshot_version.desc()))
         if existing:
             return existing
         chapters = db.scalars(select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.active.is_(True), Chapter.number >= (volume.actual_chapter_start or 1), Chapter.number <= (volume.actual_chapter_end or 2**31 - 1)).order_by(Chapter.number)).all()
@@ -287,6 +294,14 @@ class AuthorGuidedVolumeService:
         run.status = AutoDirectorRunStatus.RUNNING
         orchestrator = AutoDirectorOrchestrator()
         orchestrator.advance_to_pause(db, run)
+        adopted_number = int((run.context or {}).get("last_adopted_chapter_number", 0) or 0)
+        if adopted_number:
+            window.actual_generated_count = len(db.scalars(select(Chapter.id).where(Chapter.project_id == project.id, Chapter.number >= window.start_chapter_number, Chapter.number <= adopted_number, Chapter.active.is_(True), Chapter.content.is_not(None))).all())
+            if adopted_number <= window.end_chapter_number - 2:
+                next_window = self.ensure_window(db, project, volume)
+                if next_window.id != window.id:
+                    self.ensure_window_tasks(db, project, volume, next_window, contract)
+                    run.context = {**(run.context or {}), "next_window_id": next_window.id}
         if run.status == AutoDirectorRunStatus.COMPLETED and int((run.context or {}).get("last_adopted_chapter_number", 0) or 0) >= window.end_chapter_number:
             volume.actual_chapter_start = volume.actual_chapter_start or window.start_chapter_number
             volume.actual_chapter_end = max(volume.actual_chapter_end or 0, window.end_chapter_number)
