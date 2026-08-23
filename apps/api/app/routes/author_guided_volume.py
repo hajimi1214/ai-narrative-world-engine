@@ -71,6 +71,34 @@ def continue_author_guided_run(project_id: str, run_id: str, db: Session = Depen
     db.commit(); return _run_payload(db, run)
 
 
+@router.post("/projects/{project_id}/author-guided-volume/runs/{run_id}/retry")
+def retry_author_guided_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    run = db.get(AutoDirectorRun, run_id)
+    if not run or run.project_id != project_id or run.run_mode != "AUTHOR_GUIDED_VOLUME":
+        raise HTTPException(status_code=404, detail="Author-guided run not found")
+    if run.status == AutoDirectorRunStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail={"code": "RUN_ALREADY_COMPLETED"})
+    steps = db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()
+    failures = sum(1 for step in steps if step.status in {"FAILED", "BLOCKED"})
+    if failures >= int((run.settings or {}).get("max_retries", 2) or 2):
+        run.status = AutoDirectorRunStatus.BLOCKED; run.current_stage = AutoDirectorStage.BLOCKED; run.pause_reason = "MAX_RETRIES_REACHED"; run.next_action = "请接管运行或重新规划。"
+    else:
+        run.status = AutoDirectorRunStatus.RUNNING; run.context = {**(run.context or {}), "execute_window": True, "stop_requested": False}; run.pause_reason = None; run.next_action = "已加入作者卷级队列，等待 worker 重试。"
+    db.commit(); return _run_payload(db, run)
+
+
+@router.post("/projects/{project_id}/author-guided-volume/runs/{run_id}/takeover")
+def takeover_author_guided_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    run = db.get(AutoDirectorRun, run_id)
+    if not run or run.project_id != project_id or run.run_mode != "AUTHOR_GUIDED_VOLUME":
+        raise HTTPException(status_code=404, detail="Author-guided run not found")
+    run.context = {**(run.context or {}), "stop_requested": True, "resume_stage": _enum(run.current_stage)}
+    run.status = AutoDirectorRunStatus.PAUSED; run.current_stage = AutoDirectorStage.PAUSED; run.pause_reason = "AUTHOR_TAKEOVER"; run.next_action = "作者已接管，可从现有检查点进入手动工作台。"
+    db.commit(); return _run_payload(db, run)
+
+
 @router.post("/projects/{project_id}/author-guided-volume/runs/{run_id}/pause")
 def pause_author_guided_run(project_id: str, run_id: str, payload: VolumeActionPayload, db: Session = Depends(get_db)):
     require_project(db, project_id); run = db.get(AutoDirectorRun, run_id)
