@@ -83,7 +83,9 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail={"code": "RUN_ALREADY_COMPLETED", "message": "已采用正文的运行不可重新生成。"})
     steps = db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()
     failures = sum(1 for step in steps if step.status in {AutoDirectorStepStatus.FAILED, AutoDirectorStepStatus.BLOCKED})
-    if failures >= int((run.settings or {}).get("max_retries", 0) or 0):
+    # The first failed generation is not itself a retry. A configured value of
+    # two therefore permits two recovery attempts after that initial failure.
+    if failures > int((run.settings or {}).get("max_retries", 0) or 0):
         run.status = AutoDirectorRunStatus.BLOCKED; run.current_stage = AutoDirectorStage.BLOCKED; run.pause_reason = "MAX_RETRIES_REACHED"; run.next_action = "请接管运行或重新规划。"; db.commit(); return _payload(db, run)
     context = {**(run.context or {}), "stop_requested": False}
     if context.get("run_budget_reached"):
