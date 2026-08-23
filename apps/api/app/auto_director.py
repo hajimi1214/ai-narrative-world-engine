@@ -192,7 +192,7 @@ class AutoDirectorOrchestrator:
         step.status = AutoDirectorStepStatus.COMMITTED
         step.output_payload = payload
         step.output_artifact_id = artifact_id
-        token_usage = {**(usage or {}), "calls": calls, "tokens": tokens, "latency_ms": latency_ms, "estimated_cost": None, "cost_status": "UNKNOWN"}
+        token_usage = {**(usage or {}), "calls": calls, "tokens": tokens, "latency_ms": latency_ms, "provider": provider, "model": model, "estimated_cost": None, "cost_status": "UNKNOWN"}
         step.token_usage = token_usage
         step.calls = calls
         step.prompt_tokens = int(token_usage.get("prompt_tokens", 0))
@@ -218,7 +218,7 @@ class AutoDirectorOrchestrator:
         run.next_action = "检查错误后重试或接管运行。"
 
     def _add_usage(self, run: AutoDirectorRun, step: AutoDirectorStep) -> None:
-        self._add_usage_metrics(run, step.token_usage or {})
+        self._add_usage_metrics(run, {**(step.token_usage or {}), "provider": step.provider, "model": step.model})
 
     def _add_usage_metrics(self, run: AutoDirectorRun, metrics: dict[str, Any]) -> None:
         usage = dict(run.token_usage or {})
@@ -228,6 +228,12 @@ class AutoDirectorOrchestrator:
         usage["total_tokens"] = int(usage.get("total_tokens", 0)) + total
         usage["total_calls"] = int(usage.get("total_calls", 0)) + int(metrics.get("calls", 0) or 0)
         usage["latency_ms"] = int(usage.get("latency_ms", 0)) + int(metrics.get("latency_ms", 0) or 0)
+        providers = set(usage.get("providers") or [])
+        models = set(usage.get("models") or [])
+        providers.update(item.strip() for item in str(metrics.get("provider") or "").split(",") if item.strip())
+        models.update(item.strip() for item in str(metrics.get("model") or "").split(",") if item.strip())
+        usage["providers"] = sorted(providers)
+        usage["models"] = sorted(models)
         usage["estimated_cost"] = None
         usage["cost_status"] = "UNKNOWN"
         run.token_usage = usage
@@ -247,9 +253,15 @@ class AutoDirectorOrchestrator:
         current["total_tokens"] = int(current.get("total_tokens", current.get("tokens", 0))) + int(metrics.get("total_tokens", metrics.get("tokens", 0)) or 0)
         current["calls"] = int(current.get("calls", 0)) + int(metrics.get("calls", 0) or 0)
         current["latency_ms"] = int(current.get("latency_ms", 0)) + int(metrics.get("latency_ms", 0) or 0)
+        providers = set(current.get("providers") or [])
+        models = set(current.get("models") or [])
+        providers.update(item.strip() for item in str(metrics.get("provider") or "").split(",") if item.strip())
+        models.update(item.strip() for item in str(metrics.get("model") or "").split(",") if item.strip())
+        current["providers"] = sorted(providers)
+        current["models"] = sorted(models)
         current["estimated_cost"] = None; current["cost_status"] = "UNKNOWN"
         step.token_usage = current
-        step.calls = current["calls"]; step.prompt_tokens = current["prompt_tokens"]; step.completion_tokens = current["completion_tokens"]; step.total_tokens = current["total_tokens"]; step.latency_ms = current["latency_ms"]; step.estimated_cost = None; step.cost_status = "UNKNOWN"
+        step.calls = current["calls"]; step.prompt_tokens = current["prompt_tokens"]; step.completion_tokens = current["completion_tokens"]; step.total_tokens = current["total_tokens"]; step.latency_ms = current["latency_ms"]; step.provider = ",".join(current["providers"]) or None; step.model = ",".join(current["models"]) or None; step.estimated_cost = None; step.cost_status = "UNKNOWN"
 
     def create(self, db: Session, project: Project, payload: AutoDirectorRunCreatePayload) -> AutoDirectorRun:
         key = payload.idempotency_key or f"auto-{project.id}-{fingerprint(payload.model_dump())}"
@@ -430,7 +442,7 @@ class AutoDirectorOrchestrator:
         autonomous_run_ids.append(autonomous.id)
         result = AutonomousWorldLoopService().advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
         if scene_events:
-            metrics = {"calls": sum(int(item.get("calls", 0) or 0) for item in scene_events), "prompt_tokens": sum(int(item.get("prompt_tokens", 0) or 0) for item in scene_events), "completion_tokens": sum(int(item.get("completion_tokens", 0) or 0) for item in scene_events), "total_tokens": sum(int(item.get("total_tokens", 0) or 0) for item in scene_events), "latency_ms": sum(int(item.get("latency_ms", 0) or 0) for item in scene_events)}
+            metrics = {"calls": sum(int(item.get("calls", 0) or 0) for item in scene_events), "prompt_tokens": sum(int(item.get("prompt_tokens", 0) or 0) for item in scene_events), "completion_tokens": sum(int(item.get("completion_tokens", 0) or 0) for item in scene_events), "total_tokens": sum(int(item.get("total_tokens", 0) or 0) for item in scene_events), "latency_ms": sum(int(item.get("latency_ms", 0) or 0) for item in scene_events), "provider": ",".join(sorted({str(item.get("provider")) for item in scene_events if item.get("provider")})), "model": ",".join(sorted({str(item.get("model")) for item in scene_events if item.get("model")}))}
             self._merge_step_usage(detail_step, metrics)
             self._add_usage_metrics(run, metrics)
         committed_scene_steps = [item for item in result.get("steps", []) if item.get("scene_id")]

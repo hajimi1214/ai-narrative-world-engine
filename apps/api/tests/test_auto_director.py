@@ -19,6 +19,7 @@ from app.models import (
 from app.auto_director_worker import AutoDirectorWorker
 from app.auto_director import AutoDirectorOrchestrator
 from app.autonomy import AutonomousWorldLoopService
+from app.planning import validate_task_output
 
 
 def _client(monkeypatch, directions):
@@ -112,6 +113,42 @@ def test_chapter_task_validation_rejects_missing_and_forbidden_events():
     turns[0].observable_action += "并烧毁档案"
     valid, report = AutonomousWorldLoopService._validate_chapter_task(DB(), performance, proposal)
     assert "烧毁档案" in report["forbidden_events"]
+
+
+def test_task_event_contract_accepts_event_ref_and_aliases():
+    task = {
+        "must_events": [{"event_ref": "key-obtained", "label": "取得钥匙", "aliases": ["拿到钥匙", "钥匙到手"]}],
+        "forbidden_events": [{"event_ref": "archive-burned", "label": "烧毁档案", "aliases": ["焚毁档案"]}],
+    }
+    assert validate_task_output({"task_coverage": ["key-obtained"], "task_forbidden_hits": []}, task) == []
+    assert validate_task_output({"task_coverage": ["钥匙到手"], "task_forbidden_hits": []}, task) == []
+    assert validate_task_output({"task_coverage": ["取得钥匙"], "task_forbidden_hits": ["焚毁档案"]}, task)[0]["code"] == "PLAN_FORBIDDEN_EVENT_PRESENT"
+
+
+def test_task_event_contract_still_blocks_missing_event():
+    task = {"must_events": [{"event_ref": "must-a", "label": "找到入口", "aliases": ["发现入口"]}]}
+    issues = validate_task_output({"task_coverage": ["无关事件"], "task_forbidden_hits": []}, task)
+    assert issues and issues[0]["code"] == "PLAN_REQUIRED_EVENT_MISSING"
+
+
+def test_runtime_task_validation_reports_event_ref_and_alias_matches():
+    from types import SimpleNamespace
+    turns = [SimpleNamespace(observable_action="拿到钥匙。", spoken_content="", scene_beat_refs=["beat-entry"])]
+    performance = SimpleNamespace(id="performance")
+    proposal = SimpleNamespace(
+        entry_state={"planning_task": {
+            "must_events": [{"event_ref": "key-obtained", "label": "取得钥匙", "aliases": ["拿到钥匙"]}],
+            "forbidden_events": [],
+            "scene_beats": [{"event_ref": "beat-entry", "label": "进入档案馆"}],
+        }},
+        expected_progress={"task_fingerprint": "task"},
+    )
+    class DB:
+        def scalars(self, _query): return SimpleNamespace(all=lambda: turns)
+    valid, report = AutonomousWorldLoopService._validate_chapter_task(DB(), performance, proposal)
+    assert valid
+    assert report["matched_by"]["key-obtained"] == "ALIAS"
+    assert report["matched_by"]["beat-entry"] == "EVENT_REF"
 
 
 def test_auto_director_select_direction_requires_author_confirmation(monkeypatch):
@@ -272,6 +309,12 @@ def test_full_auto_completes_two_chapters_with_fake_provider(monkeypatch):
     assert {"CAST_PREPARATION", "WORLD_BUILDING", "STORY_MACRO", "VOLUME_PLANNING", "CHAPTER_DETAIL", "CHAPTER_EXECUTION", "QUALITY_REVIEW"} <= committed_stages
     assert state["usage_metrics"]["total_tokens"] > 0
     assert state["usage_metrics"]["calls"] > 0
+    assert "fake" in state["usage_metrics"]["provider"]
+    assert "fake" in state["usage_metrics"]["model"]
+    assert "fake" in state["token_usage"]["providers"]
+    assert "fake" in state["token_usage"]["models"]
+    assert len(state["token_usage"]["providers"]) == len(set(state["token_usage"]["providers"]))
+    assert len(state["token_usage"]["models"]) == len(set(state["token_usage"]["models"]))
     assert any(item["usage_metrics"]["total_tokens"] > 0 for item in state["steps"] if item["status"] == "COMMITTED")
     with api_module.SessionLocal() as db:
         chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True)).order_by(Chapter.number)).all()

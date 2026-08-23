@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -85,6 +87,57 @@ def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def normalize_event_text(value: Any) -> str:
+    """Normalize legacy prose event labels without changing their meaning."""
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    value = re.sub(r"[，。！？；：、,.!?;:\"'“”‘’（）()\[\]{}]", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def event_ref(value: Any, field: str) -> str:
+    if isinstance(value, dict):
+        explicit = value.get("event_ref") or value.get("canonical_key") or value.get("key")
+        if explicit:
+            return str(explicit)
+        label = value.get("label") or value.get("name") or value.get("text") or ""
+    else:
+        label = value
+    digest = hashlib.sha256(normalize_event_text(label).encode("utf-8")).hexdigest()[:20]
+    return f"{field}:{digest}"
+
+
+def event_label(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("label") or value.get("name") or value.get("text") or value.get("event_ref") or "").strip()
+    return str(value or "").strip()
+
+
+def event_spec(value: Any, field: str) -> dict[str, Any]:
+    label = event_label(value)
+    aliases = value.get("aliases", []) if isinstance(value, dict) else []
+    aliases = [str(item).strip() for item in aliases if str(item).strip()]
+    return {"event_ref": event_ref(value, field), "label": label, "aliases": aliases}
+
+
+def task_event_specs(task: dict[str, Any] | None, field: str) -> list[dict[str, Any]]:
+    if not task:
+        return []
+    contracts = (task.get("event_contracts") or {}).get(field) or []
+    if contracts:
+        return [dict(item) for item in contracts]
+    return [event_spec(item, field) for item in task.get(field, []) or []]
+
+
+def event_match(spec: dict[str, Any], observed_refs: set[str], text: str) -> str | None:
+    if spec.get("event_ref") in observed_refs:
+        return "EVENT_REF"
+    normalized_text = normalize_event_text(text)
+    aliases = [*spec.get("aliases", []), spec.get("label", "")]
+    if any(normalize_event_text(item) and normalize_event_text(item) in normalized_text for item in aliases):
+        return "ALIAS" if spec.get("aliases") else "TEXT"
+    return None
+
+
 def _chapter_payload(item: StoryPlanChapter) -> dict[str, Any]:
     return {column.name: getattr(item, column.name).value if hasattr(getattr(item, column.name), "value") else getattr(item, column.name) for column in item.__table__.columns}
 
@@ -116,6 +169,7 @@ def chapter_task_context(db: Session, project_id: str, chapter_number: int, *, r
         if required:
             raise ValueError("PLAN_CHAPTER_MISSING")
         return None
+    event_contracts = {field: [event_spec(item, field) for item in (getattr(task, field) or [])] for field in ("must_events", "forbidden_events", "scene_beats")}
     return {
         "plan_id": plan.id, "plan_version": plan.version, "plan_fingerprint": plan.source_fingerprint,
         "chapter_plan_id": task.id, "chapter_number": task.number, "volume_number": task.volume_number, "arc_number": task.arc_number,
@@ -124,6 +178,7 @@ def chapter_task_context(db: Session, project_id: str, chapter_number: int, *, r
         "start_state": task.start_state or {}, "end_state": task.end_state or {}, "objective": task.objective, "conflict": task.conflict,
         "must_events": task.must_events or [], "forbidden_events": task.forbidden_events or [], "allowed_reveals": task.allowed_reveals or [], "forbidden_reveals": task.forbidden_reveals or [],
         "foreshadow_create": task.foreshadow_create or [], "foreshadow_payoff": task.foreshadow_payoff or [], "character_changes": task.character_changes or [], "consequences": task.consequences or [], "scene_beats": task.scene_beats or [],
+        "event_contracts": event_contracts,
         "target_words": task.target_words, "pace": task.pace, "status": task.status.value if hasattr(task.status, "value") else task.status, "locked": task.locked,
     }
 
@@ -142,9 +197,17 @@ def validate_task_output(output: dict[str, Any], task: dict[str, Any] | None) ->
     if not isinstance(coverage, list):
         return [{"code": "PLAN_TASK_COVERAGE_MISSING", "blocking": True}]
     covered = {str(item) for item in coverage}
-    issues = [{"code": "PLAN_REQUIRED_EVENT_MISSING", "blocking": True, "event": event} for event in task.get("must_events", []) if str(event) not in covered]
+    coverage_text = "\n".join(covered)
+    issues = []
+    for spec in task_event_specs(task, "must_events"):
+        matched = "EVENT_REF" if spec["event_ref"] in covered else event_match(spec, set(), coverage_text)
+        if not matched:
+            issues.append({"code": "PLAN_REQUIRED_EVENT_MISSING", "blocking": True, "event": spec["label"], "event_ref": spec["event_ref"]})
     forbidden_hits = output.get("task_forbidden_hits") or []
-    issues.extend({"code": "PLAN_FORBIDDEN_EVENT_PRESENT", "blocking": True, "event": event} for event in forbidden_hits if str(event) in {str(item) for item in task.get("forbidden_events", [])})
+    forbidden_text = "\n".join(str(item) for item in forbidden_hits)
+    for spec in task_event_specs(task, "forbidden_events"):
+        if spec["event_ref"] in {str(item) for item in forbidden_hits} or event_match(spec, set(), forbidden_text):
+            issues.append({"code": "PLAN_FORBIDDEN_EVENT_PRESENT", "blocking": True, "event": spec["label"], "event_ref": spec["event_ref"]})
     return issues
 
 

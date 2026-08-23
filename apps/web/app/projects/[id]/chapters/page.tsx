@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { AlertTriangle, ArrowRight, CheckCircle2, FileCheck2, Lock, PenLine, RefreshCw, ShieldCheck, Sparkles } from "lucide-react";
 import { api, ApiError } from "../../../lib";
 import { EmptyState, ErrorState, LoadingState, PageHeader, SectionCard, StatusBadge } from "../../../../components/ui/primitives";
@@ -13,6 +14,8 @@ const display = (value: unknown) => String(value || "未设置");
 const list = (value: unknown) => Array.isArray(value) ? value : [];
 
 export default function ChaptersPage({ params }: { params: { id: string } }) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const [evaluation, setEvaluation] = useState<Evaluation | null>(null);
   const [plan, setPlan] = useState<any>(null);
   const [next, setNext] = useState<any>(null);
@@ -35,7 +38,10 @@ export default function ChaptersPage({ params }: { params: { id: string } }) {
         api(`/projects/${params.id}/planning/plan`),
       ]);
       setEvaluation(evaluationValue); setNext(nextValue); setPlan(planValue?.plan === null ? null : planValue);
-      const number = keepSelection && selectedNumber ? selectedNumber : nextValue?.task?.number || evaluationValue?.chapters?.[0]?.number || null;
+      const requestedId = searchParams.get("chapter");
+      const requestedNumber = Number(searchParams.get("chapter_number"));
+      const requested = requestedId ? evaluationValue.chapters.find((item) => item.chapter?.id === requestedId || item.id === requestedId) : evaluationValue.chapters.find((item) => item.number === requestedNumber);
+      const number = requested?.number || (keepSelection && selectedNumber ? selectedNumber : nextValue?.task?.number || evaluationValue?.chapters?.[0]?.number || null);
       setSelectedNumber(number);
     } catch (reason) { setError(reason instanceof ApiError ? reason.message : "无法读取章节工作台"); }
     finally { setBusy(false); }
@@ -65,6 +71,7 @@ export default function ChaptersPage({ params }: { params: { id: string } }) {
   };
   useEffect(() => { if (evaluation) void loadChapterData(); }, [selectedNumber, evaluation]);
   const selectDraft = async (draftId: string) => { setBusy(true); setError(""); try { setDraft(await api(`/projects/${params.id}/writer-drafts/${draftId}`)); } catch (reason) { setError(reason instanceof ApiError ? reason.message : "无法读取草稿版本"); } finally { setBusy(false); } };
+  const selectChapter = (number: number) => { setSelectedNumber(number); router.replace(`/projects/${params.id}/chapters?chapter_number=${number}`, { scroll: false }); };
 
   const run = async (path: string, options: RequestInit = {}, success?: string) => {
     if (!chapterId) return;
@@ -90,7 +97,7 @@ export default function ChaptersPage({ params }: { params: { id: string } }) {
     <PageHeader title="章节工作台" description="先完成章节任务单，再生成 Writer 草稿；正文必须通过连续性与反 AI 质量门禁才能采用。" action={<button className="secondary" onClick={() => void load()} disabled={busy}><RefreshCw size={15} />刷新状态</button>} />
     {error && <ErrorState message={error} retry={() => setError("")} />}{message && <div className="success-state"><CheckCircle2 size={16} />{message}</div>}
     <section className="chapter-progress"><div><small>已开始 / 计划</small><strong>{summary.started || 0} / {summary.planned || 0}</strong></div><div><small>质量通过率</small><strong>{Math.round((summary.quality_pass_rate || 0) * 100)}%</strong></div><div><small>任务进度</small><strong>{Math.round((summary.task_progress || 0) * 100)}%</strong></div><div><small>当前状态</small><StatusBadge value={evaluation.status === "HEALTHY" ? "正常" : "需要处理"} /></div><div className="chapter-next"><small>下一章</small><strong>{next?.status === "PLAN_COMPLETE" ? "规划已完成" : next?.task?.number ? `第 ${next.task.number} 章` : "先审批规划"}</strong>{next?.blocked_reasons?.length ? <span><AlertTriangle size={13} />{next.blocked_reasons.join("、")}</span> : null}</div></section>
-    <div className="chapter-grid"><section className="chapter-list-panel"><div className="section-heading"><h2>章节任务</h2><span className="muted">{evaluation.chapters.length} 章</span></div>{evaluation.chapters.map((item) => <button type="button" key={item.number} className={`chapter-row ${item.number === selectedNumber ? "active" : ""}`} onClick={() => setSelectedNumber(item.number)}><span>{String(item.number).padStart(2, "0")}</span><div><strong>{item.title || `第 ${item.number} 章`}</strong><small>{item.task_locked ? "任务已锁定" : "任务待锁定"} · {item.quality_status || "未开始"}</small></div><StatusBadge value={item.quality_status || (item.chapter ? item.chapter.status : "未开始")} /></button>)}</section>
+    <div className="chapter-grid"><section className="chapter-list-panel"><div className="section-heading"><h2>章节任务</h2><span className="muted">{evaluation.chapters.length} 章</span></div>{evaluation.chapters.map((item) => <button type="button" key={item.number} className={`chapter-row ${item.number === selectedNumber ? "active" : ""}`} onClick={() => selectChapter(item.number)}><span>{String(item.number).padStart(2, "0")}</span><div><strong>{item.title || `第 ${item.number} 章`}</strong><small>{item.task_locked ? "任务已锁定" : "任务待锁定"} · {item.quality_status || "未开始"}</small></div><StatusBadge value={item.quality_status || (item.chapter ? item.chapter.status : "未开始")} /></button>)}</section>
       <section className="chapter-editor-panel">{!row ? <div className="chapter-placeholder"><PenLine size={30} /><strong>选择一个章节</strong><p>从左侧选择任务单，查看本章目标和正文状态。</p></div> : <><div className="chapter-editor-header"><div><p className="eyebrow">CHAPTER {String(row.number).padStart(2, "0")}</p><h2>{row.title || `第 ${row.number} 章`}</h2><p>{row.chapter ? `正文状态：${display(row.chapter.status)} · ${row.chapter.word_count || 0} 字` : "尚未形成正式章节正文"}</p></div><StatusBadge value={row.quality_status || (row.task_locked ? "已锁定任务" : "待锁定任务")} /></div>
         {!chapterId ? <div className="chapter-placeholder compact"><Lock size={25} /><strong>{row.task_locked ? "等待正式章节" : "先锁定本章任务单"}</strong><p>{row.task_locked ? "导演或结构投影形成正式 Chapter 后，Writer 操作会在这里开放。" : "回到整本规划，补齐并锁定本章任务单。"}</p><Link className="button secondary" href={row.task_locked ? `/projects/${params.id}/director` : `/projects/${params.id}/planning`}>{row.task_locked ? "去导演台" : "去整本规划"} <ArrowRight size={15} /></Link></div> : <>
           <SectionCard title="本章任务" description="这些边界会同时进入 Writer 和质量门禁。"><div className="task-summary"><div><small>章节目标</small><p>{display(task?.objective)}</p></div><div><small>核心冲突</small><p>{display(task?.conflict)}</p></div><div><small>起始 → 结束状态</small><p>{JSON.stringify(task?.start_state || {})} → {JSON.stringify(task?.end_state || {})}</p></div><div><small>必须事件</small><p>{list(task?.must_events).join("；") || "无"}</p></div><div><small>禁止事件 / 揭示</small><p>{list(task?.forbidden_events).join("；") || "无"} · {list(task?.forbidden_reveals).join("；") || "无"}</p></div></div></SectionCard>

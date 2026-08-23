@@ -25,6 +25,7 @@ from .model_router import ModelRouter
 from .settings import get_settings
 from .ai.factory import get_model_provider
 from .runtime import PerformanceRuntimeService, RuntimeFailure, WorldResolutionRuntimeService, persisted_turns
+from .planning import event_match, task_event_specs, normalize_event_text
 
 
 class AutonomousWorldLoopService:
@@ -41,11 +42,22 @@ class AutonomousWorldLoopService:
         turns = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence)).all()
         text = "\n".join((turn.observable_action or "") + "\n" + (turn.spoken_content or "") for turn in turns)
         beat_refs = {str(ref) for turn in turns for ref in (turn.scene_beat_refs or [])}
-        missing = [str(event) for event in task.get("must_events", []) if str(event) not in text and str(event) not in beat_refs]
-        forbidden = [str(event) for event in task.get("forbidden_events", []) if str(event) in text or str(event) in beat_refs]
-        beats = [str(beat) for beat in task.get("scene_beats", [])]
-        uncovered_beats = [beat for beat in beats if beat not in beat_refs and beat not in text]
-        report = {"status": "PASS" if not missing and not forbidden and not uncovered_beats else "BLOCKED", "missing_must_events": missing, "forbidden_events": forbidden, "uncovered_scene_beats": uncovered_beats, "task_fingerprint": (proposal.expected_progress or {}).get("task_fingerprint")}
+        matched_by: dict[str, str] = {}
+        missing = []
+        for spec in task_event_specs(task, "must_events"):
+            matched = event_match(spec, beat_refs, text)
+            if matched: matched_by[spec["event_ref"]] = matched
+            else: missing.append(spec["label"])
+        forbidden = []
+        for spec in task_event_specs(task, "forbidden_events"):
+            matched = event_match(spec, beat_refs, text)
+            if matched: forbidden.append(spec["label"]); matched_by[spec["event_ref"]] = matched
+        uncovered_beats = []
+        for spec in task_event_specs(task, "scene_beats"):
+            matched = event_match(spec, beat_refs, text)
+            if matched: matched_by[spec["event_ref"]] = matched
+            else: uncovered_beats.append(spec["label"])
+        report = {"status": "PASS" if not missing and not forbidden and not uncovered_beats else "BLOCKED", "matched_by": matched_by, "missing_must_events": missing, "forbidden_events": forbidden, "uncovered_scene_beats": uncovered_beats, "task_fingerprint": (proposal.expected_progress or {}).get("task_fingerprint")}
         return report["status"] == "PASS", report
 
     def _fingerprint(self, db: Session, project_id: str) -> tuple[int, str]:
