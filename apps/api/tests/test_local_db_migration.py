@@ -16,10 +16,11 @@ def test_sqlite_migrations_reach_head_with_auto_director_usage(tmp_path: Path):
     engine = create_engine(f"sqlite:///{database.as_posix()}")
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.scalar(text("select version_num from alembic_version")) == "0041_author_guided_volume"
+        assert connection.scalar(text("select version_num from alembic_version")) == "0042_volume_snapshot_uniqueness"
     assert {column["name"] for column in inspector.get_columns("auto_director_runs")} >= {"total_tokens", "estimated_cost", "cost_status"}
     assert {column["name"] for column in inspector.get_columns("auto_director_steps")} >= {"provider", "model", "total_tokens", "estimated_cost"}
     assert {"book_contracts", "volume_contracts", "chapter_planning_windows", "volume_continuity_snapshots", "foreshadowing_ledger", "author_guidance", "book_completion_proposals"} <= set(inspector.get_table_names())
+    assert any(item["name"] == "uq_volume_continuity_snapshot_volume" and item["unique"] for item in inspector.get_indexes("volume_continuity_snapshots"))
 
 
 def test_legacy_sqlite_schema_is_upgraded_before_stamp(tmp_path: Path, monkeypatch):
@@ -33,7 +34,7 @@ def test_legacy_sqlite_schema_is_upgraded_before_stamp(tmp_path: Path, monkeypat
 
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.scalar(text("select version_num from alembic_version")) == "0041_author_guided_volume"
+        assert connection.scalar(text("select version_num from alembic_version")) == "0042_volume_snapshot_uniqueness"
     assert "story_seed" in {column["name"] for column in inspector.get_columns("projects")}
     assert "auto_director_runs" in inspector.get_table_names()
     assert "book_contracts" in inspector.get_table_names()
