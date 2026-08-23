@@ -13,8 +13,9 @@ from app.ai.fake import FakeModelProvider
 from app.db import Base
 from app.main import app
 from app.models import (
-    AutonomousWorldRun, Chapter, ChapterQualityAssessment, ChapterWriterDraft,
-    Project, SceneProposal,
+    AutoDirectorRun, AutonomousWorldRun, Chapter, ChapterQualityAssessment,
+    ChapterWriterDraft, Project, SceneProposal, VolumeContract,
+    VolumeContractStatus,
 )
 from app.auto_director_worker import AutoDirectorWorker
 from app.auto_director import AutoDirectorOrchestrator
@@ -56,6 +57,26 @@ def test_auto_director_uses_target_chapters_when_maximum_is_omitted(monkeypatch)
     body = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "灵感", "target_chapters": 7, "idempotency_key": "default-limit"}).json()
     assert body["settings"]["max_chapters"] == 7
     assert body["settings"]["effective_max_chapters"] == 7
+
+
+def test_full_auto_creates_volume_boundary_and_blocks_sealed_volume(monkeypatch):
+    directions = [{"title": "完整方向", "premise": "主线", "core_conflict": "冲突", "first_volume_goal": "完成调查", "world_boundaries": ["档案馆"], "first_ten_chapter_promises": ["一", "二", "三"], "foreshadowing_directions": ["回收"], "protagonist": {"desire": "查明", "cost": "失去"}}] * 3
+    client, project_id = _client(monkeypatch, directions)
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "卷边界", "target_chapters": 600, "max_chapters": 3, "idempotency_key": "volume-boundary"})
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        volume = db.get(VolumeContract, run.context["volume_id"])
+        assert run.context["book_contract_id"]
+        assert volume and volume.status == VolumeContractStatus.ACTIVE
+        assert volume.estimated_chapter_start == 1
+        volume.status = VolumeContractStatus.SEALED
+        db.commit()
+    assert AutoDirectorWorker(api_module.SessionLocal, poll_seconds=0).run_once() is True
+    state = client.get(f"/projects/{project_id}/auto-director/runs/{run_id}").json()
+    assert state["status"] == "BLOCKED"
+    assert state["pause_reason"] == "VOLUME_SEALED"
 
 
 def test_all_invalid_directions_are_repaired_once_then_blocked(monkeypatch):

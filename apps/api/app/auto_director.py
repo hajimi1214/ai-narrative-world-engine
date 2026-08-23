@@ -275,7 +275,22 @@ class AutoDirectorOrchestrator:
             run = AutoDirectorRun(project_id=project.id, idempotency_key=key, status=AutoDirectorRunStatus.RUNNING, current_stage=AutoDirectorStage.BOOK_CONTRACT, run_mode="AUTHOR_GUIDED_VOLUME", settings=request, context={"request": request, "book_contract_id": contract.id, "current_volume_number": 1})
             db.add(run); db.flush(); return run
         request["max_chapters"] = self._chapter_limit(request)
-        run = AutoDirectorRun(project_id=project.id, idempotency_key=key, status=AutoDirectorRunStatus.RUNNING, current_stage=AutoDirectorStage.IDEA, run_mode="FULL_AUTO", settings={**request, "effective_max_chapters": request["max_chapters"]}, context={"request": request, "current_chapter_number": 1, "completed_chapters": []})
+        # FULL_AUTO remains unattended, but it shares the durable book and
+        # volume boundary used by the author-guided workflow. Estimates are
+        # planning data only, never book-completion conditions.
+        from .author_guided_volume import AuthorGuidedVolumeService
+        boundary_service = AuthorGuidedVolumeService()
+        boundary_request = {
+            **request,
+            "title": request.get("name") or project.name,
+            "premise": request.get("inspiration") or project.story_seed,
+            "global_plot_direction": request.get("inspiration") or project.story_seed,
+            "estimated_chapters": request.get("target_chapters"),
+            "operational_run_chapter_budget": request["max_chapters"],
+        }
+        contract = boundary_service.ensure_contract(db, project, boundary_request)
+        volume = boundary_service.ensure_volume(db, project, contract, {"estimated_chapter_start": 1})
+        run = AutoDirectorRun(project_id=project.id, idempotency_key=key, status=AutoDirectorRunStatus.RUNNING, current_stage=AutoDirectorStage.IDEA, run_mode="FULL_AUTO", settings={**request, "effective_max_chapters": request["max_chapters"]}, context={"request": request, "book_contract_id": contract.id, "volume_id": volume.id, "current_volume_number": volume.volume_number, "current_chapter_number": 1, "completed_chapters": []})
         db.add(run); db.flush()
         return run
 
@@ -285,6 +300,17 @@ class AutoDirectorOrchestrator:
             raise AutoDirectorError("PROJECT_NOT_FOUND")
         if run.status in {AutoDirectorRunStatus.PAUSED, AutoDirectorRunStatus.FAILED, AutoDirectorRunStatus.BLOCKED, AutoDirectorRunStatus.COMPLETED} or (run.context or {}).get("stop_requested"):
             return run
+        if run.run_mode == "FULL_AUTO" and (run.context or {}).get("volume_id"):
+            from .models import VolumeContract, VolumeContractStatus
+            volume = db.get(VolumeContract, run.context["volume_id"])
+            if not volume or volume.project_id != project.id:
+                raise AutoDirectorError("VOLUME_BOUNDARY_NOT_FOUND")
+            if volume.status == VolumeContractStatus.SEALED:
+                run.status = AutoDirectorRunStatus.BLOCKED
+                run.current_stage = AutoDirectorStage.BLOCKED
+                run.pause_reason = "VOLUME_SEALED"
+                run.next_action = "当前卷已封存；请创建下一卷或由作者明确解封后再继续。"
+                return run
         try:
             if run.current_stage == AutoDirectorStage.NEXT_CHAPTER:
                 if (run.context or {}).get("stop_requested") or run.status != AutoDirectorRunStatus.RUNNING:
@@ -544,6 +570,13 @@ class AutoDirectorOrchestrator:
         if number not in completed: completed.append(number)
         adopted_this_run = int((run.context or {}).get("adopted_this_run", 0)) + (0 if number in prior_completed else 1)
         run.context = {**(run.context or {}), "completed_chapters": completed, "adopted_chapters": int((run.context or {}).get("adopted_chapters", 0)) + (0 if number in prior_completed else 1), "adopted_this_run": adopted_this_run, "last_adopted_chapter_number": number, "last_adopted_chapter_id": draft.chapter_id, "last_adopted_draft_id": draft.id}
+        if run.run_mode == "FULL_AUTO" and (run.context or {}).get("volume_id"):
+            from .models import VolumeContract, VolumeContractStatus
+            volume = db.get(VolumeContract, run.context["volume_id"])
+            if not volume or volume.status == VolumeContractStatus.SEALED:
+                raise AutoDirectorError("VOLUME_SEALED")
+            volume.actual_chapter_start = volume.actual_chapter_start or number
+            volume.actual_chapter_end = max(int(volume.actual_chapter_end or 0), number)
         # A chapter budget is an operational checkpoint for this worker run,
         # never evidence that the book itself has ended. The next request can
         # resume from the persisted chapter number without creating a duplicate.
