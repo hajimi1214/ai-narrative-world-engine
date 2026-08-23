@@ -9,7 +9,7 @@ type Volume = { id: string; volume_number: number; title?: string; status: strin
 export default function VolumeDirectorPage({ params, searchParams }: { params: { id: string }; searchParams?: { volume?: string } }) {
   const [volume, setVolume] = useState<Volume>(); const [note, setNote] = useState(""); const [message, setMessage] = useState(""); const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
   const load = () => { void api(`/projects/${params.id}/volumes`).then((items: unknown) => { const volumes = items as Volume[]; setVolume(volumes.find((item) => item.id === searchParams?.volume) || volumes[0]); }).catch((reason: unknown) => setError(reason instanceof ApiError ? reason.message : "无法读取当前卷")); };
-  useEffect(load, [params.id, searchParams?.volume]);
+  useEffect(() => { load(); const timer = window.setInterval(load, 2000); return () => window.clearInterval(timer); }, [params.id, searchParams?.volume]);
   async function action(path: string, body?: unknown) { if (!volume) return; setBusy(true); try { await api(`/projects/${params.id}/volumes/${volume.id}/${path}`, { method: "POST", body: body ? JSON.stringify(body) : undefined }); setMessage("操作已保存"); load(); } catch (reason) { setError(reason instanceof ApiError ? reason.message : "操作失败"); } finally { setBusy(false); } }
   async function guidance() { if (!volume || !note.trim()) return; await action("guidance", { author_note: note, affected_scope: "WINDOW", requires_replan: false }); setNote(""); }
   if (!volume) return <main className="stack"><PageHeader title="当前卷导演" description="正在读取卷级检查点。" /></main>;
