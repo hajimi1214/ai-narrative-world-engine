@@ -542,13 +542,19 @@ class AutoDirectorOrchestrator:
         prior_completed = [*(run.context or {}).get("completed_chapters", [])]
         completed = list(prior_completed)
         if number not in completed: completed.append(number)
-        run.context = {**(run.context or {}), "completed_chapters": completed, "adopted_chapters": int((run.context or {}).get("adopted_chapters", 0)) + (0 if number in prior_completed else 1), "last_adopted_chapter_number": number, "last_adopted_chapter_id": draft.chapter_id, "last_adopted_draft_id": draft.id}
-        plan_id = (run.context or {}).get("plan_id")
-        planned_count = db.scalar(select(func.count(StoryPlanChapter.id)).where(StoryPlanChapter.plan_id == plan_id)) if plan_id else None
-        configured_limit = min(int((run.settings or {}).get("max_chapters", 1)), int((run.settings or {}).get("target_chapters", 1)))
-        limit = min(configured_limit, int(planned_count)) if planned_count else configured_limit
-        if number >= limit:
-            run.status = AutoDirectorRunStatus.COMPLETED; run.current_stage = AutoDirectorStage.COMPLETED; run.next_action = "自动导演已完成章节上限。"; run.completed_at = datetime.utcnow()
+        adopted_this_run = int((run.context or {}).get("adopted_this_run", 0)) + (0 if number in prior_completed else 1)
+        run.context = {**(run.context or {}), "completed_chapters": completed, "adopted_chapters": int((run.context or {}).get("adopted_chapters", 0)) + (0 if number in prior_completed else 1), "adopted_this_run": adopted_this_run, "last_adopted_chapter_number": number, "last_adopted_chapter_id": draft.chapter_id, "last_adopted_draft_id": draft.id}
+        # A chapter budget is an operational checkpoint for this worker run,
+        # never evidence that the book itself has ended. The next request can
+        # resume from the persisted chapter number without creating a duplicate.
+        configured_budget = int((run.settings or {}).get("max_chapters") or (run.settings or {}).get("operational_run_chapter_budget") or 10)
+        if adopted_this_run >= configured_budget:
+            run.status = AutoDirectorRunStatus.PAUSED
+            run.current_stage = AutoDirectorStage.NEXT_CHAPTER
+            run.pause_reason = "RUN_CHAPTER_BUDGET_REACHED"
+            run.next_action = f"本次运行已完成 {adopted_this_run} 章；继续运行以推进第 {number + 1} 章。"
+            run.context = {**run.context, "current_chapter_number": number + 1, "run_budget_reached": True}
+            run.current_chapter_id = None
         else:
             run.status = AutoDirectorRunStatus.RUNNING; run.current_stage = AutoDirectorStage.NEXT_CHAPTER; run.context = {**run.context, "current_chapter_number": number + 1}; run.next_action = f"正在准备第 {number + 1} 章。"; run.current_chapter_id = None
         return run

@@ -69,7 +69,10 @@ def resume_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
     run = _run_or_404(db, project_id, run_id)
     if run.current_stage == AutoDirectorStage.PAUSED:
         run.current_stage = AutoDirectorStage(run.context.get("resume_stage", "DIRECTION_SELECTION" if not run.context.get("selected_direction") else "CAST_PREPARATION"))
-    run.status = AutoDirectorRunStatus.RUNNING; run.context = {**(run.context or {}), "stop_requested": False}; run.pause_reason = None
+    context = {**(run.context or {}), "stop_requested": False}
+    if context.get("run_budget_reached"):
+        context.update({"adopted_this_run": 0, "run_budget_reached": False})
+    run.status = AutoDirectorRunStatus.RUNNING; run.context = context; run.pause_reason = None
     run.next_action = "已加入本地自动导演队列，等待 worker 继续。"; db.commit(); return _payload(db, run)
 
 
@@ -82,7 +85,10 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
     failures = sum(1 for step in steps if step.status in {AutoDirectorStepStatus.FAILED, AutoDirectorStepStatus.BLOCKED})
     if failures >= int((run.settings or {}).get("max_retries", 0) or 0):
         run.status = AutoDirectorRunStatus.BLOCKED; run.current_stage = AutoDirectorStage.BLOCKED; run.pause_reason = "MAX_RETRIES_REACHED"; run.next_action = "请接管运行或重新规划。"; db.commit(); return _payload(db, run)
-    run.status = AutoDirectorRunStatus.RUNNING; run.context = {**(run.context or {}), "stop_requested": False}
+    context = {**(run.context or {}), "stop_requested": False}
+    if context.get("run_budget_reached"):
+        context.update({"adopted_this_run": 0, "run_budget_reached": False})
+    run.status = AutoDirectorRunStatus.RUNNING; run.context = context
     if run.current_stage == AutoDirectorStage.DIRECTION_SELECTION:
         run.context = {**(run.context or {}), "directions": [], "regenerate_nonce": datetime.utcnow().isoformat()}
         run.current_stage = AutoDirectorStage.FRAMING

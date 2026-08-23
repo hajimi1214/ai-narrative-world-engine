@@ -248,7 +248,7 @@ def test_auto_director_uses_runtime_scene_before_writer(monkeypatch):
     assert body["status"] in {"RUNNING", "COMPLETED", "FAILED", "BLOCKED"}
 
 
-def test_full_auto_completes_two_chapters_with_fake_provider(monkeypatch):
+def test_full_auto_pauses_at_operational_budget_without_completing_book(monkeypatch):
     directions = [{
         "title": "档案回声",
         "premise": "修复师追查一份会回应的失踪档案",
@@ -323,13 +323,18 @@ def test_full_auto_completes_two_chapters_with_fake_provider(monkeypatch):
     for _ in range(10):
         worked = worker.run_once()
         state = client.get(f"/projects/{project_id}/auto-director/runs/{run_id}").json()
-        if state["status"] == "COMPLETED":
+        if state["status"] in {"PAUSED", "COMPLETED"}:
             break
         if not worked:
             break
-    assert state["status"] == "COMPLETED", [(item["stage"], item["error_code"], item["error_summary"]) for item in state["steps"] if item["error_code"]]
-    assert state["current_stage"] == "COMPLETED"
+    assert state["status"] == "PAUSED", [(item["stage"], item["error_code"], item["error_summary"]) for item in state["steps"] if item["error_code"]]
+    assert state["current_stage"] == "NEXT_CHAPTER"
+    assert state["pause_reason"] == "RUN_CHAPTER_BUDGET_REACHED"
+    assert state["context"]["current_chapter_number"] == 3
     assert state["context"]["completed_chapters"] == [1, 2]
+    resumed = client.post(f"/projects/{project_id}/auto-director/runs/{run_id}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["context"]["adopted_this_run"] == 0
     committed_stages = {item["stage"] for item in state["steps"] if item["status"] == "COMMITTED"}
     assert {"CAST_PREPARATION", "WORLD_BUILDING", "STORY_MACRO", "VOLUME_PLANNING", "CHAPTER_DETAIL", "CHAPTER_EXECUTION", "QUALITY_REVIEW"} <= committed_stages
     assert state["usage_metrics"]["total_tokens"] > 0
@@ -341,9 +346,6 @@ def test_full_auto_completes_two_chapters_with_fake_provider(monkeypatch):
     assert len(state["token_usage"]["providers"]) == len(set(state["token_usage"]["providers"]))
     assert len(state["token_usage"]["models"]) == len(set(state["token_usage"]["models"]))
     assert any(item["usage_metrics"]["total_tokens"] > 0 for item in state["steps"] if item["status"] == "COMMITTED")
-    total_before_retry = state["usage_metrics"]["total_tokens"]
-    assert worker.run_once() is False
-    assert client.get(f"/projects/{project_id}/auto-director/runs/{run_id}").json()["usage_metrics"]["total_tokens"] == total_before_retry
     with api_module.SessionLocal() as db:
         chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True)).order_by(Chapter.number)).all()
         assert len(chapters) >= 2

@@ -366,11 +366,11 @@ class AuthorGuidedVolumeService:
             raise AuthorGuidedVolumeError("WINDOW_PLAN_MISSING")
         request = dict(run.settings or {})
         request.setdefault("target_chapters", window.end_chapter_number)
-        request.setdefault("max_chapters", window.end_chapter_number)
+        request["max_chapters"] = int(request.get("window_size") or (window.end_chapter_number - window.start_chapter_number + 1))
         token_budget = (contract.length_policy or {}).get("operational_token_budget") or request.get("operational_token_budget") or request.get("max_tokens")
-        run.settings = {**request, "target_chapters": window.end_chapter_number, "max_chapters": window.end_chapter_number, "max_tokens": token_budget}
+        run.settings = {**request, "target_chapters": window.end_chapter_number, "max_tokens": token_budget}
         direction = {"title": contract.title or project.name, "premise": contract.premise or project.story_seed or "", "core_conflict": volume.core_conflict or contract.global_plot_direction or "", "first_volume_goal": volume.volume_goal or "", "style_advice": (contract.style_contract or {}).get("tone", ""), "world_boundaries": [], "protagonist": contract.protagonist_contract or {}}
-        context = {**(run.context or {}), "selected_direction": direction, "plan_id": plan_id}
+        context = {**(run.context or {}), "selected_direction": direction, "plan_id": plan_id, "run_start_chapter_number": window.start_chapter_number, "adopted_this_run": 0, "run_budget_reached": False}
         run.context = context
         if not any(step.stage == AutoDirectorStage.CHAPTER_PLANNING and step.status == AutoDirectorStepStatus.COMMITTED for step in db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()):
             step = AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.CHAPTER_PLANNING, input_fingerprint=_fingerprint({"window_id": window.id, "plan_id": plan_id}), status=AutoDirectorStepStatus.COMMITTED, output_artifact_id=plan_id, output_payload={"plan_id": plan_id, "author_window_id": window.id}, completed_at=datetime.utcnow())
@@ -387,7 +387,7 @@ class AuthorGuidedVolumeService:
                 next_window = self.ensure_followup_window(db, project, volume, window)
                 self.ensure_window_tasks(db, project, volume, next_window, contract)
                 run.context = {**(run.context or {}), "next_window_id": next_window.id}
-        if run.status == AutoDirectorRunStatus.COMPLETED and int((run.context or {}).get("last_adopted_chapter_number", 0) or 0) >= window.end_chapter_number:
+        if run.status in {AutoDirectorRunStatus.COMPLETED, AutoDirectorRunStatus.PAUSED} and int((run.context or {}).get("last_adopted_chapter_number", 0) or 0) >= window.end_chapter_number:
             volume.actual_chapter_start = volume.actual_chapter_start or window.start_chapter_number
             volume.actual_chapter_end = max(volume.actual_chapter_end or 0, window.end_chapter_number)
             run.status = AutoDirectorRunStatus.PAUSED
