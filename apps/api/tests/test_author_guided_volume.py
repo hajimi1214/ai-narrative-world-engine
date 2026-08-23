@@ -51,6 +51,13 @@ def test_idempotent_author_guided_run_does_not_duplicate_contract(monkeypatch):
         assert len(db.scalars(select(BookContract).where(BookContract.project_id == project_id)).all()) == 1
 
 
+def test_existing_auto_director_endpoint_accepts_author_guided_mode(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    response = client.post(f"/projects/{project_id}/auto-director/runs", json={"run_mode": "AUTHOR_GUIDED_VOLUME", "premise": "作者主线", "estimated_chapters": 2000, "idempotency_key": "compat-author"})
+    assert response.status_code == 201, response.text
+    assert response.json()["run_mode"] == "AUTHOR_GUIDED_VOLUME"
+
+
 def test_sealed_volume_requires_author_confirmation_and_snapshot(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"volume": {"target_closing_state": {"case": "closed"}}, "idempotency_key": "seal"}).json()

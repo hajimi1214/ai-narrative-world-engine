@@ -264,11 +264,16 @@ class AutoDirectorOrchestrator:
         step.calls = current["calls"]; step.prompt_tokens = current["prompt_tokens"]; step.completion_tokens = current["completion_tokens"]; step.total_tokens = current["total_tokens"]; step.latency_ms = current["latency_ms"]; step.provider = ",".join(current["providers"]) or None; step.model = ",".join(current["models"]) or None; step.estimated_cost = None; step.cost_status = "UNKNOWN"
 
     def create(self, db: Session, project: Project, payload: AutoDirectorRunCreatePayload) -> AutoDirectorRun:
+        request = payload.model_dump()
         key = payload.idempotency_key or f"auto-{project.id}-{fingerprint(payload.model_dump())}"
         existing = db.scalar(select(AutoDirectorRun).where(AutoDirectorRun.project_id == project.id, AutoDirectorRun.idempotency_key == key))
         if existing:
             return existing
-        request = payload.model_dump()
+        if request.get("run_mode") == "AUTHOR_GUIDED_VOLUME":
+            from .author_guided_volume import AuthorGuidedVolumeService
+            contract = AuthorGuidedVolumeService().ensure_contract(db, project, request)
+            run = AutoDirectorRun(project_id=project.id, idempotency_key=key, status=AutoDirectorRunStatus.RUNNING, current_stage=AutoDirectorStage.BOOK_CONTRACT, run_mode="AUTHOR_GUIDED_VOLUME", settings=request, context={"request": request, "book_contract_id": contract.id, "current_volume_number": 1})
+            db.add(run); db.flush(); return run
         request["max_chapters"] = self._chapter_limit(request)
         run = AutoDirectorRun(project_id=project.id, idempotency_key=key, status=AutoDirectorRunStatus.RUNNING, current_stage=AutoDirectorStage.IDEA, run_mode="FULL_AUTO", settings={**request, "effective_max_chapters": request["max_chapters"]}, context={"request": request, "current_chapter_number": 1, "completed_chapters": []})
         db.add(run); db.flush()
