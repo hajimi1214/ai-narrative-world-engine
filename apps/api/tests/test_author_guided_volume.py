@@ -281,3 +281,17 @@ def test_new_worker_instance_resumes_persisted_author_checkpoint_without_duplica
         after = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.project_id == project_id)).all()
         assert [item.id for item in after] == before_ids
         assert db.get(AutoDirectorRun, created["id"]).context["window_id"] == before_ids[0]
+
+
+def test_quality_failed_chapter_blocks_volume_seal(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "quality-seal"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume.target_closing_state = {"done": True}; volume.actual_chapter_start = 1; volume.actual_chapter_end = 1
+        db.add(Chapter(project_id=project_id, number=1, content="有草稿但质量失败", status="DRAFT", active=True))
+        db.commit(); volume_id = volume.id
+    response = client.post(f"/projects/{project_id}/volumes/{volume_id}/seal", json={"author_confirmed": True})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "VOLUME_COMPLETION_CONDITIONS_UNMET"
