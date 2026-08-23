@@ -34,6 +34,9 @@ def test_phase2_plan_generation_creates_versioned_chapter_task_sheets(monkeypatc
         assert body["counts"]["chapters"] == 2
         assert body["chapters"][0]["must_events"] == ["接案"]
         assert fake.calls == 1
+        traces = TestClient(app).get(f"/projects/{project.id}/execution-traces?source_type=STORY_PLAN").json()
+        assert traces[0]["stage"] == "DIRECTOR"
+        assert traces[0]["status"] == "SUCCEEDED"
 
         chapter_id = body["chapters"][0]["id"]
         patch = TestClient(app).patch(f"/projects/{project.id}/planning/plans/{body['id']}/chapters/{chapter_id}", json={"locked": True, "status": "LOCKED"})
@@ -87,4 +90,19 @@ def test_long_book_keeps_macro_plan_when_detail_provider_fails(monkeypatch):
         generated, _ = planning_module.generate_plan(db, project, {"inspiration": "长篇设定", "target_chapters": 450, "target_words_per_chapter": 2800}, None, {}, {})
         assert fake.calls == 2
         assert generated["generation_warning"] == "CHAPTER_DETAIL_DEFERRED"
+        assert len(generated["chapters"]) == planning_module.INITIAL_CHAPTER_WINDOW
+
+
+def test_long_book_uses_author_outline_when_macro_provider_fails(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="Long", story_seed="【分卷大纲】卷一《第九次下葬》：调查第一宗旧案。 卷二《死人宗》：查出宗门秘密。 【前十章承诺】首章死人入铺。")
+        db.add(project); db.flush(); db.add(ProjectModelConfig(project_id=project.id, provider="openai_compatible", base_url="https://tokenrhythm.studio/v1", director_model="deepseek-v4-pro")); db.commit()
+        monkeypatch.setattr(planning_module, "get_model_provider", lambda *args, **kwargs: FakeModelProvider(error=ModelProviderError(MODEL_UPSTREAM_ERROR)))
+        generated, result = planning_module.generate_plan(db, project, {"inspiration": project.story_seed, "target_chapters": 450}, "核心冲突", {}, {})
+        assert result is None
+        assert generated["generation_warning"] == "MODEL_MACRO_DEFERRED"
+        assert [volume["title"] for volume in generated["volumes"]] == ["第九次下葬", "死人宗"]
         assert len(generated["chapters"]) == planning_module.INITIAL_CHAPTER_WINDOW

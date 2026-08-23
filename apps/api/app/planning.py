@@ -303,6 +303,33 @@ def _fallback_chapter_window(framing: dict[str, Any], count: int) -> list[dict[s
     return [_default_chapter(number, framing) for number in range(1, count + 1)]
 
 
+def _local_macro_fallback(project: Project, framing: dict[str, Any], premise: str | None) -> dict[str, Any]:
+    """Turn an author's existing long outline into an editable checkpoint on model outage."""
+    source = str(project.story_seed or premise or framing.get("inspiration") or "")
+    match = re.search(r"【分卷大纲】(.*?)(?=【前十章承诺】|\Z)", source, re.S)
+    outline = match.group(1) if match else source
+    entries = list(re.finditer(r"卷([一二三四五六七八九十]+)《([^》]+)》[：:]\s*(.*?)(?=\s*卷[一二三四五六七八九十]+《|\Z)", outline, re.S))
+    target = int(framing.get("target_chapters") or 50)
+    volume_count = len(entries) or min(10, max(1, (target + 44) // 45))
+    volumes, arcs = [], []
+    for index in range(volume_count):
+        entry = entries[index] if index < len(entries) else None
+        start = index * target // volume_count + 1
+        end = (index + 1) * target // volume_count
+        title = entry.group(2).strip() if entry else f"第{index + 1}卷"
+        summary = re.sub(r"\s+", " ", entry.group(3)).strip() if entry else "围绕既定主线推进，并在卷末留下下一卷的明确问题。"
+        volumes.append({"number": index + 1, "title": title, "summary": summary, "start_chapter": start, "end_chapter": end, "turning_points": []})
+        arcs.append({"number": index + 1, "volume_number": index + 1, "title": title, "goal": summary[:120], "summary": summary, "turning_points": []})
+    return {
+        "premise": premise or source[:1200],
+        "macro_plan": {"logline": premise or source[:500], "core_conflict": premise or "以作者已保存的大纲为准，待模型恢复后可局部深化。", "planning_source": "AUTHOR_OUTLINE_FALLBACK"},
+        "volumes": volumes,
+        "arcs": arcs,
+        "chapters": _fallback_chapter_window(framing, min(target, INITIAL_CHAPTER_WINDOW)),
+        "generation_warning": "MODEL_MACRO_DEFERRED",
+    }
+
+
 def generate_plan(db: Session, project: Project, framing: dict[str, Any], premise: str | None, style_guide: dict[str, Any], anti_ai_rules: dict[str, Any]) -> tuple[dict[str, Any], Any]:
     settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
     key = ProviderCredentialResolver().generation_key(db, project.id, settings)
@@ -330,8 +357,11 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
     macro_contract = {"framing": "object", "premise": "string", "macro_plan": "object with logline, ending and core promises", "style_guide": "object", "anti_ai_rules": "object", "volumes": "concise array covering every chapter", "arcs": "concise array covering every chapter"}
     macro_instruction = f"Return exactly one compact JSON object for a {target_chapters}-chapter Chinese novel. Create the complete book architecture: volumes and arcs must cover every chapter from 1 through {target_chapters}, with no gaps. Keep every volume and arc concise (one short summary and 2-4 turning points); do not return chapters, scenes, or prose in this call. Preserve chronology and the supplied story constraints."
     macro_messages = [{"role": "system", "content": "你是长篇小说总策划与连续性编辑。"}, {"role": "user", "content": json.dumps({"instruction": macro_instruction, "output_contract": macro_contract, "context": context, "style_guide": style_guide, "anti_ai_rules": anti_ai_rules}, ensure_ascii=False)}]
-    macro_result = provider.generate(macro_messages, route.model)
-    macro = _extract_single_json_object(macro_result.content)
+    try:
+        macro_result = provider.generate(macro_messages, route.model)
+        macro = _extract_single_json_object(macro_result.content)
+    except (ModelProviderError, ValueError, TypeError, json.JSONDecodeError):
+        return _local_macro_fallback(project, framing, premise), None
 
     detail_contract = {"chapters": f"array with exactly chapters 1-{detailed_chapters}"}
     detail_instruction = f"Return exactly one JSON object containing executable task sheets for chapters 1-{detailed_chapters} only. Each chapter needs title, summary, volume_number, arc_number, POV, start/end state, objective, conflict, mandatory and forbidden events, reveal permissions, foreshadowing, character changes, consequences, and 3-6 scene beats. Use the approved macro architecture below; do not repeat it and do not write prose."

@@ -635,14 +635,30 @@ def create_story_plan(project_id: str, payload: PlanCreatePayload, db: Session =
 def generate_story_plan(project_id: str, payload: PlanCreatePayload, db: Session = Depends(get_db)):
     project = require_project(db, project_id)
     values = payload.model_dump()
+    route = ModelRouter().resolve(db, project_id, get_settings(), "DIRECTOR")
+    trace = ExecutionTraceRecorder().start(
+        db,
+        project_id=project_id,
+        stage=ExecutionStage.DIRECTOR,
+        source_type="STORY_PLAN",
+        source_id=project_id,
+        provider=route.provider,
+        model=route.model,
+        input_fingerprint=stable_fingerprint({"framing": values["framing"], "premise": values.get("premise")}, "story-plan-input-v1"),
+    )
+    # Commit before the synchronous model request so the live panel can see it.
+    db.commit()
     try:
         generated, result = generate_plan(db, project, values["framing"], values.get("premise"), values.get("style_guide") or {}, values.get("anti_ai_rules") or {})
         generated.setdefault("framing", values["framing"]); generated.setdefault("premise", values.get("premise")); generated.setdefault("style_guide", values.get("style_guide") or {}); generated.setdefault("anti_ai_rules", values.get("anti_ai_rules") or {})
         generated["framing"] = values["framing"] | (generated.get("framing") or {})
         errors = validate_plan_references(db, project_id, generated)
         if errors:
+            ExecutionTraceRecorder().block(trace, "PLAN_REFERENCE_INVALID", validation_report={"errors": errors})
+            db.commit()
             raise HTTPException(status_code=422, detail={"code": "PLAN_REFERENCE_INVALID", "errors": errors})
-        plan = persist_plan(db, project, generated, provider=result.provider, model=result.model, request_id=result.request_id, report={"latency_ms": result.latency_ms, "direction_options": generated.get("direction_options", [])})
+        plan = persist_plan(db, project, generated, provider=result.provider if result else None, model=result.model if result else None, request_id=result.request_id if result else None, report={"latency_ms": result.latency_ms if result else None, "direction_options": generated.get("direction_options", []), "generation_warning": generated.get("generation_warning")})
+        ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms if result else None, request_id=result.request_id if result else None, output_fingerprint=stable_fingerprint({"plan_id": plan.id, "warning": generated.get("generation_warning")}, "story-plan-output-v1"))
         db.commit(); db.refresh(plan)
         return plan_payload(db, plan)
     except HTTPException:
@@ -650,6 +666,8 @@ def generate_story_plan(project_id: str, payload: PlanCreatePayload, db: Session
     except Exception as exc:
         db.rollback()
         code = getattr(exc, "code", None) or getattr(exc, "error_code", None) or "PLAN_GENERATION_FAILED"
+        ExecutionTraceRecorder().fail(trace, code, upstream_status=getattr(exc, "upstream_status", None))
+        db.commit()
         raise HTTPException(status_code=502, detail={"code": code, "message": str(exc)}) from exc
 
 
