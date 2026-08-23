@@ -9,7 +9,7 @@ import app.api as api_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, Project, StoryPlanChapter, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, ForeshadowingStatus, Project, StoryPlanChapter, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -110,3 +110,24 @@ def test_author_can_add_character_and_change_plot_direction_without_touching_sea
     direction = client.post(f"/projects/{project_id}/volumes/{volume_id}/plot-direction", json={"global_plot_direction": "主角必须先保护证人"})
     assert direction.status_code == 200, direction.text
     assert direction.json()["requires_replan"] is True
+
+
+def test_foreshadowing_context_respects_payoff_window_and_status_transitions(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "foreshadow-context"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume_number = volume.volume_number
+        volume_id = volume.id
+    seeded = client.post(f"/projects/{project_id}/volumes/{volume_id}/foreshadowings", json={"foreshadow_ref": "secret-door", "title": "密门", "earliest_payoff_volume": 2, "target_payoff_volume": 3}).json()
+    with Session() as db:
+        from app.author_guided_volume import AuthorGuidedVolumeService
+        volume = db.get(VolumeContract, volume_id)
+        context = AuthorGuidedVolumeService().continuity_context(db, volume)
+        assert seeded["id"] in {item["id"] for item in context["forbidden_to_reveal"]}
+    touched = client.post(f"/projects/{project_id}/foreshadowings/{seeded['id']}/status", json={"status": "TOUCHED", "volume_id": volume_id})
+    assert touched.status_code == 200
+    paid = client.post(f"/projects/{project_id}/foreshadowings/{seeded['id']}/status", json={"status": "PAID_OFF", "volume_id": volume_id})
+    assert paid.status_code == 200
+    assert paid.json()["status"] == ForeshadowingStatus.PAID_OFF.value

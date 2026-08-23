@@ -176,8 +176,9 @@ class AuthorGuidedVolumeService:
         existing = next((item for item in plans if (item.generation_report or {}).get("author_window_id") == window.id), None)
         if existing:
             return [item.id for item in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == existing.id)).all()]
-        framing = {"target_words_per_chapter": project.target_chapter_words, "pov": (contract.style_contract or {}).get("pov", "THIRD_PERSON_LIMITED"), "author_window_id": window.id}
-        chapters = [{"number": number, "volume_number": volume.volume_number, "arc_number": 1, "title": f"第{number}章", "summary": volume.volume_goal or "推进当前卷目标", "objective": "推进当前卷目标并形成不可逆后果", "conflict": volume.core_conflict or "外部阻力迫使主角选择", "must_events": volume.required_events or [], "forbidden_events": volume.forbidden_events or [], "allowed_reveals": volume.allowed_reveals or [], "forbidden_reveals": volume.forbidden_reveals or [], "scene_beats": ["建立本章局势", "形成关键选择", "留下可验证后果"], "locked": False} for number in range(window.start_chapter_number, window.end_chapter_number + 1)]
+        continuity = self.continuity_context(db, volume)
+        framing = {"target_words_per_chapter": project.target_chapter_words, "pov": (contract.style_contract or {}).get("pov", "THIRD_PERSON_LIMITED"), "author_window_id": window.id, "continuity_constraints": continuity}
+        chapters = [{"number": number, "volume_number": volume.volume_number, "arc_number": 1, "title": f"第{number}章", "summary": volume.volume_goal or "推进当前卷目标", "objective": "推进当前卷目标并形成不可逆后果", "conflict": volume.core_conflict or "外部阻力迫使主角选择", "must_events": volume.required_events or [], "forbidden_events": volume.forbidden_events or [], "allowed_reveals": (volume.allowed_reveals or []) + continuity["touchable_foreshadowings"], "forbidden_reveals": (volume.forbidden_reveals or []) + continuity["forbidden_to_reveal"], "foreshadow_create": [], "foreshadow_payoff": continuity["payoffable_foreshadowings"], "scene_beats": ["建立本章局势", "形成关键选择", "留下可验证后果"], "locked": False} for number in range(window.start_chapter_number, window.end_chapter_number + 1)]
         plan = persist_plan(db, project, {"framing": framing, "premise": contract.premise, "macro_plan": {"author_window": marker, "volume_goal": volume.volume_goal}, "style_guide": contract.style_contract or {}, "anti_ai_rules": {}, "volumes": [{"number": volume.volume_number, "title": volume.title or f"第 {volume.volume_number} 卷", "start_chapter": window.start_chapter_number, "end_chapter": window.end_chapter_number}], "chapters": chapters}, report={"author_guided": True, "author_window_id": window.id}, archive_latest=False)
         plan.status = StoryPlanStatus.APPROVED
         window.plan_fingerprint = plan.source_fingerprint
@@ -185,6 +186,31 @@ class AuthorGuidedVolumeService:
         window.status = ChapterWindowStatus.COMPLETED
         db.flush()
         return [item.id for item in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id)).all()]
+
+    def continuity_context(self, db: Session, volume: VolumeContract) -> dict[str, Any]:
+        rows = db.scalars(select(ForeshadowingLedger).where(ForeshadowingLedger.project_id == volume.project_id, ForeshadowingLedger.status.not_in([ForeshadowingStatus.PAID_OFF, ForeshadowingStatus.CANCELLED]))).all()
+        touchable, payable, forbidden = [], [], []
+        for item in rows:
+            source = {"id": item.id, "foreshadow_ref": item.foreshadow_ref, "title": item.title, "source_volume_id": item.source_volume_id, "source_chapter_id": item.source_chapter_id, "allowed_reveal_level": item.allowed_reveal_level}
+            if item.status == ForeshadowingStatus.FORBIDDEN_TO_REVEAL or (item.earliest_payoff_volume and volume.volume_number < item.earliest_payoff_volume):
+                forbidden.append(source)
+            else:
+                touchable.append(source)
+                if item.target_payoff_volume is None or volume.volume_number >= item.target_payoff_volume:
+                    payable.append(source)
+        snapshot = db.scalar(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == volume.id))
+        return {"source_snapshot_id": snapshot.id if snapshot else volume.sealed_snapshot_id, "touchable_foreshadowings": touchable, "payoffable_foreshadowings": payable, "forbidden_to_reveal": forbidden, "unresolved_from_prior_volumes": snapshot.unresolved_foreshadowings if snapshot else []}
+
+    def update_foreshadowing(self, db: Session, item: ForeshadowingLedger, status: ForeshadowingStatus, *, volume_id: str | None = None, chapter_id: str | None = None) -> ForeshadowingLedger:
+        if item.status == ForeshadowingStatus.PAID_OFF and status != ForeshadowingStatus.PAID_OFF:
+            raise AuthorGuidedVolumeError("FORESHADOWING_ALREADY_PAID_OFF")
+        item.status = status
+        if volume_id:
+            item.source_volume_id = item.source_volume_id or volume_id
+        if chapter_id:
+            item.source_chapter_id = item.source_chapter_id or chapter_id
+        item.fingerprint = _fingerprint({"ref": item.foreshadow_ref, "status": _enum(status), "volume": volume_id, "chapter": chapter_id})
+        return item
 
     def progress(self, db: Session, volume: VolumeContract) -> dict[str, Any]:
         start = volume.actual_chapter_start or volume.estimated_chapter_start or 1

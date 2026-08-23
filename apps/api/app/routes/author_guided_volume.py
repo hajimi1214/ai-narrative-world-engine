@@ -167,6 +167,22 @@ def seed_foreshadowing(project_id: str, volume_id: str, payload: dict, db: Sessi
     db.add(item); db.commit(); return {"id": item.id, "status": _enum(item.status), "foreshadow_ref": item.foreshadow_ref}
 
 
+@router.post("/projects/{project_id}/foreshadowings/{foreshadow_id}/status")
+def update_foreshadowing_status(project_id: str, foreshadow_id: str, payload: dict, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    item = db.get(ForeshadowingLedger, foreshadow_id)
+    if not item or item.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Foreshadowing not found")
+    try:
+        next_status = ForeshadowingStatus(str(payload.get("status") or "").upper())
+        AuthorGuidedVolumeService().update_foreshadowing(db, item, next_status, volume_id=payload.get("volume_id"), chapter_id=payload.get("chapter_id"))
+        db.commit()
+        return {"id": item.id, "status": _enum(item.status), "fingerprint": item.fingerprint}
+    except (ValueError, AuthorGuidedVolumeError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "FORESHADOWING_STATUS_INVALID"), "message": str(exc)}) from exc
+
+
 @router.post("/projects/{project_id}/volumes/{volume_id}/guidance")
 def add_guidance(project_id: str, volume_id: str, payload: AuthorGuidancePayload, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id)
