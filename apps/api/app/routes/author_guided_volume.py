@@ -62,6 +62,13 @@ def get_author_guided_run(project_id: str, run_id: str, db: Session = Depends(ge
     return _run_payload(db, run)
 
 
+@router.get("/projects/{project_id}/author-guided-volume/runs")
+def list_author_guided_runs(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    runs = db.scalars(select(AutoDirectorRun).where(AutoDirectorRun.project_id == project_id, AutoDirectorRun.run_mode == "AUTHOR_GUIDED_VOLUME").order_by(AutoDirectorRun.updated_at.desc())).all()
+    return [_run_payload(db, run) for run in runs]
+
+
 @router.post("/projects/{project_id}/author-guided-volume/runs/{run_id}/continue")
 def continue_author_guided_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id); run = db.get(AutoDirectorRun, run_id)
