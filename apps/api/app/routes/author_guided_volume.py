@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, PlotDirectionPayload, VolumeActionPayload
+from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, PlotDirectionPayload, VolumeActionPayload, VolumeContractUpdatePayload
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _contract_payload, _enum, _volume_payload, _window_payload
 from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookContract, ChapterPlanningWindow, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
 from .common import get_db, require_project
@@ -241,6 +241,18 @@ def add_author_character(project_id: str, volume_id: str, payload: AuthorCharact
     character, guidance = AuthorGuidedVolumeService().add_character(db, project_id, volume, payload.model_dump())
     db.commit()
     return {"character": {"id": character.id, "name": character.name, "profile": character.profile, "goals": character.goals, "narrative_relevance": character.narrative_relevance}, "guidance": {"id": guidance.id, "analysis": guidance.analysis, "requires_replan": guidance.requires_replan}}
+
+
+@router.patch("/projects/{project_id}/volumes/{volume_id}/contract")
+def update_volume_contract(project_id: str, volume_id: str, payload: VolumeContractUpdatePayload, db: Session = Depends(get_db)):
+    volume = _volume_or_404(db, project_id, volume_id)
+    try:
+        guidance = AuthorGuidedVolumeService().update_volume_contract(db, volume, payload.model_dump(exclude_none=True))
+        db.commit()
+        return {"volume": _volume_payload(volume), "guidance": {"id": guidance.id, "analysis": guidance.analysis, "requires_replan": guidance.requires_replan}}
+    except AuthorGuidedVolumeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
 
 
 @router.post("/projects/{project_id}/volumes/{volume_id}/plot-direction")

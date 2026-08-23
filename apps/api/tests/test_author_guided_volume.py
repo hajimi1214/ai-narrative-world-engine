@@ -182,3 +182,22 @@ def test_sealed_snapshot_does_not_expose_future_character_secret(monkeypatch):
         db.commit()
         assert "secrets" not in snapshot.character_states[character.id]
         assert "未来才揭示的秘密" not in snapshot.character_states[character.id]["known_facts_at_seal"]
+
+
+def test_author_can_update_unsealed_volume_contract_but_not_sealed_volume(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "volume-contract"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume_id = volume.id
+        version = volume.version
+    updated = client.patch(f"/projects/{project_id}/volumes/{volume_id}/contract", json={"volume_goal": "作者指定的新目标", "author_note": "调整本卷目标"})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["volume"]["version"] == version + 1
+    with Session() as db:
+        volume = db.get(VolumeContract, volume_id)
+        volume.status = VolumeContractStatus.SEALED
+        db.commit()
+    rejected = client.patch(f"/projects/{project_id}/volumes/{volume_id}/contract", json={"volume_goal": "不应修改", "author_note": "尝试修改封存卷"})
+    assert rejected.status_code == 409

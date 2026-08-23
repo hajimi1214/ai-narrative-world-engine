@@ -77,6 +77,20 @@ class PlotDirectionPayload(BaseModel):
     requires_replan: bool = True
 
 
+class VolumeContractUpdatePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    title: str | None = Field(default=None, max_length=300)
+    volume_goal: str | None = Field(default=None, max_length=12000)
+    core_conflict: str | None = Field(default=None, max_length=12000)
+    target_closing_state: dict[str, Any] | None = None
+    completion_conditions: list[Any] | None = None
+    required_events: list[Any] | None = None
+    forbidden_events: list[Any] | None = None
+    allowed_reveals: list[Any] | None = None
+    forbidden_reveals: list[Any] | None = None
+    author_note: str = Field(min_length=1, max_length=4000)
+
+
 class VolumeActionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: str | None = Field(default=None, max_length=4000)

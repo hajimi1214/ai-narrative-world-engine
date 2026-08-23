@@ -122,6 +122,17 @@ class AuthorGuidedVolumeService:
         data = {"author_note": payload.get("author_note") or "作者修改全书剧情走向", "affected_scope": "MAINLINE", "author_locked_constraints": payload.get("author_locked_constraints") or [], "requires_replan": True}
         return self.record_guidance(db, volume, data)
 
+    def update_volume_contract(self, db: Session, volume: VolumeContract, payload: dict[str, Any]) -> AuthorGuidance:
+        if volume.status == VolumeContractStatus.SEALED:
+            raise AuthorGuidedVolumeError("VOLUME_SEALED")
+        mutable = ("title", "volume_goal", "core_conflict", "target_closing_state", "completion_conditions", "required_events", "forbidden_events", "allowed_reveals", "forbidden_reveals")
+        for key in mutable:
+            if key in payload and payload[key] is not None:
+                setattr(volume, key, payload[key])
+        volume.version += 1
+        volume.fingerprint = _fingerprint(_volume_payload(volume))
+        return self.record_guidance(db, volume, {"author_note": payload["author_note"], "affected_scope": "VOLUME", "requires_replan": True})
+
     def ensure_contract(self, db: Session, project: Project, payload: dict[str, Any]) -> BookContract:
         contract = db.scalar(select(BookContract).where(BookContract.project_id == project.id))
         if contract:
