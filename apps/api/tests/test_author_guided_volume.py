@@ -9,7 +9,7 @@ import app.api as api_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, ForeshadowingStatus, Project, StoryPlanChapter, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, ForeshadowingStatus, Project, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -143,3 +143,24 @@ def test_author_run_takeover_and_retry_are_durable(monkeypatch):
     assert retry.status_code == 200 and retry.json()["status"] == "RUNNING"
     with Session() as db:
         assert db.get(AutoDirectorRun, run_id).context["execute_window"] is True
+
+
+def test_next_volume_window_inherits_only_sealed_snapshot_reference(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "next-volume"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        current = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        current.status = VolumeContractStatus.READY_TO_SEAL
+        current.actual_chapter_start = 1; current.actual_chapter_end = 1
+        db.add(Chapter(project_id=project_id, number=1, content="完成", status="QUALITY_APPROVED", active=True))
+        from app.author_guided_volume import AuthorGuidedVolumeService
+        snapshot = AuthorGuidedVolumeService().create_snapshot(db, current)
+        current.status = VolumeContractStatus.SEALED; current.sealed_snapshot_id = snapshot.id
+        db.commit(); current_id = current.id
+    response = client.post(f"/projects/{project_id}/volumes/{current_id}/next")
+    assert response.status_code == 200, response.text
+    next_window_id = response.json()["window"]["id"]
+    with Session() as db:
+        window = db.get(ChapterPlanningWindow, next_window_id)
+        assert window.source_volume_snapshot_id == response.json()["source_snapshot_id"]

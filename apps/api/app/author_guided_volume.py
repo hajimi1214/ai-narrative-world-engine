@@ -166,7 +166,8 @@ class AuthorGuidedVolumeService:
             return existing
         start = self.next_chapter_number(db, project.id)
         end = start + max(1, min(int(size or self.WINDOW_SIZE), 10)) - 1
-        window = ChapterPlanningWindow(project_id=project.id, volume_id=volume.id, start_chapter_number=start, end_chapter_number=end, status=ChapterWindowStatus.ACTIVE, author_note=author_note, plan_fingerprint=_fingerprint({"volume": volume.fingerprint, "start": start, "end": end, "author_note": author_note}), source_volume_snapshot_id=volume.sealed_snapshot_id)
+        source_snapshot_id = volume.sealed_snapshot_id or (volume.opening_state or {}).get("source_volume_snapshot_id")
+        window = ChapterPlanningWindow(project_id=project.id, volume_id=volume.id, start_chapter_number=start, end_chapter_number=end, status=ChapterWindowStatus.ACTIVE, author_note=author_note, plan_fingerprint=_fingerprint({"volume": volume.fingerprint, "start": start, "end": end, "author_note": author_note, "source_snapshot": source_snapshot_id}), source_volume_snapshot_id=source_snapshot_id)
         db.add(window); db.flush()
         return window
 
@@ -198,8 +199,9 @@ class AuthorGuidedVolumeService:
                 touchable.append(source)
                 if item.target_payoff_volume is None or volume.volume_number >= item.target_payoff_volume:
                     payable.append(source)
-        snapshot = db.scalar(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == volume.id))
-        return {"source_snapshot_id": snapshot.id if snapshot else volume.sealed_snapshot_id, "touchable_foreshadowings": touchable, "payoffable_foreshadowings": payable, "forbidden_to_reveal": forbidden, "unresolved_from_prior_volumes": snapshot.unresolved_foreshadowings if snapshot else []}
+        source_snapshot_id = volume.sealed_snapshot_id or (volume.opening_state or {}).get("source_volume_snapshot_id")
+        snapshot = db.get(VolumeContinuitySnapshot, source_snapshot_id) if source_snapshot_id else db.scalar(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == volume.id))
+        return {"source_snapshot_id": snapshot.id if snapshot else source_snapshot_id, "touchable_foreshadowings": touchable, "payoffable_foreshadowings": payable, "forbidden_to_reveal": forbidden, "unresolved_from_prior_volumes": snapshot.unresolved_foreshadowings if snapshot else []}
 
     def update_foreshadowing(self, db: Session, item: ForeshadowingLedger, status: ForeshadowingStatus, *, volume_id: str | None = None, chapter_id: str | None = None) -> ForeshadowingLedger:
         if item.status == ForeshadowingStatus.PAID_OFF and status != ForeshadowingStatus.PAID_OFF:
