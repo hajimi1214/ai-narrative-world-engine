@@ -91,6 +91,8 @@ def retry_author_guided_run(project_id: str, run_id: str, db: Session = Depends(
         raise HTTPException(status_code=404, detail="Author-guided run not found")
     if run.status == AutoDirectorRunStatus.COMPLETED:
         raise HTTPException(status_code=409, detail={"code": "RUN_ALREADY_COMPLETED"})
+    if run.pause_reason == "WINDOW_COMPLETE" and (run.context or {}).get("window_complete"):
+        return _run_payload(db, run)
     steps = db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()
     failures = sum(1 for step in steps if step.status in {"FAILED", "BLOCKED"})
     if failures >= int((run.settings or {}).get("max_retries", 2) or 2):

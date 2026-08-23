@@ -323,7 +323,16 @@ class AuthorGuidedVolumeService:
         run.current_stage = AutoDirectorStage.VOLUME_SKELETON
         volume = self.ensure_volume(db, project, contract, request.get("volume") or {})
         run.context = {**run.context, "volume_id": volume.id}
-        window = self.ensure_window(db, project, volume, author_note=request.get("author_note"), size=request.get("window_size"))
+        context = dict(run.context or {})
+        if context.get("window_complete") and context.get("execute_window") and context.get("window_id"):
+            previous = db.get(ChapterPlanningWindow, context["window_id"])
+            if previous and previous.status != ChapterWindowStatus.COMPLETED:
+                previous.status = ChapterWindowStatus.COMPLETED
+                previous.completed_at = datetime.utcnow()
+            window = self.ensure_followup_window(db, project, volume, previous, size=request.get("window_size")) if previous else self.ensure_window(db, project, volume, author_note=request.get("author_note"), size=request.get("window_size"))
+            run.context = {**context, "window_complete": False, "current_chapter_number": window.start_chapter_number, "last_adopted_chapter_number": 0, "last_adopted_chapter_id": None, "last_adopted_draft_id": None}
+        else:
+            window = self.ensure_window(db, project, volume, author_note=request.get("author_note"), size=request.get("window_size"))
         task_ids = self.ensure_window_tasks(db, project, volume, window, contract)
         prior_context = dict(run.context or {})
         current_number = int(prior_context.get("current_chapter_number") or window.start_chapter_number)
@@ -380,6 +389,7 @@ class AuthorGuidedVolumeService:
             run.current_stage = AutoDirectorStage.VOLUME_PROGRESS_ASSESSMENT
             run.pause_reason = "WINDOW_COMPLETE"
             run.next_action = "当前窗口已完成，系统等待继续当前卷、扩展当前卷或作者确认封存。"
+            run.context = {**(run.context or {}), "window_complete": True}
             window.continuation_decision = "ASSESS_VOLUME"
         elif run.status == AutoDirectorRunStatus.RUNNING:
             run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION

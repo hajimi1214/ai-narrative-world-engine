@@ -465,6 +465,7 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
     with Session() as db:
         chapter = db.scalar(select(Chapter).where(Chapter.project_id == project_id, Chapter.number == 1, Chapter.active.is_(True)))
         assert chapter and chapter.content
+        original_content = chapter.content
         assert chapter.current_writer_draft_id
         draft = db.get(ChapterWriterDraft, chapter.current_writer_draft_id)
         assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True)))
@@ -474,3 +475,14 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
         assert run.status.value == "PAUSED"
         assert run.current_stage.value == "VOLUME_PROGRESS_ASSESSMENT"
         assert run.token_usage["total_tokens"] > 0
+
+    retry = client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/retry")
+    assert retry.status_code == 200 and retry.json()["status"] == "PAUSED"
+    assert client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/continue").status_code == 200
+    assert worker.run_once() is True
+    with Session() as db:
+        chapter = db.scalar(select(Chapter).where(Chapter.project_id == project_id, Chapter.number == 1, Chapter.active.is_(True)))
+        windows = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.project_id == project_id).order_by(ChapterPlanningWindow.start_chapter_number)).all()
+        assert chapter.content == original_content
+        assert len(windows) == 2 and windows[0].status.value == "COMPLETED", [(item.start_chapter_number, item.end_chapter_number, item.status.value) for item in windows]
+        assert windows[1].start_chapter_number > windows[0].end_chapter_number
