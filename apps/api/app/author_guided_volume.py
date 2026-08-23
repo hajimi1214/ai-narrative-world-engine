@@ -249,7 +249,11 @@ class AuthorGuidedVolumeService:
         completed = [event for event in required if any(str(event) in (item.content or "") for item in adopted)]
         conditions = list(volume.completion_conditions or [])
         conditions_met = all(any(str(condition) in (item.content or "") for item in adopted) for condition in conditions)
-        target_reached = bool(volume.target_closing_state) and bool(adopted)
+        latest_number = max((item.number for item in adopted), default=None)
+        latest_task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == volume.project_id, StoryPlanChapter.number == latest_number).order_by(StoryPlanChapter.created_at.desc())) if latest_number is not None else None
+        target = volume.target_closing_state or {}
+        end_state = latest_task.end_state if latest_task else {}
+        target_reached = bool(target) and bool(adopted) and all(end_state.get(key) == value for key, value in target.items())
         ready = bool(adopted) and not incomplete and conditions_met and target_reached
         return {"volume_goal_progress": 1.0 if ready else min(0.99, len(adopted) / max(1, len(adopted) + len(incomplete) + 1)), "protagonist_arc_progress": 1.0 if ready else (0.5 if adopted else 0.0), "conflict_progress": 1.0 if ready else (0.5 if adopted else 0.0), "required_events_completed": completed, "incomplete_chapters": incomplete, "unresolved_threads": volume.unresolved_threads or [], "pending_foreshadowings": [], "target_closing_state_reached": target_reached, "should_extend_volume": not ready, "should_prepare_seal": ready, "should_start_next_volume": False, "reason": "本卷仍需继续推进，未满足剧情目标或仍有未通过质量门的章节。" if not ready else "本卷完成条件已满足，等待作者确认封存。"}
 

@@ -75,6 +75,8 @@ def test_sealed_volume_requires_author_confirmation_and_snapshot(monkeypatch):
         volume.actual_chapter_end = 1
         from app.models import Chapter
         db.add(Chapter(project_id=project_id, number=1, content="本卷完成", status="QUALITY_APPROVED", active=True))
+        task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
+        task.end_state = {"case": "closed"}
         db.commit(); volume_id = volume.id
     rejected = client.post(f"/projects/{project_id}/volumes/{volume_id}/seal", json={"author_confirmed": False})
     assert rejected.status_code == 409
@@ -221,6 +223,8 @@ def test_dynamic_length_and_window_rollover_do_not_use_estimate_as_completion_li
         volume.actual_chapter_start = 1; volume.actual_chapter_end = 1
         volume.target_closing_state = {"done": True}
         db.add(Chapter(project_id=project_id, number=1, content="已收束", status="QUALITY_APPROVED", active=True))
+        task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
+        task.end_state = {"done": True}
         db.commit()
         report = __import__("app.author_guided_volume", fromlist=["AuthorGuidedVolumeService"]).AuthorGuidedVolumeService().progress(db, volume)
         assert report["should_prepare_seal"] is True
@@ -310,11 +314,30 @@ def test_completion_proposal_contains_adopted_evidence_and_honors_policy(monkeyp
         volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
         volume.actual_chapter_start = 1; volume.actual_chapter_end = 1; volume.target_closing_state = {"done": True}
         chapter = Chapter(project_id=project_id, number=1, content="已采用正文", status="QUALITY_APPROVED", active=True)
-        db.add(chapter); db.commit(); volume_id = volume.id; chapter_id = chapter.id
+        db.add(chapter)
+        task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
+        task.end_state = {"done": True}
+        db.commit(); volume_id = volume.id; chapter_id = chapter.id
     proposal = client.get(f"/projects/{project_id}/volumes/{volume_id}/completion-proposal")
     assert proposal.status_code == 200
     assert proposal.json()["status"] == "PROPOSED"
     assert proposal.json()["evidence_chapter_ids"] == [chapter_id]
+
+
+def test_volume_progress_requires_structured_closing_state(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "closing-state"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume.actual_chapter_start = 1; volume.actual_chapter_end = 1; volume.target_closing_state = {"case": "closed"}
+        db.add(Chapter(project_id=project_id, number=1, content="质量通过但未收束", status="QUALITY_APPROVED", active=True))
+        task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
+        task.end_state = {"case": "open"}
+        db.commit(); volume_id = volume.id
+    blocked = client.post(f"/projects/{project_id}/volumes/{volume_id}/seal", json={"author_confirmed": True})
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "VOLUME_COMPLETION_CONDITIONS_UNMET"
 
 
 def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkeypatch):
