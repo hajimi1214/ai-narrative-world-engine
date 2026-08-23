@@ -96,6 +96,15 @@ def continue_volume(project_id: str, volume_id: str, payload: dict | None = None
     db.commit(); return {"volume": _volume_payload(volume), "window": _window_payload(window)}
 
 
+@router.post("/projects/{project_id}/volumes/{volume_id}/extend")
+def extend_volume(project_id: str, volume_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
+    volume = _volume_or_404(db, project_id, volume_id)
+    if volume.status == VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
+    volume.status = VolumeContractStatus.EXTENDING
+    window = AuthorGuidedVolumeService().ensure_window(db, db.get(Project, project_id), volume, author_note=(payload or {}).get("author_note"), size=(payload or {}).get("window_size"))
+    db.commit(); return {"volume": _volume_payload(volume), "window": _window_payload(window), "extended": True}
+
+
 @router.post("/projects/{project_id}/volumes/{volume_id}/pause")
 def pause_volume(project_id: str, volume_id: str, payload: VolumeActionPayload, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id)
@@ -165,3 +174,12 @@ def completion_proposal(project_id: str, volume_id: str, db: Session = Depends(g
     if not contract: raise HTTPException(status_code=409, detail={"code": "BOOK_CONTRACT_MISSING"})
     proposal = AuthorGuidedVolumeService().completion_proposal(db, contract, volume); db.commit()
     return {"id": proposal.id, "status": _enum(proposal.status), "reason": proposal.reason, "unresolved_threads": proposal.unresolved_threads, "unresolved_foreshadowings": proposal.unresolved_foreshadowings, "protagonist_arc_status": proposal.protagonist_arc_status, "main_conflict_status": proposal.main_conflict_status, "ending_requirements": proposal.ending_requirements}
+
+
+@router.post("/projects/{project_id}/completion-proposals/{proposal_id}/confirm")
+def confirm_completion(project_id: str, proposal_id: str, payload: VolumeActionPayload, db: Session = Depends(get_db)):
+    require_project(db, project_id); proposal = db.get(BookCompletionProposal, proposal_id)
+    if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Completion proposal not found")
+    if not payload.author_confirmed or proposal.status != "PROPOSED": raise HTTPException(status_code=409, detail={"code": "AUTHOR_CONFIRMATION_REQUIRED"})
+    proposal.status = "AUTHOR_CONFIRMED"; db.commit()
+    return {"id": proposal.id, "status": _enum(proposal.status), "book_completed": False, "next_action": "作者仍需明确完成书籍，系统不会因章节数量自动结束。"}
