@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+import json
+import re
+from types import SimpleNamespace
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import app.api as api_module
+import app.auto_director as auto_module
+import app.runtime as runtime_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, Character, CharacterKnowledge, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, Character, CharacterKnowledge, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -295,3 +300,102 @@ def test_quality_failed_chapter_blocks_volume_seal(monkeypatch):
     response = client.post(f"/projects/{project_id}/volumes/{volume_id}/seal", json={"author_confirmed": True})
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "VOLUME_COMPLETION_CONDITIONS_UNMET"
+
+
+def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    with Session() as db:
+        project = db.get(Project, project_id)
+        project.autonomy_settings = {"quality_gate": {"require_critic": False}}
+        db.commit()
+
+    plan_payload = {
+        "premise": "修复师追查会回应的档案",
+        "macro_plan": {"promise": "找到档案来源"},
+        "volumes": [], "arcs": [],
+        "chapters": [{
+            "number": 1, "volume_number": 1, "arc_number": 1,
+            "title": "回声", "summary": "档案首次回应",
+            "objective": "接受调查", "conflict": "回应带来代价",
+            "scene_beats": [], "must_events": [], "forbidden_events": [],
+            "end_state": {"case": "open"},
+        }],
+    }
+    monkeypatch.setattr(
+        auto_module, "generate_plan",
+        lambda *args, **kwargs: (
+            plan_payload,
+            SimpleNamespace(provider="fake", model="fake", request_id="plan", latency_ms=0, usage={"total_tokens": 4}),
+        ),
+    )
+
+    class AuthorChainProvider:
+        name = "fake"
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, messages, model):
+            from app.ai.provider import ModelResult
+            self.calls += 1
+            prompt = "\n".join(item.get("content", "") for item in messages)
+            if "actor_view" in prompt:
+                payload = {
+                    "decision_type": "OBSERVE", "intent": "推进调查", "chosen_action": "检查档案",
+                    "motivation": "确认线索", "target_character_id": None, "target_entity_id": None,
+                    "goal_refs": [], "knowledge_used": [], "memory_refs": [], "ability_refs": [],
+                    "inventory_refs": [], "relationship_factors": {}, "perceived_risk": None,
+                    "accepted_cost": None, "expected_personal_result": "获得线索", "uncertainties": [],
+                    "refused_options": [], "boundary_override_reason": None, "decision_summary": "检查档案。",
+                }
+                action = {"visibility": "PUBLIC", "observable_action": "检查档案", "spoken_content": None,
+                          "requires_world_resolution": False, "world_resolution_request": None,
+                          "disclosure_knowledge_ids": [], "scene_beat_refs": [], "target_character_id": None}
+                beats = re.search(r'"scene_beats"\s*:\s*\[(.*?)\]', prompt)
+                if beats:
+                    action["scene_beat_refs"] = re.findall(r'"([^\"]+)"', beats.group(1))
+                payload = {"decision": payload, "action": action}
+            elif "quality_context" in prompt:
+                payload = {"decision": "PASS", "scores": {key: 95 for key in [
+                    "factual_grounding", "pov_compliance", "reveal_safety", "style_naturalness",
+                    "repetition", "pacing", "voice_consistency", "overall",
+                ]}, "findings": []}
+            elif "chapter_title" in prompt and "source_manifest" in prompt:
+                context = json.loads(messages[-1]["content"])["context"]
+                payload = {"chapter_title": "回声", "prose": "修复师检查档案，纸页深处传来微弱回声。",
+                           "scene_coverage": [item["scene_id"] for item in context["source_manifest"]["scenes"]],
+                           "source_refs": [], "pov_character_id": context["rendering_contract"]["pov_character_id"],
+                           "task_coverage": []}
+            else:
+                payload = {"decision": "PASS", "scores": {"overall": 95}, "findings": []}
+            return ModelResult(content=json.dumps(payload, ensure_ascii=False), latency_ms=0,
+                               request_id=f"author-fake-{self.calls}", provider="fake", model=model,
+                               usage={"total_tokens": 3})
+
+    provider = AuthorChainProvider()
+    monkeypatch.setattr(auto_module, "get_model_provider", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(runtime_module, "get_model_provider", lambda *args, **kwargs: provider)
+    created = client.post(
+        f"/projects/{project_id}/author-guided-volume/runs",
+        json={"window_size": 1, "idempotency_key": "author-e2e"},
+    )
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    worker = AutoDirectorWorker(Session, poll_seconds=0)
+    assert worker.run_once() is True
+    assert client.get(f"/projects/{project_id}/author-guided-volume/runs/{run_id}").json()["status"] == "PAUSED"
+    assert client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/continue").status_code == 200
+    assert worker.run_once() is True
+
+    with Session() as db:
+        chapter = db.scalar(select(Chapter).where(Chapter.project_id == project_id, Chapter.number == 1, Chapter.active.is_(True)))
+        assert chapter and chapter.content
+        assert chapter.current_writer_draft_id
+        draft = db.get(ChapterWriterDraft, chapter.current_writer_draft_id)
+        assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True)))
+        run = db.get(AutoDirectorRun, run_id)
+        assert draft and draft.status.value == "ADOPTED"
+        assert assessment and assessment.status.value == "PASS"
+        assert run.status.value == "PAUSED"
+        assert run.current_stage.value == "VOLUME_PROGRESS_ASSESSMENT"
+        assert run.token_usage["total_tokens"] > 0
