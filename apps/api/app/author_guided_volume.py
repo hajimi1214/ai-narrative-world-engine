@@ -21,7 +21,7 @@ from .models import (
     Chapter, ChapterPlanningWindow, ChapterWindowStatus, ForeshadowingLedger,
     ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus,
     VolumeContinuitySnapshot, StoryPlan, StoryPlanChapter, StoryPlanStatus,
-    Character, PlanChapterStatus,
+    Character, CharacterKnowledge, KnowledgeStatus, PlanChapterStatus,
 )
 from .planning import persist_plan
 
@@ -201,7 +201,7 @@ class AuthorGuidedVolumeService:
                     payable.append(source)
         source_snapshot_id = volume.sealed_snapshot_id or (volume.opening_state or {}).get("source_volume_snapshot_id")
         snapshot = db.get(VolumeContinuitySnapshot, source_snapshot_id) if source_snapshot_id else db.scalar(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == volume.id))
-        return {"source_snapshot_id": snapshot.id if snapshot else source_snapshot_id, "touchable_foreshadowings": touchable, "payoffable_foreshadowings": payable, "forbidden_to_reveal": forbidden, "unresolved_from_prior_volumes": snapshot.unresolved_foreshadowings if snapshot else []}
+        return {"source_snapshot_id": snapshot.id if snapshot else source_snapshot_id, "character_states": snapshot.character_states if snapshot else {}, "touchable_foreshadowings": touchable, "payoffable_foreshadowings": payable, "forbidden_to_reveal": forbidden, "unresolved_from_prior_volumes": snapshot.unresolved_foreshadowings if snapshot else []}
 
     def update_foreshadowing(self, db: Session, item: ForeshadowingLedger, status: ForeshadowingStatus, *, volume_id: str | None = None, chapter_id: str | None = None) -> ForeshadowingLedger:
         if item.status == ForeshadowingStatus.PAID_OFF and status != ForeshadowingStatus.PAID_OFF:
@@ -238,7 +238,11 @@ class AuthorGuidedVolumeService:
         if existing:
             return existing
         chapters = db.scalars(select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.active.is_(True), Chapter.number >= (volume.actual_chapter_start or 1), Chapter.number <= (volume.actual_chapter_end or 2**31 - 1)).order_by(Chapter.number)).all()
-        snapshot = VolumeContinuitySnapshot(project_id=volume.project_id, book_contract_id=volume.book_contract_id, volume_id=volume.id, summary=f"第 {volume.volume_number} 卷已完成，共 {len(chapters)} 章。", confirmed_facts=[], character_states={}, relationship_changes=[], timeline_end={"chapter": volume.actual_chapter_end}, location_states={}, item_states={}, active_threads=volume.unresolved_threads or [], unresolved_foreshadowings=[], paid_off_foreshadowings=list(volume.foreshadowing_payoff_refs or []), forbidden_future_reveals=volume.forbidden_reveals or [], next_volume_hooks=volume.next_volume_hooks or [], source_fingerprint=_fingerprint({"volume": volume.fingerprint, "chapters": [item.id for item in chapters]}))
+        character_states = {}
+        for character in db.scalars(select(Character).where(Character.project_id == volume.project_id, Character.active.is_(True))).all():
+            known = db.scalars(select(CharacterKnowledge.proposition).where(CharacterKnowledge.character_id == character.id, CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED]))).all()
+            character_states[character.id] = {"character_id": character.id, "name": character.name, "profile": character.profile or {}, "goals": character.goals or {}, "current_state": character.current_state or {}, "physical_state": character.physical_state or {}, "emotional_state": character.emotional_state or {}, "relationships": character.relationships or {}, "known_facts_at_seal": list(known)}
+        snapshot = VolumeContinuitySnapshot(project_id=volume.project_id, book_contract_id=volume.book_contract_id, volume_id=volume.id, summary=f"第 {volume.volume_number} 卷已完成，共 {len(chapters)} 章。", confirmed_facts=[], character_states=character_states, relationship_changes=[], timeline_end={"chapter": volume.actual_chapter_end}, location_states={}, item_states={}, active_threads=volume.unresolved_threads or [], unresolved_foreshadowings=[], paid_off_foreshadowings=list(volume.foreshadowing_payoff_refs or []), forbidden_future_reveals=volume.forbidden_reveals or [], next_volume_hooks=volume.next_volume_hooks or [], source_fingerprint=_fingerprint({"volume": volume.fingerprint, "chapters": [item.id for item in chapters], "characters": character_states}))
         db.add(snapshot); db.flush(); return snapshot
 
     def seal(self, db: Session, volume: VolumeContract, author_confirmed: bool = False) -> VolumeContract:

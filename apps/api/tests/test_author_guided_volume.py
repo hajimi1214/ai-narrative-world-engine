@@ -9,7 +9,7 @@ import app.api as api_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, ForeshadowingStatus, Project, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, Character, CharacterKnowledge, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -164,3 +164,21 @@ def test_next_volume_window_inherits_only_sealed_snapshot_reference(monkeypatch)
     with Session() as db:
         window = db.get(ChapterPlanningWindow, next_window_id)
         assert window.source_volume_snapshot_id == response.json()["source_snapshot_id"]
+
+
+def test_sealed_snapshot_does_not_expose_future_character_secret(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "cognition"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        character = Character(project_id=project_id, name="主角", secrets=["导演内部未来答案"], profile={"public": "调查员"})
+        db.add(character); db.flush()
+        volume.status = VolumeContractStatus.READY_TO_SEAL; volume.actual_chapter_start = 1; volume.actual_chapter_end = 1
+        db.add(Chapter(project_id=project_id, number=1, content="收束", status="QUALITY_APPROVED", active=True))
+        from app.author_guided_volume import AuthorGuidedVolumeService
+        snapshot = AuthorGuidedVolumeService().create_snapshot(db, volume)
+        db.add(CharacterKnowledge(character_id=character.id, proposition="未来才揭示的秘密", status=KnowledgeStatus.KNOWN, source="future-scene"))
+        db.commit()
+        assert "secrets" not in snapshot.character_states[character.id]
+        assert "未来才揭示的秘密" not in snapshot.character_states[character.id]["known_facts_at_seal"]
