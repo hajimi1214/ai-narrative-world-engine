@@ -13,7 +13,7 @@ type NavGroup = { label: string; items: readonly NavItem[] };
 const groups: readonly NavGroup[] = [
   { label: "世界", items: [["世界总览", "", Compass], ["世界实体", "world-entities", Landmark], ["世界事实", "canon", BookOpen]] },
   { label: "人物", items: [["人物档案", "characters", Users]] },
-  { label: "剧情", items: [["整本规划", "planning", BookOpen], ["卷总览", "volumes", BookOpen], ["跨卷连续性", "continuity", History], ["当前卷导演", "director/volume", Sparkles], ["剧情线程", "story-threads", Workflow], ["导演台", "director", Sparkles], ["世界运行", "world-run", PlayCircle]] },
+  { label: "剧情", items: [["自动导演", "director/auto", Sparkles], ["整本规划", "planning", BookOpen], ["卷总览", "volumes", BookOpen], ["跨卷连续性", "continuity", History], ["当前卷导演", "director/volume", Sparkles], ["剧情线程", "story-threads", Workflow], ["导演台", "director", Sparkles], ["世界运行", "world-run", PlayCircle]] },
   { label: "写作", items: [["章节工作台", "chapters", PenLine], ["写作手册", "writing-bibles", FileText], ["反 AI 规则", "anti-ai-bibles", ShieldAlert]] },
   { label: "作品安全", items: [["小说安全", "safety", Archive], ["异常修复", "recovery-candidates", Wrench], ["历史改写", "retcon", History]] },
   { label: "设置", items: [["模型配置", "model-config", Settings]] },
