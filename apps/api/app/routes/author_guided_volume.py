@@ -6,14 +6,20 @@ from sqlalchemy.orm import Session
 
 from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, PlotDirectionPayload, VolumeActionPayload
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _contract_payload, _enum, _volume_payload, _window_payload
-from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, BookCompletionProposal, BookContract, ChapterPlanningWindow, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
+from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookContract, ChapterPlanningWindow, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
 from .common import get_db, require_project
 
 router = APIRouter(tags=["author-guided-volume"])
 
 
 def _run_payload(db: Session, run: AutoDirectorRun) -> dict:
-    return {"id": run.id, "project_id": run.project_id, "status": _enum(run.status), "run_mode": run.run_mode, "current_stage": _enum(run.current_stage), "pause_reason": run.pause_reason, "next_action": run.next_action, "idempotency_key": run.idempotency_key, "context": run.context or {}, "settings": run.settings or {}, "token_usage": run.token_usage or {}}
+    steps = db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()
+    def metrics(rows):
+        return {"calls": sum(item.calls or 0 for item in rows), "prompt_tokens": sum(item.prompt_tokens or 0 for item in rows), "completion_tokens": sum(item.completion_tokens or 0 for item in rows), "total_tokens": sum(item.total_tokens or 0 for item in rows), "latency_ms": sum(item.latency_ms or 0 for item in rows), "estimated_cost": None, "cost_status": "UNKNOWN"}
+    current_chapter = (run.context or {}).get("current_chapter_number")
+    chapter_rows = [item for item in steps if (current_chapter and (item.output_payload or {}).get("chapter_number") == current_chapter) or (run.current_chapter_id and (item.output_payload or {}).get("chapter_id") == run.current_chapter_id)]
+    usage_summary = {"chapter": metrics(chapter_rows), "window": metrics(steps), "volume": metrics(steps), "book": metrics(steps)}
+    return {"id": run.id, "project_id": run.project_id, "status": _enum(run.status), "run_mode": run.run_mode, "current_stage": _enum(run.current_stage), "pause_reason": run.pause_reason, "next_action": run.next_action, "idempotency_key": run.idempotency_key, "context": run.context or {}, "settings": run.settings or {}, "token_usage": run.token_usage or {}, "usage_summary": usage_summary}
 
 
 def _volume_or_404(db: Session, project_id: str, volume_id: str) -> VolumeContract:
