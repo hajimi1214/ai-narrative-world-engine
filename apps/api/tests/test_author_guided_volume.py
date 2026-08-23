@@ -254,6 +254,20 @@ def test_dynamic_length_and_window_rollover_do_not_use_estimate_as_completion_li
         assert len(windows) == 2 and windows[1].start_chapter_number == 6
 
 
+def test_open_window_can_continue_after_estimated_chapter_600(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"estimated_chapters": 600, "window_size": 5, "idempotency_key": "beyond-estimate"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        from app.author_guided_volume import AuthorGuidedVolumeService
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        previous = db.scalar(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id))
+        db.add(Chapter(project_id=project_id, number=600, content="实际写到预估之外", status="QUALITY_APPROVED", active=True))
+        db.commit()
+        followup = AuthorGuidedVolumeService().ensure_followup_window(db, db.get(Project, project_id), volume, previous)
+        assert followup.start_chapter_number == 601
+
+
 def test_operational_token_budget_pauses_author_run_at_checkpoint(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"operational_token_budget": 1, "idempotency_key": "token-budget"}).json()
