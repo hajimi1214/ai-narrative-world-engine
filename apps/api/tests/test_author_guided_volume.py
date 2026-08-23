@@ -377,6 +377,26 @@ def test_completion_proposal_waits_for_global_contract_events(monkeypatch):
     assert proposal.json()["status"] == "NOT_READY"
 
 
+def test_completion_confirmation_only_auto_completes_when_enabled(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"length_policy": {"allow_completion_proposal": True, "allow_auto_complete": True}, "idempotency_key": "auto-complete"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume.actual_chapter_start = 1; volume.actual_chapter_end = 1; volume.target_closing_state = {"done": True}
+        db.add(Chapter(project_id=project_id, number=1, content="终局证据", status="QUALITY_APPROVED", active=True))
+        task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
+        task.end_state = {"done": True}
+        db.commit(); volume_id = volume.id
+    proposal = client.get(f"/projects/{project_id}/volumes/{volume_id}/completion-proposal").json()
+    confirmed = client.post(f"/projects/{project_id}/completion-proposals/{proposal['id']}/confirm", json={"author_confirmed": True})
+    assert confirmed.status_code == 200 and confirmed.json()["book_completed"] is True
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        assert db.get(BookContract, run.context["book_contract_id"]).status == "COMPLETED"
+        assert run.current_stage.value == "BOOK_COMPLETED"
+
+
 def test_volume_progress_requires_structured_closing_state(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "closing-state"})

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, PlotDirectionPayload, VolumeActionPayload, VolumeContractUpdatePayload
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _contract_payload, _enum, _volume_payload, _window_payload
-from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookContract, ChapterPlanningWindow, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
+from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookCompletionProposalStatus, BookContract, ChapterPlanningWindow, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
 from .common import get_db, require_project
 
 router = APIRouter(tags=["author-guided-volume"])
@@ -296,6 +298,23 @@ def completion_proposal(project_id: str, volume_id: str, db: Session = Depends(g
 def confirm_completion(project_id: str, proposal_id: str, payload: VolumeActionPayload, db: Session = Depends(get_db)):
     require_project(db, project_id); proposal = db.get(BookCompletionProposal, proposal_id)
     if not proposal or proposal.project_id != project_id: raise HTTPException(status_code=404, detail="Completion proposal not found")
-    if not payload.author_confirmed or proposal.status != "PROPOSED": raise HTTPException(status_code=409, detail={"code": "AUTHOR_CONFIRMATION_REQUIRED"})
-    proposal.status = "AUTHOR_CONFIRMED"; db.commit()
-    return {"id": proposal.id, "status": _enum(proposal.status), "book_completed": False, "next_action": "作者仍需明确完成书籍，系统不会因章节数量自动结束。"}
+    if not payload.author_confirmed or proposal.status != BookCompletionProposalStatus.PROPOSED: raise HTTPException(status_code=409, detail={"code": "AUTHOR_CONFIRMATION_REQUIRED"})
+    contract = db.get(BookContract, proposal.book_contract_id) if proposal.book_contract_id else None
+    if not contract:
+        raise HTTPException(status_code=409, detail={"code": "BOOK_CONTRACT_MISSING"})
+    allow_auto_complete = bool((contract.length_policy or {}).get("allow_auto_complete", False))
+    if not allow_auto_complete:
+        proposal.status = BookCompletionProposalStatus.AUTHOR_CONFIRMED
+        db.commit()
+        return {"id": proposal.id, "status": _enum(proposal.status), "book_completed": False, "next_action": "作者已确认完结建议；系统保持开放，未启用自动完结。"}
+    proposal.status = BookCompletionProposalStatus.COMPLETED
+    contract.status = "COMPLETED"
+    run = db.scalar(select(AutoDirectorRun).where(AutoDirectorRun.project_id == project_id, AutoDirectorRun.run_mode == "AUTHOR_GUIDED_VOLUME", AutoDirectorRun.context["book_contract_id"].as_string() == contract.id).order_by(AutoDirectorRun.updated_at.desc()))
+    if run:
+        run.status = AutoDirectorRunStatus.COMPLETED
+        run.current_stage = AutoDirectorStage.BOOK_COMPLETED
+        run.pause_reason = None
+        run.next_action = "作者已确认，书籍已按合同条件完成。"
+        run.completed_at = datetime.utcnow()
+    db.commit()
+    return {"id": proposal.id, "status": _enum(proposal.status), "book_completed": True, "next_action": "书籍已按作者配置完成。"}
