@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -21,6 +22,7 @@ from app.auto_director_worker import AutoDirectorWorker
 from app.auto_director import AutoDirectorOrchestrator
 from app.autonomy import AutonomousWorldLoopService
 from app.planning import validate_task_output
+from app.planning import persist_plan
 from app.runtime import _emit_usage
 
 
@@ -57,6 +59,65 @@ def test_auto_director_uses_target_chapters_when_maximum_is_omitted(monkeypatch)
     body = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "灵感", "target_chapters": 7, "idempotency_key": "default-limit"}).json()
     assert body["settings"]["max_chapters"] == 7
     assert body["settings"]["effective_max_chapters"] == 7
+
+
+def test_auto_director_keeps_full_book_plan_when_run_writes_fewer_chapters(monkeypatch):
+    directions = [{"title": "完整方向", "premise": "主线", "core_conflict": "冲突", "first_volume_goal": "完成调查", "world_boundaries": ["档案馆"], "first_ten_chapter_promises": ["一", "二", "三"], "foreshadowing_directions": ["回收"], "protagonist": {"desire": "查明", "cost": "失去"}}] * 3
+    client, project_id = _client(monkeypatch, directions)
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "灵感", "target_chapters": 450, "max_chapters": 10, "idempotency_key": "separate-plan-and-run"}).json()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        run.context = {**run.context, "selected_direction": directions[0], "foundation": {"ready": True}}
+        captured = {}
+        def fake_generate_plan(_db, _project, framing, *_args):
+            captured["framing"] = dict(framing)
+            return {"framing": framing, "premise": "主线", "macro_plan": {}, "volumes": [], "arcs": [], "chapters": [{"number": 1, "title": "第一章", "summary": "开始"}]}, SimpleNamespace(provider="fake", model="fake", request_id="plan", latency_ms=0, usage={})
+        monkeypatch.setattr(auto_module, "generate_plan", fake_generate_plan)
+        monkeypatch.setattr(auto_module, "validate_plan_references", lambda *_args: [])
+        monkeypatch.setattr(auto_module, "persist_plan", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("STOP_AFTER_PLAN_INPUT")))
+        with pytest.raises(RuntimeError, match="STOP_AFTER_PLAN_INPUT"):
+            AutoDirectorOrchestrator()._plan_and_first_chapter(db, run, db.get(Project, project_id))
+        assert run.settings["max_chapters"] == 10
+        assert run.context["request"]["target_chapters"] == 450
+        assert captured["framing"]["target_chapters"] == 450
+
+
+def test_auto_director_generates_missing_long_plan_chapter_task(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="长篇", story_seed="一段长篇设定", target_chapter_words=2400)
+        db.add(project); db.flush()
+        plan = persist_plan(db, project, {"framing": {"target_chapters": 20, "target_words_per_chapter": 2400}, "premise": "主线", "macro_plan": {"logline": "主线"}, "volumes": [{"number": 1, "title": "第一卷", "summary": "开端", "start_chapter": 1, "end_chapter": 20}], "arcs": [{"number": 1, "volume_number": 1, "title": "开局", "goal": "进入冲突", "summary": "开端"}], "chapters": [{"number": 1, "title": "第一章", "summary": "开始"}]})
+        run = AutoDirectorRun(project_id=project.id, idempotency_key="long-task", settings={}, context={"selected_direction": {"premise": "主线", "core_conflict": "冲突"}})
+        db.add(run); db.flush()
+        from app.ai.provider import ModelResult
+        class TaskProvider:
+            name = "fake"
+            def generate(self, _messages, model):
+                return ModelResult(content=json.dumps({"chapter": {"title": "第十三章", "summary": "主线升级", "objective": "取得关键证据", "conflict": "对手先一步行动", "must_events": ["取得证据"], "forbidden_events": ["揭开最终真相"], "scene_beats": ["追查", "受阻", "反转"]}}, ensure_ascii=False), latency_ms=1, request_id="task", provider="fake", model=model)
+        monkeypatch.setattr(auto_module, "get_model_provider", lambda *args, **kwargs: TaskProvider())
+        row, result = AutoDirectorOrchestrator()._generate_next_chapter_task(db, run, project, plan, 13, {"target_words_per_chapter": 2400})
+        assert row.number == 13 and row.title == "第十三章"
+        assert result.provider == "fake"
+
+
+def test_quality_debt_does_not_block_next_chapter():
+    run = AutoDirectorRun(
+        settings={"max_chapters": 2},
+        context={"current_chapter_number": 1, "generated_this_run": 0, "generated_chapters": []},
+    )
+    orchestrator = AutoDirectorOrchestrator()
+    orchestrator._record_quality_debt_and_advance(run)
+    assert run.status.value == "RUNNING"
+    assert run.current_stage.value == "NEXT_CHAPTER"
+    assert run.context["current_chapter_number"] == 2
+    assert run.context["quality_debts"] == ["QUALITY_GATE_NOT_PASS"]
+
+    orchestrator._record_quality_debt_and_advance(run)
+    assert run.status.value == "PAUSED"
+    assert run.pause_reason == "RUN_CHAPTER_BUDGET_REACHED"
 
 
 def test_full_auto_creates_volume_boundary_and_blocks_sealed_volume(monkeypatch):

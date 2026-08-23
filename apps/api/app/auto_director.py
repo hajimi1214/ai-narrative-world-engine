@@ -18,6 +18,8 @@ from .api_types import AutoDirectorRunCreatePayload
 from .creation import generate_creation_directions
 from .model_router import ModelRouter, ProviderCredentialResolver
 from .planning import chapter_task_context, generate_plan, persist_plan, validate_plan_references
+from .planning import _default_chapter
+from .llm_actor import _extract_single_json_object
 from .quality import QualityGateService, QualityRepairService
 from .settings import get_settings
 from .writer import WriterProjectionService
@@ -26,7 +28,7 @@ from .narrative_structure import NarrativeStructureConfig
 from .models import (
     AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep,
     AutoDirectorStepStatus, Chapter, ChapterWriterDraft, ChapterQualityAssessment, ChapterQualityFinding,
-    Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, StoryPlanStatus, WriterDraftStatus, Character,
+    Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, StoryPlanArc, StoryPlanStatus, WriterDraftStatus, Character,
     WorldEntity, StoryThread, CanonFact, StoryArc, EntityType, CanonType,
 )
 
@@ -421,7 +423,9 @@ class AutoDirectorOrchestrator:
     def _plan_and_first_chapter(self, db: Session, run: AutoDirectorRun, project: Project) -> None:
         direction = run.context["selected_direction"]
         framing = dict(run.context.get("request") or {})
-        framing.update({"target_chapters": min(int(framing.get("target_chapters") or 10), int((run.settings or {}).get("max_chapters", 1) or 1)), "target_words_per_chapter": int(framing.get("target_words_per_chapter") or project.target_chapter_words), "pov": framing.get("pov") or "THIRD_PERSON_LIMITED"})
+        # Book length defines the macro plan. max_chapters only defines how
+        # many finished chapters this unattended run should produce.
+        framing.update({"target_chapters": int(framing.get("target_chapters") or 10), "target_words_per_chapter": int(framing.get("target_words_per_chapter") or project.target_chapter_words), "pov": framing.get("pov") or "THIRD_PERSON_LIMITED"})
         step = self._step(db, run, AutoDirectorStage.CHAPTER_PLANNING, {"direction": direction, "framing": framing})
         if step.status != AutoDirectorStepStatus.COMMITTED:
             self._check_budget(run)
@@ -451,7 +455,12 @@ class AutoDirectorOrchestrator:
             self._commit_step(detail_step, {"plan_id": plan_id, "chapter_count": db.scalar(select(func.count(StoryPlanChapter.id)).where(StoryPlanChapter.plan_id == plan_id)) or 0})
         chapter_number = int((run.context or {}).get("current_chapter_number", 1))
         plan_chapter = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan_id, StoryPlanChapter.number == chapter_number))
-        if not plan_chapter: raise AutoDirectorError("CHAPTER_PLAN_NOT_FOUND")
+        if not plan_chapter:
+            plan_chapter, detail_result = self._generate_next_chapter_task(db, run, project, plan, chapter_number, framing)
+            detail_step = self._step(db, run, AutoDirectorStage.CHAPTER_DETAIL, {"plan_id": plan_id, "chapter_number": chapter_number, "task_id": plan_chapter.id})
+            if detail_step.status != AutoDirectorStepStatus.COMMITTED:
+                self._commit_step(detail_step, {"plan_id": plan_id, "chapter_number": chapter_number, "chapter_task_id": plan_chapter.id}, plan_chapter.id, calls=1, latency_ms=detail_result.latency_ms, tokens=self._model_tokens(detail_result), usage=self._model_usage(detail_result), provider=detail_result.provider, model=detail_result.model)
+                self._add_usage(run, detail_step)
         # The runtime owns formal scenes and chapter formation. Do not create a
         # placeholder Chapter here; SceneCommitService will form it from the
         # committed scene and preserve the existing structure invariants.
@@ -545,10 +554,35 @@ class AutoDirectorOrchestrator:
                 run.context = {**(run.context or {}), "adopt_draft_id": repair_payload["draft_id"]}
                 self.adopt_chapter(db, run)
             else:
-                run.status = AutoDirectorRunStatus.BLOCKED
-                run.current_stage = AutoDirectorStage.BLOCKED
-                run.pause_reason = "QUALITY_GATE_NOT_PASS"
-                run.next_action = "质量门未通过，保留草稿和修复候选，等待作者接管。"
+                self._record_quality_debt_and_advance(run)
+
+    @staticmethod
+    def _record_quality_debt_and_advance(run: AutoDirectorRun) -> None:
+        """Keep an imperfect draft visible without stalling the book queue."""
+        debt = "QUALITY_GATE_NOT_PASS"
+        context = run.context or {}
+        existing_debts = [str(item) for item in context.get("quality_debts", [])]
+        if debt not in existing_debts:
+            existing_debts.append(debt)
+        number = int(context.get("current_chapter_number", 1))
+        generated_this_run = int(context.get("generated_this_run", 0)) + 1
+        generated_chapters = [*context.get("generated_chapters", [])]
+        if number not in generated_chapters:
+            generated_chapters.append(number)
+        configured_budget = int((run.settings or {}).get("max_chapters") or (run.settings or {}).get("operational_run_chapter_budget") or 10)
+        run.context = {**context, "quality_debts": existing_debts, "generated_this_run": generated_this_run, "generated_chapters": generated_chapters, "current_chapter_number": number + 1, "current_chapter_id": None}
+        run.current_chapter_id = None
+        if generated_this_run >= configured_budget:
+            run.status = AutoDirectorRunStatus.PAUSED
+            run.current_stage = AutoDirectorStage.NEXT_CHAPTER
+            run.pause_reason = "RUN_CHAPTER_BUDGET_REACHED"
+            run.next_action = f"本次运行已生成 {generated_this_run} 章；第 {number} 章保留质量债务，继续运行可推进下一章。"
+            run.context = {**run.context, "run_budget_reached": True}
+        else:
+            run.status = AutoDirectorRunStatus.RUNNING
+            run.current_stage = AutoDirectorStage.NEXT_CHAPTER
+            run.pause_reason = None
+            run.next_action = f"第 {number} 章保留质量债务，正在准备第 {number + 1} 章。"
 
     def adopt_chapter(self, db: Session, run: AutoDirectorRun) -> AutoDirectorRun:
         draft_id = (run.context.get("adopt_draft_id") or self._latest_draft_id(db, run))
@@ -591,6 +625,34 @@ class AutoDirectorOrchestrator:
         else:
             run.status = AutoDirectorRunStatus.RUNNING; run.current_stage = AutoDirectorStage.NEXT_CHAPTER; run.context = {**run.context, "current_chapter_number": number + 1}; run.next_action = f"正在准备第 {number + 1} 章。"; run.current_chapter_id = None
         return run
+
+    def _generate_next_chapter_task(self, db: Session, run: AutoDirectorRun, project: Project, plan: StoryPlan, chapter_number: int, framing: dict[str, Any]) -> tuple[StoryPlanChapter, Any]:
+        """Extend a long plan just-in-time with a real director-model task sheet."""
+        settings = get_settings()
+        route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
+        key = ProviderCredentialResolver().generation_key(db, project.id, settings)
+        provider = get_model_provider(settings, route.provider, route.base_url, key)
+        volume = db.scalar(select(StoryPlanVolume).where(StoryPlanVolume.plan_id == plan.id, StoryPlanVolume.start_chapter <= chapter_number, StoryPlanVolume.end_chapter >= chapter_number))
+        arc = db.scalar(select(StoryPlanArc).where(StoryPlanArc.plan_id == plan.id, StoryPlanArc.volume_number == (volume.number if volume else 1)).order_by(StoryPlanArc.number))
+        previous = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id, StoryPlanChapter.number == chapter_number - 1))
+        contract = {"chapter": {"number": chapter_number, "volume_number": "integer", "arc_number": "integer", "title": "string", "summary": "string", "pov_mode": "string", "objective": "string", "conflict": "string", "start_state": "object", "end_state": "object", "must_events": ["string"], "forbidden_events": ["string"], "allowed_reveals": ["string"], "forbidden_reveals": ["string"], "foreshadow_create": ["string"], "foreshadow_payoff": ["string"], "character_changes": ["string"], "consequences": ["string"], "scene_beats": ["string"]}}
+        context = {"book": plan.macro_plan or {}, "volume": {"number": volume.number, "title": volume.title, "summary": volume.summary, "theme": volume.theme, "core_question": volume.core_question, "major_conflict": volume.major_conflict, "main_thread": volume.main_thread, "ending_turn": volume.ending_turn} if volume else {}, "arc": {"number": arc.number, "title": arc.title, "goal": arc.goal, "summary": arc.summary} if arc else {}, "previous_chapter": {"title": previous.title, "summary": previous.summary, "end_state": previous.end_state} if previous else {}, "direction": {"premise": (run.context.get("selected_direction") or {}).get("premise"), "core_conflict": (run.context.get("selected_direction") or {}).get("core_conflict")}}
+        messages = [{"role": "system", "content": "你是长篇小说分章策划编辑。"}, {"role": "user", "content": json.dumps({"instruction": f"只输出一个 JSON 对象。为第 {chapter_number} 章生成可执行章节任务单，必须延续已给出的全书、卷纲、故事弧和上一章后果。所有字段都必须具体，禁止空字段、模板话和正文。", "output_contract": contract, "context": context}, ensure_ascii=False)}]
+        result = provider.generate(messages, route.model)
+        try:
+            parsed = _extract_single_json_object(result.content)
+            raw = parsed.get("chapter") if isinstance(parsed, dict) else None
+            if not isinstance(raw, dict):
+                raise ValueError("CHAPTER_TASK_MISSING")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise AutoDirectorError("CHAPTER_TASK_CONTRACT_FAILED", str(exc)) from exc
+        task = _default_chapter(chapter_number, framing, volume.number if volume else 1, arc.number if arc else 1, raw)
+        task["number"] = chapter_number
+        task["volume_number"] = volume.number if volume else int(task.get("volume_number") or 1)
+        task["arc_number"] = arc.number if arc else int(task.get("arc_number") or 1)
+        row = StoryPlanChapter(project_id=project.id, plan_id=plan.id, **task)
+        db.add(row); db.flush()
+        return row, result
 
     @staticmethod
     def _latest_draft_id(db: Session, run: AutoDirectorRun) -> str | None:

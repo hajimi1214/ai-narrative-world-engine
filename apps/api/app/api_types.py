@@ -15,7 +15,8 @@ class AutoDirectorRunCreatePayload(BaseModel):
     tone: str = ""
     max_chapters: int | None = Field(default=None, ge=1, le=100000)
     max_repairs: int = Field(default=2, ge=0, le=10)
-    max_tokens: int = Field(default=100000, ge=1, le=10000000)
+    # Zero means unlimited for the local single-user workflow.
+    max_tokens: int = Field(default=0, ge=0, le=10000000)
     max_retries: int = Field(default=2, ge=0, le=10)
     idempotency_key: str | None = Field(default=None, max_length=200)
 
