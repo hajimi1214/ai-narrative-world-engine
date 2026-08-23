@@ -24,6 +24,7 @@ from app.autonomy import AutonomousWorldLoopService
 from app.planning import validate_task_output
 from app.planning import persist_plan
 from app.runtime import _emit_usage
+from app.live_execution import live_execution_broker
 
 
 def _client(monkeypatch, directions):
@@ -69,7 +70,7 @@ def test_auto_director_keeps_full_book_plan_when_run_writes_fewer_chapters(monke
         run = db.get(AutoDirectorRun, created["id"])
         run.context = {**run.context, "selected_direction": directions[0], "foundation": {"ready": True}}
         captured = {}
-        def fake_generate_plan(_db, _project, framing, *_args):
+        def fake_generate_plan(_db, _project, framing, *_args, **_kwargs):
             captured["framing"] = dict(framing)
             return {"framing": framing, "premise": "主线", "macro_plan": {}, "volumes": [], "arcs": [], "chapters": [{"number": 1, "title": "第一章", "summary": "开始"}]}, SimpleNamespace(provider="fake", model="fake", request_id="plan", latency_ms=0, usage={})
         monkeypatch.setattr(auto_module, "generate_plan", fake_generate_plan)
@@ -181,6 +182,7 @@ def test_full_auto_worker_scores_and_selects_best_direction(monkeypatch):
     assert state["context"]["selected_direction"]["title"] == "最佳方向"
     assert state["context"]["direction_score"] > 50
     assert state["current_stage"] == "CAST_PREPARATION"
+    assert any(item["label"] == "自动导演：生成整书方向" and item["status"] == "COMPLETED" for item in live_execution_broker.snapshots(project_id))
 
 
 def test_chapter_task_validation_rejects_missing_and_forbidden_events():

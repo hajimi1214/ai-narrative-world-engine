@@ -32,7 +32,7 @@ def _direction_contract() -> dict[str, Any]:
     }
 
 
-def generate_creation_directions(db: Session, project_id: str, request: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+def generate_creation_directions(db: Session, project_id: str, request: dict[str, Any], on_delta=None) -> tuple[dict[str, Any], Any]:
     settings = get_settings()
     route = ModelRouter().resolve(db, project_id, settings, "DIRECTOR")
     key = ProviderCredentialResolver().generation_key(db, project_id, settings)
@@ -47,7 +47,8 @@ def generate_creation_directions(db: Session, project_id: str, request: dict[str
         {"role": "system", "content": "你是长篇小说创作顾问和连续性策划编辑。"},
         {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
     ]
-    result = provider.generate(messages, route.model)
+    stream = getattr(provider, "generate_stream", None)
+    result = stream(messages, route.model, on_delta) if on_delta and callable(stream) else provider.generate(messages, route.model)
     try:
         parsed = _extract_single_json_object(result.content)
     except (ValueError, TypeError, json.JSONDecodeError, ModelProviderError) as first_error:
@@ -55,7 +56,7 @@ def generate_creation_directions(db: Session, project_id: str, request: dict[str
             {"role": "assistant", "content": result.content},
             {"role": "user", "content": json.dumps({"instruction": "上一条不是有效 JSON。只修复格式，保留三套故事方向和内容，不要 Markdown。", "error": str(first_error)[:500], "output_contract": contract}, ensure_ascii=False)},
         ]
-        result = provider.generate(repair, route.model)
+        result = stream(repair, route.model, on_delta) if on_delta and callable(stream) else provider.generate(repair, route.model)
         parsed = _extract_single_json_object(result.content)
     directions = parsed.get("directions") if isinstance(parsed, dict) else None
     if not isinstance(directions, list) or len(directions) < 3:

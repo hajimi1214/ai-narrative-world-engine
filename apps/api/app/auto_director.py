@@ -25,6 +25,7 @@ from .settings import get_settings
 from .writer import WriterProjectionService
 from .autonomy import AutonomousWorldLoopService
 from .narrative_structure import NarrativeStructureConfig
+from .live_execution import live_execution_broker
 from .models import (
     AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep,
     AutoDirectorStepStatus, Chapter, ChapterWriterDraft, ChapterQualityAssessment, ChapterQualityFinding,
@@ -170,6 +171,28 @@ class AutoDirectorOrchestrator:
     def _steps(db: Session, run: AutoDirectorRun) -> list[AutoDirectorStep]:
         return db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()
 
+    @staticmethod
+    def _live_begin(run: AutoDirectorRun, label: str, stage: str, *, provider: str | None = None, model: str | None = None) -> str:
+        return live_execution_broker.begin(
+            project_id=run.project_id,
+            trace_id=f"auto-director:{run.id}:{stage}:{datetime.utcnow().timestamp()}",
+            label=label,
+            provider=provider,
+            model=model,
+            stage=stage,
+        )
+
+    @staticmethod
+    def _live_complete(session_id: str, message: str) -> None:
+        live_execution_broker.complete(session_id, message)
+
+    @staticmethod
+    def _live_fail(session_id: str, exc: Exception) -> None:
+        code = str(getattr(exc, "code", None) or getattr(exc, "error_code", None) or "AUTO_DIRECTOR_STAGE_FAILED")
+        status = getattr(exc, "upstream_status", None)
+        message = f"模型请求未完成{f'（HTTP {status}）' if status else ''}，可重试当前阶段。"
+        live_execution_broker.fail(session_id, code, message)
+
     def _check_budget(self, run: AutoDirectorRun) -> None:
         limit = int((run.settings or {}).get("max_tokens", 0) or 0)
         used = int((run.token_usage or {}).get("total_tokens", 0) or 0)
@@ -210,9 +233,11 @@ class AutoDirectorOrchestrator:
 
     def _fail(self, run: AutoDirectorRun, step: AutoDirectorStep, exc: Exception, blocked: bool = False) -> None:
         code = getattr(exc, "code", None) or getattr(exc, "error_code", None) or "AUTO_DIRECTOR_STAGE_FAILED"
+        upstream_status = getattr(exc, "upstream_status", None)
         step.status = AutoDirectorStepStatus.BLOCKED if blocked else AutoDirectorStepStatus.FAILED
         step.error_code = str(code)
-        step.error_summary = str(exc)[:1000]
+        step.error_summary = f"{str(exc)[:900]}{f' (HTTP {upstream_status})' if upstream_status else ''}"
+        step.output_payload = {**(step.output_payload or {}), "upstream_status": upstream_status}
         step.completed_at = datetime.utcnow()
         run.status = AutoDirectorRunStatus.BLOCKED if blocked else AutoDirectorRunStatus.FAILED
         run.current_stage = AutoDirectorStage.BLOCKED if blocked else AutoDirectorStage.FAILED
@@ -327,7 +352,15 @@ class AutoDirectorOrchestrator:
                     data = step.output_payload
                 else:
                     self._check_budget(run)
-                    result, model_result = generate_creation_directions(db, project.id, request)
+                    settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
+                    live_session = self._live_begin(run, "自动导演：生成整书方向", "FRAMING", provider=route.provider, model=route.model)
+                    live_execution_broker.phase(live_session, "GENERATING_DIRECTIONS", "正在生成并比较整书方向、角色和世界设定")
+                    try:
+                        result, model_result = generate_creation_directions(db, project.id, request, on_delta=lambda content: live_execution_broker.append(live_session, content))
+                        self._live_complete(live_session, "方向、主要角色和世界边界已生成")
+                    except Exception as exc:
+                        self._live_fail(live_session, exc)
+                        raise
                     data = result
                     self._commit_step(step, data, calls=1, latency_ms=getattr(model_result, "latency_ms", 0), tokens=self._model_tokens(model_result), usage=self._model_usage(model_result), provider=getattr(model_result, "provider", None), model=getattr(model_result, "model", None))
                     self._add_usage(run, step)
@@ -389,6 +422,16 @@ class AutoDirectorOrchestrator:
         context = dict(run.context or {})
         if context.get("foundation"):
             return
+        live_session = self._live_begin(run, "自动导演：建立人物与世界", "FOUNDATION")
+        live_execution_broker.phase(live_session, "MATERIALIZING_WORLD", "正在把 AI 方向写入世界百科、世界事实和人物档案")
+        try:
+            self._materialize_foundation(db, run, project, direction, context)
+            self._live_complete(live_session, "世界百科、世界事实、人物档案和主线线程已建立")
+        except Exception as exc:
+            self._live_fail(live_session, exc)
+            raise
+
+    def _materialize_foundation(self, db: Session, run: AutoDirectorRun, project: Project, direction: dict[str, Any], context: dict[str, Any]) -> None:
         world_ids: list[str] = []
         for raw_name in direction.get("world_boundaries") or []:
             name = str(raw_name).strip()
@@ -429,7 +472,16 @@ class AutoDirectorOrchestrator:
         step = self._step(db, run, AutoDirectorStage.CHAPTER_PLANNING, {"direction": direction, "framing": framing})
         if step.status != AutoDirectorStepStatus.COMMITTED:
             self._check_budget(run)
-            generated, result = generate_plan(db, project, framing, direction.get("premise"), {"tone": direction.get("style_advice", "")}, {"forbidden_patterns": []})
+            settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
+            live_session = self._live_begin(run, "自动导演：生成整书规划", "STORY_PLAN", provider=route.provider, model=route.model)
+            def update_plan_phase(phase: str, message: str) -> None:
+                live_execution_broker.phase(live_session, phase, message)
+            try:
+                generated, result = generate_plan(db, project, framing, direction.get("premise"), {"tone": direction.get("style_advice", "")}, {"forbidden_patterns": []}, on_phase=update_plan_phase, on_delta=lambda content: live_execution_broker.append(live_session, content))
+                self._live_complete(live_session, "整书主线、卷纲、故事弧和首批章节任务已生成")
+            except Exception as exc:
+                self._live_fail(live_session, exc)
+                raise
             generated.setdefault("framing", framing); generated.setdefault("premise", direction.get("premise")); generated.setdefault("style_guide", {"tone": direction.get("style_advice", "")}); generated.setdefault("anti_ai_rules", {"forbidden_patterns": []})
             errors = validate_plan_references(db, project.id, generated)
             if errors: raise AutoDirectorError("PLAN_REFERENCE_INVALID", str(errors))
@@ -480,7 +532,14 @@ class AutoDirectorOrchestrator:
         autonomous = AutonomousWorldLoopService().create_run(db, project.id, scene_budget=scene_count, max_turns_per_scene=2, performance_mode="LLM", resolver_mode="LLM", config={"auto_director_run_id": run.id, "plan_id": plan_id, "plan_chapter_id": plan_chapter.id, "chapter_number": chapter_number, "planning_task": planning_task}, client_request_id=f"{run.id}-chapter-{chapter_number}")
         db.flush()
         autonomous_run_ids.append(autonomous.id)
-        result = AutonomousWorldLoopService().advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
+        runtime_live = self._live_begin(run, f"第 {chapter_number} 章：角色 Agent 与世界运行", "WORLD_RUNTIME")
+        live_execution_broker.phase(runtime_live, "AGENT_ACTING", "角色 Agent 正在根据目标、记忆和世界边界行动")
+        try:
+            result = AutonomousWorldLoopService().advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
+            self._live_complete(runtime_live, "角色行动与世界裁定已提交，正在形成章节")
+        except Exception as exc:
+            self._live_fail(runtime_live, exc)
+            raise
         if scene_events:
             metrics = {"calls": sum(int(item.get("calls", 0) or 0) for item in scene_events), "prompt_tokens": sum(int(item.get("prompt_tokens", 0) or 0) for item in scene_events), "completion_tokens": sum(int(item.get("completion_tokens", 0) or 0) for item in scene_events), "total_tokens": sum(int(item.get("total_tokens", 0) or 0) for item in scene_events), "latency_ms": sum(int(item.get("latency_ms", 0) or 0) for item in scene_events), "provider": ",".join(sorted({str(item.get("provider")) for item in scene_events if item.get("provider")})), "model": ",".join(sorted({str(item.get("model")) for item in scene_events if item.get("model")}))}
             self._merge_step_usage(detail_step, metrics)
@@ -502,7 +561,14 @@ class AutoDirectorOrchestrator:
             key = ProviderCredentialResolver().generation_key(db, project.id, settings)
             pov_character_id = (run.context.get("foundation") or {}).get("character_ids", [None])[0]
             writer_provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key))
-            draft = WriterProjectionService().render(db, chapter.id, {"idempotency_key": f"{run.id}-chapter-{chapter_number}", "pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": pov_character_id}, provider=writer_provider, model=route.model, settings=settings)
+            writer_live = self._live_begin(run, f"第 {chapter_number} 章：正文写作", "WRITER", provider=route.provider, model=route.model)
+            live_execution_broker.phase(writer_live, "WRITING", "Writer 正在依据角色 Agent 行动和章节任务生成正文")
+            try:
+                draft = WriterProjectionService().render(db, chapter.id, {"idempotency_key": f"{run.id}-chapter-{chapter_number}", "pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": pov_character_id}, provider=writer_provider, model=route.model, settings=settings)
+                self._live_complete(writer_live, "正文草稿已生成，正在进入质量审计")
+            except Exception as exc:
+                self._live_fail(writer_live, exc)
+                raise
             if draft.status not in {WriterDraftStatus.VALIDATED, WriterDraftStatus.ADOPTED}:
                 raise AutoDirectorError("WRITER_DRAFT_FAILED", str(draft.validation_report))
             metrics = self._tracked_metrics(writer_provider)
@@ -518,7 +584,14 @@ class AutoDirectorOrchestrator:
             if not draft:
                 raise AutoDirectorError("WRITER_DRAFT_NOT_FOUND")
             critic_provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key))
-            assessment = QualityGateService().assess(db, chapter.id, {"idempotency_key": f"{run.id}-quality-{chapter_number}"}, provider=critic_provider, model=route.model, settings=settings, draft=draft, require_current=False)
+            critic_live = self._live_begin(run, f"第 {chapter_number} 章：质量审计", "CRITIC", provider=route.provider, model=route.model)
+            live_execution_broker.phase(critic_live, "REVIEWING", "质量 Agent 正在审计任务覆盖、连续性和正文问题")
+            try:
+                assessment = QualityGateService().assess(db, chapter.id, {"idempotency_key": f"{run.id}-quality-{chapter_number}"}, provider=critic_provider, model=route.model, settings=settings, draft=draft, require_current=False)
+                self._live_complete(critic_live, f"质量审计完成：{enum_value(assessment.status)}")
+            except Exception as exc:
+                self._live_fail(critic_live, exc)
+                raise
             metrics = self._tracked_metrics(critic_provider)
             self._commit_step(quality_step, {"assessment_id": assessment.id, "status": enum_value(assessment.status)}, assessment.id, **metrics); self._add_usage(run, quality_step)
         assessment = db.get(ChapterQualityAssessment, quality_step.output_payload["assessment_id"])
