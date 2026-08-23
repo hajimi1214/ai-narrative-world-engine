@@ -361,6 +361,22 @@ def test_completion_proposal_contains_adopted_evidence_and_honors_policy(monkeyp
     assert proposal.json()["evidence_chapter_ids"] == [chapter_id]
 
 
+def test_completion_proposal_waits_for_global_contract_events(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"global_required_events": ["终局证据"], "idempotency_key": "global-ending"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume.actual_chapter_start = 1; volume.actual_chapter_end = 1; volume.target_closing_state = {"done": True}
+        db.add(Chapter(project_id=project_id, number=1, content="已采用正文", status="QUALITY_APPROVED", active=True))
+        task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
+        task.end_state = {"done": True}
+        db.commit(); volume_id = volume.id
+    proposal = client.get(f"/projects/{project_id}/volumes/{volume_id}/completion-proposal")
+    assert proposal.status_code == 200
+    assert proposal.json()["status"] == "NOT_READY"
+
+
 def test_volume_progress_requires_structured_closing_state(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "closing-state"})

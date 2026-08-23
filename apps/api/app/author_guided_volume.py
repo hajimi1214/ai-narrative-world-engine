@@ -304,11 +304,16 @@ class AuthorGuidedVolumeService:
             query = query.where(Chapter.number <= volume.actual_chapter_end)
         adopted = db.scalars(query.order_by(Chapter.number)).all()
         evidence_ids = [item.id for item in adopted]
+        content = "\n".join(item.content or "" for item in adopted)
+        global_required = [str(item) for item in contract.global_required_events or []]
+        missing_global = [item for item in global_required if item not in content]
+        forbidden_global = [str(item) for item in contract.global_forbidden_events or [] if str(item) in content]
         policy = contract.length_policy or {}
         allowed = policy.get("allow_completion_proposal", True)
-        status = BookCompletionProposalStatus.PROPOSED if allowed and report["should_prepare_seal"] and not volume.unresolved_threads else BookCompletionProposalStatus.NOT_READY
-        reason = report["reason"] if allowed else "当前书籍合同未允许 AI 提出完结建议。"
-        proposal = BookCompletionProposal(project_id=contract.project_id, book_contract_id=contract.id, status=status, reason=reason, unresolved_threads=report["unresolved_threads"], unresolved_foreshadowings=report["pending_foreshadowings"], protagonist_arc_status={"progress": report["protagonist_arc_progress"]}, main_conflict_status={"progress": report["conflict_progress"]}, ending_requirements=contract.global_required_events or [], evidence_chapter_ids=evidence_ids)
+        ready = allowed and report["should_prepare_seal"] and not volume.unresolved_threads and not missing_global and not forbidden_global
+        status = BookCompletionProposalStatus.PROPOSED if ready else BookCompletionProposalStatus.NOT_READY
+        reason = report["reason"] if ready else ("书籍合同的全书结局条件尚未满足。" if allowed else "当前书籍合同未允许 AI 提出完结建议。")
+        proposal = BookCompletionProposal(project_id=contract.project_id, book_contract_id=contract.id, status=status, reason=reason, unresolved_threads=report["unresolved_threads"], unresolved_foreshadowings=report["pending_foreshadowings"], protagonist_arc_status={"progress": report["protagonist_arc_progress"]}, main_conflict_status={"progress": report["conflict_progress"], "missing_global_required_events": missing_global, "forbidden_global_events": forbidden_global}, ending_requirements=contract.global_required_events or [], evidence_chapter_ids=evidence_ids)
         db.add(proposal); db.flush(); return proposal
 
     def advance_run(self, db: Session, run: AutoDirectorRun) -> AutoDirectorRun:
