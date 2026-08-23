@@ -9,7 +9,7 @@ import app.api as api_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, BookContract, ChapterPlanningWindow, Project, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, BookContract, ChapterPlanningWindow, Project, StoryPlanChapter, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -37,6 +37,8 @@ def test_author_guided_run_creates_contract_and_bounded_window(monkeypatch):
         assert contract and contract.length_policy["estimated_chapters"] == 600
         assert volume and volume.status == VolumeContractStatus.ACTIVE
         assert window and window.end_chapter_number - window.start_chapter_number + 1 == 5
+        tasks = db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.id.in_(db.get(AutoDirectorRun, run_id).context["window_task_ids"])).order_by(StoryPlanChapter.number)).all()
+        assert len(tasks) == 5 and [item.number for item in tasks] == [1, 2, 3, 4, 5]
         assert db.get(AutoDirectorRun, run_id).status.value == "PAUSED"
 
 

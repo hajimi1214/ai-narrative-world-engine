@@ -19,8 +19,9 @@ from .models import (
     BookCompletionProposal, BookCompletionProposalStatus, BookContract,
     Chapter, ChapterPlanningWindow, ChapterWindowStatus, ForeshadowingLedger,
     ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus,
-    VolumeContinuitySnapshot,
+    VolumeContinuitySnapshot, StoryPlan, StoryPlanChapter, StoryPlanStatus,
 )
+from .planning import persist_plan
 
 
 def _fingerprint(value: Any) -> str:
@@ -99,6 +100,20 @@ class AuthorGuidedVolumeService:
         db.add(window); db.flush()
         return window
 
+    def ensure_window_tasks(self, db: Session, project: Project, volume: VolumeContract, window: ChapterPlanningWindow, contract: BookContract) -> list[str]:
+        marker = f"author_window:{window.id}"
+        plans = db.scalars(select(StoryPlan).where(StoryPlan.project_id == project.id).order_by(StoryPlan.version.desc())).all()
+        existing = next((item for item in plans if (item.generation_report or {}).get("author_window_id") == window.id), None)
+        if existing:
+            return [item.id for item in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == existing.id)).all()]
+        framing = {"target_words_per_chapter": project.target_chapter_words, "pov": (contract.style_contract or {}).get("pov", "THIRD_PERSON_LIMITED"), "author_window_id": window.id}
+        chapters = [{"number": number, "volume_number": volume.volume_number, "arc_number": 1, "title": f"第{number}章", "summary": volume.volume_goal or "推进当前卷目标", "objective": "推进当前卷目标并形成不可逆后果", "conflict": volume.core_conflict or "外部阻力迫使主角选择", "must_events": volume.required_events or [], "forbidden_events": volume.forbidden_events or [], "allowed_reveals": volume.allowed_reveals or [], "forbidden_reveals": volume.forbidden_reveals or [], "scene_beats": ["建立本章局势", "形成关键选择", "留下可验证后果"], "locked": False} for number in range(window.start_chapter_number, window.end_chapter_number + 1)]
+        plan = persist_plan(db, project, {"framing": framing, "premise": contract.premise, "macro_plan": {"author_window": marker, "volume_goal": volume.volume_goal}, "style_guide": contract.style_contract or {}, "anti_ai_rules": {}, "volumes": [{"number": volume.volume_number, "title": volume.title or f"第 {volume.volume_number} 卷", "start_chapter": window.start_chapter_number, "end_chapter": window.end_chapter_number}], "chapters": chapters}, report={"author_guided": True, "author_window_id": window.id}, archive_latest=False)
+        plan.status = StoryPlanStatus.APPROVED
+        window.plan_fingerprint = plan.source_fingerprint
+        db.flush()
+        return [item.id for item in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id)).all()]
+
     def progress(self, db: Session, volume: VolumeContract) -> dict[str, Any]:
         chapters = db.scalars(select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.number >= (volume.actual_chapter_start or 1), Chapter.active.is_(True)).order_by(Chapter.number)).all()
         adopted = [item for item in chapters if item.status in {"QUALITY_APPROVED", "ADOPTED"} and item.content]
@@ -160,8 +175,9 @@ class AuthorGuidedVolumeService:
         volume = self.ensure_volume(db, project, contract, request.get("volume") or {})
         run.context = {**run.context, "volume_id": volume.id}
         window = self.ensure_window(db, project, volume, author_note=request.get("author_note"), size=request.get("window_size"))
+        task_ids = self.ensure_window_tasks(db, project, volume, window, contract)
         run.context = {**run.context, "window_id": window.id, "current_chapter_number": window.start_chapter_number}
-        run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_PLANNING
+        run.context = {**run.context, "window_task_ids": task_ids, "window_task_count": len(task_ids)}
+        run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION
         run.status = AutoDirectorRunStatus.PAUSED; run.pause_reason = "AUTHOR_WINDOW_READY"; run.next_action = f"第 {volume.volume_number} 卷第 {window.start_chapter_number}-{window.end_chapter_number} 章窗口已准备，作者可继续或输入指导。"
         return run
-

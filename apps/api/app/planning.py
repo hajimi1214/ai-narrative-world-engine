@@ -236,6 +236,7 @@ def validate_plan_references(db: Session, project_id: str, data: dict[str, Any])
 
 def _default_chapter(number: int, framing: dict[str, Any], volume: int = 1, arc: int = 1, raw: dict[str, Any] | None = None) -> dict[str, Any]:
     raw = raw or {}
+    number = int(raw.get("number", number))
     return {
         "number": number, "volume_number": int(raw.get("volume_number", volume)), "arc_number": int(raw.get("arc_number", arc)),
         "title": str(raw.get("title") or f"第{number}章"), "summary": str(raw.get("summary") or "本章推进主线并留下可验证的后果。"),
@@ -249,7 +250,7 @@ def _default_chapter(number: int, framing: dict[str, Any], volume: int = 1, arc:
     }
 
 
-def persist_plan(db: Session, project: Project, payload: dict[str, Any], *, provider: str | None = None, model: str | None = None, request_id: str | None = None, report: dict[str, Any] | None = None) -> StoryPlan:
+def persist_plan(db: Session, project: Project, payload: dict[str, Any], *, provider: str | None = None, model: str | None = None, request_id: str | None = None, report: dict[str, Any] | None = None, archive_latest: bool = True) -> StoryPlan:
     latest = db.scalar(select(StoryPlan).where(StoryPlan.project_id == project.id).order_by(StoryPlan.version.desc()))
     version = (latest.version + 1) if latest else 1
     framing = payload.get("framing") or {}
@@ -259,7 +260,7 @@ def persist_plan(db: Session, project: Project, payload: dict[str, Any], *, prov
         chapters = [_default_chapter(i, framing) for i in range(1, target + 1)]
     normalized = {"framing": framing, "premise": payload.get("premise"), "macro_plan": payload.get("macro_plan") or {}, "style_guide": payload.get("style_guide") or {}, "anti_ai_rules": payload.get("anti_ai_rules") or {}, "chapters": chapters, "arcs": payload.get("arcs") or [], "volumes": payload.get("volumes") or []}
     plan = StoryPlan(project_id=project.id, version=version, status=StoryPlanStatus.GENERATED, framing=framing, premise=payload.get("premise"), macro_plan=payload.get("macro_plan") or {}, style_guide=payload.get("style_guide") or {}, anti_ai_rules=payload.get("anti_ai_rules") or {}, source_fingerprint=_fingerprint(normalized), provider=provider, model=model, request_id=request_id, generation_report=report or {})
-    if latest and latest.status != StoryPlanStatus.ARCHIVED:
+    if archive_latest and latest and latest.status != StoryPlanStatus.ARCHIVED:
         latest.status = StoryPlanStatus.ARCHIVED
     db.add(plan); db.flush()
     for raw in payload.get("volumes") or []:
