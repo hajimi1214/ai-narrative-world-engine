@@ -302,6 +302,21 @@ def test_quality_failed_chapter_blocks_volume_seal(monkeypatch):
     assert response.json()["detail"]["code"] == "VOLUME_COMPLETION_CONDITIONS_UNMET"
 
 
+def test_completion_proposal_contains_adopted_evidence_and_honors_policy(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"length_policy": {"allow_completion_proposal": True}, "idempotency_key": "completion-evidence"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume.actual_chapter_start = 1; volume.actual_chapter_end = 1; volume.target_closing_state = {"done": True}
+        chapter = Chapter(project_id=project_id, number=1, content="已采用正文", status="QUALITY_APPROVED", active=True)
+        db.add(chapter); db.commit(); volume_id = volume.id; chapter_id = chapter.id
+    proposal = client.get(f"/projects/{project_id}/volumes/{volume_id}/completion-proposal")
+    assert proposal.status_code == 200
+    assert proposal.json()["status"] == "PROPOSED"
+    assert proposal.json()["evidence_chapter_ids"] == [chapter_id]
+
+
 def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     with Session() as db:

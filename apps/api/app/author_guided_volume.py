@@ -294,8 +294,17 @@ class AuthorGuidedVolumeService:
 
     def completion_proposal(self, db: Session, contract: BookContract, volume: VolumeContract) -> BookCompletionProposal:
         report = self.progress(db, volume)
-        status = BookCompletionProposalStatus.PROPOSED if report["should_prepare_seal"] and not volume.unresolved_threads else BookCompletionProposalStatus.NOT_READY
-        proposal = BookCompletionProposal(project_id=contract.project_id, book_contract_id=contract.id, status=status, reason=report["reason"], unresolved_threads=report["unresolved_threads"], unresolved_foreshadowings=report["pending_foreshadowings"], protagonist_arc_status={"progress": report["protagonist_arc_progress"]}, main_conflict_status={"progress": report["conflict_progress"]}, ending_requirements=contract.global_required_events or [], evidence_chapter_ids=[])
+        start = volume.actual_chapter_start or volume.estimated_chapter_start or 1
+        query = select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.number >= start, Chapter.active.is_(True), Chapter.content.is_not(None), Chapter.status.in_(["QUALITY_APPROVED", "ADOPTED"]))
+        if volume.actual_chapter_end is not None:
+            query = query.where(Chapter.number <= volume.actual_chapter_end)
+        adopted = db.scalars(query.order_by(Chapter.number)).all()
+        evidence_ids = [item.id for item in adopted]
+        policy = contract.length_policy or {}
+        allowed = policy.get("allow_completion_proposal", True)
+        status = BookCompletionProposalStatus.PROPOSED if allowed and report["should_prepare_seal"] and not volume.unresolved_threads else BookCompletionProposalStatus.NOT_READY
+        reason = report["reason"] if allowed else "当前书籍合同未允许 AI 提出完结建议。"
+        proposal = BookCompletionProposal(project_id=contract.project_id, book_contract_id=contract.id, status=status, reason=reason, unresolved_threads=report["unresolved_threads"], unresolved_foreshadowings=report["pending_foreshadowings"], protagonist_arc_status={"progress": report["protagonist_arc_progress"]}, main_conflict_status={"progress": report["conflict_progress"]}, ending_requirements=contract.global_required_events or [], evidence_chapter_ids=evidence_ids)
         db.add(proposal); db.flush(); return proposal
 
     def advance_run(self, db: Session, run: AutoDirectorRun) -> AutoDirectorRun:

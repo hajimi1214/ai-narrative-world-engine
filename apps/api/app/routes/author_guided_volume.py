@@ -287,7 +287,7 @@ def completion_proposal(project_id: str, volume_id: str, db: Session = Depends(g
     volume = _volume_or_404(db, project_id, volume_id); contract = db.get(BookContract, volume.book_contract_id)
     if not contract: raise HTTPException(status_code=409, detail={"code": "BOOK_CONTRACT_MISSING"})
     proposal = AuthorGuidedVolumeService().completion_proposal(db, contract, volume); db.commit()
-    return {"id": proposal.id, "status": _enum(proposal.status), "reason": proposal.reason, "unresolved_threads": proposal.unresolved_threads, "unresolved_foreshadowings": proposal.unresolved_foreshadowings, "protagonist_arc_status": proposal.protagonist_arc_status, "main_conflict_status": proposal.main_conflict_status, "ending_requirements": proposal.ending_requirements}
+    return {"id": proposal.id, "status": _enum(proposal.status), "reason": proposal.reason, "unresolved_threads": proposal.unresolved_threads, "unresolved_foreshadowings": proposal.unresolved_foreshadowings, "protagonist_arc_status": proposal.protagonist_arc_status, "main_conflict_status": proposal.main_conflict_status, "ending_requirements": proposal.ending_requirements, "evidence_chapter_ids": proposal.evidence_chapter_ids}
 
 
 @router.post("/projects/{project_id}/completion-proposals/{proposal_id}/confirm")
