@@ -12,6 +12,7 @@ from sqlalchemy import select
 from .db import SessionLocal
 from .models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage
 from .auto_director import AutoDirectorOrchestrator
+from .author_guided_volume import AuthorGuidedVolumeService
 
 
 class AutoDirectorWorker:
@@ -27,7 +28,10 @@ class AutoDirectorWorker:
         try:
             run = db.scalar(select(AutoDirectorRun).where(AutoDirectorRun.status.in_([AutoDirectorRunStatus.CREATED, AutoDirectorRunStatus.RUNNING])).order_by(AutoDirectorRun.created_at).with_for_update())
             if not run: return False
-            AutoDirectorOrchestrator().advance_to_pause(db, run)
+            if run.run_mode == "AUTHOR_GUIDED_VOLUME":
+                AuthorGuidedVolumeService().advance_run(db, run)
+            else:
+                AutoDirectorOrchestrator().advance_to_pause(db, run)
             db.commit()
             return True
         except Exception as exc:
