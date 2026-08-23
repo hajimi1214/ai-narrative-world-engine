@@ -38,15 +38,22 @@ from .world_resolution import (
 )
 
 
-def _emit_usage(collector: Callable[[dict[str, Any]], None] | None, result: Any = None, error: Exception | None = None) -> None:
+def _emit_usage(
+    collector: Callable[[dict[str, Any]], None] | None,
+    result: Any = None,
+    error: Exception | None = None,
+    *,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
+) -> None:
     if not collector:
         return
     usage = getattr(result, "usage", None) if result is not None else getattr(error, "usage", None)
     usage = usage if isinstance(usage, dict) else {}
     collector({
         "calls": 1,
-        "provider": getattr(result, "provider", None),
-        "model": getattr(result, "model", None),
+        "provider": getattr(result, "provider", None) or getattr(error, "provider", None) or fallback_provider,
+        "model": getattr(result, "model", None) or getattr(error, "model", None) or fallback_model,
         "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
         "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
         "total_tokens": int(usage.get("total_tokens", usage.get("tokens", 0)) or 0),
@@ -139,12 +146,15 @@ class PerformanceRuntimeService:
             provider="HEURISTIC" if performance.mode == PerformanceMode.HEURISTIC else None,
             input_fingerprint=context["fingerprint"],
         )
+        route_provider = None
+        route_model = None
         try:
             if performance.mode == PerformanceMode.HEURISTIC:
                 raw, model_result = (heuristic_performer or HeuristicCharacterPerformer)().perform(context)
             else:
                 settings = get_settings()
                 route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
+                route_provider, route_model = route.provider, route.model
                 trace.provider, trace.model = route.provider, route.model
                 provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
                 performer = LLMCharacterPerformer(provider, route.model)
@@ -152,9 +162,9 @@ class PerformanceRuntimeService:
                     raw, model_result = performer.perform(ActorPerceptionSanitizer().sanitize(context))
                 finally:
                     for result in performer.results:
-                        _emit_usage(usage_collector, result)
+                        _emit_usage(usage_collector, result, fallback_provider=route_provider, fallback_model=route_model)
         except ModelProviderError as exc:
-            _emit_usage(usage_collector, error=exc)
+            _emit_usage(usage_collector, error=exc, fallback_provider=route_provider, fallback_model=route_model)
             ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status)
             performance.status, performance.stop_reason = initial_status, initial_stop_reason
             raise RuntimeFailure(exc.code, {"upstream_status": exc.upstream_status}) from exc
@@ -242,12 +252,15 @@ class WorldResolutionRuntimeService:
             provider="HEURISTIC" if mode == ResolverMode.HEURISTIC else None,
             input_fingerprint=context_fingerprint,
         )
+        route_provider = None
+        route_model = None
         try:
             if mode == ResolverMode.HEURISTIC:
                 raw, model_result = (heuristic_resolver or HeuristicWorldResolver)().resolve(context)
             else:
                 settings = get_settings()
                 route = ModelRouter().resolve(db, project_id, settings, "WORLD")
+                route_provider, route_model = route.provider, route.model
                 trace.provider, trace.model = route.provider, route.model
                 provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
                 resolver = LLMWorldResolver(provider, route.model)
@@ -255,10 +268,10 @@ class WorldResolutionRuntimeService:
                     raw, model_result = resolver.resolve(context)
                 finally:
                     for result in resolver.results:
-                        _emit_usage(usage_collector, result)
+                        _emit_usage(usage_collector, result, fallback_provider=route_provider, fallback_model=route_model)
             payload = WorldResolutionPayload.model_validate(raw)
         except ModelProviderError as exc:
-            _emit_usage(usage_collector, error=exc)
+            _emit_usage(usage_collector, error=exc, fallback_provider=route_provider, fallback_model=route_model)
             ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status)
             raise RuntimeFailure(exc.code, {"upstream_status": exc.upstream_status}) from exc
         except Exception as exc:

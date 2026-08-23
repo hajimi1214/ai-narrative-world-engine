@@ -20,6 +20,7 @@ from app.auto_director_worker import AutoDirectorWorker
 from app.auto_director import AutoDirectorOrchestrator
 from app.autonomy import AutonomousWorldLoopService
 from app.planning import validate_task_output
+from app.runtime import _emit_usage
 
 
 def _client(monkeypatch, directions):
@@ -149,6 +150,30 @@ def test_runtime_task_validation_reports_event_ref_and_alias_matches():
     assert valid
     assert report["matched_by"]["key-obtained"] == "ALIAS"
     assert report["matched_by"]["beat-entry"] == "EVENT_REF"
+
+
+def test_runtime_usage_collector_keeps_character_and_world_provider_metadata():
+    from app.ai.provider import ModelResult
+    events = []
+    _emit_usage(events.append, ModelResult(content="{}", latency_ms=4, request_id="character", provider="character-provider", model="character-model", usage={"total_tokens": 3}))
+    _emit_usage(events.append, ModelResult(content="{}", latency_ms=5, request_id="world", provider="world-provider", model="world-model", usage={"total_tokens": 7}))
+    assert events[0]["provider"] == "character-provider" and events[0]["model"] == "character-model"
+    assert events[1]["provider"] == "world-provider" and events[1]["model"] == "world-model"
+    assert sum(item["total_tokens"] for item in events) == 10
+
+
+def test_chapter_task_events_do_not_leak_between_chapters():
+    from types import SimpleNamespace
+    performance = SimpleNamespace(id="performance")
+    turns = [SimpleNamespace(observable_action="第一章取得钥匙", spoken_content="", scene_beat_refs=["chapter-one-beat"])]
+    proposal_one = SimpleNamespace(entry_state={"planning_task": {"must_events": [{"event_ref": "chapter-one-key", "label": "取得钥匙", "aliases": []}], "forbidden_events": [], "scene_beats": [{"event_ref": "chapter-one-beat", "label": "打开入口"}]}}, expected_progress={})
+    proposal_two = SimpleNamespace(entry_state={"planning_task": {"must_events": [{"event_ref": "chapter-two-key", "label": "取得徽章", "aliases": []}], "forbidden_events": [], "scene_beats": [{"event_ref": "chapter-two-beat", "label": "进入塔楼"}]}}, expected_progress={})
+    class DB:
+        def scalars(self, _query): return SimpleNamespace(all=lambda: turns)
+    valid_one, report_one = AutonomousWorldLoopService._validate_chapter_task(DB(), performance, proposal_one)
+    valid_two, report_two = AutonomousWorldLoopService._validate_chapter_task(DB(), performance, proposal_two)
+    assert valid_one and report_one["matched_by"]["chapter-one-key"] == "TEXT"
+    assert not valid_two and report_two["missing_must_events"] == ["取得徽章"]
 
 
 def test_auto_director_select_direction_requires_author_confirmation(monkeypatch):
@@ -316,6 +341,9 @@ def test_full_auto_completes_two_chapters_with_fake_provider(monkeypatch):
     assert len(state["token_usage"]["providers"]) == len(set(state["token_usage"]["providers"]))
     assert len(state["token_usage"]["models"]) == len(set(state["token_usage"]["models"]))
     assert any(item["usage_metrics"]["total_tokens"] > 0 for item in state["steps"] if item["status"] == "COMMITTED")
+    total_before_retry = state["usage_metrics"]["total_tokens"]
+    assert worker.run_once() is False
+    assert client.get(f"/projects/{project_id}/auto-director/runs/{run_id}").json()["usage_metrics"]["total_tokens"] == total_before_retry
     with api_module.SessionLocal() as db:
         chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True)).order_by(Chapter.number)).all()
         assert len(chapters) >= 2
