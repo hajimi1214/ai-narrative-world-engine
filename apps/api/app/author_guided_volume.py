@@ -20,6 +20,7 @@ from .models import (
     Chapter, ChapterPlanningWindow, ChapterWindowStatus, ForeshadowingLedger,
     ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus,
     VolumeContinuitySnapshot, StoryPlan, StoryPlanChapter, StoryPlanStatus,
+    Character, PlanChapterStatus,
 )
 from .planning import persist_plan
 
@@ -52,6 +53,73 @@ class AuthorGuidedVolumeError(RuntimeError):
 
 class AuthorGuidedVolumeService:
     WINDOW_SIZE = 5
+
+    @staticmethod
+    def _task_text(task: StoryPlanChapter) -> str:
+        values = [task.title, task.summary, task.objective, task.conflict]
+        values.extend(task.must_events or [])
+        values.extend(task.character_changes or [])
+        return " ".join(str(item) for item in values if item).lower()
+
+    def analyze_impact(self, db: Session, project_id: str, volume: VolumeContract, *, note: str, scope: str = "WINDOW", character: Character | None = None) -> dict[str, Any]:
+        """Return a conservative impact report without touching written history."""
+        active_windows = db.scalars(select(ChapterPlanningWindow).where(
+            ChapterPlanningWindow.project_id == project_id,
+            ChapterPlanningWindow.volume_id == volume.id,
+            ChapterPlanningWindow.status.in_([ChapterWindowStatus.PLANNING, ChapterWindowStatus.ACTIVE, ChapterWindowStatus.EXTENDING]),
+        ).order_by(ChapterPlanningWindow.start_chapter_number)).all()
+        tasks = db.scalars(select(StoryPlanChapter).where(
+            StoryPlanChapter.project_id == project_id,
+            StoryPlanChapter.number >= (active_windows[0].start_chapter_number if active_windows else 1),
+        ).order_by(StoryPlanChapter.number)).all()
+        adopted_numbers = set(db.scalars(select(Chapter.number).where(
+            Chapter.project_id == project_id,
+            Chapter.active.is_(True),
+            Chapter.status.in_(["QUALITY_APPROVED", "ADOPTED"]),
+        )).all())
+        locked_numbers = {task.number for task in tasks if task.locked or task.status == PlanChapterStatus.LOCKED}
+        scope_upper = scope.upper()
+        needle = (note or "").lower()
+        affected = []
+        protected = []
+        for task in tasks:
+            if task.number in adopted_numbers or task.number in locked_numbers:
+                protected.append({"chapter_number": task.number, "reason": "ADOPTED" if task.number in adopted_numbers else "AUTHOR_LOCKED"})
+                continue
+            matches = not needle or any(token in self._task_text(task) for token in needle.split() if len(token) > 1)
+            if scope_upper in {"BOOK", "MAINLINE", "VOLUME"} or matches or any(task.number in range(w.start_chapter_number, w.end_chapter_number + 1) for w in active_windows):
+                affected.append({"chapter_number": task.number, "task_id": task.id, "window_id": next((w.id for w in active_windows if w.start_chapter_number <= task.number <= w.end_chapter_number), None), "replan_required": True})
+        character_ids = [character.id] if character else []
+        text_blob = f"{note} {character.name if character else ''}".lower()
+        foreshadowings = db.scalars(select(ForeshadowingLedger).where(ForeshadowingLedger.project_id == project_id)).all()
+        affected_foreshadowings = [item.id for item in foreshadowings if any(token in f"{item.title} {item.description or ''}".lower() for token in text_blob.split() if len(token) > 1)]
+        future_volumes = db.scalars(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number >= volume.volume_number, VolumeContract.status != VolumeContractStatus.SEALED).order_by(VolumeContract.volume_number)).all()
+        return {"affected_volume_ids": [item.id for item in future_volumes], "affected_chapters": affected, "protected_chapters": protected, "affected_character_ids": character_ids, "affected_foreshadowing_ids": affected_foreshadowings, "affected_timeline": [{"volume_id": item.id, "volume_number": item.volume_number} for item in future_volumes], "requires_replan": bool(affected) and (scope_upper in {"BOOK", "MAINLINE", "VOLUME"} or bool(character)), "reason": "只标记未写、未锁定章节；已采用正文和封存卷保持不变。"}
+
+    def record_guidance(self, db: Session, volume: VolumeContract, payload: dict[str, Any], *, character: Character | None = None) -> AuthorGuidance:
+        analysis = self.analyze_impact(db, volume.project_id, volume, note=payload["author_note"], scope=payload.get("affected_scope", "WINDOW"), character=character)
+        guidance = AuthorGuidance(project_id=volume.project_id, volume_id=volume.id, author_note=payload["author_note"], author_locked_constraints=payload.get("author_locked_constraints") or [], author_override_reason=payload.get("author_override_reason"), affected_scope=payload.get("affected_scope", "WINDOW"), requires_replan=bool(payload.get("requires_replan", False) or analysis["requires_replan"]), analysis=analysis, status="PENDING_REPLAN" if analysis["requires_replan"] else "APPLIED")
+        db.add(guidance); db.flush()
+        return guidance
+
+    def add_character(self, db: Session, project_id: str, volume: VolumeContract, payload: dict[str, Any]) -> tuple[Character, AuthorGuidance]:
+        existing = db.scalar(select(Character).where(Character.project_id == project_id, Character.name == payload["name"], Character.active.is_(True)))
+        if existing:
+            return existing, self.record_guidance(db, volume, {"author_note": f"保留人物：{existing.name}", "affected_scope": "VOLUME"}, character=existing)
+        values = {key: payload.get(key) for key in ("profile", "personality", "goals", "abilities", "relationships", "secrets")}
+        character = Character(project_id=project_id, name=payload["name"], **{key: (value or {}) if key in {"profile", "personality", "goals", "relationships"} else (value or []) for key, value in values.items()}, narrative_relevance={"source": "AUTHOR_GUIDANCE", "first_appearance": {"volume": volume.volume_number}})
+        db.add(character); db.flush()
+        guidance = self.record_guidance(db, volume, {"author_note": f"新增人物：{character.name}", "affected_scope": "VOLUME", "requires_replan": True}, character=character)
+        return character, guidance
+
+    def update_plot_direction(self, db: Session, contract: BookContract, volume: VolumeContract, payload: dict[str, Any]) -> AuthorGuidance:
+        if volume.status == VolumeContractStatus.SEALED:
+            raise AuthorGuidedVolumeError("VOLUME_SEALED")
+        contract.global_plot_direction = payload["global_plot_direction"]
+        contract.version += 1
+        contract.fingerprint = _fingerprint(_contract_payload(contract))
+        data = {"author_note": payload.get("author_note") or "作者修改全书剧情走向", "affected_scope": "MAINLINE", "author_locked_constraints": payload.get("author_locked_constraints") or [], "requires_replan": True}
+        return self.record_guidance(db, volume, data)
 
     def ensure_contract(self, db: Session, project: Project, payload: dict[str, Any]) -> BookContract:
         contract = db.scalar(select(BookContract).where(BookContract.project_id == project.id))

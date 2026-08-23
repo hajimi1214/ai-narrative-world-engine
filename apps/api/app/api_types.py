@@ -58,6 +58,25 @@ class AuthorGuidancePayload(BaseModel):
     requires_replan: bool = False
 
 
+class AuthorCharacterPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    name: str = Field(min_length=1, max_length=200)
+    profile: dict[str, Any] = Field(default_factory=dict)
+    personality: dict[str, Any] = Field(default_factory=dict)
+    goals: dict[str, Any] = Field(default_factory=dict)
+    abilities: list[Any] = Field(default_factory=list)
+    relationships: dict[str, Any] = Field(default_factory=dict)
+    secrets: list[Any] = Field(default_factory=list)
+
+
+class PlotDirectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    global_plot_direction: str = Field(min_length=1, max_length=12000)
+    author_note: str | None = Field(default=None, max_length=4000)
+    author_locked_constraints: list[Any] = Field(default_factory=list)
+    requires_replan: bool = True
+
+
 class VolumeActionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: str | None = Field(default=None, max_length=4000)

@@ -9,7 +9,7 @@ import app.api as api_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, BookContract, ChapterPlanningWindow, Project, StoryPlanChapter, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, Project, StoryPlanChapter, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -77,3 +77,36 @@ def test_sealed_volume_requires_author_confirmation_and_snapshot(monkeypatch):
     assert sealed.status_code == 200, sealed.text
     assert sealed.json()["snapshot_id"]
     assert client.get(f"/projects/{project_id}/volumes/{volume_id}/snapshot").status_code == 200
+
+
+def test_author_guidance_returns_unwritten_impact_and_protects_adopted_chapters(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "impact"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        db.add(Chapter(project_id=project_id, number=1, content="已采用", status="QUALITY_APPROVED", active=True))
+        db.commit(); volume_id = volume.id
+    response = client.post(f"/projects/{project_id}/volumes/{volume_id}/guidance", json={"author_note": "改变主线目标", "affected_scope": "MAINLINE"})
+    assert response.status_code == 200, response.text
+    analysis = response.json()["analysis"]
+    assert any(item["chapter_number"] == 2 for item in analysis["affected_chapters"])
+    assert {item["chapter_number"] for item in analysis["protected_chapters"]} == {1}
+    assert response.json()["requires_replan"] is True
+
+
+def test_author_can_add_character_and_change_plot_direction_without_touching_sealed_volume(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "author-input"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume.target_closing_state = {"done": True}; volume.actual_chapter_start = 1; volume.actual_chapter_end = 1
+        db.add(Chapter(project_id=project_id, number=1, content="收束", status="QUALITY_APPROVED", active=True))
+        db.commit(); volume_id = volume.id
+    character = client.post(f"/projects/{project_id}/volumes/{volume_id}/characters", json={"name": "沈砚", "goals": {"current": "追查真相"}})
+    assert character.status_code == 201, character.text
+    assert character.json()["guidance"]["analysis"]["affected_character_ids"]
+    direction = client.post(f"/projects/{project_id}/volumes/{volume_id}/plot-direction", json={"global_plot_direction": "主角必须先保护证人"})
+    assert direction.status_code == 200, direction.text
+    assert direction.json()["requires_replan"] is True

@@ -4,9 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..api_types import AuthorGuidancePayload, AuthorGuidedRunCreatePayload, VolumeActionPayload
+from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, PlotDirectionPayload, VolumeActionPayload
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _contract_payload, _enum, _volume_payload, _window_payload
-from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, BookCompletionProposal, BookContract, ChapterPlanningWindow, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
+from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, BookCompletionProposal, BookContract, ChapterPlanningWindow, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
 from .common import get_db, require_project
 
 router = APIRouter(tags=["author-guided-volume"])
@@ -164,8 +164,33 @@ def seed_foreshadowing(project_id: str, volume_id: str, payload: dict, db: Sessi
 def add_guidance(project_id: str, volume_id: str, payload: AuthorGuidancePayload, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id)
     if volume.status == VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
-    guidance = AuthorGuidance(project_id=project_id, volume_id=volume.id, author_note=payload.author_note, author_locked_constraints=payload.author_locked_constraints, author_override_reason=payload.author_override_reason, affected_scope=payload.affected_scope, requires_replan=payload.requires_replan, analysis={"scope": payload.affected_scope, "written_content_protected": True})
-    db.add(guidance); db.commit(); return {"id": guidance.id, "analysis": guidance.analysis, "requires_replan": guidance.requires_replan, "affected_scope": guidance.affected_scope}
+    guidance = AuthorGuidedVolumeService().record_guidance(db, volume, payload.model_dump())
+    db.commit(); return {"id": guidance.id, "analysis": guidance.analysis, "requires_replan": guidance.requires_replan, "affected_scope": guidance.affected_scope, "status": guidance.status}
+
+
+@router.post("/projects/{project_id}/volumes/{volume_id}/characters", status_code=status.HTTP_201_CREATED)
+def add_author_character(project_id: str, volume_id: str, payload: AuthorCharacterPayload, db: Session = Depends(get_db)):
+    volume = _volume_or_404(db, project_id, volume_id)
+    if volume.status == VolumeContractStatus.SEALED:
+        raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
+    character, guidance = AuthorGuidedVolumeService().add_character(db, project_id, volume, payload.model_dump())
+    db.commit()
+    return {"character": {"id": character.id, "name": character.name, "profile": character.profile, "goals": character.goals, "narrative_relevance": character.narrative_relevance}, "guidance": {"id": guidance.id, "analysis": guidance.analysis, "requires_replan": guidance.requires_replan}}
+
+
+@router.post("/projects/{project_id}/volumes/{volume_id}/plot-direction")
+def update_plot_direction(project_id: str, volume_id: str, payload: PlotDirectionPayload, db: Session = Depends(get_db)):
+    volume = _volume_or_404(db, project_id, volume_id)
+    contract = db.get(BookContract, volume.book_contract_id)
+    if not contract:
+        raise HTTPException(status_code=409, detail={"code": "BOOK_CONTRACT_MISSING"})
+    try:
+        guidance = AuthorGuidedVolumeService().update_plot_direction(db, contract, volume, payload.model_dump())
+        db.commit()
+        return {"guidance_id": guidance.id, "contract": _contract_payload(contract), "analysis": guidance.analysis, "requires_replan": guidance.requires_replan}
+    except AuthorGuidedVolumeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
 
 
 @router.get("/projects/{project_id}/volumes/{volume_id}/completion-proposal")
