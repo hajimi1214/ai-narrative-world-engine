@@ -1,4 +1,5 @@
 import time
+import json
 from collections import defaultdict, deque
 from threading import Lock
 import httpx
@@ -68,3 +69,34 @@ class OpenAICompatibleProvider:
         usage = body.get("usage") if isinstance(body, dict) else {}
         usage = usage if isinstance(usage, dict) else {}
         return ModelResult(content=str(content), latency_ms=latency_ms, request_id=response.headers.get("x-request-id"), provider=self.name, model=model, usage={key: int(usage.get(key, 0) or 0) for key in ("prompt_tokens", "completion_tokens", "total_tokens")})
+
+    def generate_stream(self, messages: list[dict[str, str]], model: str, on_delta) -> ModelResult:
+        """Consume provider SSE server-side; callers receive only a safe preview callback."""
+        self._check_rate_limit(model)
+        started = time.perf_counter(); chunks: list[str] = []; usage: dict[str, int] = {}; request_id = None
+        try:
+            with httpx.stream("POST", f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}, json={"model": model, "messages": messages, "stream": True}, timeout=self.timeout_seconds) as response:
+                request_id = response.headers.get("x-request-id")
+                if response.status_code in (401, 403): raise ModelProviderError(MODEL_AUTH_FAILED, upstream_status=response.status_code)
+                if response.status_code == 429: raise ModelProviderError(MODEL_RATE_LIMITED, upstream_status=response.status_code)
+                if response.status_code >= 500: raise ModelProviderError(MODEL_UPSTREAM_ERROR, upstream_status=response.status_code)
+                if response.status_code >= 400: raise ModelProviderError(MODEL_UPSTREAM_ERROR, f"Upstream HTTP status {response.status_code}", response.status_code)
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data:"): continue
+                    data = line[5:].strip()
+                    if data == "[DONE]": break
+                    try: body = json.loads(data)
+                    except json.JSONDecodeError: continue
+                    delta = (((body.get("choices") or [{}])[0].get("delta") or {}).get("content"))
+                    if delta:
+                        text = str(delta); chunks.append(text); on_delta(text)
+                    if isinstance(body.get("usage"), dict): usage = body["usage"]
+        except httpx.TimeoutException as exc:
+            raise ModelProviderError(MODEL_TIMEOUT) from exc
+        except ModelProviderError:
+            raise
+        except httpx.HTTPError as exc:
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR) from exc
+        content = "".join(chunks)
+        if not content: raise ModelProviderError(MODEL_UPSTREAM_ERROR, "Stream completed without content")
+        return ModelResult(content=content, latency_ms=int((time.perf_counter() - started) * 1000), request_id=request_id, provider=self.name, model=model, usage={key: int(usage.get(key, 0) or 0) for key in ("prompt_tokens", "completion_tokens", "total_tokens")})

@@ -3,6 +3,7 @@ import json
 from enum import Enum
 from typing import Any, Type
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -21,6 +22,7 @@ from .revision import RevisionChangeNormalizer, RevisionCreatePayload, RevisionI
 from .versioning import WorldSnapshotBuilder, RevisionApplyService
 from .model_router import ModelRouter, ProjectModelConfigPayload, ProviderCredentialResolver
 from .execution_trace import ExecutionTraceRecorder, RecoveryPolicy, stable_fingerprint
+from .live_execution import live_execution_broker
 from .recovery import CandidateRepairAgent, RecoveryActionResolver, RecoveryCandidateService, RecoveryContextStaleError, RecoveryEditPayload
 from .services import DomainRuleError, activate_anti_ai_bible, activate_writing_bible, update_canon
 from .retcon import RetconImpactPlanner, RetconPlanStalenessChecker, CLASSIFICATION_LABELS, semantic_fingerprint
@@ -648,11 +650,13 @@ def generate_story_plan(project_id: str, payload: PlanCreatePayload, db: Session
     )
     # Commit before the synchronous model request so the live panel can see it.
     db.commit()
+    live_session_id = live_execution_broker.begin(project_id=project_id, trace_id=trace.id, label="整书规划", provider=route.provider, model=route.model, stage="STORY_PLAN")
     def update_live_phase(phase: str, message: str) -> None:
         trace.validation_report = {"live_phase": phase, "live_message": message}
+        live_execution_broker.phase(live_session_id, phase, message)
         db.commit()
     try:
-        generated, result = generate_plan(db, project, values["framing"], values.get("premise"), values.get("style_guide") or {}, values.get("anti_ai_rules") or {}, on_phase=update_live_phase)
+        generated, result = generate_plan(db, project, values["framing"], values.get("premise"), values.get("style_guide") or {}, values.get("anti_ai_rules") or {}, on_phase=update_live_phase, on_delta=lambda content: live_execution_broker.append(live_session_id, content))
         generated.setdefault("framing", values["framing"]); generated.setdefault("premise", values.get("premise")); generated.setdefault("style_guide", values.get("style_guide") or {}); generated.setdefault("anti_ai_rules", values.get("anti_ai_rules") or {})
         generated["framing"] = values["framing"] | (generated.get("framing") or {})
         errors = validate_plan_references(db, project_id, generated)
@@ -664,6 +668,7 @@ def generate_story_plan(project_id: str, payload: PlanCreatePayload, db: Session
         plan = persist_plan(db, project, generated, provider=result.provider if result else None, model=result.model if result else None, request_id=result.request_id if result else None, report={"latency_ms": result.latency_ms if result else None, "direction_options": generated.get("direction_options", []), "generation_warning": generated.get("generation_warning")})
         ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms if result else None, request_id=result.request_id if result else None, output_fingerprint=stable_fingerprint({"plan_id": plan.id, "warning": generated.get("generation_warning")}, "story-plan-output-v1"))
         trace.validation_report = {"live_phase": "COMPLETED", "live_message": "整书规划已保存，可继续查看卷纲和首批章节任务", "generation_warning": generated.get("generation_warning")}
+        live_execution_broker.complete(live_session_id, "整书规划已保存，可继续查看卷纲和首批章节任务")
         db.commit(); db.refresh(plan)
         return plan_payload(db, plan)
     except HTTPException:
@@ -672,6 +677,7 @@ def generate_story_plan(project_id: str, payload: PlanCreatePayload, db: Session
         db.rollback()
         code = getattr(exc, "code", None) or getattr(exc, "error_code", None) or "PLAN_GENERATION_FAILED"
         ExecutionTraceRecorder().fail(trace, code, upstream_status=getattr(exc, "upstream_status", None))
+        live_execution_broker.fail(live_session_id, code, "模型调用未完成，正式规划没有被覆盖")
         db.commit()
         raise HTTPException(status_code=502, detail={"code": code, "message": str(exc)}) from exc
 
@@ -1603,6 +1609,32 @@ def list_execution_traces(project_id:str,stage:str|None=None,status_filter:str|N
     if source_type: query=query.where(ExecutionTrace.source_type==source_type)
     if source_id: query=query.where(ExecutionTrace.source_id==source_id)
     return [_trace_payload(x, db) for x in db.scalars(query.order_by(ExecutionTrace.created_at.desc(),ExecutionTrace.id).limit(min(max(limit, 1), 200))).all()]
+
+
+@router.get("/projects/{project_id}/ai-live")
+def list_ai_live_sessions(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return live_execution_broker.snapshots(project_id)
+
+
+@router.get("/projects/{project_id}/ai-live/stream")
+def stream_ai_live_sessions(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+
+    def event_stream():
+        version = -1
+        while True:
+            next_version, sessions = live_execution_broker.wait_for_snapshots(project_id, version)
+            if next_version == version:
+                yield ": keepalive\n\n"
+                continue
+            version = next_version
+            payload = json.dumps({"version": version, "sessions": sessions}, ensure_ascii=False, separators=(",", ":"))
+            yield f"event: snapshot\ndata: {payload}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @router.get("/projects/{project_id}/execution-traces/{trace_id}")
 def get_execution_trace(project_id:str,trace_id:str,db:Session=Depends(get_db)):
     item=db.get(ExecutionTrace,trace_id)

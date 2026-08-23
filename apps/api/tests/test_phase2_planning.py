@@ -9,6 +9,7 @@ import app.api as api_module
 import app.planning as planning_module
 from app.ai.fake import FakeModelProvider
 from app.ai.errors import MODEL_UPSTREAM_ERROR, ModelProviderError
+from app.ai.provider import ModelResult
 from app.db import Base
 from app.main import app
 from app.models import Project, ProjectModelConfig
@@ -37,6 +38,9 @@ def test_phase2_plan_generation_creates_versioned_chapter_task_sheets(monkeypatc
         traces = TestClient(app).get(f"/projects/{project.id}/execution-traces?source_type=STORY_PLAN").json()
         assert traces[0]["stage"] == "DIRECTOR"
         assert traces[0]["status"] == "SUCCEEDED"
+        live = TestClient(app).get(f"/projects/{project.id}/ai-live").json()
+        assert live[0]["label"] == "整书规划"
+        assert live[0]["status"] == "COMPLETED"
 
         chapter_id = body["chapters"][0]["id"]
         patch = TestClient(app).patch(f"/projects/{project.id}/planning/plans/{body['id']}/chapters/{chapter_id}", json={"locked": True, "status": "LOCKED"})
@@ -109,3 +113,31 @@ def test_long_book_uses_author_outline_when_macro_provider_fails(monkeypatch):
         assert generated["generation_warning"] == "MODEL_MACRO_DEFERRED"
         assert [volume["title"] for volume in generated["volumes"]] == ["第九次下葬", "死人宗"]
         assert len(generated["chapters"]) == planning_module.INITIAL_CHAPTER_WINDOW
+
+
+def test_plan_generation_forwards_streamed_preview_deltas(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+
+    class StreamingFake:
+        name = "fake-stream"
+
+        def generate(self, *_args, **_kwargs):
+            raise AssertionError("streaming path was not used")
+
+        def generate_stream(self, _messages, model, on_delta):
+            chunks = ['{"premise":"流式', '规划","volumes":[],"arcs":[],"chapters":[]}']
+            for chunk in chunks:
+                on_delta(chunk)
+            return ModelResult(content="".join(chunks), latency_ms=1, request_id="stream-request", provider=self.name, model=model)
+
+    with Session() as db:
+        project = Project(name="Stream", story_seed="一个正在生成的故事")
+        db.add(project); db.flush()
+        db.add(ProjectModelConfig(project_id=project.id, provider="openai_compatible", base_url="https://example.test/v1", director_model="fake-model")); db.commit()
+        monkeypatch.setattr(planning_module, "get_model_provider", lambda *args, **kwargs: StreamingFake())
+        deltas = []
+        generated, result = planning_module.generate_plan(db, project, {"inspiration": "一个正在生成的故事", "target_chapters": 1}, None, {}, {}, on_delta=deltas.append)
+        assert "".join(deltas) == result.content
+        assert generated["premise"] == "流式规划"
