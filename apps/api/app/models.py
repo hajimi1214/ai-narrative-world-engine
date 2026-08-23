@@ -86,6 +86,13 @@ class NarrativeStructureProjectionStatus(str, enum.Enum): READY="READY"; DIRTY="
 class SnapshotStorageMode(str, enum.Enum): LEGACY_FULL="LEGACY_FULL"; COMPACT_ANCHOR="COMPACT_ANCHOR"; COMPACT_DELTA="COMPACT_DELTA"; REFERENCE="REFERENCE"
 class StoryPlanStatus(str, enum.Enum): DRAFT="DRAFT"; GENERATED="GENERATED"; APPROVED="APPROVED"; ARCHIVED="ARCHIVED"
 class PlanChapterStatus(str, enum.Enum): DRAFT="DRAFT"; READY="READY"; LOCKED="LOCKED"; SUPERSEDED="SUPERSEDED"
+class AuthorGuidedRunMode(str, enum.Enum): AUTHOR_GUIDED_VOLUME="AUTHOR_GUIDED_VOLUME"
+class LengthPolicyMode(str, enum.Enum): OPEN_ENDED="OPEN_ENDED"; ESTIMATE_ONLY="ESTIMATE_ONLY"; AUTHOR_DEFINED="AUTHOR_DEFINED"
+class CompletionStrategy(str, enum.Enum): STORY_CONTRACT="STORY_CONTRACT"; AUTHOR_CONFIRMATION="AUTHOR_CONFIRMATION"; MANUAL_CLOSE="MANUAL_CLOSE"
+class VolumeContractStatus(str, enum.Enum): DRAFT="DRAFT"; ACTIVE="ACTIVE"; EXTENDING="EXTENDING"; READY_TO_SEAL="READY_TO_SEAL"; SEALED="SEALED"; CANCELLED="CANCELLED"; BLOCKED="BLOCKED"
+class ChapterWindowStatus(str, enum.Enum): PLANNING="PLANNING"; ACTIVE="ACTIVE"; EXTENDING="EXTENDING"; COMPLETED="COMPLETED"; STALE="STALE"; BLOCKED="BLOCKED"
+class BookCompletionProposalStatus(str, enum.Enum): NOT_READY="NOT_READY"; PROPOSED="PROPOSED"; AUTHOR_CONFIRMED="AUTHOR_CONFIRMED"; COMPLETED="COMPLETED"
+class ForeshadowingStatus(str, enum.Enum): SEEDED="SEEDED"; ACTIVE="ACTIVE"; TOUCHED="TOUCHED"; PARTIALLY_PAID="PARTIALLY_PAID"; PAID_OFF="PAID_OFF"; FORBIDDEN_TO_REVEAL="FORBIDDEN_TO_REVEAL"; CANCELLED="CANCELLED"
 class RecoveryCandidateType(str, enum.Enum): CHARACTER_DECISION="CHARACTER_DECISION"; CHARACTER_PERFORMANCE="CHARACTER_PERFORMANCE"; WORLD_RESOLUTION="WORLD_RESOLUTION"
 class RecoveryVersionOrigin(str, enum.Enum): ORIGINAL="ORIGINAL"; MANUAL_EDIT="MANUAL_EDIT"; AI_REPAIR="AI_REPAIR"
 
@@ -106,6 +113,158 @@ class Project(TimestampMixin, Base):
     autonomy_settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     research_settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     current_world_time: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class BookContract(TimestampMixin, Base):
+    """Author-owned book boundary; estimates never act as completion limits."""
+    __tablename__ = "book_contracts"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_book_contract_project"), Index("ix_book_contract_project_status", "project_id", "status"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    title: Mapped[str | None] = mapped_column(String(300))
+    theme: Mapped[str | None] = mapped_column(Text)
+    premise: Mapped[str | None] = mapped_column(Text)
+    ending_direction: Mapped[str | None] = mapped_column(Text)
+    protagonist_contract: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    global_plot_direction: Mapped[str | None] = mapped_column(Text)
+    global_required_events: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    global_forbidden_events: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    style_contract: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    author_locked_constraints: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    length_policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(30), default="ACTIVE", nullable=False)
+
+
+class VolumeContract(TimestampMixin, Base):
+    __tablename__ = "volume_contracts"
+    __table_args__ = (UniqueConstraint("project_id", "volume_number", name="uq_volume_contract_project_number"), Index("ix_volume_contract_project_status", "project_id", "status"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    book_contract_id: Mapped[str | None] = mapped_column(ForeignKey("book_contracts.id"), index=True)
+    volume_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(300))
+    status: Mapped[VolumeContractStatus] = mapped_column(Enum(VolumeContractStatus, native_enum=False, length=30), default=VolumeContractStatus.DRAFT, nullable=False)
+    estimated_chapter_start: Mapped[int | None] = mapped_column(Integer)
+    estimated_chapter_end: Mapped[int | None] = mapped_column(Integer)
+    actual_chapter_start: Mapped[int | None] = mapped_column(Integer)
+    actual_chapter_end: Mapped[int | None] = mapped_column(Integer)
+    volume_goal: Mapped[str | None] = mapped_column(Text)
+    core_conflict: Mapped[str | None] = mapped_column(Text)
+    opening_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    target_closing_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    completion_conditions: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    protagonist_arc: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    main_cast: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    new_cast: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    required_events: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    forbidden_events: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    allowed_reveals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    forbidden_reveals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    foreshadowing_seed_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    foreshadowing_payoff_refs: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    unresolved_threads: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    next_volume_hooks: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    sealed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    sealed_snapshot_id: Mapped[str | None] = mapped_column(String(36))
+
+
+class ChapterPlanningWindow(TimestampMixin, Base):
+    __tablename__ = "chapter_planning_windows"
+    __table_args__ = (UniqueConstraint("volume_id", "start_chapter_number", "end_chapter_number", name="uq_chapter_window_range"), Index("ix_chapter_window_project_status", "project_id", "status"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    volume_id: Mapped[str] = mapped_column(ForeignKey("volume_contracts.id", ondelete="CASCADE"), nullable=False, index=True)
+    start_chapter_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_chapter_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_generated_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[ChapterWindowStatus] = mapped_column(Enum(ChapterWindowStatus, native_enum=False, length=20), default=ChapterWindowStatus.PLANNING, nullable=False)
+    plan_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    source_volume_snapshot_id: Mapped[str | None] = mapped_column(String(36))
+    author_note: Mapped[str | None] = mapped_column(Text)
+    continuation_decision: Mapped[str | None] = mapped_column(String(40))
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class VolumeContinuitySnapshot(Base):
+    __tablename__ = "volume_continuity_snapshots"
+    __table_args__ = (UniqueConstraint("volume_id", name="uq_volume_continuity_snapshot_volume"), Index("ix_volume_snapshot_project", "project_id"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    book_contract_id: Mapped[str | None] = mapped_column(ForeignKey("book_contracts.id"))
+    volume_id: Mapped[str] = mapped_column(ForeignKey("volume_contracts.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text)
+    confirmed_facts: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    character_states: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    relationship_changes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    timeline_end: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    location_states: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    item_states: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    active_threads: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    unresolved_foreshadowings: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    paid_off_foreshadowings: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    forbidden_future_reveals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    next_volume_hooks: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+
+
+class ForeshadowingLedger(Base):
+    __tablename__ = "foreshadowing_ledger"
+    __table_args__ = (UniqueConstraint("project_id", "foreshadow_ref", name="uq_foreshadow_project_ref"), Index("ix_foreshadow_project_status", "project_id", "status"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    foreshadow_ref: Mapped[str] = mapped_column(String(160), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    source_volume_id: Mapped[str | None] = mapped_column(ForeignKey("volume_contracts.id"))
+    source_chapter_id: Mapped[str | None] = mapped_column(ForeignKey("chapters.id"))
+    status: Mapped[ForeshadowingStatus] = mapped_column(Enum(ForeshadowingStatus, native_enum=False, length=30), default=ForeshadowingStatus.SEEDED, nullable=False)
+    earliest_payoff_volume: Mapped[int | None] = mapped_column(Integer)
+    target_payoff_volume: Mapped[int | None] = mapped_column(Integer)
+    allowed_reveal_level: Mapped[str | None] = mapped_column(String(50))
+    related_character_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    related_fact_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    aliases: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+
+
+class AuthorGuidance(TimestampMixin, Base):
+    __tablename__ = "author_guidance"
+    __table_args__ = (Index("ix_author_guidance_project_scope", "project_id", "affected_scope"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    volume_id: Mapped[str | None] = mapped_column(ForeignKey("volume_contracts.id"), index=True)
+    window_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_planning_windows.id"), index=True)
+    author_note: Mapped[str] = mapped_column(Text, nullable=False)
+    author_locked_constraints: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    author_override_reason: Mapped[str | None] = mapped_column(Text)
+    affected_scope: Mapped[str] = mapped_column(String(40), default="WINDOW", nullable=False)
+    requires_replan: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    analysis: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="APPLIED", nullable=False)
+
+
+class BookCompletionProposal(TimestampMixin, Base):
+    __tablename__ = "book_completion_proposals"
+    __table_args__ = (Index("ix_book_completion_project_status", "project_id", "status"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    book_contract_id: Mapped[str | None] = mapped_column(ForeignKey("book_contracts.id"))
+    status: Mapped[BookCompletionProposalStatus] = mapped_column(Enum(BookCompletionProposalStatus, native_enum=False, length=30), default=BookCompletionProposalStatus.NOT_READY, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    unresolved_threads: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    unresolved_foreshadowings: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    protagonist_arc_status: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    main_conflict_status: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    ending_requirements: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    evidence_chapter_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 class ProjectTemplate(TimestampMixin, Base):
     __tablename__ = "project_templates"
@@ -1551,7 +1710,7 @@ class ResearchTermStat(TimestampMixin, Base):
 
 
 class AutoDirectorStage(str, enum.Enum):
-    IDEA="IDEA"; FRAMING="FRAMING"; DIRECTION_SELECTION="DIRECTION_SELECTION"; CAST_PREPARATION="CAST_PREPARATION"; WORLD_BUILDING="WORLD_BUILDING"; STORY_MACRO="STORY_MACRO"; VOLUME_PLANNING="VOLUME_PLANNING"; CHAPTER_PLANNING="CHAPTER_PLANNING"; CHAPTER_DETAIL="CHAPTER_DETAIL"; CHAPTER_EXECUTION="CHAPTER_EXECUTION"; QUALITY_REVIEW="QUALITY_REVIEW"; QUALITY_REPAIR="QUALITY_REPAIR"; AUTHOR_ADOPTION="AUTHOR_ADOPTION"; NEXT_CHAPTER="NEXT_CHAPTER"; COMPLETED="COMPLETED"; PAUSED="PAUSED"; FAILED="FAILED"; BLOCKED="BLOCKED"
+    IDEA="IDEA"; FRAMING="FRAMING"; DIRECTION_SELECTION="DIRECTION_SELECTION"; BOOK_CONTRACT="BOOK_CONTRACT"; VOLUME_SKELETON="VOLUME_SKELETON"; VOLUME_ACTIVE="VOLUME_ACTIVE"; CHAPTER_WINDOW_PLANNING="CHAPTER_WINDOW_PLANNING"; CHAPTER_WINDOW_EXECUTION="CHAPTER_WINDOW_EXECUTION"; VOLUME_PROGRESS_ASSESSMENT="VOLUME_PROGRESS_ASSESSMENT"; VOLUME_CLOSING="VOLUME_CLOSING"; VOLUME_SEALED="VOLUME_SEALED"; NEXT_VOLUME_READY="NEXT_VOLUME_READY"; BOOK_COMPLETION_PROPOSED="BOOK_COMPLETION_PROPOSED"; BOOK_COMPLETED="BOOK_COMPLETED"; CAST_PREPARATION="CAST_PREPARATION"; WORLD_BUILDING="WORLD_BUILDING"; STORY_MACRO="STORY_MACRO"; VOLUME_PLANNING="VOLUME_PLANNING"; CHAPTER_PLANNING="CHAPTER_PLANNING"; CHAPTER_DETAIL="CHAPTER_DETAIL"; CHAPTER_EXECUTION="CHAPTER_EXECUTION"; QUALITY_REVIEW="QUALITY_REVIEW"; QUALITY_REPAIR="QUALITY_REPAIR"; AUTHOR_ADOPTION="AUTHOR_ADOPTION"; NEXT_CHAPTER="NEXT_CHAPTER"; COMPLETED="COMPLETED"; PAUSED="PAUSED"; FAILED="FAILED"; BLOCKED="BLOCKED"
 
 
 class AutoDirectorRunStatus(str, enum.Enum):

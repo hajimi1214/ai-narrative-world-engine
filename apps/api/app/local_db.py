@@ -111,6 +111,24 @@ def prepare_sqlite_database() -> str | None:
                 connection.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column.name}" {type_sql}{nullable}'))
             for index in table.indexes:
                 index.create(connection, checkfirst=True)
+        # The migration chain cannot run against a legacy database without an
+        # Alembic revision row. Reproduce the non-destructive legacy mapping
+        # here before stamping the verified additive schema.
+        if "book_contracts" in inspect(connection).get_table_names() and "projects" in inspect(connection).get_table_names():
+            project_columns = {column["name"] for column in inspect(connection).get_columns("projects")}
+            if {"id", "name"}.issubset(project_columns):
+                rows = connection.execute(text("SELECT id, name, story_seed, autonomy_settings FROM projects")) if {"story_seed", "autonomy_settings"}.issubset(project_columns) else connection.execute(text("SELECT id, name FROM projects"))
+                for row in rows.mappings():
+                    exists = connection.scalar(text("SELECT 1 FROM book_contracts WHERE project_id = :project_id LIMIT 1"), {"project_id": row["id"]})
+                    if exists:
+                        continue
+                    settings = row.get("autonomy_settings") or {}
+                    if isinstance(settings, str):
+                        try: settings = json.loads(settings)
+                        except Exception: settings = {}
+                    settings = settings if isinstance(settings, dict) else {}
+                    policy = {"mode": "ESTIMATE_ONLY", "estimated_chapters": settings.get("target_chapters") or settings.get("estimated_chapters"), "estimated_volumes": None, "completion_strategy": "AUTHOR_CONFIRMATION", "operational_run_chapter_budget": settings.get("max_chapters") or settings.get("operational_run_chapter_budget"), "operational_token_budget": None}
+                    connection.execute(text("INSERT INTO book_contracts (id, project_id, title, premise, protagonist_contract, global_required_events, global_forbidden_events, style_contract, author_locked_constraints, length_policy, version, fingerprint, status) VALUES (:id, :project_id, :title, :premise, :protagonist_contract, :global_required_events, :global_forbidden_events, :style_contract, :author_locked_constraints, :length_policy, 1, :fingerprint, :status)"), {"id": models.new_id(), "project_id": row["id"], "title": row["name"], "premise": row.get("story_seed"), "protagonist_contract": "{}", "global_required_events": "[]", "global_forbidden_events": "[]", "style_contract": "{}", "author_locked_constraints": "[]", "length_policy": json.dumps(policy, ensure_ascii=False), "fingerprint": "legacy-import", "status": "ACTIVE"})
     inspector = inspect(engine)
     missing = {table.name: [column.name for column in table.columns if column.name not in {item["name"] for item in inspector.get_columns(table.name)}] for table in Base.metadata.sorted_tables if table.name in inspector.get_table_names()}
     missing = {table: columns for table, columns in missing.items() if columns}
