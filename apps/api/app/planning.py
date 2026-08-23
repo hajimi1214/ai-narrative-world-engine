@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -330,7 +330,7 @@ def _local_macro_fallback(project: Project, framing: dict[str, Any], premise: st
     }
 
 
-def generate_plan(db: Session, project: Project, framing: dict[str, Any], premise: str | None, style_guide: dict[str, Any], anti_ai_rules: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+def generate_plan(db: Session, project: Project, framing: dict[str, Any], premise: str | None, style_guide: dict[str, Any], anti_ai_rules: dict[str, Any], on_phase: Callable[[str, str], None] | None = None) -> tuple[dict[str, Any], Any]:
     settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
     key = ProviderCredentialResolver().generation_key(db, project.id, settings)
     config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project.id))
@@ -338,6 +338,7 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
     target_chapters = int(framing.get("target_chapters") or 50)
     detailed_chapters = min(target_chapters, INITIAL_CHAPTER_WINDOW)
     context = _planning_context(db, project, framing, premise)
+    if on_phase: on_phase("PREPARING", "正在整理整书约束与已保存资料")
 
     # Small books can be planned in one turn. For a long serial, asking for its
     # entire architecture and detailed task sheets together is a common 502 cause
@@ -346,10 +347,13 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
         contract = {"framing": "object", "premise": "string", "macro_plan": "object", "style_guide": "object", "anti_ai_rules": "object", "volumes": "array covering the full book", "arcs": "array covering the full book", "chapters": f"array with exactly chapters 1-{detailed_chapters}"}
         instruction = f"Return exactly one JSON object. Build a coherent Chinese novel plan, not prose. The book has {target_chapters} chapters. Volumes and arcs must cover chapter 1 through chapter {target_chapters}. Every returned chapter must include start/end state, conflict, mandatory and forbidden events, reveal permissions, foreshadowing, character changes, consequences, and 3-6 scene beats. Do not invent UUIDs: use existing IDs only when supplied, otherwise use stable human-readable names. Avoid generic AI phrasing, symmetrical slogans, empty metaphors, and omniscient knowledge leaks. Preserve chronology. Output keys must match the contract."
         messages = [{"role": "system", "content": "你是长篇小说总策划与连续性编辑。"}, {"role": "user", "content": json.dumps({"instruction": instruction, "output_contract": contract, "context": context, "style_guide": style_guide, "anti_ai_rules": anti_ai_rules}, ensure_ascii=False)}]
+        if on_phase: on_phase("GENERATING", "正在生成整书结构与章节任务")
         result = provider.generate(messages, route.model)
         try:
+            if on_phase: on_phase("VALIDATING", "正在校验结构化规划")
             return _extract_single_json_object(result.content), result
         except (ValueError, TypeError, json.JSONDecodeError) as first_error:
+            if on_phase: on_phase("REPAIRING", "正在修复模型返回的结构")
             repair_messages = messages + [{"role": "assistant", "content": result.content}, {"role": "user", "content": json.dumps({"instruction": "你的上一条输出不是有效 JSON。只修复 JSON 格式，不改变故事内容；返回完整、可解析的 JSON 对象，不要 Markdown。", "error": str(first_error)[:500], "output_contract": contract}, ensure_ascii=False)}]
             result = provider.generate(repair_messages, route.model)
             return _extract_single_json_object(result.content), result
@@ -358,20 +362,26 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
     macro_instruction = f"Return exactly one compact JSON object for a {target_chapters}-chapter Chinese novel. Create the complete book architecture: volumes and arcs must cover every chapter from 1 through {target_chapters}, with no gaps. Keep every volume and arc concise (one short summary and 2-4 turning points); do not return chapters, scenes, or prose in this call. Preserve chronology and the supplied story constraints."
     macro_messages = [{"role": "system", "content": "你是长篇小说总策划与连续性编辑。"}, {"role": "user", "content": json.dumps({"instruction": macro_instruction, "output_contract": macro_contract, "context": context, "style_guide": style_guide, "anti_ai_rules": anti_ai_rules}, ensure_ascii=False)}]
     try:
+        if on_phase: on_phase("GENERATING_MACRO", "正在生成全书主线、卷纲与故事弧")
         macro_result = provider.generate(macro_messages, route.model)
+        if on_phase: on_phase("VALIDATING_MACRO", "正在校验全书结构")
         macro = _extract_single_json_object(macro_result.content)
     except (ModelProviderError, ValueError, TypeError, json.JSONDecodeError):
+        if on_phase: on_phase("FALLBACK", "模型未返回可用结构，正在整理作者已保存的十卷大纲")
         return _local_macro_fallback(project, framing, premise), None
 
     detail_contract = {"chapters": f"array with exactly chapters 1-{detailed_chapters}"}
     detail_instruction = f"Return exactly one JSON object containing executable task sheets for chapters 1-{detailed_chapters} only. Each chapter needs title, summary, volume_number, arc_number, POV, start/end state, objective, conflict, mandatory and forbidden events, reveal permissions, foreshadowing, character changes, consequences, and 3-6 scene beats. Use the approved macro architecture below; do not repeat it and do not write prose."
     detail_messages = [{"role": "system", "content": "你是长篇小说分章策划编辑。"}, {"role": "user", "content": json.dumps({"instruction": detail_instruction, "output_contract": detail_contract, "story_brief": context["story_brief"], "framing": context["framing"], "macro_architecture": {"macro_plan": macro.get("macro_plan") or {}, "volumes": macro.get("volumes") or [], "arcs": macro.get("arcs") or []}}, ensure_ascii=False)}]
     try:
+        if on_phase: on_phase("GENERATING_CHAPTERS", f"正在生成第 1-{detailed_chapters} 章任务单")
         details_result = provider.generate(detail_messages, route.model)
+        if on_phase: on_phase("VALIDATING_CHAPTERS", "正在校验章节任务与全书结构的一致性")
         details = _extract_single_json_object(details_result.content)
         macro["chapters"] = (details.get("chapters") or [])[:detailed_chapters]
         return macro, details_result
     except (ModelProviderError, ValueError, TypeError, json.JSONDecodeError):
+        if on_phase: on_phase("CHAPTER_FALLBACK", "章节任务将以可编辑草稿继续，后续可按窗口深化")
         macro["chapters"] = _fallback_chapter_window(framing, detailed_chapters)
         macro["generation_warning"] = "CHAPTER_DETAIL_DEFERRED"
         return macro, macro_result

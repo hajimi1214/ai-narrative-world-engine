@@ -648,8 +648,11 @@ def generate_story_plan(project_id: str, payload: PlanCreatePayload, db: Session
     )
     # Commit before the synchronous model request so the live panel can see it.
     db.commit()
+    def update_live_phase(phase: str, message: str) -> None:
+        trace.validation_report = {"live_phase": phase, "live_message": message}
+        db.commit()
     try:
-        generated, result = generate_plan(db, project, values["framing"], values.get("premise"), values.get("style_guide") or {}, values.get("anti_ai_rules") or {})
+        generated, result = generate_plan(db, project, values["framing"], values.get("premise"), values.get("style_guide") or {}, values.get("anti_ai_rules") or {}, on_phase=update_live_phase)
         generated.setdefault("framing", values["framing"]); generated.setdefault("premise", values.get("premise")); generated.setdefault("style_guide", values.get("style_guide") or {}); generated.setdefault("anti_ai_rules", values.get("anti_ai_rules") or {})
         generated["framing"] = values["framing"] | (generated.get("framing") or {})
         errors = validate_plan_references(db, project_id, generated)
@@ -657,8 +660,10 @@ def generate_story_plan(project_id: str, payload: PlanCreatePayload, db: Session
             ExecutionTraceRecorder().block(trace, "PLAN_REFERENCE_INVALID", validation_report={"errors": errors})
             db.commit()
             raise HTTPException(status_code=422, detail={"code": "PLAN_REFERENCE_INVALID", "errors": errors})
+        update_live_phase("PERSISTING", "正在保存整书规划版本")
         plan = persist_plan(db, project, generated, provider=result.provider if result else None, model=result.model if result else None, request_id=result.request_id if result else None, report={"latency_ms": result.latency_ms if result else None, "direction_options": generated.get("direction_options", []), "generation_warning": generated.get("generation_warning")})
         ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms if result else None, request_id=result.request_id if result else None, output_fingerprint=stable_fingerprint({"plan_id": plan.id, "warning": generated.get("generation_warning")}, "story-plan-output-v1"))
+        trace.validation_report = {"live_phase": "COMPLETED", "live_message": "整书规划已保存，可继续查看卷纲和首批章节任务", "generation_warning": generated.get("generation_warning")}
         db.commit(); db.refresh(plan)
         return plan_payload(db, plan)
     except HTTPException:

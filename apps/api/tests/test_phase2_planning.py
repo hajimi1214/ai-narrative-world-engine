@@ -58,8 +58,11 @@ def test_long_book_generation_separates_macro_architecture_and_detail_window(mon
         fake = FakeModelProvider([json.dumps(macro, ensure_ascii=False), json.dumps(details, ensure_ascii=False)])
         monkeypatch.setattr(planning_module, "get_model_provider", lambda *args, **kwargs: fake)
         payload = {"framing": {"inspiration": "很长的故事设定", "target_chapters": 450, "target_words_per_chapter": 2800}}
-        generated, _ = planning_module.generate_plan(db, project, payload["framing"], None, {}, {})
+        phases = []
+        generated, _ = planning_module.generate_plan(db, project, payload["framing"], None, {}, {}, on_phase=lambda phase, _message: phases.append(phase))
         assert fake.calls == 2
+        assert "GENERATING_MACRO" in phases
+        assert "GENERATING_CHAPTERS" in phases
         assert generated["volumes"][0]["end_chapter"] == 45
         assert generated["chapters"][0]["number"] == 1
         first_request = json.loads(fake.messages[0][1]["content"])
