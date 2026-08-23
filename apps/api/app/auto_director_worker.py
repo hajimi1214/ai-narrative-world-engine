@@ -39,10 +39,11 @@ class AutoDirectorWorker:
             failed = db.scalar(select(AutoDirectorRun).where(AutoDirectorRun.id == run.id).with_for_update()) if run else None
             if failed and failed.status in {AutoDirectorRunStatus.CREATED, AutoDirectorRunStatus.RUNNING}:
                 failed_stage = getattr(failed.current_stage, "value", failed.current_stage)
-                failed.status = AutoDirectorRunStatus.FAILED
-                failed.current_stage = AutoDirectorStage.FAILED
-                failed.pause_reason = "WORKER_UNEXPECTED_ERROR"
-                failed.next_action = "检查 worker 错误后重试当前阶段或接管运行。"
+                budget_pause = getattr(exc, "code", None) == "TOKEN_BUDGET_EXCEEDED" and failed.run_mode == "AUTHOR_GUIDED_VOLUME"
+                failed.status = AutoDirectorRunStatus.PAUSED if budget_pause else AutoDirectorRunStatus.FAILED
+                failed.current_stage = AutoDirectorStage.PAUSED if budget_pause else AutoDirectorStage.FAILED
+                failed.pause_reason = "TOKEN_BUDGET_EXCEEDED" if budget_pause else "WORKER_UNEXPECTED_ERROR"
+                failed.next_action = "增加本次运行 token 预算后继续，或接管运行。" if budget_pause else "检查 worker 错误后重试当前阶段或接管运行。"
                 failed.context = {**(failed.context or {}), "worker_error": str(exc)[:1000], "worker_error_code": getattr(exc, "code", None) or "WORKER_UNEXPECTED_ERROR", "worker_stage": failed_stage, "worker_traceback": traceback.format_exc(limit=8)[-4000:]}
                 failed.pause_reason = getattr(exc, "code", None) or "WORKER_UNEXPECTED_ERROR"
                 db.commit()

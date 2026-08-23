@@ -243,3 +243,22 @@ def test_dynamic_length_and_window_rollover_do_not_use_estimate_as_completion_li
     with Session() as db:
         windows = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id).order_by(ChapterPlanningWindow.start_chapter_number)).all()
         assert len(windows) == 2 and windows[1].start_chapter_number == 6
+
+
+def test_operational_token_budget_pauses_author_run_at_checkpoint(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"operational_token_budget": 1, "idempotency_key": "token-budget"}).json()
+    worker = AutoDirectorWorker(Session, poll_seconds=0)
+    assert worker.run_once() is True
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        assert run.settings.get("max_tokens") == 1
+    import app.auto_director as auto_module
+    from app.auto_director import AutoDirectorError
+    def budget_error(self, db, run):
+        raise AutoDirectorError("TOKEN_BUDGET_EXCEEDED")
+    monkeypatch.setattr(auto_module.AutoDirectorOrchestrator, "advance_to_pause", budget_error)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}/continue")
+    assert worker.run_once() is True
+    state = client.get(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}").json()
+    assert state["status"] == "PAUSED" and state["pause_reason"] == "TOKEN_BUDGET_EXCEEDED"

@@ -304,6 +304,9 @@ class AuthorGuidedVolumeService:
         request = dict((run.context or {}).get("request") or run.settings or {})
         contract = self.ensure_contract(db, project, request)
         run.context = {**(run.context or {}), "book_contract_id": contract.id}
+        configured_token_budget = (contract.length_policy or {}).get("operational_token_budget") or request.get("operational_token_budget") or request.get("max_tokens")
+        if configured_token_budget is not None:
+            run.settings = {**(run.settings or {}), "max_tokens": int(configured_token_budget), "operational_token_budget": int(configured_token_budget)}
         run.current_stage = AutoDirectorStage.VOLUME_SKELETON
         volume = self.ensure_volume(db, project, contract, request.get("volume") or {})
         run.context = {**run.context, "volume_id": volume.id}
@@ -337,7 +340,8 @@ class AuthorGuidedVolumeService:
         request = dict(run.settings or {})
         request.setdefault("target_chapters", window.end_chapter_number)
         request.setdefault("max_chapters", window.end_chapter_number)
-        run.settings = {**request, "target_chapters": window.end_chapter_number, "max_chapters": window.end_chapter_number}
+        token_budget = (contract.length_policy or {}).get("operational_token_budget") or request.get("operational_token_budget") or request.get("max_tokens")
+        run.settings = {**request, "target_chapters": window.end_chapter_number, "max_chapters": window.end_chapter_number, "max_tokens": token_budget}
         direction = {"title": contract.title or project.name, "premise": contract.premise or project.story_seed or "", "core_conflict": volume.core_conflict or contract.global_plot_direction or "", "first_volume_goal": volume.volume_goal or "", "style_advice": (contract.style_contract or {}).get("tone", ""), "world_boundaries": [], "protagonist": contract.protagonist_contract or {}}
         context = {**(run.context or {}), "selected_direction": direction, "plan_id": plan_id}
         run.context = context
