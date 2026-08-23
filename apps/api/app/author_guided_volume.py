@@ -88,7 +88,8 @@ class AuthorGuidedVolumeService:
 
     def next_chapter_number(self, db: Session, project_id: str) -> int:
         maximum = db.scalar(select(Chapter.number).where(Chapter.project_id == project_id).order_by(Chapter.number.desc()).limit(1))
-        return int(maximum or 0) + 1
+        planned = db.scalar(select(StoryPlanChapter.number).where(StoryPlanChapter.project_id == project_id).order_by(StoryPlanChapter.number.desc()).limit(1))
+        return max(int(maximum or 0), int(planned or 0)) + 1
 
     def ensure_window(self, db: Session, project: Project, volume: VolumeContract, *, author_note: str | None = None, size: int | None = None) -> ChapterPlanningWindow:
         existing = db.scalar(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id, ChapterPlanningWindow.status.in_([ChapterWindowStatus.PLANNING, ChapterWindowStatus.ACTIVE, ChapterWindowStatus.EXTENDING])).order_by(ChapterPlanningWindow.created_at.desc()))
@@ -111,6 +112,8 @@ class AuthorGuidedVolumeService:
         plan = persist_plan(db, project, {"framing": framing, "premise": contract.premise, "macro_plan": {"author_window": marker, "volume_goal": volume.volume_goal}, "style_guide": contract.style_contract or {}, "anti_ai_rules": {}, "volumes": [{"number": volume.volume_number, "title": volume.title or f"第 {volume.volume_number} 卷", "start_chapter": window.start_chapter_number, "end_chapter": window.end_chapter_number}], "chapters": chapters}, report={"author_guided": True, "author_window_id": window.id}, archive_latest=False)
         plan.status = StoryPlanStatus.APPROVED
         window.plan_fingerprint = plan.source_fingerprint
+        window.actual_generated_count = len(chapters)
+        window.status = ChapterWindowStatus.COMPLETED
         db.flush()
         return [item.id for item in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id)).all()]
 
