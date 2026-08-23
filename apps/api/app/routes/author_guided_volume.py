@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from ..api_types import AuthorGuidancePayload, AuthorGuidedRunCreatePayload, VolumeActionPayload
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _contract_payload, _enum, _volume_payload, _window_payload
-from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, BookCompletionProposal, BookContract, ChapterPlanningWindow, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
+from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, BookCompletionProposal, BookContract, ChapterPlanningWindow, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
 from .common import get_db, require_project
 
 router = APIRouter(tags=["author-guided-volume"])
@@ -69,6 +69,16 @@ def list_volumes(project_id: str, db: Session = Depends(get_db)):
     return [{**_volume_payload(volume), "progress": service.progress(db, volume), "windows": [_window_payload(item) for item in db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id).order_by(ChapterPlanningWindow.created_at)).all()]} for volume in volumes]
 
 
+@router.post("/projects/{project_id}/volumes/{volume_id}/next")
+def prepare_next_volume(project_id: str, volume_id: str, db: Session = Depends(get_db)):
+    current = _volume_or_404(db, project_id, volume_id)
+    if current.status != VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "CURRENT_VOLUME_NOT_SEALED"})
+    contract = db.get(BookContract, current.book_contract_id); project = db.get(Project, project_id)
+    next_volume = AuthorGuidedVolumeService().ensure_volume(db, project, contract, {"title": f"第 {current.volume_number + 1} 卷", "opening_state": {"source_volume_snapshot_id": current.sealed_snapshot_id}}, current.volume_number + 1)
+    window = AuthorGuidedVolumeService().ensure_window(db, project, next_volume)
+    db.commit(); return {"volume": _volume_payload(next_volume), "window": _window_payload(window), "source_snapshot_id": current.sealed_snapshot_id}
+
+
 @router.post("/projects/{project_id}/volumes/{volume_id}/start")
 def start_volume(project_id: str, volume_id: str, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id)
@@ -122,6 +132,23 @@ def get_volume_snapshot(project_id: str, volume_id: str, db: Session = Depends(g
 def get_volume_continuity(project_id: str, volume_id: str, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id); snapshot = db.scalar(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == volume.id))
     return {"volume": _volume_payload(volume), "snapshot": {"id": snapshot.id, "summary": snapshot.summary, "confirmed_facts": snapshot.confirmed_facts, "character_states": snapshot.character_states, "active_threads": snapshot.active_threads, "unresolved_foreshadowings": snapshot.unresolved_foreshadowings, "forbidden_future_reveals": snapshot.forbidden_future_reveals, "next_volume_hooks": snapshot.next_volume_hooks} if snapshot else None}
+
+
+@router.get("/projects/{project_id}/foreshadowings")
+def list_foreshadowings(project_id: str, db: Session = Depends(get_db)):
+    require_project(db, project_id)
+    return [{"id": item.id, "foreshadow_ref": item.foreshadow_ref, "title": item.title, "description": item.description, "source_volume_id": item.source_volume_id, "source_chapter_id": item.source_chapter_id, "status": _enum(item.status), "earliest_payoff_volume": item.earliest_payoff_volume, "target_payoff_volume": item.target_payoff_volume, "allowed_reveal_level": item.allowed_reveal_level, "related_character_ids": item.related_character_ids, "related_fact_ids": item.related_fact_ids, "aliases": item.aliases} for item in db.scalars(select(ForeshadowingLedger).where(ForeshadowingLedger.project_id == project_id).order_by(ForeshadowingLedger.created_at)).all()]
+
+
+@router.post("/projects/{project_id}/volumes/{volume_id}/foreshadowings")
+def seed_foreshadowing(project_id: str, volume_id: str, payload: dict, db: Session = Depends(get_db)):
+    volume = _volume_or_404(db, project_id, volume_id)
+    ref = str(payload.get("foreshadow_ref") or "").strip(); title = str(payload.get("title") or "").strip()
+    if not ref or not title: raise HTTPException(status_code=422, detail={"code": "FORESHADOW_REF_AND_TITLE_REQUIRED"})
+    existing = db.scalar(select(ForeshadowingLedger).where(ForeshadowingLedger.project_id == project_id, ForeshadowingLedger.foreshadow_ref == ref))
+    if existing: return {"id": existing.id, "status": _enum(existing.status), "idempotent": True}
+    item = ForeshadowingLedger(project_id=project_id, foreshadow_ref=ref, title=title, description=payload.get("description"), source_volume_id=volume.id, status=ForeshadowingStatus.SEEDED, earliest_payoff_volume=payload.get("earliest_payoff_volume"), target_payoff_volume=payload.get("target_payoff_volume"), allowed_reveal_level=payload.get("allowed_reveal_level"), related_character_ids=payload.get("related_character_ids") or [], related_fact_ids=payload.get("related_fact_ids") or [], aliases=payload.get("aliases") or [], fingerprint=str(payload.get("fingerprint") or ref))
+    db.add(item); db.commit(); return {"id": item.id, "status": _enum(item.status), "foreshadow_ref": item.foreshadow_ref}
 
 
 @router.post("/projects/{project_id}/volumes/{volume_id}/guidance")
