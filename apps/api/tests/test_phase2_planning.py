@@ -88,3 +88,27 @@ def test_long_book_keeps_macro_plan_when_detail_provider_fails(monkeypatch):
         assert fake.calls == 2
         assert generated["generation_warning"] == "CHAPTER_DETAIL_DEFERRED"
         assert len(generated["chapters"]) == planning_module.INITIAL_CHAPTER_WINDOW
+
+
+def test_long_book_sets_bounded_output_limits(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+
+    class RecordingProvider:
+        name = "fake"
+        max_output_tokens = None
+        def __init__(self): self.limits = []
+        def generate(self, messages, model):
+            self.limits.append(self.max_output_tokens)
+            from app.ai.provider import ModelResult
+            content = {"macro_plan": {}, "volumes": [], "arcs": []} if len(self.limits) == 1 else {"chapters": []}
+            return ModelResult(content=json.dumps(content), latency_ms=1, request_id="fake", provider="fake", model=model)
+
+    with Session() as db:
+        project = Project(name="Long", story_seed="长篇设定")
+        db.add(project); db.flush(); db.add(ProjectModelConfig(project_id=project.id, provider="openai_compatible", base_url="https://tokenrhythm.studio/v1", director_model="deepseek-v4-pro")); db.commit()
+        provider = RecordingProvider()
+        monkeypatch.setattr(planning_module, "get_model_provider", lambda *args, **kwargs: provider)
+        planning_module.generate_plan(db, project, {"inspiration": "长篇设定", "target_chapters": 450}, None, {}, {})
+        assert provider.limits == [3600, 5200]
