@@ -262,3 +262,22 @@ def test_operational_token_budget_pauses_author_run_at_checkpoint(monkeypatch):
     assert worker.run_once() is True
     state = client.get(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}").json()
     assert state["status"] == "PAUSED" and state["pause_reason"] == "TOKEN_BUDGET_EXCEEDED"
+
+
+def test_new_worker_instance_resumes_persisted_author_checkpoint_without_duplicate_window(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"window_size": 5, "idempotency_key": "restart"}).json()
+    first_worker = AutoDirectorWorker(Session, poll_seconds=0)
+    assert first_worker.run_once() is True
+    with Session() as db:
+        before = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.project_id == project_id)).all()
+        assert len(before) == 1
+        before_ids = [item.id for item in before]
+    client.post(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}/continue")
+    second_worker = AutoDirectorWorker(Session, poll_seconds=0)
+    monkeypatch.setattr("app.auto_director.AutoDirectorOrchestrator.advance_to_pause", lambda self, db, run: run)
+    assert second_worker.run_once() is True
+    with Session() as db:
+        after = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.project_id == project_id)).all()
+        assert [item.id for item in after] == before_ids
+        assert db.get(AutoDirectorRun, created["id"]).context["window_id"] == before_ids[0]
