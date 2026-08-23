@@ -201,3 +201,45 @@ def test_author_can_update_unsealed_volume_contract_but_not_sealed_volume(monkey
         db.commit()
     rejected = client.patch(f"/projects/{project_id}/volumes/{volume_id}/contract", json={"volume_goal": "不应修改", "author_note": "尝试修改封存卷"})
     assert rejected.status_code == 409
+
+
+def test_dynamic_length_and_window_rollover_do_not_use_estimate_as_completion_limit(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"estimated_chapters": 600, "window_size": 5, "idempotency_key": "dynamic-length"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        contract = db.scalar(select(BookContract).where(BookContract.project_id == project_id))
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        window = db.scalar(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id))
+        assert contract.length_policy["estimated_chapters"] == 600
+        assert db.scalar(select(StoryPlanChapter.number).where(StoryPlanChapter.project_id == project_id).order_by(StoryPlanChapter.number.desc())) == 5
+        volume.actual_chapter_start = 1; volume.actual_chapter_end = 1
+        volume.target_closing_state = {"done": True}
+        db.add(Chapter(project_id=project_id, number=1, content="已收束", status="QUALITY_APPROVED", active=True))
+        db.commit()
+        report = __import__("app.author_guided_volume", fromlist=["AuthorGuidedVolumeService"]).AuthorGuidedVolumeService().progress(db, volume)
+        assert report["should_prepare_seal"] is True
+        assert report["reason"]
+    with Session() as db:
+        other_project = Project(name="另一部小说", story_seed="独立故事")
+        db.add(other_project); db.commit(); other_project_id = other_project.id
+    other_response = client.post(f"/projects/{other_project_id}/author-guided-volume/runs", json={"estimated_chapters": 300, "idempotency_key": "independent"})
+    assert other_response.status_code == 201
+    with Session() as db:
+        other = db.scalar(select(BookContract).where(BookContract.project_id == other_project_id))
+        assert other.length_policy["estimated_chapters"] == 300
+        assert other.id != contract.id
+
+    import app.auto_director as volume_module
+    def fake_advance(self, db, run):
+        run.context = {**(run.context or {}), "last_adopted_chapter_number": 3}
+        run.status = "COMPLETED"
+        return run
+    monkeypatch.setattr(volume_module.AutoDirectorOrchestrator, "advance_to_pause", fake_advance)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}/continue")
+    with Session() as db:
+        db.expire_all()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        windows = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id).order_by(ChapterPlanningWindow.start_chapter_number)).all()
+        assert len(windows) == 2 and windows[1].start_chapter_number == 6

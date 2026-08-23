@@ -182,6 +182,17 @@ class AuthorGuidedVolumeService:
         db.add(window); db.flush()
         return window
 
+    def ensure_followup_window(self, db: Session, project: Project, volume: VolumeContract, previous: ChapterPlanningWindow, *, size: int | None = None) -> ChapterPlanningWindow:
+        start = max(previous.end_chapter_number + 1, self.next_chapter_number(db, project.id))
+        existing = db.scalar(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id, ChapterPlanningWindow.start_chapter_number == start).order_by(ChapterPlanningWindow.created_at.desc()))
+        if existing:
+            return existing
+        end = start + max(1, min(int(size or self.WINDOW_SIZE), 10)) - 1
+        source_snapshot_id = volume.sealed_snapshot_id or (volume.opening_state or {}).get("source_volume_snapshot_id")
+        window = ChapterPlanningWindow(project_id=project.id, volume_id=volume.id, start_chapter_number=start, end_chapter_number=end, status=ChapterWindowStatus.ACTIVE, author_note=previous.author_note, plan_fingerprint=_fingerprint({"volume": volume.fingerprint, "start": start, "end": end, "source_snapshot": source_snapshot_id}), source_volume_snapshot_id=source_snapshot_id)
+        db.add(window); db.flush()
+        return window
+
     def ensure_window_tasks(self, db: Session, project: Project, volume: VolumeContract, window: ChapterPlanningWindow, contract: BookContract) -> list[str]:
         marker = f"author_window:{window.id}"
         plans = db.scalars(select(StoryPlan).where(StoryPlan.project_id == project.id).order_by(StoryPlan.version.desc())).all()
@@ -195,7 +206,7 @@ class AuthorGuidedVolumeService:
         plan.status = StoryPlanStatus.APPROVED
         window.plan_fingerprint = plan.source_fingerprint
         window.actual_generated_count = len(chapters)
-        window.status = ChapterWindowStatus.COMPLETED
+        window.status = ChapterWindowStatus.ACTIVE
         db.flush()
         return [item.id for item in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id)).all()]
 
@@ -341,10 +352,9 @@ class AuthorGuidedVolumeService:
         if adopted_number:
             window.actual_generated_count = len(db.scalars(select(Chapter.id).where(Chapter.project_id == project.id, Chapter.number >= window.start_chapter_number, Chapter.number <= adopted_number, Chapter.active.is_(True), Chapter.content.is_not(None))).all())
             if adopted_number <= window.end_chapter_number - 2:
-                next_window = self.ensure_window(db, project, volume)
-                if next_window.id != window.id:
-                    self.ensure_window_tasks(db, project, volume, next_window, contract)
-                    run.context = {**(run.context or {}), "next_window_id": next_window.id}
+                next_window = self.ensure_followup_window(db, project, volume, window)
+                self.ensure_window_tasks(db, project, volume, next_window, contract)
+                run.context = {**(run.context or {}), "next_window_id": next_window.id}
         if run.status == AutoDirectorRunStatus.COMPLETED and int((run.context or {}).get("last_adopted_chapter_number", 0) or 0) >= window.end_chapter_number:
             volume.actual_chapter_start = volume.actual_chapter_start or window.start_chapter_number
             volume.actual_chapter_end = max(volume.actual_chapter_end or 0, window.end_chapter_number)
