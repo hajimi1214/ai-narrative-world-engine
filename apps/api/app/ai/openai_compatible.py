@@ -17,7 +17,6 @@ class OpenAICompatibleProvider:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, min(int(max_retries), 3))
         self.rate_limit_per_minute = max(0, int(rate_limit_per_minute))
-        self.max_output_tokens: int | None = None
 
     def _check_rate_limit(self, model: str) -> None:
         if not self.rate_limit_per_minute:
@@ -38,13 +37,10 @@ class OpenAICompatibleProvider:
         response = None
         for attempt in range(self.max_retries + 1):
             try:
-                request_body = {"model": model, "messages": messages, "stream": False}
-                if self.max_output_tokens:
-                    request_body["max_tokens"] = self.max_output_tokens
                 response = httpx.post(
                     f"{self.base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                    json=request_body,
+                    json={"model": model, "messages": messages, "stream": False},
                     timeout=self.timeout_seconds,
                 )
                 if response.status_code not in {429, 500, 502, 503, 504} or attempt >= self.max_retries:

@@ -330,10 +330,6 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
     macro_contract = {"framing": "object", "premise": "string", "macro_plan": "object with logline, ending and core promises", "style_guide": "object", "anti_ai_rules": "object", "volumes": "concise array covering every chapter", "arcs": "concise array covering every chapter"}
     macro_instruction = f"Return exactly one compact JSON object for a {target_chapters}-chapter Chinese novel. Create the complete book architecture: volumes and arcs must cover every chapter from 1 through {target_chapters}, with no gaps. Keep every volume and arc concise (one short summary and 2-4 turning points); do not return chapters, scenes, or prose in this call. Preserve chronology and the supplied story constraints."
     macro_messages = [{"role": "system", "content": "你是长篇小说总策划与连续性编辑。"}, {"role": "user", "content": json.dumps({"instruction": macro_instruction, "output_contract": macro_contract, "context": context, "style_guide": style_guide, "anti_ai_rules": anti_ai_rules}, ensure_ascii=False)}]
-    # Some compatible gateways reject an unconstrained long-form completion
-    # before generation starts. These caps bound transport size, not book scope.
-    if hasattr(provider, "max_output_tokens"):
-        provider.max_output_tokens = 3600
     macro_result = provider.generate(macro_messages, route.model)
     macro = _extract_single_json_object(macro_result.content)
 
@@ -341,8 +337,6 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
     detail_instruction = f"Return exactly one JSON object containing executable task sheets for chapters 1-{detailed_chapters} only. Each chapter needs title, summary, volume_number, arc_number, POV, start/end state, objective, conflict, mandatory and forbidden events, reveal permissions, foreshadowing, character changes, consequences, and 3-6 scene beats. Use the approved macro architecture below; do not repeat it and do not write prose."
     detail_messages = [{"role": "system", "content": "你是长篇小说分章策划编辑。"}, {"role": "user", "content": json.dumps({"instruction": detail_instruction, "output_contract": detail_contract, "story_brief": context["story_brief"], "framing": context["framing"], "macro_architecture": {"macro_plan": macro.get("macro_plan") or {}, "volumes": macro.get("volumes") or [], "arcs": macro.get("arcs") or []}}, ensure_ascii=False)}]
     try:
-        if hasattr(provider, "max_output_tokens"):
-            provider.max_output_tokens = 5200
         details_result = provider.generate(detail_messages, route.model)
         details = _extract_single_json_object(details_result.content)
         macro["chapters"] = (details.get("chapters") or [])[:detailed_chapters]
