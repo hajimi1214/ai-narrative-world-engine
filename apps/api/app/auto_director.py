@@ -345,6 +345,9 @@ class AutoDirectorOrchestrator:
                 run.current_stage = AutoDirectorStage.CHAPTER_PLANNING
             if run.context.get("selected_direction") and not run.context.get("foundation"):
                 self._prepare_foundation(db, run, run.context["selected_direction"])
+                run.current_stage = AutoDirectorStage.STORY_MACRO
+                run.next_action = "世界百科、世界事实、人物档案和剧情线程已保存；正在生成整本规划。"
+                return run
             if run.current_stage in {AutoDirectorStage.IDEA, AutoDirectorStage.FRAMING, AutoDirectorStage.DIRECTION_SELECTION} and not run.context.get("directions"):
                 request = dict(run.context.get("request") or {})
                 step = self._step(db, run, AutoDirectorStage.FRAMING, request)
@@ -386,11 +389,18 @@ class AutoDirectorOrchestrator:
                 if not valid_indices:
                     raise AutoDirectorError("DIRECTION_REPAIR_FAILED", "方向修复后仍没有结构化验证通过的候选。")
                 best = max(valid_indices, key=lambda index: scored[index][0])
-                run.context = {**run.context, "directions": directions, "selected_direction": directions[best], "selected_direction_fingerprint": fingerprint(directions[best]), "direction_score": scored[best][0], "direction_validation_report": scored[best][1], "rejected_direction_summaries": [{"index": i, "score": scored[i][0], "report": scored[i][1]} for i in range(len(directions)) if i != best]}
+                context = {**run.context, "directions": directions, "recommended_direction_index": best, "direction_scores": [score for score, _ in scored], "direction_validation_reports": [report for _, report in scored]}
+                if (run.settings or {}).get("require_direction_confirmation", True):
+                    run.context = context
+                    run.status = AutoDirectorRunStatus.PAUSED
+                    run.current_stage = AutoDirectorStage.DIRECTION_SELECTION
+                    run.pause_reason = "DIRECTION_CONFIRMATION_REQUIRED"
+                    run.next_action = "请选择一套整书方向；确认后将自动生成世界、角色、规划和正文。"
+                    return run
+                run.context = {**context, "selected_direction": directions[best], "selected_direction_fingerprint": fingerprint(directions[best]), "direction_score": scored[best][0], "direction_validation_report": scored[best][1]}
                 run.current_stage = AutoDirectorStage.CAST_PREPARATION
                 run.next_action = "正在自动准备书级设定、角色和世界边界。"
-                self._prepare_foundation(db, run, directions[best])
-                self._plan_and_first_chapter(db, run, project)
+                return run
                 return run
             if run.current_stage == AutoDirectorStage.DIRECTION_SELECTION:
                 return run
@@ -410,8 +420,6 @@ class AutoDirectorOrchestrator:
         run.status = AutoDirectorRunStatus.RUNNING
         run.pause_reason = None
         run.current_stage = AutoDirectorStage.CAST_PREPARATION
-        self._prepare_foundation(db, run, selected)
-        self.advance_to_pause(db, run)
         return run
 
     def _prepare_foundation(self, db: Session, run: AutoDirectorRun, direction: dict[str, Any]) -> None:
@@ -433,11 +441,22 @@ class AutoDirectorOrchestrator:
 
     def _materialize_foundation(self, db: Session, run: AutoDirectorRun, project: Project, direction: dict[str, Any], context: dict[str, Any]) -> None:
         world_ids: list[str] = []
-        for raw_name in direction.get("world_boundaries") or []:
-            name = str(raw_name).strip()
+        world_specs = list(direction.get("world_encyclopedia") or [])
+        world_specs.extend({"name": raw_name, "entity_type": "LOCATION", "description": raw_name} for raw_name in direction.get("world_boundaries") or [])
+        seen_world_names: set[str] = set()
+        for raw in world_specs:
+            raw = raw if isinstance(raw, dict) else {"name": raw}
+            name = str(raw.get("name") or "").strip()
             if not name:
                 continue
-            entity = WorldEntity(project_id=project.id, entity_type=EntityType.LOCATION, name=name[:200], profile={"boundary": name, "auto_director": True})
+            if name in seen_world_names:
+                continue
+            seen_world_names.add(name)
+            try:
+                entity_type = EntityType(str(raw.get("entity_type") or "LOCATION").upper())
+            except ValueError:
+                entity_type = EntityType.CUSTOM
+            entity = WorldEntity(project_id=project.id, entity_type=entity_type, name=name[:200], profile={"boundary": name, "description": raw.get("description", ""), "rules": raw.get("rules") or [], "auto_director": True})
             db.add(entity); db.flush(); world_ids.append(entity.id)
         if not world_ids:
             entity = WorldEntity(project_id=project.id, entity_type=EntityType.LOCATION, name="故事起点", profile={"auto_director": True})
@@ -449,19 +468,43 @@ class AutoDirectorOrchestrator:
             name = str(raw.get("name") or ("主角" if position == 0 else f"主要角色{position}"))[:200]
             character = Character(project_id=project.id, name=name, profile={"role": raw.get("role", "PROTAGONIST" if position == 0 else "SUPPORTING"), "auto_director": True}, goals={"current": raw.get("desire") or direction.get("premise") or "推动故事继续"}, current_state={"location_id": world_ids[0]}, personality={"secret": raw.get("secret", "")}, narrative_relevance={"score": 5 if position == 0 else 2})
             db.add(character); db.flush(); character_ids.append(character.id)
-        thread = StoryThread(project_id=project.id, title=str(direction.get("core_conflict") or "主线冲突")[:200], type="MAIN", weight=5.0, goal=str(direction.get("premise") or "推进主线"), state={"auto_director": True})
+        thread_specs = list(direction.get("story_threads") or [])
+        thread_specs.insert(0, {"title": direction.get("core_conflict") or "主线冲突", "goal": direction.get("premise") or "推进主线", "weight": 5.0, "type": "MAIN"})
+        threads: list[StoryThread] = []
+        for index, raw in enumerate(thread_specs):
+            raw = raw if isinstance(raw, dict) else {"title": raw}
+            title = str(raw.get("title") or "剧情线程")[:200]
+            thread_item = StoryThread(project_id=project.id, title=title, type=str(raw.get("type") or ("MAIN" if index == 0 else "SUB"))[:100], weight=float(raw.get("weight") or (5.0 if index == 0 else 2.0)), goal=str(raw.get("goal") or direction.get("premise") or "推进故事"), state={"auto_director": True})
+            db.add(thread_item)
+            threads.append(thread_item)
         arc = StoryArc(project_id=project.id, title=str(direction.get("title") or "第一幕")[:200], core_question=str(direction.get("core_conflict") or "主角要付出什么代价？"), core_conflict=str(direction.get("core_conflict") or "目标与代价"), status="ACTIVE")
-        db.add_all([thread, arc])
-        fact = CanonFact(project_id=project.id, fact_type=CanonType.WORLD_FACT, proposition=str(direction.get("premise") or project.story_seed or "故事从这里开始"), data={"auto_director": True, "world_boundary_ids": world_ids}, locked=False)
-        db.add(fact); db.flush()
-        run.context = {**context, "foundation": {"world_entity_ids": world_ids, "character_ids": character_ids, "thread_id": thread.id, "arc_id": arc.id, "canon_fact_id": fact.id}}
+        db.add(arc)
+        fact_specs = list(direction.get("world_facts") or [])
+        fact_specs.insert(0, {"proposition": direction.get("premise") or project.story_seed or "故事从这里开始", "fact_type": "WORLD_FACT"})
+        facts: list[CanonFact] = []
+        for raw in fact_specs:
+            raw = raw if isinstance(raw, dict) else {"proposition": raw}
+            proposition = str(raw.get("proposition") or "").strip()
+            if not proposition:
+                continue
+            try:
+                fact_type = CanonType(str(raw.get("fact_type") or "WORLD_FACT").upper())
+            except ValueError:
+                fact_type = CanonType.WORLD_FACT
+            fact = CanonFact(project_id=project.id, fact_type=fact_type, proposition=proposition, data={"auto_director": True, "world_boundary_ids": world_ids}, locked=False)
+            db.add(fact)
+            facts.append(fact)
+        db.flush()
+        main_thread = threads[0]
+        first_fact = facts[0]
+        run.context = {**context, "foundation": {"world_entity_ids": world_ids, "character_ids": character_ids, "thread_id": main_thread.id, "thread_ids": [item.id for item in threads], "arc_id": arc.id, "canon_fact_id": first_fact.id, "canon_fact_ids": [item.id for item in facts]}}
 
         foundation_step = self._step(db, run, AutoDirectorStage.CAST_PREPARATION, {"direction": direction})
         if foundation_step.status != AutoDirectorStepStatus.COMMITTED:
-            self._commit_step(foundation_step, {"character_ids": character_ids, "thread_id": thread.id, "arc_id": arc.id}, thread.id)
+            self._commit_step(foundation_step, {"character_ids": character_ids, "thread_ids": [item.id for item in threads], "thread_id": main_thread.id, "arc_id": arc.id}, main_thread.id)
         world_step = self._step(db, run, AutoDirectorStage.WORLD_BUILDING, {"direction_fingerprint": fingerprint(direction), "world_entity_ids": world_ids})
         if world_step.status != AutoDirectorStepStatus.COMMITTED:
-            self._commit_step(world_step, {"world_entity_ids": world_ids, "canon_fact_id": fact.id}, fact.id)
+            self._commit_step(world_step, {"world_entity_ids": world_ids, "canon_fact_ids": [item.id for item in facts], "canon_fact_id": first_fact.id}, first_fact.id)
 
     def _plan_and_first_chapter(self, db: Session, run: AutoDirectorRun, project: Project) -> None:
         direction = run.context["selected_direction"]
@@ -490,6 +533,10 @@ class AutoDirectorOrchestrator:
             for planned_chapter in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id)).all():
                 planned_chapter.locked = True
             db.flush(); self._commit_step(step, {"plan_id": plan.id}, plan.id, calls=1, latency_ms=result.latency_ms, tokens=self._model_tokens(result), usage=self._model_usage(result), provider=result.provider, model=result.model); self._add_usage(run, step)
+            run.context = {**(run.context or {}), "plan_id": plan.id}
+            run.current_stage = AutoDirectorStage.STORY_MACRO
+            run.next_action = "整书规划已保存；正在准备卷纲、章节任务和第一章世界运行。"
+            return
         plan_id = step.output_payload["plan_id"]
         plan = db.get(StoryPlan, plan_id)
         if not plan:

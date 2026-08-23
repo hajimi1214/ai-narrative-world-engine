@@ -18,6 +18,7 @@ class AutoDirectorRunCreatePayload(BaseModel):
     # Zero means unlimited for the local single-user workflow.
     max_tokens: int = Field(default=0, ge=0, le=10000000)
     max_retries: int = Field(default=2, ge=0, le=10)
+    require_direction_confirmation: bool = True
     idempotency_key: str | None = Field(default=None, max_length=200)
 
 

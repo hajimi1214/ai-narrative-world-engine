@@ -166,22 +166,20 @@ def test_worker_can_be_stopped_cleanly(monkeypatch):
     assert worker._thread is not None and not worker._thread.is_alive()
 
 
-def test_full_auto_worker_scores_and_selects_best_direction(monkeypatch):
+def test_full_auto_worker_scores_and_pauses_for_best_direction_confirmation(monkeypatch):
     directions = [
         {"title": "弱方向", "premise": "主线"},
         {"title": "最佳方向", "premise": "主线", "core_conflict": "代价", "first_volume_goal": "完成调查", "world_boundaries": ["档案馆"], "first_ten_chapter_promises": ["一", "二", "三"], "foreshadowing_directions": ["回收"], "protagonist": {"desire": "查明", "cost": "失去"}},
         {"title": "普通方向", "premise": "主线", "core_conflict": "代价"},
     ]
     client, project_id = _client(monkeypatch, directions)
-    monkeypatch.setattr(AutoDirectorOrchestrator, "_prepare_foundation", lambda self, db, run, direction: setattr(run, "context", {**run.context, "foundation": {"ready": True}}))
-    monkeypatch.setattr(AutoDirectorOrchestrator, "_plan_and_first_chapter", lambda self, db, run, project: setattr(run, "next_action", "planned"))
     created = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "一句灵感", "idempotency_key": "worker-score"}).json()
     assert created["status"] == "RUNNING"
     assert AutoDirectorWorker(api_module.SessionLocal, poll_seconds=0).run_once() is True
     state = client.get(f"/projects/{project_id}/auto-director/runs/{created['id']}").json()
-    assert state["context"]["selected_direction"]["title"] == "最佳方向"
-    assert state["context"]["direction_score"] > 50
-    assert state["current_stage"] == "CAST_PREPARATION"
+    assert state["context"]["recommended_direction_index"] == 1
+    assert state["status"] == "PAUSED"
+    assert state["current_stage"] == "DIRECTION_SELECTION"
     assert any(item["label"] == "自动导演：生成整书方向" and item["status"] == "COMPLETED" for item in live_execution_broker.snapshots(project_id))
 
 
@@ -404,6 +402,16 @@ def test_full_auto_pauses_at_operational_budget_without_completing_book(monkeypa
     assert created.status_code == 201, created.text
     run_id = created.json()["id"]
     worker = AutoDirectorWorker(api_module.SessionLocal, poll_seconds=0)
+    for _ in range(10):
+        worked = worker.run_once()
+        state = client.get(f"/projects/{project_id}/auto-director/runs/{run_id}").json()
+        if state["current_stage"] == "DIRECTION_SELECTION":
+            break
+        if not worked:
+            break
+    assert state["current_stage"] == "DIRECTION_SELECTION"
+    selected = client.post(f"/projects/{project_id}/auto-director/runs/{run_id}/select-direction", json={"direction_index": 0})
+    assert selected.status_code == 200, selected.text
     for _ in range(10):
         worked = worker.run_once()
         state = client.get(f"/projects/{project_id}/auto-director/runs/{run_id}").json()
