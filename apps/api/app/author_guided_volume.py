@@ -383,7 +383,10 @@ class AuthorGuidedVolumeService:
         adopted_number = int((run.context or {}).get("last_adopted_chapter_number", 0) or 0)
         if adopted_number:
             window.actual_generated_count = len(db.scalars(select(Chapter.id).where(Chapter.project_id == project.id, Chapter.number >= window.start_chapter_number, Chapter.number <= adopted_number, Chapter.active.is_(True), Chapter.content.is_not(None))).all())
-            if adopted_number <= window.end_chapter_number - 2:
+            # Keep the planning horizon bounded: pre-plan only when this
+            # window has two chapters remaining, not immediately after it
+            # starts.
+            if adopted_number >= window.end_chapter_number - 2:
                 next_window = self.ensure_followup_window(db, project, volume, window)
                 self.ensure_window_tasks(db, project, volume, next_window, contract)
                 run.context = {**(run.context or {}), "next_window_id": next_window.id}
