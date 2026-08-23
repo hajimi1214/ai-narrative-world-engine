@@ -27,14 +27,15 @@ def upgrade():
     op.create_index("ix_narrative_structure_revisions_project_id", "narrative_structure_revisions", ["project_id"])
     op.create_index("uq_narrative_structure_revision_project_active", "narrative_structure_revisions", ["project_id"], unique=True, postgresql_where=sa.text("active = true"), sqlite_where=sa.text("active = 1"))
 
-    op.add_column("chapters", sa.Column("structure_revision_id", sa.String(36), sa.ForeignKey("narrative_structure_revisions.id")))
-    op.add_column("chapters", sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.false()))
-    op.add_column("chapters", sa.Column("structure_status", sa.String(20), nullable=False, server_default="LEGACY"))
-    op.add_column("chapters", sa.Column("start_sequence", sa.Integer()))
-    op.add_column("chapters", sa.Column("end_sequence", sa.Integer()))
-    op.add_column("chapters", sa.Column("structure_fingerprint", sa.String(120)))
-    op.add_column("chapters", sa.Column("boundary_metadata", sa.JSON(), nullable=False, server_default=sa.text("'{}'")))
-    op.add_column("chapters", sa.Column("supersedes_chapter_id", sa.String(36), sa.ForeignKey("chapters.id")))
+    with op.batch_alter_table("chapters", schema=None) as batch_op:
+        batch_op.add_column(sa.Column("structure_revision_id", sa.String(36), sa.ForeignKey("narrative_structure_revisions.id", name="fk_chapters_structure_revision_id")))
+        batch_op.add_column(sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.false()))
+        batch_op.add_column(sa.Column("structure_status", sa.String(20), nullable=False, server_default="LEGACY"))
+        batch_op.add_column(sa.Column("start_sequence", sa.Integer()))
+        batch_op.add_column(sa.Column("end_sequence", sa.Integer()))
+        batch_op.add_column(sa.Column("structure_fingerprint", sa.String(120)))
+        batch_op.add_column(sa.Column("boundary_metadata", sa.JSON(), nullable=False, server_default=sa.text("'{}'")))
+        batch_op.add_column(sa.Column("supersedes_chapter_id", sa.String(36), sa.ForeignKey("chapters.id", name="fk_chapters_supersedes_chapter_id")))
     op.create_index("uq_chapter_project_active_number", "chapters", ["project_id", "number"], unique=True, postgresql_where=sa.text("active = true"), sqlite_where=sa.text("active = 1"))
 
     op.create_table(

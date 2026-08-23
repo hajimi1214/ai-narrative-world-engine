@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 
@@ -9,6 +9,7 @@ class ModelResult:
     request_id: str | None
     provider: str
     model: str
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 class ModelProvider(Protocol):

@@ -65,4 +65,6 @@ class OpenAICompatibleProvider:
             content = body["choices"][0]["message"]["content"]
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise ModelProviderError(MODEL_UPSTREAM_ERROR) from exc
-        return ModelResult(content=str(content), latency_ms=latency_ms, request_id=response.headers.get("x-request-id"), provider=self.name, model=model)
+        usage = body.get("usage") if isinstance(body, dict) else {}
+        usage = usage if isinstance(usage, dict) else {}
+        return ModelResult(content=str(content), latency_ms=latency_ms, request_id=response.headers.get("x-request-id"), provider=self.name, model=model, usage={key: int(usage.get(key, 0) or 0) for key in ("prompt_tokens", "completion_tokens", "total_tokens")})

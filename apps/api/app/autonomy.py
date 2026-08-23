@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 from decimal import Decimal
+import json
 from typing import Any
 
 from sqlalchemy import func, select
@@ -31,6 +32,21 @@ class AutonomousWorldLoopService:
     runnable_pause_reasons = {"QUIESCENT", "TURN_LIMIT", "INSUFFICIENT_ACTIVE_PARTICIPANTS"}
     default_stagnation_limit = 3
     failure_injector = None
+
+    @staticmethod
+    def _validate_chapter_task(db: Session, performance: ScenePerformance, proposal: SceneProposal) -> tuple[bool, dict[str, Any]]:
+        task = (proposal.entry_state or {}).get("planning_task") or {}
+        if not task:
+            return True, {"status": "NOT_APPLICABLE"}
+        turns = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence)).all()
+        text = "\n".join((turn.observable_action or "") + "\n" + (turn.spoken_content or "") for turn in turns)
+        beat_refs = {str(ref) for turn in turns for ref in (turn.scene_beat_refs or [])}
+        missing = [str(event) for event in task.get("must_events", []) if str(event) not in text and str(event) not in beat_refs]
+        forbidden = [str(event) for event in task.get("forbidden_events", []) if str(event) in text or str(event) in beat_refs]
+        beats = [str(beat) for beat in task.get("scene_beats", [])]
+        uncovered_beats = [beat for beat in beats if beat not in beat_refs and beat not in text]
+        report = {"status": "PASS" if not missing and not forbidden and not uncovered_beats else "BLOCKED", "missing_must_events": missing, "forbidden_events": forbidden, "uncovered_scene_beats": uncovered_beats, "task_fingerprint": (proposal.expected_progress or {}).get("task_fingerprint")}
+        return report["status"] == "PASS", report
 
     def _fingerprint(self, db: Session, project_id: str) -> tuple[int, str]:
         sequence = db.scalar(select(func.max(Scene.sequence)).where(Scene.project_id == project_id, Scene.history_status == "ACTIVE")) or 0
@@ -132,7 +148,7 @@ class AutonomousWorldLoopService:
         step = db.scalar(select(AutonomousWorldStep).where(AutonomousWorldStep.run_id == run.id).order_by(AutonomousWorldStep.ordinal.desc()))
         return {"run": self.run_payload(run), "current_step": self.step_payload(step) if step else None}
 
-    def advance(self, db: Session, run_id: str, *, max_scenes: int = 1, request_key: str = "default", request_offset: int = 0) -> dict[str, Any]:
+    def advance(self, db: Session, run_id: str, *, max_scenes: int = 1, request_key: str = "default", request_offset: int = 0, usage_collector=None) -> dict[str, Any]:
         run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run_id).with_for_update())
         if not run: raise LookupError("AUTONOMY_RUN_NOT_FOUND")
         if max_scenes < 1 or max_scenes > 20: raise ValueError("INVALID_ADVANCE_LIMIT")
@@ -164,7 +180,7 @@ class AutonomousWorldLoopService:
                         steps.append(step)
                         break
                     try:
-                        step = self.continue_step(db, run, step)
+                        step = self.continue_step(db, run, step, usage_collector=usage_collector)
                     except Exception as exc:
                         db.rollback()
                         failed_run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run_id).with_for_update())
@@ -176,7 +192,7 @@ class AutonomousWorldLoopService:
                             failed_run.last_error_detail = {"message": str(exc)}
                             self._refresh_run_fingerprint(db, failed_run)
                             db.commit()
-                        raise ValueError("AUTONOMY_SCENE_FAILED") from exc
+                        raise ValueError(f"AUTONOMY_SCENE_FAILED:{exc}") from exc
                     steps.append(step)
                     db.flush(); db.commit()
                     run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run_id).with_for_update())
@@ -202,7 +218,7 @@ class AutonomousWorldLoopService:
             if run.committed_scene_count >= run.scene_budget:
                 break
             try:
-                step = self.advance_one_scene(db, run, request_key, offset)
+                step = self.advance_one_scene(db, run, request_key, offset, usage_collector=usage_collector)
             except Exception as exc:
                 # Earlier offsets were committed already.  Roll back only this
                 # Scene's transaction, then durably record a resumable pause.
@@ -216,7 +232,7 @@ class AutonomousWorldLoopService:
                     failed_run.last_error_detail = {"message": str(exc)}
                     self._refresh_run_fingerprint(db, failed_run)
                     db.commit()
-                raise ValueError("AUTONOMY_SCENE_FAILED") from exc
+                raise ValueError(f"AUTONOMY_SCENE_FAILED:{exc}") from exc
             steps.append(step)
             # Each scene is a durable unit. A later scene can fail without
             # rolling back an already committed scene.
@@ -232,7 +248,7 @@ class AutonomousWorldLoopService:
             db.commit()
         return {"run": self.run_payload(run), "steps": [self.step_payload(step) for step in steps], "existing": any_existing}
 
-    def continue_step(self, db: Session, run: AutonomousWorldRun, step: AutonomousWorldStep) -> AutonomousWorldStep:
+    def continue_step(self, db: Session, run: AutonomousWorldRun, step: AutonomousWorldStep, *, usage_collector=None) -> AutonomousWorldStep:
         """Resume a paused step without regenerating proposal/performance."""
         run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run.id).with_for_update())
         project = db.scalar(select(Project).where(Project.id == run.project_id).with_for_update())
@@ -253,7 +269,7 @@ class AutonomousWorldLoopService:
         # but align their derived context token with that recovered runtime.
         proposal.context_fingerprint = current["fingerprint"]
         performance.proposal_context_fingerprint = current["fingerprint"]
-        if not self._drive_performance(db, run, step, performance, proposal):
+        if not self._drive_performance(db, run, step, performance, proposal, usage_collector=usage_collector):
             return step
         performance_stop_reason = performance.stop_reason
         result = SceneCommitService().commit(db, run.project_id, performance.id)
@@ -265,7 +281,7 @@ class AutonomousWorldLoopService:
         self._apply_stagnation_guard(db, run)
         return step
 
-    def advance_one_scene(self, db: Session, run: AutonomousWorldRun, request_key: str, request_offset: int) -> AutonomousWorldStep:
+    def advance_one_scene(self, db: Session, run: AutonomousWorldRun, request_key: str, request_offset: int, *, usage_collector=None) -> AutonomousWorldStep:
         RetconPendingReplayGuard().assert_progression_allowed(db, run.project_id)
         run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run.id).with_for_update())
         project = db.scalar(select(Project).where(Project.id == run.project_id).with_for_update())
@@ -277,13 +293,22 @@ class AutonomousWorldLoopService:
         db.add(step); db.flush()
         trace = ExecutionTraceRecorder().start(db, project_id=run.project_id, stage=ExecutionStage.AUTONOMOUS_LOOP, source_type="AUTONOMOUS_WORLD_RUN", source_id=run.id, input_fingerprint=before)
         try:
-            context = DirectorContextBuilder().build(db, run.project_id)
+            configured_task = (run.config or {}).get("planning_task")
+            planning_task = None
+            if configured_task is not None:
+                planning_task = {
+                    **configured_task,
+                    "plan_id": (run.config or {}).get("plan_id"),
+                    "chapter_plan_id": (run.config or {}).get("plan_chapter_id"),
+                    "chapter_number": (run.config or {}).get("chapter_number"),
+                }
+            context = DirectorContextBuilder().build(db, run.project_id, planning_task=planning_task)
             gravity_context = StoryGravityContextBuilder().build(db, run.project_id)
             gravity = StoryGravityEngine().build(gravity_context)
             candidates = DirectorCandidateEngine().generate(gravity_context, gravity)
             checker = DirectorConstraintChecker(); selected = None; report = None
             for candidate in candidates:
-                proposal_data = DirectorProposalFactory().create(run.project_id, gravity_context, gravity, candidate)
+                proposal_data = DirectorProposalFactory().create(run.project_id, context, gravity, candidate)
                 transient = SceneProposal(project_id=run.project_id, context_fingerprint=context["fingerprint"], **proposal_data)
                 current_report = checker.validate(db, context, transient)
                 if current_report.valid: selected, report = candidate, current_report; break
@@ -293,18 +318,29 @@ class AutonomousWorldLoopService:
             if getattr(selected.proposal_type, "value", selected.proposal_type) == "NEW_THREAD":
                 ExecutionTraceRecorder().block(trace, "AUTONOMY_AUTHOR_INTERVENTION_REQUIRED")
                 return self._blocked(step, run, "AUTONOMY_AUTHOR_INTERVENTION_REQUIRED")
-            step.step_input_fingerprint = stable_fingerprint({"run_id": run.id, "ordinal": ordinal, "world": before, "sequence": sequence, "gravity": gravity.gravity_fingerprint, "candidate": selected.candidate_key, "config": run.config or {}}, "autonomous-step-input-v1")
-            proposal = SceneProposal(project_id=run.project_id, context_fingerprint=context["fingerprint"], status=ProposalStatus.APPROVED, **DirectorProposalFactory().create(run.project_id, gravity_context, gravity, selected))
+            proposal = SceneProposal(project_id=run.project_id, context_fingerprint=context["fingerprint"], status=ProposalStatus.APPROVED, **DirectorProposalFactory().create(run.project_id, context, gravity, selected))
+            if (run.config or {}).get("auto_director_run_id"):
+                proposal.entry_state = {**(proposal.entry_state or {}), "auto_director_run_id": (run.config or {}).get("auto_director_run_id")}
             db.add(proposal); db.flush()
+            task = (proposal.entry_state or {}).get("planning_task") or {}
+            task_text = json.dumps({"objective": task.get("objective"), "conflict": task.get("conflict"), "must_events": task.get("must_events", []), "forbidden_events": task.get("forbidden_events", []), "scene_beats": task.get("scene_beats", []), "end_state": task.get("end_state", {})}, ensure_ascii=False, sort_keys=True, default=str)
+            if task and proposal.expected_progress.get("task_fingerprint") != __import__("hashlib").sha256(json.dumps(task, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:120]:
+                return self._blocked(step, run, "CHAPTER_TASK_FINGERPRINT_INVALID")
+            step.step_input_fingerprint = stable_fingerprint({"run_id": run.id, "ordinal": ordinal, "world": before, "sequence": sequence, "gravity": gravity.gravity_fingerprint, "candidate": selected.candidate_key, "config": run.config or {}, "task": task_text}, "autonomous-step-input-v1")
             db.add(DirectorDecisionLog(project_id=run.project_id, context_version=context["version"], proposal_id=proposal.id, decision_type=DecisionType.DRY_RUN, brief_reason="Autonomous Story Gravity selection.", validation_result=report.as_dict()))
             db.add(DirectorDecisionLog(project_id=run.project_id, context_version=context["version"], proposal_id=proposal.id, decision_type=DecisionType.APPROVE, brief_reason="Explicit Autonomous Run approval.", validation_result=report.as_dict()))
             performance = ScenePerformance(project_id=run.project_id, scene_proposal_id=proposal.id, take_number=1, proposal_context_fingerprint=context["fingerprint"], mode=run.performance_mode, participant_order=list(proposal.participants or []), active_participant_ids=list(proposal.participants or []), max_turns=run.max_turns_per_scene, turn_count=0)
             if not performance.active_participant_ids: return self._blocked(step, run, "NO_RUNNABLE_SCENE_PARTICIPANT")
             db.add(performance); db.flush(); step.proposal_id = proposal.id; step.performance_id = performance.id; step.director_context_fingerprint = context["fingerprint"]; step.gravity_fingerprint = gravity.gravity_fingerprint; step.candidate_key = selected.candidate_key; step.stage = "PERFORMANCE"
-            if not self._drive_performance(db, run, step, performance, proposal):
+            if not self._drive_performance(db, run, step, performance, proposal, usage_collector=usage_collector):
                 return step
             if performance.turn_count == 0:
                 return self._blocked(step, run, "EMPTY_PERFORMANCE", stage="PERFORMANCE")
+            task_valid, task_report = self._validate_chapter_task(db, performance, proposal)
+            proposal.expected_progress = {**(proposal.expected_progress or {}), "forbidden_event_check": task_report, "task_validation": task_report}
+            if not task_valid:
+                self._blocked(step, run, "CHAPTER_TASK_CONTRACT_FAILED", stage="TASK_VALIDATION")
+                return step
             performance_stop_reason = performance.stop_reason
             result = SceneCommitService().commit(db, run.project_id, performance.id)
             if self.failure_injector:
@@ -323,7 +359,7 @@ class AutonomousWorldLoopService:
         if candidate_id and candidate_id not in (step.recovery_candidate_ids or []):
             step.recovery_candidate_ids = [*(step.recovery_candidate_ids or []), candidate_id]
 
-    def _drive_performance(self, db, run, step, performance, proposal) -> bool:
+    def _drive_performance(self, db, run, step, performance, proposal, *, usage_collector=None) -> bool:
         """Bounded persisted scene state machine; no local turn list is authority."""
         turn_runtime, world_runtime = PerformanceRuntimeService(), WorldResolutionRuntimeService()
         while True:
@@ -343,7 +379,7 @@ class AutonomousWorldLoopService:
                         self._blocked(step, run, "STATE_DELTA_REJECTED", stage="STATE_DELTA"); return False
             if getattr(performance.status, "value", performance.status) in {"READY", "RUNNING"}:
                 try:
-                    result = turn_runtime.step(db, run.project_id, performance, proposal)
+                    result = turn_runtime.step(db, run.project_id, performance, proposal, usage_collector=usage_collector)
                 except RuntimeFailure as exc:
                     step.error_code = exc.code; step.error_detail = exc.detail or {}; step.stage = "PERFORMANCE"
                     run.last_error_code = exc.code
@@ -355,7 +391,7 @@ class AutonomousWorldLoopService:
                     continue
             if performance.status == PerformanceStatus.AWAITING_WORLD:
                 try:
-                    result = world_runtime.resolve(db, run.project_id, performance, proposal, run.resolver_mode)
+                    result = world_runtime.resolve(db, run.project_id, performance, proposal, run.resolver_mode, usage_collector=usage_collector)
                 except RuntimeFailure as exc:
                     step.error_code = exc.code; step.error_detail = exc.detail or {}; step.stage = "WORLD_RESOLUTION"
                     run.last_error_code = exc.code

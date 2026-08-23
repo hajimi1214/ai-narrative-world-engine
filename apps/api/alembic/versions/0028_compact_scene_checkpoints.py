@@ -14,10 +14,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("world_snapshots", sa.Column("storage_mode", sa.String(length=30), nullable=False, server_default="LEGACY_FULL"))
-    op.add_column("world_snapshots", sa.Column("base_snapshot_id", sa.String(length=36), sa.ForeignKey("world_snapshots.id")))
-    op.add_column("world_snapshots", sa.Column("storage_fingerprint", sa.String(length=120)))
-    op.add_column("world_snapshots", sa.Column("materialization_depth", sa.Integer(), nullable=False, server_default="0"))
+    with op.batch_alter_table("world_snapshots") as batch:
+        batch.add_column(sa.Column("storage_mode", sa.String(length=30), nullable=False, server_default="LEGACY_FULL"))
+        batch.add_column(sa.Column("base_snapshot_id", sa.String(length=36), sa.ForeignKey("world_snapshots.id", name="fk_world_snapshots_base_snapshot_id")))
+        batch.add_column(sa.Column("storage_fingerprint", sa.String(length=120)))
+        batch.add_column(sa.Column("materialization_depth", sa.Integer(), nullable=False, server_default="0"))
     op.create_index("ix_world_snapshots_project_storage_mode", "world_snapshots", ["project_id", "storage_mode"])
     op.create_index("ix_world_snapshots_base_snapshot_id", "world_snapshots", ["base_snapshot_id"])
     op.create_table(

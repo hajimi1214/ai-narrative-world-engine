@@ -50,12 +50,14 @@ from .routes import research as research_routes
 from .routes import scaling as scaling_routes
 from .routes import state_history as state_history_routes
 from .routes import writer as writer_routes
+from .routes import auto_director as auto_director_routes
 
 router = APIRouter()
 router.include_router(research_routes.router)
 router.include_router(scaling_routes.router)
 router.include_router(state_history_routes.router)
 router.include_router(writer_routes.router)
+router.include_router(auto_director_routes.router)
 
 class Payload(BaseModel):
     model_config = ConfigDict(extra="allow")

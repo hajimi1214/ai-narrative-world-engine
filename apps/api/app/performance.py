@@ -74,15 +74,17 @@ class HeuristicCharacterPerformer:
 
 
 class LLMCharacterPerformer:
-    def __init__(self, provider: ModelProvider, model: str): self.provider, self.model = provider, model
+    def __init__(self, provider: ModelProvider, model: str): self.provider, self.model, self.results = provider, model, []
     def perform(self, actor_view: dict[str, Any]) -> tuple[dict[str, Any], ModelResult]:
         messages = [{"role": "system", "content": CHARACTER_SYSTEM_PROMPT + "\nYou control only yourself. Describe attempts, not world outcomes or another character's reaction. Separate private decision from observable action. If the environment, object, uncertain information, combat, travel, or ability resolution must answer, set requires_world_resolution=true and provide a request."}, {"role": "user", "content": json.dumps({"actor_view": actor_view, "output_contract": performance_contract(), "instruction": "Return exactly one JSON object conforming to the contract. Do not add or omit fields."}, ensure_ascii=True, sort_keys=True)}]
         first = self.provider.generate(messages, self.model)
+        self.results.append(first)
         try: return _parse_performance(first.content).model_dump(mode="json"), first
         except ModelProviderError as error:
             diagnostics = getattr(error, "diagnostics", [{"path": "$", "type": "invalid_output", "message": "Output does not match the contract."}])
         repair = messages + [{"role": "assistant", "content": first.content}, {"role": "user", "content": json.dumps({"validation_errors": diagnostics, "instruction": "Repair into exactly one valid performance JSON object. Preserve meaning and do not add facts."}, ensure_ascii=True)}]
         second = self.provider.generate(repair, self.model)
+        self.results.append(second)
         return _parse_performance(second.content).model_dump(mode="json"), second
 
 

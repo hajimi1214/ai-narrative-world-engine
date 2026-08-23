@@ -976,6 +976,11 @@ class QualityRepairService:
     def _source_is_repairable(db: Session, chapter: Chapter, assessment: ChapterQualityAssessment, source: ChapterWriterDraft) -> bool:
         if source.id == chapter.current_writer_draft_id:
             return _value(source.status) == "ADOPTED" and chapter.content == source.content
+        # Auto Director reviews a validated candidate before author adoption.
+        # It is safe to repair this lineage while the chapter projection is
+        # still empty; adoption remains an explicit later action.
+        if source.id == assessment.writer_draft_id and _value(source.origin) == "WRITER" and _value(source.status) == "VALIDATED":
+            return chapter.current_writer_draft_id is None and chapter.content is None
         if _value(source.origin) != "QUALITY_REPAIR" or _value(source.status) != "VALIDATED" or not source.parent_draft_id or not source.source_quality_assessment_id:
             return False
         parent = db.get(ChapterWriterDraft, source.parent_draft_id)

@@ -302,7 +302,7 @@ class SceneCommitService:
             raise ValueError("SCENE_COMMIT_PROPOSAL_NOT_APPROVED")
         if proposal.context_fingerprint != performance.proposal_context_fingerprint:
             raise ValueError("SCENE_COMMIT_CONTEXT_STALE")
-        if DirectorContextBuilder().build(db, project_id)["fingerprint"] != proposal.context_fingerprint:
+        if DirectorContextBuilder().build(db, project_id, planning_task=(proposal.entry_state or {}).get("planning_task"))["fingerprint"] != proposal.context_fingerprint:
             raise ValueError("SCENE_COMMIT_CONTEXT_STALE")
         turns = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence, ScenePerformanceTurn.id)).all()
         if not turns:

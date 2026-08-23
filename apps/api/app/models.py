@@ -1548,3 +1548,67 @@ class ResearchTermStat(TimestampMixin, Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
     term: Mapped[str] = mapped_column(String(300), nullable=False)
     document_frequency: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class AutoDirectorStage(str, enum.Enum):
+    IDEA="IDEA"; FRAMING="FRAMING"; DIRECTION_SELECTION="DIRECTION_SELECTION"; CAST_PREPARATION="CAST_PREPARATION"; WORLD_BUILDING="WORLD_BUILDING"; STORY_MACRO="STORY_MACRO"; VOLUME_PLANNING="VOLUME_PLANNING"; CHAPTER_PLANNING="CHAPTER_PLANNING"; CHAPTER_DETAIL="CHAPTER_DETAIL"; CHAPTER_EXECUTION="CHAPTER_EXECUTION"; QUALITY_REVIEW="QUALITY_REVIEW"; QUALITY_REPAIR="QUALITY_REPAIR"; AUTHOR_ADOPTION="AUTHOR_ADOPTION"; NEXT_CHAPTER="NEXT_CHAPTER"; COMPLETED="COMPLETED"; PAUSED="PAUSED"; FAILED="FAILED"; BLOCKED="BLOCKED"
+
+
+class AutoDirectorRunStatus(str, enum.Enum):
+    CREATED="CREATED"; RUNNING="RUNNING"; PAUSED="PAUSED"; FAILED="FAILED"; BLOCKED="BLOCKED"; COMPLETED="COMPLETED"
+
+
+class AutoDirectorStepStatus(str, enum.Enum):
+    PENDING="PENDING"; RUNNING="RUNNING"; COMMITTED="COMMITTED"; PAUSED="PAUSED"; FAILED="FAILED"; BLOCKED="BLOCKED"
+
+
+class AutoDirectorRun(TimestampMixin, Base):
+    __tablename__ = "auto_director_runs"
+    __table_args__ = (UniqueConstraint("project_id", "idempotency_key", name="uq_auto_director_run_project_idempotency"), Index("ix_auto_director_run_project_status", "project_id", "status"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    status: Mapped[AutoDirectorRunStatus] = mapped_column(Enum(AutoDirectorRunStatus, native_enum=False, length=20), default=AutoDirectorRunStatus.CREATED, nullable=False)
+    current_stage: Mapped[AutoDirectorStage] = mapped_column(Enum(AutoDirectorStage, native_enum=False, length=30), default=AutoDirectorStage.IDEA, nullable=False)
+    current_chapter_id: Mapped[str | None] = mapped_column(ForeignKey("chapters.id"))
+    run_mode: Mapped[str] = mapped_column(String(30), default="LOCAL_SINGLE_USER", nullable=False)
+    pause_reason: Mapped[str | None] = mapped_column(String(500))
+    next_action: Mapped[str | None] = mapped_column(String(500))
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    token_usage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    total_calls: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    estimated_cost: Mapped[float | None] = mapped_column(Float)
+    cost_status: Mapped[str] = mapped_column(String(20), default="UNKNOWN", nullable=False)
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class AutoDirectorStep(TimestampMixin, Base):
+    __tablename__ = "auto_director_steps"
+    __table_args__ = (UniqueConstraint("run_id", "stage", "input_fingerprint", name="uq_auto_director_step_checkpoint"), Index("ix_auto_director_step_run_stage", "run_id", "stage"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(ForeignKey("auto_director_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    stage: Mapped[AutoDirectorStage] = mapped_column(Enum(AutoDirectorStage, native_enum=False, length=30), nullable=False)
+    status: Mapped[AutoDirectorStepStatus] = mapped_column(Enum(AutoDirectorStepStatus, native_enum=False, length=20), default=AutoDirectorStepStatus.PENDING, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    output_artifact_id: Mapped[str | None] = mapped_column(String(120))
+    output_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    token_usage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    calls: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(120))
+    model: Mapped[str | None] = mapped_column(String(200))
+    estimated_cost: Mapped[float | None] = mapped_column(Float)
+    cost_status: Mapped[str] = mapped_column(String(20), default="UNKNOWN", nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)

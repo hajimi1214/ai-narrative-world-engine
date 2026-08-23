@@ -55,10 +55,11 @@ def upgrade():
     op.create_index("ix_chapter_writer_drafts_request_fingerprint", "chapter_writer_drafts", ["request_fingerprint"])
     op.create_index("ix_chapter_writer_drafts_content_fingerprint", "chapter_writer_drafts", ["content_fingerprint"])
     op.create_index("ix_chapter_writer_drafts_chapter_status", "chapter_writer_drafts", ["chapter_id", "status"])
-    op.add_column("chapters", sa.Column("current_writer_draft_id", sa.String(36), sa.ForeignKey("chapter_writer_drafts.id")))
-    op.add_column("chapters", sa.Column("writer_content_fingerprint", sa.String(120)))
-    op.add_column("chapters", sa.Column("writer_context_fingerprint", sa.String(120)))
-    op.add_column("chapters", sa.Column("written_at", sa.DateTime()))
+    with op.batch_alter_table("chapters") as batch:
+        batch.add_column(sa.Column("current_writer_draft_id", sa.String(36), sa.ForeignKey("chapter_writer_drafts.id", name="fk_chapters_current_writer_draft_id")))
+        batch.add_column(sa.Column("writer_content_fingerprint", sa.String(120)))
+        batch.add_column(sa.Column("writer_context_fingerprint", sa.String(120)))
+        batch.add_column(sa.Column("written_at", sa.DateTime()))
 
 
 def downgrade():

@@ -418,7 +418,9 @@ class DirectorProposalFactory:
         meta = {"protocol": "story-gravity-v1", "gravity_fingerprint": gravity.gravity_fingerprint, "candidate_key": candidate.candidate_key, "reason_codes": list(candidate.reason_codes), "score_components": candidate.score_components, "focus_type": candidate.focus_type, "focus_ids": list(candidate.focus_ids), "pressure_kind": candidate.pressure_kind, "evidence": candidate.evidence}
         motivations = {character_id: {"reason": "The current situation creates a structured opportunity for an autonomous choice."} for character_id in participant_ids}
         task = (context.get("planning_chapter_tasks") or [None])[0]
-        return {"proposal_type": candidate.proposal_type, "primary_thread_id": candidate.primary_thread_id, "location_id": candidate.location_id, "proposed_location": None, "participants": participant_ids, "scene_goal": (task or {}).get("objective") or "Create an opportunity to respond to the current pressure.", "character_motivations": motivations, "entry_state": {"director_meta": meta, "planning_task": task}, "planned_pressure": (task or {}).get("conflict") or "A structured external pressure creates multiple plausible responses.", "expected_progress": candidate.expected_progress, "allowed_reveals": list(candidate.reveal_ids), "forbidden_reveals": (task or {}).get("forbidden_reveals", []), "required_canon": [], "possible_outcomes": ["The pressure is refused, delayed, or investigated.", "The situation changes through an autonomous character choice."], "new_entity_requests": [], "risk_flags": list(candidate.reason_codes), "director_reasoning_summary": "Selected a structured situation; character decisions remain autonomous."}
+        task_identity = hashlib.sha256(json.dumps(task or {}, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:120]
+        task_progress = {**candidate.expected_progress, "plan_id": (task or {}).get("plan_id"), "plan_chapter_id": (task or {}).get("chapter_plan_id"), "task_fingerprint": task_identity, "referenced_beat_ids": list((task or {}).get("scene_beats", [])), "referenced_must_events": list((task or {}).get("must_events", [])), "forbidden_event_check": {"forbidden_events": list((task or {}).get("forbidden_events", [])), "status": "PENDING"}}
+        return {"proposal_type": candidate.proposal_type, "primary_thread_id": candidate.primary_thread_id, "location_id": candidate.location_id, "proposed_location": None, "participants": participant_ids, "scene_goal": (task or {}).get("objective") or "Create an opportunity to respond to the current pressure.", "character_motivations": motivations, "entry_state": {"director_meta": meta, "planning_task": task, "task_fingerprint": task_identity}, "planned_pressure": (task or {}).get("conflict") or "A structured external pressure creates multiple plausible responses.", "expected_progress": task_progress, "allowed_reveals": list((task or {}).get("allowed_reveals", candidate.reveal_ids)), "forbidden_reveals": (task or {}).get("forbidden_reveals", []), "required_canon": [], "possible_outcomes": ["The pressure is refused, delayed, or investigated.", "The situation changes through an autonomous character choice."], "new_entity_requests": [], "risk_flags": list(candidate.reason_codes), "director_reasoning_summary": "Selected a structured situation; character decisions remain autonomous."}
 
 
 class DirectorCandidatePayload(BaseModel):
@@ -504,7 +506,7 @@ class ValidationReport:
         return {"valid": self.valid, "issues": [issue.__dict__ for issue in self.issues]}
 
 class DirectorContextBuilder:
-    def build(self, session: Session, project_id: str, include_secret_canon: bool = True) -> dict[str, Any]:
+    def build(self, session: Session, project_id: str, include_secret_canon: bool = True, planning_task: dict[str, Any] | None = None) -> dict[str, Any]:
         project = session.get(Project, project_id)
         if not project:
             raise ValueError("Project not found")
@@ -542,7 +544,7 @@ class DirectorContextBuilder:
         if plan:
             # Planning is advisory to the Director candidate; formal scene and character validators remain authoritative.
             context["planning_plan"] = {"plan_id": plan.id, "version": plan.version, "premise": plan.premise, "macro_plan": plan.macro_plan, "style_guide": plan.style_guide, "anti_ai_rules": plan.anti_ai_rules}
-            next_task = next_chapter_task_context(session, project_id)
+            next_task = planning_task if planning_task is not None else next_chapter_task_context(session, project_id)
             context["planning_chapter_tasks"] = [next_task] if next_task else []
         gravity_context = StoryGravityContextBuilder().build(session, project_id)
         gravity_report = StoryGravityEngine().build(gravity_context)

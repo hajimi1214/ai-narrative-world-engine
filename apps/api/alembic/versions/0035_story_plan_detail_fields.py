@@ -25,9 +25,9 @@ def upgrade() -> None:
             ("end_state", sa.JSON(), "{}"),
         ],
     }.items():
-        for name, column_type, default in columns:
-            op.add_column(table, sa.Column(name, column_type, nullable=False, server_default=default))
-            op.alter_column(table, name, server_default=None)
+        with op.batch_alter_table(table) as batch:
+            for name, column_type, default in columns:
+                batch.add_column(sa.Column(name, column_type, nullable=False, server_default=default))
 
 
 def downgrade() -> None:

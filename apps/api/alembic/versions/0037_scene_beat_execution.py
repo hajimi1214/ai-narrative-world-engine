@@ -13,8 +13,8 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("scene_performance_turns", sa.Column("scene_beat_refs", sa.JSON(), nullable=False, server_default="[]"))
-    op.alter_column("scene_performance_turns", "scene_beat_refs", server_default=None)
+    with op.batch_alter_table("scene_performance_turns") as batch:
+        batch.add_column(sa.Column("scene_beat_refs", sa.JSON(), nullable=False, server_default="[]"))
 
 
 def downgrade() -> None:

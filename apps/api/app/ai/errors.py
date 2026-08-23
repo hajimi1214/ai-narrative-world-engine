@@ -1,8 +1,9 @@
 class ModelProviderError(Exception):
-    def __init__(self, code: str, message: str = "Model provider request failed", upstream_status: int | None = None):
+    def __init__(self, code: str, message: str = "Model provider request failed", upstream_status: int | None = None, usage: dict | None = None):
         super().__init__(message)
         self.code = code
         self.upstream_status = upstream_status
+        self.usage = usage or {}
 
 
 MODEL_AUTH_FAILED = "MODEL_AUTH_FAILED"

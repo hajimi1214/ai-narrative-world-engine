@@ -13,10 +13,9 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("characters", sa.Column("agent_enabled", sa.Boolean(), nullable=False, server_default=sa.true()))
-    op.add_column("characters", sa.Column("agent_profile", sa.JSON(), nullable=False, server_default="{}"))
-    op.alter_column("characters", "agent_enabled", server_default=None)
-    op.alter_column("characters", "agent_profile", server_default=None)
+    with op.batch_alter_table("characters") as batch:
+        batch.add_column(sa.Column("agent_enabled", sa.Boolean(), nullable=False, server_default=sa.true()))
+        batch.add_column(sa.Column("agent_profile", sa.JSON(), nullable=False, server_default="{}"))
 
 
 def downgrade() -> None:

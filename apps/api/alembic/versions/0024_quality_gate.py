@@ -72,12 +72,14 @@ def upgrade():
     )
     op.create_index("ix_chapter_quality_findings_assessment_id", "chapter_quality_findings", ["assessment_id"])
     op.create_index("ix_chapter_quality_findings_finding_fingerprint", "chapter_quality_findings", ["finding_fingerprint"])
-    op.add_column("chapter_writer_drafts", sa.Column("origin", sa.String(30), nullable=False, server_default="WRITER"))
-    op.add_column("chapter_writer_drafts", sa.Column("source_quality_assessment_id", sa.String(36), sa.ForeignKey("chapter_quality_assessments.id")))
-    op.add_column("chapters", sa.Column("current_quality_assessment_id", sa.String(36), sa.ForeignKey("chapter_quality_assessments.id")))
-    op.add_column("chapters", sa.Column("quality_status", sa.String(30)))
-    op.add_column("chapters", sa.Column("quality_content_fingerprint", sa.String(120)))
-    op.add_column("chapters", sa.Column("quality_approved_at", sa.DateTime()))
+    with op.batch_alter_table("chapter_writer_drafts") as batch:
+        batch.add_column(sa.Column("origin", sa.String(30), nullable=False, server_default="WRITER"))
+        batch.add_column(sa.Column("source_quality_assessment_id", sa.String(36), sa.ForeignKey("chapter_quality_assessments.id", name="fk_drafts_source_quality_assessment_id")))
+    with op.batch_alter_table("chapters") as batch:
+        batch.add_column(sa.Column("current_quality_assessment_id", sa.String(36), sa.ForeignKey("chapter_quality_assessments.id", name="fk_chapters_current_quality_assessment_id")))
+        batch.add_column(sa.Column("quality_status", sa.String(30)))
+        batch.add_column(sa.Column("quality_content_fingerprint", sa.String(120)))
+        batch.add_column(sa.Column("quality_approved_at", sa.DateTime()))
 
 
 def downgrade():

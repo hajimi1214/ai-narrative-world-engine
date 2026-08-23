@@ -7,7 +7,7 @@ commit: their caller owns the transaction boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -38,6 +38,23 @@ from .world_resolution import (
 )
 
 
+def _emit_usage(collector: Callable[[dict[str, Any]], None] | None, result: Any = None, error: Exception | None = None) -> None:
+    if not collector:
+        return
+    usage = getattr(result, "usage", None) if result is not None else getattr(error, "usage", None)
+    usage = usage if isinstance(usage, dict) else {}
+    collector({
+        "calls": 1,
+        "provider": getattr(result, "provider", None),
+        "model": getattr(result, "model", None),
+        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+        "total_tokens": int(usage.get("total_tokens", usage.get("tokens", 0)) or 0),
+        "latency_ms": int(getattr(result, "latency_ms", 0) or 0),
+        "error_code": getattr(error, "code", None),
+    })
+
+
 @dataclass
 class RuntimeFailure(Exception):
     code: str
@@ -63,17 +80,31 @@ def persisted_turns(db: Session, performance_id: str) -> list[ScenePerformanceTu
 class PerformanceRuntimeService:
     """One persisted turn, with the same scheduler, context, routing and checks."""
 
-    def step(self, db: Session, project_id: str, performance: ScenePerformance, proposal: SceneProposal, *, heuristic_performer=None, model_provider_factory=None) -> dict[str, Any]:
+    def step(self, db: Session, project_id: str, performance: ScenePerformance, proposal: SceneProposal, *, heuristic_performer=None, model_provider_factory=None, usage_collector: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         initial_status, initial_stop_reason = performance.status, performance.stop_reason
         if getattr(performance.status, "value", performance.status) == "READY":
             performance.status = PerformanceStatus.RUNNING
         if performance.status != PerformanceStatus.RUNNING:
             raise RuntimeFailure("PERFORMANCE_NOT_RUNNABLE", {"status": getattr(performance.status, "value", performance.status), "stop_reason": performance.stop_reason})
-        current = DirectorContextBuilder().build(db, project_id)
-        if proposal.context_fingerprint != current["fingerprint"] or performance.proposal_context_fingerprint != current["fingerprint"]:
+        current = DirectorContextBuilder().build(
+            db,
+            project_id,
+            planning_task=(proposal.entry_state or {}).get("planning_task"),
+        )
+        context_changed = proposal.context_fingerprint != current["fingerprint"] or performance.proposal_context_fingerprint != current["fingerprint"]
+        auto_director_context = bool((proposal.entry_state or {}).get("auto_director_run_id"))
+        if context_changed and auto_director_context and performance.turn_count == 0:
+            # The auto-director creates the proposal and performance in one
+            # local transaction. Rebase the untouched checkpoint if the
+            # derived history projection changed while that transaction was
+            # flushed; after the first turn, the normal stale guard remains
+            # strict.
+            proposal.context_fingerprint = current["fingerprint"]
+            performance.proposal_context_fingerprint = current["fingerprint"]
+        elif context_changed:
             performance.status = PerformanceStatus.INVALIDATED
             performance.stop_reason = "STALE_PERFORMANCE"
-            raise RuntimeFailure("STALE_PERFORMANCE")
+            raise RuntimeFailure("STALE_PERFORMANCE", {"proposal": proposal.context_fingerprint, "performance": performance.proposal_context_fingerprint, "current": current["fingerprint"]})
         turns = persisted_turns(db, performance.id)
         sequences = [turn.sequence for turn in turns]
         if sequences != list(range(1, len(sequences) + 1)):
@@ -116,8 +147,14 @@ class PerformanceRuntimeService:
                 route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
                 trace.provider, trace.model = route.provider, route.model
                 provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
-                raw, model_result = LLMCharacterPerformer(provider, route.model).perform(ActorPerceptionSanitizer().sanitize(context))
+                performer = LLMCharacterPerformer(provider, route.model)
+                try:
+                    raw, model_result = performer.perform(ActorPerceptionSanitizer().sanitize(context))
+                finally:
+                    for result in performer.results:
+                        _emit_usage(usage_collector, result)
         except ModelProviderError as exc:
+            _emit_usage(usage_collector, error=exc)
             ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status)
             performance.status, performance.stop_reason = initial_status, initial_stop_reason
             raise RuntimeFailure(exc.code, {"upstream_status": exc.upstream_status}) from exc
@@ -175,7 +212,7 @@ class PerformanceRuntimeService:
 class WorldResolutionRuntimeService:
     """One pending world request. Non-valid outcomes are durable audit rows."""
 
-    def resolve(self, db: Session, project_id: str, performance: ScenePerformance, proposal: SceneProposal, mode: ResolverMode | str | None = None, *, heuristic_resolver=None, model_provider_factory=None) -> dict[str, Any]:
+    def resolve(self, db: Session, project_id: str, performance: ScenePerformance, proposal: SceneProposal, mode: ResolverMode | str | None = None, *, heuristic_resolver=None, model_provider_factory=None, usage_collector: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         if performance.status != PerformanceStatus.AWAITING_WORLD:
             raise RuntimeFailure("PERFORMANCE_NOT_AWAITING_WORLD")
         turns = list(reversed(persisted_turns(db, performance.id)))
@@ -213,9 +250,15 @@ class WorldResolutionRuntimeService:
                 route = ModelRouter().resolve(db, project_id, settings, "WORLD")
                 trace.provider, trace.model = route.provider, route.model
                 provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
-                raw, model_result = LLMWorldResolver(provider, route.model).resolve(context)
+                resolver = LLMWorldResolver(provider, route.model)
+                try:
+                    raw, model_result = resolver.resolve(context)
+                finally:
+                    for result in resolver.results:
+                        _emit_usage(usage_collector, result)
             payload = WorldResolutionPayload.model_validate(raw)
         except ModelProviderError as exc:
+            _emit_usage(usage_collector, error=exc)
             ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status)
             raise RuntimeFailure(exc.code, {"upstream_status": exc.upstream_status}) from exc
         except Exception as exc:

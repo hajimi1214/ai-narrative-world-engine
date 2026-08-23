@@ -129,13 +129,15 @@ def _unresolved(summary: str, missing: str, entities: list[str] | None = None) -
 
 class LLMWorldResolver:
     system_prompt = "You are the objective world resolution engine. Do not invent facts or choose dramatic outcomes. Return UNRESOLVED when information is missing. Return only required JSON."
-    def __init__(self, provider: ModelProvider, model: str): self.provider, self.model = provider, model
+    def __init__(self, provider: ModelProvider, model: str): self.provider, self.model, self.results = provider, model, []
     def resolve(self, context: dict[str, Any]) -> tuple[dict[str, Any], ModelResult]:
         messages = [{"role":"system", "content":self.system_prompt}, {"role":"user", "content":json.dumps({"world_context":WorldContextSanitizer().sanitize(context), "output_contract":world_resolution_contract(), "instruction":"Return exactly one JSON object."}, ensure_ascii=True, sort_keys=True)}]
         first = self.provider.generate(messages, self.model)
+        self.results.append(first)
         try: return WorldResolutionPayload.model_validate(_extract_single_json_object(first.content)).model_dump(mode="json"), first
         except ValidationError as error: diagnostics = _validation_diagnostics(error)
         second = self.provider.generate(messages + [{"role":"assistant", "content":first.content}, {"role":"user", "content":json.dumps({"validation_errors":diagnostics, "instruction":"Repair exactly one valid JSON object without inventing facts."})}], self.model)
+        self.results.append(second)
         return WorldResolutionPayload.model_validate(_extract_single_json_object(second.content)).model_dump(mode="json"), second
 
 
