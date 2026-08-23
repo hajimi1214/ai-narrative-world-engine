@@ -30,6 +30,17 @@ def _volume_or_404(db: Session, project_id: str, volume_id: str) -> VolumeContra
     return volume
 
 
+def _wake_volume_run(db: Session, project_id: str, volume_id: str) -> AutoDirectorRun | None:
+    run = db.scalar(select(AutoDirectorRun).where(AutoDirectorRun.project_id == project_id, AutoDirectorRun.run_mode == "AUTHOR_GUIDED_VOLUME", AutoDirectorRun.status.in_([AutoDirectorRunStatus.PAUSED, AutoDirectorRunStatus.FAILED]), AutoDirectorRun.context["volume_id"].as_string() == volume_id).order_by(AutoDirectorRun.updated_at.desc()))
+    if run:
+        run.status = AutoDirectorRunStatus.RUNNING
+        run.current_stage = AutoDirectorStage.VOLUME_ACTIVE
+        run.pause_reason = None
+        run.context = {**(run.context or {}), "execute_window": True}
+        run.next_action = "正在继续当前卷窗口。"
+    return run
+
+
 @router.post("/projects/{project_id}/author-guided-volume/runs", status_code=status.HTTP_201_CREATED)
 def create_author_guided_run(project_id: str, payload: AuthorGuidedRunCreatePayload, db: Session = Depends(get_db)):
     project = require_project(db, project_id)
@@ -92,6 +103,7 @@ def start_volume(project_id: str, volume_id: str, db: Session = Depends(get_db))
     if volume.status == VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
     volume.status = VolumeContractStatus.ACTIVE
     window = AuthorGuidedVolumeService().ensure_window(db, db.get(Project, project_id), volume)
+    _wake_volume_run(db, project_id, volume.id)
     db.commit(); return {"volume": _volume_payload(volume), "window": _window_payload(window)}
 
 
@@ -100,6 +112,7 @@ def continue_volume(project_id: str, volume_id: str, payload: dict | None = None
     volume = _volume_or_404(db, project_id, volume_id)
     if volume.status == VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
     window = AuthorGuidedVolumeService().ensure_window(db, db.get(Project, project_id), volume, author_note=(payload or {}).get("author_note"))
+    _wake_volume_run(db, project_id, volume.id)
     db.commit(); return {"volume": _volume_payload(volume), "window": _window_payload(window)}
 
 
@@ -109,6 +122,7 @@ def extend_volume(project_id: str, volume_id: str, payload: dict | None = None, 
     if volume.status == VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
     volume.status = VolumeContractStatus.EXTENDING
     window = AuthorGuidedVolumeService().ensure_window(db, db.get(Project, project_id), volume, author_note=(payload or {}).get("author_note"), size=(payload or {}).get("window_size"))
+    _wake_volume_run(db, project_id, volume.id)
     db.commit(); return {"volume": _volume_payload(volume), "window": _window_payload(window), "extended": True}
 
 
