@@ -14,7 +14,7 @@ import app.runtime as runtime_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, Character, CharacterKnowledge, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, Character, CharacterKnowledge, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -266,6 +266,29 @@ def test_open_window_can_continue_after_estimated_chapter_600(monkeypatch):
         db.commit()
         followup = AuthorGuidedVolumeService().ensure_followup_window(db, db.get(Project, project_id), volume, previous)
         assert followup.start_chapter_number == 601
+
+
+def test_usage_summary_projects_chapter_window_volume_and_book_scopes(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"window_size": 5, "idempotency_key": "usage-scopes"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        window = db.get(ChapterPlanningWindow, run.context["window_id"])
+        volume_id = window.volume_id
+        for stage, payload, tokens in [
+            (AutoDirectorStage.CHAPTER_EXECUTION, {"chapter_number": 1, "window_id": window.id, "volume_id": volume_id}, 5),
+            (AutoDirectorStage.CHAPTER_DETAIL, {"chapter_number": 2, "window_id": window.id, "volume_id": volume_id}, 7),
+            (AutoDirectorStage.VOLUME_PLANNING, {"window_id": window.id, "volume_id": volume_id}, 3),
+        ]:
+            db.add(AutoDirectorStep(run_id=run.id, stage=stage, status=AutoDirectorStepStatus.COMMITTED, input_fingerprint=f"scope-{tokens}", output_payload=payload, calls=1, total_tokens=tokens, prompt_tokens=tokens, completed_at=None))
+        run.context = {**run.context, "current_chapter_number": 1}
+        db.commit()
+    summary = client.get(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}").json()["usage_summary"]
+    assert summary["chapter"]["total_tokens"] == 5
+    assert summary["window"]["total_tokens"] == 15
+    assert summary["volume"]["total_tokens"] == 15
+    assert summary["book"]["total_tokens"] == 15
 
 
 def test_operational_token_budget_pauses_author_run_at_checkpoint(monkeypatch):
