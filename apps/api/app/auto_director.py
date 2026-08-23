@@ -30,7 +30,7 @@ from .models import (
     AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep,
     AutoDirectorStepStatus, Chapter, ChapterWriterDraft, ChapterQualityAssessment, ChapterQualityFinding,
     Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, StoryPlanArc, StoryPlanStatus, WriterDraftStatus, Character,
-    WorldEntity, StoryThread, CanonFact, StoryArc, EntityType, CanonType,
+    WorldEntity, StoryThread, CanonFact, StoryArc, EntityType, CanonType, AutonomousRunStatus,
 )
 
 
@@ -542,6 +542,23 @@ class AutoDirectorOrchestrator:
         run.context = {**context, "runtime_context_seeded": seeded}
         db.flush()
 
+    @staticmethod
+    def _resume_runtime_after_auto_context_seed(db: Session, runtime: AutonomousWorldLoopService, autonomous) -> None:
+        """Rebase only an untouched runtime after this orchestrator adds canon."""
+        sequence, world_fingerprint = runtime._fingerprint(db, autonomous.project_id)
+        history_fingerprint = runtime._history_fingerprint(db, autonomous.project_id)
+        if autonomous.committed_scene_count == 0:
+            autonomous.start_world_fingerprint = world_fingerprint
+            autonomous.start_history_fingerprint = history_fingerprint
+        autonomous.current_world_fingerprint = world_fingerprint
+        autonomous.current_history_fingerprint = history_fingerprint
+        if enum_value(autonomous.status) == "BLOCKED" and autonomous.stop_reason == "AUTONOMY_BASELINE_CHANGED" and autonomous.committed_scene_count == 0:
+            autonomous.status = AutonomousRunStatus.PAUSED
+            autonomous.active = True
+            autonomous.stop_reason = "WORLD_INFORMATION_MISSING"
+        db.flush()
+        runtime.resume(db, autonomous.id)
+
     def _plan_and_first_chapter(self, db: Session, run: AutoDirectorRun, project: Project) -> None:
         direction = run.context["selected_direction"]
         framing = dict(run.context.get("request") or {})
@@ -624,11 +641,13 @@ class AutoDirectorOrchestrator:
             # resume the same persisted scene once; do not regenerate it.
             if enum_value(autonomous.status) == "PAUSED" and autonomous.stop_reason == "WORLD_INFORMATION_MISSING":
                 self._seed_runtime_context(db, run, project, chapter_number, planning_task)
-                runtime.resume(db, autonomous.id)
+                self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
+            elif enum_value(autonomous.status) == "BLOCKED" and autonomous.stop_reason == "AUTONOMY_BASELINE_CHANGED" and int(autonomous.committed_scene_count or 0) == 0:
+                self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
             result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
             if result.get("run", {}).get("stop_reason") == "WORLD_INFORMATION_MISSING":
                 self._seed_runtime_context(db, run, project, chapter_number, planning_task)
-                runtime.resume(db, autonomous.id)
+                self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
                 result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
             self._live_complete(runtime_live, "角色行动与世界裁定已提交，正在形成章节")
         except Exception as exc:
