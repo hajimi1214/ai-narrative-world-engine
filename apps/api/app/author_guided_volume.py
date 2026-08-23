@@ -386,7 +386,8 @@ class AuthorGuidedVolumeService:
             # Keep the planning horizon bounded: pre-plan only when this
             # window has two chapters remaining, not immediately after it
             # starts.
-            if adopted_number >= window.end_chapter_number - 2:
+            remaining = window.end_chapter_number - adopted_number
+            if window.end_chapter_number > window.start_chapter_number and 0 < remaining <= 2:
                 next_window = self.ensure_followup_window(db, project, volume, window)
                 self.ensure_window_tasks(db, project, volume, next_window, contract)
                 run.context = {**(run.context or {}), "next_window_id": next_window.id}

@@ -275,6 +275,27 @@ def test_next_window_is_not_planned_until_two_chapters_remain(monkeypatch):
         assert len(windows) == 1
 
 
+def test_single_chapter_window_does_not_preplan_duplicate_followup(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"window_size": 1, "idempotency_key": "single-window-horizon"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+
+    import app.auto_director as volume_module
+
+    def fake_advance(self, db, run):
+        run.context = {**(run.context or {}), "last_adopted_chapter_number": 1}
+        run.status = "RUNNING"
+        return run
+
+    monkeypatch.setattr(volume_module.AutoDirectorOrchestrator, "advance_to_pause", fake_advance)
+    assert client.post(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}/continue").status_code == 200
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        windows = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id)).all()
+        assert len(windows) == 1
+
+
 def test_open_window_can_continue_after_estimated_chapter_600(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"estimated_chapters": 600, "window_size": 5, "idempotency_key": "beyond-estimate"})
