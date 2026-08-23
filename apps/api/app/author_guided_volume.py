@@ -352,6 +352,7 @@ class AuthorGuidedVolumeService:
         run.status = AutoDirectorRunStatus.RUNNING
         orchestrator = AutoDirectorOrchestrator()
         orchestrator.advance_to_pause(db, run)
+        self._annotate_usage_scope(db, run)
         adopted_number = int((run.context or {}).get("last_adopted_chapter_number", 0) or 0)
         if adopted_number:
             window.actual_generated_count = len(db.scalars(select(Chapter.id).where(Chapter.project_id == project.id, Chapter.number >= window.start_chapter_number, Chapter.number <= adopted_number, Chapter.active.is_(True), Chapter.content.is_not(None))).all())
@@ -371,3 +372,32 @@ class AuthorGuidedVolumeService:
             run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION
             run.next_action = "正在执行当前章节窗口。"
         return run
+
+    @staticmethod
+    def _annotate_usage_scope(db: Session, run: AutoDirectorRun) -> None:
+        """Persist durable boundaries for usage projections after each checkpoint."""
+        context = dict(run.context or {})
+        volume_id = context.get("volume_id")
+        window_id = context.get("window_id")
+        windows = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.project_id == run.project_id)).all()
+        chapters = db.scalars(select(Chapter).where(Chapter.project_id == run.project_id)).all()
+        chapters_by_id = {item.id: item.number for item in chapters}
+        for step in db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all():
+            payload = dict(step.output_payload or {})
+            chapter_number = payload.get("chapter_number")
+            chapter_id = payload.get("chapter_id")
+            if chapter_number is None and chapter_id:
+                chapter_number = chapters_by_id.get(chapter_id)
+            scoped_window_id = payload.get("author_window_id") or window_id
+            if chapter_number is not None:
+                for candidate in windows:
+                    if candidate.start_chapter_number <= int(chapter_number) <= candidate.end_chapter_number:
+                        scoped_window_id = candidate.id
+                        break
+            scoped_volume_id = volume_id
+            if scoped_window_id:
+                candidate = next((item for item in windows if item.id == scoped_window_id), None)
+                if candidate:
+                    scoped_volume_id = candidate.volume_id
+            payload.update({"chapter_number": chapter_number, "window_id": scoped_window_id, "volume_id": scoped_volume_id})
+            step.output_payload = payload
