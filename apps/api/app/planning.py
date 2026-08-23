@@ -15,7 +15,7 @@ from .ai.errors import ModelProviderError
 from .ai.factory import get_model_provider
 from .llm_actor import _extract_single_json_object
 from .model_router import ModelRouter, ProviderCredentialResolver
-from .models import CanonFact, Character, Project, StoryPlan, StoryPlanArc, StoryPlanChapter, StoryPlanStatus, StoryPlanVolume, StoryThread
+from .models import CanonFact, Character, Project, ProjectModelConfig, StoryPlan, StoryPlanArc, StoryPlanChapter, StoryPlanStatus, StoryPlanVolume, StoryThread
 from .settings import get_settings
 
 
@@ -280,13 +280,19 @@ def generation_context(db: Session, project: Project, framing: dict[str, Any], p
     return {"project": project.name, "framing": framing, "premise": premise or project.story_seed, "existing_characters": characters, "world_facts": facts, "story_threads": threads}
 
 
+INITIAL_CHAPTER_WINDOW = 12
+
+
 def generate_plan(db: Session, project: Project, framing: dict[str, Any], premise: str | None, style_guide: dict[str, Any], anti_ai_rules: dict[str, Any]) -> tuple[dict[str, Any], Any]:
     settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
     key = ProviderCredentialResolver().generation_key(db, project.id, settings)
-    provider = get_model_provider(settings, route.provider, route.base_url, key)
-    contract = {"framing": "object", "premise": "string", "macro_plan": "object", "style_guide": "object", "anti_ai_rules": "object", "volumes": "array", "arcs": "array", "chapters": "array"}
-    instruction = "Return exactly one JSON object. Build a coherent long-form Chinese novel plan, not prose. Every chapter must be an executable task sheet with start/end state, conflict, mandatory and forbidden events, reveal permissions, foreshadowing, character changes, consequences, and 3-6 scene beats. Do not invent UUIDs: use existing IDs only when supplied, otherwise use stable human-readable names. Avoid generic AI phrasing, symmetrical slogans, empty metaphors, and omniscient knowledge leaks. Preserve chronology. Output keys must match the contract."
-    messages = [{"role": "system", "content": "你是长篇小说总策划与连续性编辑。"}, {"role": "user", "content": json.dumps({"instruction": instruction, "output_contract": contract, "context": generation_context(db, project, framing, premise), "style_guide": style_guide, "anti_ai_rules": anti_ai_rules}, ensure_ascii=False)}]
+    config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project.id))
+    provider = get_model_provider(settings, route.provider, route.base_url, key, timeout_seconds=(config.request_timeout_seconds if config else None), max_retries=(config.max_retries if config else 0), rate_limit_per_minute=(config.rate_limit_per_minute if config else 0))
+    target_chapters = int(framing.get("target_chapters") or 50)
+    detailed_chapters = min(target_chapters, INITIAL_CHAPTER_WINDOW)
+    contract = {"framing": "object", "premise": "string", "macro_plan": "object", "style_guide": "object", "anti_ai_rules": "object", "volumes": "array covering the full book", "arcs": "array covering the full book", "chapters": f"array with exactly chapters 1-{detailed_chapters}"}
+    instruction = f"Return exactly one JSON object. Build a coherent long-form Chinese novel plan, not prose. The book has {target_chapters} chapters. Volumes and arcs must cover the entire book from chapter 1 through chapter {target_chapters}. Return executable task sheets only for chapters 1-{detailed_chapters}; later chapters will be planned at future checkpoints. Every returned chapter must include start/end state, conflict, mandatory and forbidden events, reveal permissions, foreshadowing, character changes, consequences, and 3-6 scene beats. Do not invent UUIDs: use existing IDs only when supplied, otherwise use stable human-readable names. Avoid generic AI phrasing, symmetrical slogans, empty metaphors, and omniscient knowledge leaks. Preserve chronology. Output keys must match the contract."
+    messages = [{"role": "system", "content": "你是长篇小说总策划与连续性编辑。"}, {"role": "user", "content": json.dumps({"instruction": instruction, "output_contract": contract, "context": generation_context(db, project, framing, premise), "planning_scope": {"book_target_chapters": target_chapters, "detailed_chapter_window": {"start": 1, "end": detailed_chapters}}, "style_guide": style_guide, "anti_ai_rules": anti_ai_rules}, ensure_ascii=False)}]
     result = provider.generate(messages, route.model)
     try:
         parsed = _extract_single_json_object(result.content)
@@ -297,4 +303,7 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
         ]
         result = provider.generate(repair_messages, route.model)
         parsed = _extract_single_json_object(result.content)
+    chapters = parsed.get("chapters") if isinstance(parsed, dict) else None
+    if isinstance(chapters, list) and len(chapters) > detailed_chapters:
+        parsed["chapters"] = chapters[:detailed_chapters]
     return parsed, result
