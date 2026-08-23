@@ -50,6 +50,7 @@ def continue_author_guided_run(project_id: str, run_id: str, db: Session = Depen
     require_project(db, project_id); run = db.get(AutoDirectorRun, run_id)
     if not run or run.project_id != project_id or run.run_mode != "AUTHOR_GUIDED_VOLUME": raise HTTPException(status_code=404, detail="Author-guided run not found")
     run.status = AutoDirectorRunStatus.RUNNING; run.current_stage = AutoDirectorStage.VOLUME_ACTIVE; run.pause_reason = None; run.next_action = "正在继续当前卷窗口。"
+    run.context = {**(run.context or {}), "execute_window": True}
     db.commit(); return _run_payload(db, run)
 
 

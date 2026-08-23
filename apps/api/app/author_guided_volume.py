@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from .models import (
     AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage,
+    AutoDirectorStep, AutoDirectorStepStatus,
     BookCompletionProposal, BookCompletionProposalStatus, BookContract,
     Chapter, ChapterPlanningWindow, ChapterWindowStatus, ForeshadowingLedger,
     ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus,
@@ -247,8 +248,54 @@ class AuthorGuidedVolumeService:
         run.context = {**run.context, "volume_id": volume.id}
         window = self.ensure_window(db, project, volume, author_note=request.get("author_note"), size=request.get("window_size"))
         task_ids = self.ensure_window_tasks(db, project, volume, window, contract)
-        run.context = {**run.context, "window_id": window.id, "current_chapter_number": window.start_chapter_number}
+        prior_context = dict(run.context or {})
+        current_number = int(prior_context.get("current_chapter_number") or window.start_chapter_number)
+        if prior_context.get("window_id") != window.id:
+            current_number = window.start_chapter_number
+        run.context = {**prior_context, "window_id": window.id, "current_chapter_number": current_number}
         run.context = {**run.context, "window_task_ids": task_ids, "window_task_count": len(task_ids)}
+        if not run.context.get("execute_window"):
+            run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_PLANNING
+            run.status = AutoDirectorRunStatus.PAUSED
+            run.pause_reason = "AUTHOR_WINDOW_READY"
+            run.next_action = f"第 {volume.volume_number} 卷第 {window.start_chapter_number}-{window.end_chapter_number} 章窗口已准备，作者可继续或输入指导。"
+            return run
+        # The existing orchestrator owns scenes, Writer, quality, repair and
+        # adoption. Author mode only supplies the bounded plan and checkpoint.
+        from .auto_director import AutoDirectorOrchestrator
+        plan_id = None
+        for candidate in db.scalars(select(StoryPlan).where(StoryPlan.project_id == project.id).order_by(StoryPlan.version.desc())).all():
+            if (candidate.generation_report or {}).get("author_window_id") == window.id:
+                plan_id = candidate.id
+                break
+        if not plan_id:
+            plan = db.scalar(select(StoryPlan).where(StoryPlan.project_id == project.id).order_by(StoryPlan.version.desc()))
+            plan_id = plan.id if plan else None
+        if not plan_id:
+            raise AuthorGuidedVolumeError("WINDOW_PLAN_MISSING")
+        request = dict(run.settings or {})
+        request.setdefault("target_chapters", window.end_chapter_number)
+        request.setdefault("max_chapters", window.end_chapter_number)
+        run.settings = {**request, "target_chapters": window.end_chapter_number, "max_chapters": window.end_chapter_number}
+        direction = {"title": contract.title or project.name, "premise": contract.premise or project.story_seed or "", "core_conflict": volume.core_conflict or contract.global_plot_direction or "", "first_volume_goal": volume.volume_goal or "", "style_advice": (contract.style_contract or {}).get("tone", ""), "world_boundaries": [], "protagonist": contract.protagonist_contract or {}}
+        context = {**(run.context or {}), "selected_direction": direction, "plan_id": plan_id}
+        run.context = context
+        if not any(step.stage == AutoDirectorStage.CHAPTER_PLANNING and step.status == AutoDirectorStepStatus.COMMITTED for step in db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()):
+            step = AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.CHAPTER_PLANNING, input_fingerprint=_fingerprint({"window_id": window.id, "plan_id": plan_id}), status=AutoDirectorStepStatus.COMMITTED, output_artifact_id=plan_id, output_payload={"plan_id": plan_id, "author_window_id": window.id}, completed_at=datetime.utcnow())
+            db.add(step); db.flush()
         run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION
-        run.status = AutoDirectorRunStatus.PAUSED; run.pause_reason = "AUTHOR_WINDOW_READY"; run.next_action = f"第 {volume.volume_number} 卷第 {window.start_chapter_number}-{window.end_chapter_number} 章窗口已准备，作者可继续或输入指导。"
+        run.status = AutoDirectorRunStatus.RUNNING
+        orchestrator = AutoDirectorOrchestrator()
+        orchestrator.advance_to_pause(db, run)
+        if run.status == AutoDirectorRunStatus.COMPLETED and int((run.context or {}).get("last_adopted_chapter_number", 0) or 0) >= window.end_chapter_number:
+            volume.actual_chapter_start = volume.actual_chapter_start or window.start_chapter_number
+            volume.actual_chapter_end = max(volume.actual_chapter_end or 0, window.end_chapter_number)
+            run.status = AutoDirectorRunStatus.PAUSED
+            run.current_stage = AutoDirectorStage.VOLUME_PROGRESS_ASSESSMENT
+            run.pause_reason = "WINDOW_COMPLETE"
+            run.next_action = "当前窗口已完成，系统等待继续当前卷、扩展当前卷或作者确认封存。"
+            window.continuation_decision = "ASSESS_VOLUME"
+        elif run.status == AutoDirectorRunStatus.RUNNING:
+            run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION
+            run.next_action = "正在执行当前章节窗口。"
         return run
