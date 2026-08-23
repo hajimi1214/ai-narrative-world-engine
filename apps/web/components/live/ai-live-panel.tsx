@@ -5,6 +5,7 @@ import { AlertTriangle, CheckCircle2, ChevronDown, CircleDot, LoaderCircle, Radi
 import { api } from "../../app/lib";
 
 type Trace = { id: string; stage?: string; status?: string; model?: string | null; latency_ms?: number | null; error_code?: string | null; created_at?: string | null; source_type?: string | null };
+type AutoRun = { id: string; status?: string; current_stage?: string; updated_at?: string; pause_reason?: string; steps?: Array<{ id: string; stage?: string; status?: string; error_code?: string; started_at?: string; completed_at?: string; usage_metrics?: { model?: string; latency_ms?: number } }> };
 
 const stageLabels: Record<string, string> = { WRITER: "正文写作", CRITIC: "章节审核", REPAIR: "问题修复", DIRECTOR: "导演规划", CHARACTER_ACTOR: "角色行动", WORLD_RESOLVER: "世界裁定", SCENE_COMMIT: "保存场景", AUTONOMOUS_LOOP: "自动推进" };
 const statusLabels: Record<string, string> = { STARTED: "进行中", SUCCEEDED: "已完成", FAILED: "失败", BLOCKED: "已暂停" };
@@ -14,7 +15,25 @@ const timeText = (value?: string | null) => value ? new Date(value).toLocaleTime
 
 export function AiLivePanel({ projectId }: { projectId: string }) {
   const [open, setOpen] = useState(false); const [traces, setTraces] = useState<Trace[]>([]); const [collapsed, setCollapsed] = useState(false);
-  const load = async () => { try { setTraces((await api(`/projects/${projectId}/execution-traces?limit=18`)) as Trace[]); } catch { /* A missing log must not interrupt writing. */ } };
+  const load = async () => {
+    try {
+      const [execution, autoRuns] = await Promise.all([
+        api(`/projects/${projectId}/execution-traces?limit=18`) as Promise<Trace[]>,
+        api(`/projects/${projectId}/auto-director/runs`).catch(() => []) as Promise<AutoRun[]>,
+      ]);
+      const autoTraces = (autoRuns || []).flatMap((run) => (run.steps || []).map((step) => ({
+        id: `auto-${step.id}`,
+        stage: step.stage,
+        status: step.status === "COMMITTED" ? "SUCCEEDED" : step.status === "FAILED" || step.status === "BLOCKED" ? step.status : run.status === "RUNNING" && step.stage === run.current_stage ? "STARTED" : step.status,
+        model: step.usage_metrics?.model,
+        latency_ms: step.usage_metrics?.latency_ms,
+        error_code: step.error_code,
+        created_at: step.started_at || run.updated_at,
+        source_type: "AUTO_DIRECTOR",
+      } as Trace)));
+      setTraces([...execution, ...autoTraces].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || ""))).slice(0, 24));
+    } catch { /* A missing log must not interrupt writing. */ }
+  };
   useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 2200); return () => window.clearInterval(timer); }, [projectId]);
   const active = useMemo(() => traces.filter((trace) => trace.status === "STARTED"), [traces]);
   return <>
