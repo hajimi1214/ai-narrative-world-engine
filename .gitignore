@@ -8,5 +8,6 @@ logs/
 .env
 node_modules/
 .next/
+.next-dev/
 dist/
 *.tsbuildinfo
