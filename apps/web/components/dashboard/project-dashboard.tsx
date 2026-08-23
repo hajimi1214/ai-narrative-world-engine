@@ -14,6 +14,14 @@ const stats = [
   { key:"recent_scenes", title:"最近场景", icon:Clock3, note:"已记录的世界事件", href:"director" },
 ];
 
+function storyPreview(value?: string) {
+  const source = (value || "").replace(/\s+/g, " ").trim();
+  if (!source) return "从世界、人物与一条未解的线索开始。";
+  const boundary = source.search(/[。！？]/);
+  const excerpt = boundary >= 0 ? source.slice(0, boundary + 1) : source;
+  return excerpt.length > 220 ? `${excerpt.slice(0, 220)}…` : excerpt;
+}
+
 export function ProjectDashboard({ projectId }: { projectId: string }) {
   const query = useQuery({ queryKey:["project-control-room",projectId], queryFn:async () => {
     const snapshot = await api(`/projects/${projectId}/snapshot`) as any;
@@ -28,8 +36,9 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
   if (query.isError) return <ErrorState message="暂时无法读取世界状态。" retry={() => void query.refetch()} />;
   const data = query.data; const project = data.project || {}; const scenes = data.recent_scenes || []; const arc = data.current_story_arc;
   const emptyWorld = (data.active_characters || []).length === 0 && scenes.length === 0 && !arc;
+  const seed = project.story_seed || "";
   return <main className="creative-hub">
-    <header className="hub-header"><div><p className="eyebrow">STORY CONTROL ROOM</p><h1>{project.name || "未命名世界"}</h1><p>{project.story_seed || "从世界、人物与一条未解的线索开始。"}</p></div><div className="hub-header-side"><StatusBadge value={displayStatus(project.status)} /><span>世界时间：{project.current_world_time || "尚未建立"}</span></div></header>
+    <header className="hub-header"><div><p className="eyebrow">STORY CONTROL ROOM</p><h1>{project.name || "未命名世界"}</h1><p>{storyPreview(seed)}</p>{seed.length > 240 && <details className="story-source"><summary>查看已保存的完整设定 <span>{seed.length.toLocaleString("zh-CN")} 字</span></summary><div>{seed}</div></details>}</div><div className="hub-header-side"><StatusBadge value={displayStatus(project.status)} /><span>世界时间：{project.current_world_time || "尚未建立"}</span></div></header>
     <WorkflowOverview projectId={projectId} data={data} />
     {emptyWorld ? <EmptyWorld projectId={projectId} data={data} /> : <RunningWorld projectId={projectId} data={data} scenes={scenes} arc={arc} />}
   </main>;
