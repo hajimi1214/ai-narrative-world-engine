@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 import app.api as api_module
 import app.planning as planning_module
 from app.ai.fake import FakeModelProvider
+from app.ai.errors import MODEL_UPSTREAM_ERROR, ModelProviderError
 from app.db import Base
 from app.main import app
 from app.models import Project, ProjectModelConfig
@@ -39,3 +40,51 @@ def test_phase2_plan_generation_creates_versioned_chapter_task_sheets(monkeypatc
         assert patch.status_code == 200
         blocked = TestClient(app).patch(f"/projects/{project.id}/planning/plans/{body['id']}/chapters/{chapter_id}", json={"title": "不应修改"})
         assert blocked.status_code == 409
+
+
+def test_long_book_generation_separates_macro_architecture_and_detail_window(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    with Session() as db:
+        project = Project(name="Long", story_seed="很长的故事设定")
+        db.add(project); db.flush()
+        db.add(ProjectModelConfig(project_id=project.id, provider="openai_compatible", base_url="https://tokenrhythm.studio/v1", director_model="deepseek-v4-pro")); db.commit()
+        macro = {"macro_plan": {"logline": "全书主线"}, "volumes": [{"number": 1, "title": "第一卷", "summary": "开端", "start_chapter": 1, "end_chapter": 45}], "arcs": [{"number": 1, "volume_number": 1, "title": "开局", "goal": "进入谜团", "summary": "主线启动"}]}
+        details = {"chapters": [{"number": 1, "title": "第一章", "summary": "开局", "objective": "接案", "conflict": "阻碍", "scene_beats": ["事件"]}]}
+        fake = FakeModelProvider([json.dumps(macro, ensure_ascii=False), json.dumps(details, ensure_ascii=False)])
+        monkeypatch.setattr(planning_module, "get_model_provider", lambda *args, **kwargs: fake)
+        payload = {"framing": {"inspiration": "很长的故事设定", "target_chapters": 450, "target_words_per_chapter": 2800}}
+        generated, _ = planning_module.generate_plan(db, project, payload["framing"], None, {}, {})
+        assert fake.calls == 2
+        assert generated["volumes"][0]["end_chapter"] == 45
+        assert generated["chapters"][0]["number"] == 1
+        first_request = json.loads(fake.messages[0][1]["content"])
+        assert "chapters" not in first_request["output_contract"]
+        assert "inspiration" not in first_request["context"]["framing"]
+
+
+def test_long_book_keeps_macro_plan_when_detail_provider_fails(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+
+    class MacroThenFailure:
+        name = "fake"
+        def __init__(self): self.calls = 0
+        def generate(self, messages, model):
+            self.calls += 1
+            if self.calls == 2:
+                raise ModelProviderError(MODEL_UPSTREAM_ERROR)
+            from app.ai.provider import ModelResult
+            return ModelResult(content=json.dumps({"macro_plan": {"logline": "全书主线"}, "volumes": [{"number": 1, "title": "第一卷", "summary": "开端", "start_chapter": 1, "end_chapter": 450}], "arcs": []}, ensure_ascii=False), latency_ms=1, request_id="macro", provider="fake", model=model)
+
+    with Session() as db:
+        project = Project(name="Long", story_seed="长篇设定")
+        db.add(project); db.flush(); db.add(ProjectModelConfig(project_id=project.id, provider="openai_compatible", base_url="https://tokenrhythm.studio/v1", director_model="deepseek-v4-pro")); db.commit()
+        fake = MacroThenFailure()
+        monkeypatch.setattr(planning_module, "get_model_provider", lambda *args, **kwargs: fake)
+        generated, _ = planning_module.generate_plan(db, project, {"inspiration": "长篇设定", "target_chapters": 450, "target_words_per_chapter": 2800}, None, {}, {})
+        assert fake.calls == 2
+        assert generated["generation_warning"] == "CHAPTER_DETAIL_DEFERRED"
+        assert len(generated["chapters"]) == planning_module.INITIAL_CHAPTER_WINDOW
