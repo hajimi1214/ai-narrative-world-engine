@@ -494,6 +494,16 @@ class AutoDirectorOrchestrator:
             fact = CanonFact(project_id=project.id, fact_type=fact_type, proposition=proposition, data={"auto_director": True, "world_boundary_ids": world_ids}, locked=False)
             db.add(fact)
             facts.append(fact)
+        # The runtime needs one concrete, inspectable starting point even when
+        # a direction supplied only abstract world rules. This is a reference
+        # to author-provided material, not a newly invented canon event.
+        primary_world = db.get(WorldEntity, world_ids[0])
+        if primary_world:
+            primary_world.profile = {
+                **(primary_world.profile or {}),
+                "inspectable": str(primary_world.profile.get("description") or direction.get("premise") or project.story_seed or "故事的既定开端"),
+                "auto_director_runtime_anchor": True,
+            }
         db.flush()
         main_thread = threads[0]
         first_fact = facts[0]
@@ -505,6 +515,32 @@ class AutoDirectorOrchestrator:
         world_step = self._step(db, run, AutoDirectorStage.WORLD_BUILDING, {"direction_fingerprint": fingerprint(direction), "world_entity_ids": world_ids})
         if world_step.status != AutoDirectorStepStatus.COMMITTED:
             self._commit_step(world_step, {"world_entity_ids": world_ids, "canon_fact_ids": [item.id for item in facts], "canon_fact_id": first_fact.id}, first_fact.id)
+
+    def _seed_runtime_context(self, db: Session, run: AutoDirectorRun, project: Project, chapter_number: int, planning_task: dict[str, Any]) -> None:
+        """Make existing direction and task facts available to a paused resolver."""
+        context = run.context or {}
+        seeded = dict(context.get("runtime_context_seeded") or {})
+        if seeded.get(str(chapter_number)):
+            return
+        direction = context.get("selected_direction") or {}
+        boundaries = [str(item) for item in direction.get("world_boundaries") or [] if str(item).strip()]
+        proposition = "；".join(part for part in [
+            str(direction.get("premise") or "").strip(),
+            f"本章目标：{planning_task.get('objective')}" if planning_task.get("objective") else "",
+            f"本章冲突：{planning_task.get('conflict')}" if planning_task.get("conflict") else "",
+            f"既定世界边界：{'；'.join(boundaries[:3])}" if boundaries else "",
+        ] if part)[:4000]
+        fact = CanonFact(
+            project_id=project.id,
+            fact_type=CanonType.WORLD_FACT,
+            proposition=proposition or f"第 {chapter_number} 章从已确认的书级设定继续。",
+            data={"auto_director": True, "global_world_rule": True, "chapter_number": chapter_number, "purpose": "RUNTIME_CONTEXT_RECOVERY"},
+            locked=False,
+        )
+        db.add(fact)
+        seeded[str(chapter_number)] = fact.id
+        run.context = {**context, "runtime_context_seeded": seeded}
+        db.flush()
 
     def _plan_and_first_chapter(self, db: Session, run: AutoDirectorRun, project: Project) -> None:
         direction = run.context["selected_direction"]
@@ -582,7 +618,18 @@ class AutoDirectorOrchestrator:
         runtime_live = self._live_begin(run, f"第 {chapter_number} 章：角色 Agent 与世界运行", "WORLD_RUNTIME")
         live_execution_broker.phase(runtime_live, "AGENT_ACTING", "角色 Agent 正在根据目标、记忆和世界边界行动")
         try:
-            result = AutonomousWorldLoopService().advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
+            runtime = AutonomousWorldLoopService()
+            # A resolver may correctly decline an action when a legacy project
+            # has only prose boundaries. Supply a canonical runtime anchor and
+            # resume the same persisted scene once; do not regenerate it.
+            if enum_value(autonomous.status) == "PAUSED" and autonomous.stop_reason == "WORLD_INFORMATION_MISSING":
+                self._seed_runtime_context(db, run, project, chapter_number, planning_task)
+                runtime.resume(db, autonomous.id)
+            result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
+            if result.get("run", {}).get("stop_reason") == "WORLD_INFORMATION_MISSING":
+                self._seed_runtime_context(db, run, project, chapter_number, planning_task)
+                runtime.resume(db, autonomous.id)
+                result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
             self._live_complete(runtime_live, "角色行动与世界裁定已提交，正在形成章节")
         except Exception as exc:
             self._live_fail(runtime_live, exc)
