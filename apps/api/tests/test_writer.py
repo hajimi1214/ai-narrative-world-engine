@@ -453,6 +453,12 @@ def test_parser_accepts_single_markdown_json_wrapper():
     assert parsed["prose"] == "The hall remains quiet."
 
 
+def test_parser_accepts_single_json_object_with_provider_preamble():
+    raw = response(scene_ids=["scene"])
+    parsed = WriterProjectionService._parse(f"Here is the chapter JSON:\n{raw}\nDone.")
+    assert parsed["prose"] == "The hall remains quiet."
+
+
 def test_parser_rejects_unclosed_markdown_wrapper():
     with pytest.raises(ValueError, match="MODEL_OUTPUT_INVALID"):
         WriterProjectionService._parse("```json\n{}")

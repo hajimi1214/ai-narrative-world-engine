@@ -639,7 +639,25 @@ class WriterProjectionService:
                 raise ValueError("MODEL_OUTPUT_INVALID")
             raw = "\n".join(lines[1:-1]).strip()
         try:
-            value = WriterOutputPayload.model_validate_json(raw)
+            # Some compatible providers add a short preamble or trailing note
+            # around the object. Accept exactly one decodable object and keep
+            # the strict output contract as the authority on its fields.
+            decoder = json.JSONDecoder()
+            objects: list[dict[str, Any]] = []
+            skip_until = 0
+            for index, character in enumerate(raw):
+                if index < skip_until or character != "{":
+                    continue
+                try:
+                    candidate, end = decoder.raw_decode(raw, index)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict):
+                    objects.append(candidate)
+                    skip_until = end
+            if len(objects) != 1:
+                raise ValueError("MODEL_OUTPUT_INVALID")
+            value = WriterOutputPayload.model_validate(objects[0])
         except ValidationError as exc:
             raise ValueError("MODEL_OUTPUT_INVALID") from exc
         if not value.prose.strip():
