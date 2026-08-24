@@ -652,10 +652,12 @@ class AutoDirectorOrchestrator:
         # committed scene and preserve the existing structure invariants.
         planning_task = chapter_task_context(db, project.id, chapter_number, required=True)
         existing_chapter = db.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.number == chapter_number, Chapter.active.is_(True)))
-        # A committed world scene is the durable hand-off to Writer. More
-        # scenes belong to subsequent director checkpoints; requiring a whole
-        # scene budget before prose makes a chapter appear permanently stuck.
-        scene_count = 1
+        # A recovered chapter that already has a committed scene can proceed
+        # to Writer. A brand-new chapter retains the configured scene budget
+        # so its formal chapter projection is complete.
+        max_scene_count = max(1, NarrativeStructureConfig.resolve(project).chapter_max_scenes)
+        existing_scene_count = len(existing_chapter.source_scene_ids or []) if existing_chapter else 0
+        scene_count = 1 if existing_scene_count else max(1, max_scene_count - 1)
         scene_step = None
         autonomous_run_ids = []
         if run.status != AutoDirectorRunStatus.RUNNING or (run.context or {}).get("stop_requested"):
