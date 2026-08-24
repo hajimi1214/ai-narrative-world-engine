@@ -213,6 +213,11 @@ def test_critic_parser_accepts_strict_payload():
     assert value["decision"] == "PASS" and value["scores"]["overall"] == 95
 
 
+def test_critic_parser_accepts_single_wrapped_json_object():
+    value = CriticOutputValidator().parse(f"Analysis:\n{critic_response()}\nDone.", "prose", [])
+    assert value["decision"] == "PASS"
+
+
 @pytest.mark.parametrize("content", ["not json", "```json\n{}\n```", json.dumps({"decision": "PASS"}), critic_response(overall=101)])
 def test_malformed_critic_is_rejected(content):
     with pytest.raises(QualityDomainError, match="MODEL_OUTPUT_INVALID"):

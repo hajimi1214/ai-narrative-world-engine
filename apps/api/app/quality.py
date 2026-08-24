@@ -550,12 +550,33 @@ class CriticOutputPayload(BaseModel):
 
 class CriticOutputValidator:
     def parse(self, content: str, prose: str, allowed_refs: list[dict[str, str]]) -> dict[str, Any]:
-        if content.strip().startswith("```"):
-            raise QualityDomainError(MODEL_OUTPUT_INVALID)
+        raw = content.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if len(lines) < 3 or not lines[-1].strip().startswith("```"):
+                raise QualityDomainError(MODEL_OUTPUT_INVALID)
+            raw = "\n".join(lines[1:-1]).strip()
         try:
-            payload = CriticOutputPayload.model_validate_json(content)
+            decoder = json.JSONDecoder()
+            objects: list[dict[str, Any]] = []
+            skip_until = 0
+            for index, character in enumerate(raw):
+                if index < skip_until or character != "{":
+                    continue
+                try:
+                    candidate, end = decoder.raw_decode(raw, index)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict):
+                    objects.append(candidate)
+                    skip_until = end
+            if len(objects) != 1:
+                raise ValueError("one JSON object required")
+            payload = CriticOutputPayload.model_validate(objects[0])
         except ValidationError as exc:
             raise QualityDomainError(MODEL_OUTPUT_INVALID, {"errors": exc.errors(include_url=False)}) from exc
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise QualityDomainError(MODEL_OUTPUT_INVALID) from exc
         allowed = {(item["source_type"], item["source_id"]) for item in allowed_refs}
         result = payload.model_dump(mode="json")
         for item in result["findings"]:
