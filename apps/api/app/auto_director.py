@@ -745,6 +745,14 @@ class AutoDirectorOrchestrator:
         draft_id = writer_step.output_payload["draft_id"]
         run.current_stage = AutoDirectorStage.QUALITY_REVIEW
         quality_step = self._step(db, run, AutoDirectorStage.QUALITY_REVIEW, {"draft_id": draft_id})
+        existing_assessment_id = (quality_step.output_payload or {}).get("assessment_id")
+        existing_assessment = db.get(ChapterQualityAssessment, existing_assessment_id) if existing_assessment_id else None
+        if quality_step.status == AutoDirectorStepStatus.COMMITTED and existing_assessment and enum_value(existing_assessment.status) == "FAILED":
+            # A critic upstream failure is recoverable. Reopen the checkpoint
+            # so a later worker pass can make a fresh provider request.
+            quality_step.status = AutoDirectorStepStatus.RUNNING
+            quality_step.attempt += 1
+            quality_step.started_at = datetime.utcnow()
         if quality_step.status != AutoDirectorStepStatus.COMMITTED:
             self._check_budget(run)
             settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "CRITIC")
@@ -756,7 +764,7 @@ class AutoDirectorOrchestrator:
             critic_live = self._live_begin(run, f"第 {chapter_number} 章：质量审计", "CRITIC", provider=route.provider, model=route.model)
             live_execution_broker.phase(critic_live, "REVIEWING", "质量 Agent 正在审计任务覆盖、连续性和正文问题")
             try:
-                assessment = QualityGateService().assess(db, chapter.id, {"idempotency_key": f"{run.id}-quality-{chapter_number}"}, provider=critic_provider, model=route.model, settings=settings, draft=draft, require_current=False)
+                assessment = QualityGateService().assess(db, chapter.id, {"idempotency_key": f"{run.id}-quality-{chapter_number}-attempt-{quality_step.attempt}"}, provider=critic_provider, model=route.model, settings=settings, draft=draft, require_current=False)
                 self._live_complete(critic_live, f"质量审计完成：{enum_value(assessment.status)}")
             except Exception as exc:
                 self._live_fail(critic_live, exc)
