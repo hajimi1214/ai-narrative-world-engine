@@ -629,8 +629,15 @@ class WriterProjectionService:
     @staticmethod
     def _parse(content: str) -> dict[str, Any]:
         raw = content.strip()
+        # OpenAI-compatible providers, including DeepSeek, occasionally wrap
+        # an otherwise valid structured response in one Markdown JSON fence.
+        # Treat that transport decoration as equivalent JSON, while retaining
+        # Pydantic's strict schema validation below.
         if raw.startswith("```"):
-            raise ValueError("MODEL_OUTPUT_INVALID")
+            lines = raw.splitlines()
+            if len(lines) < 3 or not lines[-1].strip().startswith("```"):
+                raise ValueError("MODEL_OUTPUT_INVALID")
+            raw = "\n".join(lines[1:-1]).strip()
         try:
             value = WriterOutputPayload.model_validate_json(raw)
         except ValidationError as exc:

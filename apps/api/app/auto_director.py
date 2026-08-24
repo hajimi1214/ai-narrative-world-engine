@@ -30,7 +30,7 @@ from .models import (
     AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep,
     AutoDirectorStepStatus, Chapter, ChapterWriterDraft, ChapterQualityAssessment, ChapterQualityFinding,
     Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, StoryPlanArc, StoryPlanStatus, WriterDraftStatus, Character,
-    WorldEntity, StoryThread, CanonFact, StoryArc, EntityType, CanonType, AutonomousRunStatus,
+    WorldEntity, StoryThread, CanonFact, StoryArc, EntityType, CanonType, AutonomousRunStatus, AutonomousWorldRun,
     AutonomousWorldStep, SceneProposal, ScenePerformance, ResolverMode,
 )
 
@@ -667,9 +667,9 @@ class AutoDirectorOrchestrator:
         def collect_scene_usage(event: dict[str, Any]) -> None:
             scene_events.append(dict(event))
         runtime_request_id = f"{run.id}-chapter-{chapter_number}"
-        existing_autonomous = db.scalar(select(__import__("app.models", fromlist=["AutonomousWorldRun"]).AutonomousWorldRun).where(
-            __import__("app.models", fromlist=["AutonomousWorldRun"]).AutonomousWorldRun.project_id == project.id,
-            __import__("app.models", fromlist=["AutonomousWorldRun"]).AutonomousWorldRun.client_request_id == runtime_request_id,
+        existing_autonomous = db.scalar(select(AutonomousWorldRun).where(
+            AutonomousWorldRun.project_id == project.id,
+            AutonomousWorldRun.client_request_id == runtime_request_id,
         ))
         autonomous = existing_autonomous or AutonomousWorldLoopService().create_run(db, project.id, scene_budget=scene_count, max_turns_per_scene=2, performance_mode="LLM", resolver_mode="LLM", config={"auto_director_run_id": run.id, "plan_id": plan_id, "plan_chapter_id": plan_chapter.id, "chapter_number": chapter_number, "planning_task": planning_task}, client_request_id=runtime_request_id)
         db.flush()

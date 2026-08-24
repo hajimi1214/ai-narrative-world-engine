@@ -432,9 +432,15 @@ def test_grounding_rejects_pov_mismatch(writer_project, session):
     assert WriterGroundingValidator().validate(grounded(context, pov_character_id=None), context)["issues"][0]["code"] == "WRITER_POV_MISMATCH"
 
 
-def test_parser_rejects_markdown_wrapper():
+def test_parser_accepts_single_markdown_json_wrapper():
+    raw = response(scene_ids=["scene"])
+    parsed = WriterProjectionService._parse(f"```json\n{raw}\n```")
+    assert parsed["prose"] == "The hall remains quiet."
+
+
+def test_parser_rejects_unclosed_markdown_wrapper():
     with pytest.raises(ValueError, match="MODEL_OUTPUT_INVALID"):
-        WriterProjectionService._parse("```json\n{}\n```")
+        WriterProjectionService._parse("```json\n{}")
 
 
 def test_parser_rejects_extra_server_fields():
