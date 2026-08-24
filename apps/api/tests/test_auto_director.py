@@ -14,7 +14,7 @@ from app.ai.fake import FakeModelProvider
 from app.db import Base
 from app.main import app
 from app.models import (
-    AutoDirectorRun, AutonomousWorldRun, Chapter, ChapterQualityAssessment,
+    AutoDirectorRun, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, AutonomousWorldRun, Chapter, ChapterQualityAssessment,
     ChapterWriterDraft, Project, SceneProposal, VolumeContract,
     VolumeContractStatus,
 )
@@ -52,6 +52,23 @@ def test_auto_director_creates_and_pauses_for_direction(monkeypatch):
     duplicate = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "不同输入", "idempotency_key": "same-run"})
     assert duplicate.status_code == 201
     assert duplicate.json()["id"] == body["id"]
+
+
+def test_retry_ignores_failures_from_recovered_stages(monkeypatch):
+    directions = [{"title": f"方向 {i}", "premise": "主线", "core_conflict": "代价"} for i in range(3)]
+    client, project_id = _client(monkeypatch, directions)
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "重试", "max_retries": 2, "idempotency_key": "retry-stage"}).json()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        for index in range(3):
+            db.add(AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.FRAMING, status=AutoDirectorStepStatus.FAILED, attempt=index + 1, input_fingerprint=f"old-{index}", error_code="OLD_FAILURE"))
+        db.add(AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.CHAPTER_EXECUTION, status=AutoDirectorStepStatus.FAILED, attempt=1, input_fingerprint="writer-1", error_code="WRITER_DRAFT_FAILED"))
+        run.status = "FAILED"; run.current_stage = AutoDirectorStage.FAILED; run.current_chapter_id = "chapter-1"
+        db.commit()
+    retried = client.post(f"/projects/{project_id}/auto-director/runs/{created['id']}/retry")
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["status"] == "RUNNING"
+    assert retried.json()["current_stage"] == "CHAPTER_EXECUTION"
 
 
 def test_auto_director_uses_target_chapters_when_maximum_is_omitted(monkeypatch):

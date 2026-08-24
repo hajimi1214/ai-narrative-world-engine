@@ -81,8 +81,13 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
     run = _run_or_404(db, project_id, run_id)
     if run.status == AutoDirectorRunStatus.COMPLETED:
         raise HTTPException(status_code=409, detail={"code": "RUN_ALREADY_COMPLETED", "message": "已采用正文的运行不可重新生成。"})
-    steps = db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()
-    failures = sum(1 for step in steps if step.status in {AutoDirectorStepStatus.FAILED, AutoDirectorStepStatus.BLOCKED})
+    steps = db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id).order_by(AutoDirectorStep.created_at.desc(), AutoDirectorStep.id.desc())).all()
+    # Historical failures from an already recovered stage must not consume the
+    # retry budget of the stage currently waiting for recovery. For FAILED or
+    # BLOCKED runs, the newest failed step is the authoritative retry target.
+    failed_steps = [step for step in steps if step.status in {AutoDirectorStepStatus.FAILED, AutoDirectorStepStatus.BLOCKED}]
+    retry_stage = failed_steps[0].stage if failed_steps else None
+    failures = sum(1 for step in failed_steps if retry_stage is None or step.stage == retry_stage)
     # The first failed generation is not itself a retry. A configured value of
     # two therefore permits two recovery attempts after that initial failure.
     if failures > int((run.settings or {}).get("max_retries", 0) or 0):
@@ -95,7 +100,8 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
         run.context = {**(run.context or {}), "directions": [], "regenerate_nonce": datetime.utcnow().isoformat()}
         run.current_stage = AutoDirectorStage.FRAMING
         run.pause_reason = None
-    if run.current_stage in {AutoDirectorStage.FAILED, AutoDirectorStage.BLOCKED}: run.current_stage = AutoDirectorStage.CHAPTER_EXECUTION if run.current_chapter_id else AutoDirectorStage.FRAMING
+    if run.current_stage in {AutoDirectorStage.FAILED, AutoDirectorStage.BLOCKED}:
+        run.current_stage = retry_stage or (AutoDirectorStage.CHAPTER_EXECUTION if run.current_chapter_id else AutoDirectorStage.FRAMING)
     run.next_action = "已加入本地自动导演队列，等待 worker 重试。"; db.commit(); return _payload(db, run)
 
 
