@@ -319,6 +319,16 @@ def test_new_request_key_can_retry_a_failed_writer_draft(writer_project, session
     assert recovered.version == failed.version + 1
 
 
+def test_writer_repairs_one_invalid_structured_response(writer_project, session):
+    chapter = writer_project[3]
+    provider = FakeModelProvider(["not-json", response(scene_ids=chapter.source_scene_ids)])
+    draft = WriterProjectionService().render(
+        session, chapter.id, {"pov_mode": "OBJECTIVE"}, provider=provider, model="fake",
+    )
+    assert draft.status == WriterDraftStatus.VALIDATED
+    assert provider.calls == 2
+
+
 def test_render_provider_failure_marks_failed(writer_project, session):
     provider = FakeModelProvider(error=ModelProviderError(MODEL_TIMEOUT))
     draft = WriterProjectionService().render(session, writer_project[3].id, {"pov_mode": "OBJECTIVE"}, provider=provider, model="fake")

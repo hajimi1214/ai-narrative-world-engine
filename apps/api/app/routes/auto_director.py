@@ -86,7 +86,8 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
     # retry budget of the stage currently waiting for recovery. For FAILED or
     # BLOCKED runs, the newest failed step is the authoritative retry target.
     failed_steps = [step for step in steps if step.status in {AutoDirectorStepStatus.FAILED, AutoDirectorStepStatus.BLOCKED}]
-    retry_stage = failed_steps[0].stage if failed_steps else None
+    chapter_failures = [step for step in failed_steps if step.stage == AutoDirectorStage.CHAPTER_EXECUTION]
+    retry_stage = (chapter_failures[0].stage if run.current_chapter_id and chapter_failures else (failed_steps[0].stage if failed_steps else None))
     failures = sum(1 for step in failed_steps if retry_stage is None or step.stage == retry_stage)
     # The first failed generation is not itself a retry. A configured value of
     # two therefore permits two recovery attempts after that initial failure.

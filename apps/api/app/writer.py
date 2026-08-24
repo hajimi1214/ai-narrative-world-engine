@@ -525,8 +525,23 @@ class WriterProjectionService:
             draft.status = WriterDraftStatus.FAILED; draft.validation_report = {"valid": False, "issues": [{"code": exc.code, "blocking": True}]}; draft.completed_at = datetime.utcnow(); ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status, validation_report=draft.validation_report); db.flush(); return draft
         trace = ExecutionTraceRecorder().start(db, project_id=chapter.project_id, stage="WRITER", source_type="CHAPTER_WRITER_DRAFT", source_id=draft.id, provider=getattr(route_provider, "name", None), model=route_model, input_fingerprint=context["writer_context_fingerprint"])
         try:
-            result = route_provider.generate(WriterPromptBuilder().build(context), route_model)
-            parsed = self._parse(result.content)
+            writer_messages = WriterPromptBuilder().build(context)
+            result = route_provider.generate(writer_messages, route_model)
+            try:
+                parsed = self._parse(result.content)
+            except (ValueError, TypeError, json.JSONDecodeError) as first_error:
+                # A formatting miss should get one model-side repair attempt
+                # before the draft is marked failed. The repaired response is
+                # still parsed by the same strict schema and grounding gate.
+                repair_messages = writer_messages + [
+                    {"role": "assistant", "content": result.content},
+                    {"role": "user", "content": json.dumps({
+                        "instruction": "Return exactly one valid JSON object for the original writer output contract. Do not add Markdown, commentary, or fields outside the contract.",
+                        "validation_error": str(first_error),
+                    }, ensure_ascii=False)},
+                ]
+                result = route_provider.generate(repair_messages, route_model)
+                parsed = self._parse(result.content)
             report = WriterGroundingValidator().validate(parsed, context)
             task_issues = validate_task_output(parsed, context.get("planning_task"))
             if task_issues:
