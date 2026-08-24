@@ -31,7 +31,7 @@ from .models import (
     AutoDirectorStepStatus, Chapter, ChapterWriterDraft, ChapterQualityAssessment, ChapterQualityFinding,
     Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, StoryPlanArc, StoryPlanStatus, WriterDraftStatus, Character,
     WorldEntity, StoryThread, CanonFact, StoryArc, EntityType, CanonType, AutonomousRunStatus,
-    AutonomousWorldStep, SceneProposal, ScenePerformance,
+    AutonomousWorldStep, SceneProposal, ScenePerformance, ResolverMode,
 )
 
 
@@ -539,6 +539,14 @@ class AutoDirectorOrchestrator:
             locked=False,
         )
         db.add(fact)
+        world_ids = ((context.get("foundation") or {}).get("world_entity_ids") or [])
+        runtime_entity = db.get(WorldEntity, world_ids[0]) if world_ids else None
+        if runtime_entity:
+            runtime_entity.profile = {
+                **(runtime_entity.profile or {}),
+                "inspectable": proposition or runtime_entity.name,
+                "auto_director_runtime_anchor": True,
+            }
         seeded[str(chapter_number)] = fact.id
         run.context = {**context, "runtime_context_seeded": seeded}
         db.flush()
@@ -566,6 +574,11 @@ class AutoDirectorOrchestrator:
                 proposal.context_fingerprint = DirectorContextBuilder().build(db, autonomous.project_id)["fingerprint"]
             if performance and proposal:
                 performance.proposal_context_fingerprint = proposal.context_fingerprint
+            # The LLM has already reported that the supplied information was
+            # insufficient. Use the newly materialized structured anchor for
+            # this one persisted resolution rather than asking the same
+            # question again; character decisions remain model-driven.
+            autonomous.resolver_mode = ResolverMode.HEURISTIC
         if enum_value(autonomous.status) == "BLOCKED" and autonomous.stop_reason == "AUTONOMY_BASELINE_CHANGED" and autonomous.committed_scene_count == 0:
             autonomous.status = AutonomousRunStatus.PAUSED
             autonomous.active = True
