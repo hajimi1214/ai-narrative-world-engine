@@ -653,7 +653,17 @@ class AutoDirectorOrchestrator:
             # A resolver may correctly decline an action when a legacy project
             # has only prose boundaries. Supply a canonical runtime anchor and
             # resume the same persisted scene once; do not regenerate it.
-            if enum_value(autonomous.status) == "PAUSED" and autonomous.stop_reason == "WORLD_INFORMATION_MISSING":
+            paused_runtime_step = db.scalar(select(AutonomousWorldStep).where(
+                AutonomousWorldStep.run_id == autonomous.id,
+                AutonomousWorldStep.scene_id.is_(None),
+            ).order_by(AutonomousWorldStep.ordinal.desc()))
+            runtime_needs_context = (
+                enum_value(autonomous.status) == "PAUSED"
+                and autonomous.stop_reason in {"WORLD_INFORMATION_MISSING", "AUTONOMY_SCENE_FAILED"}
+                and paused_runtime_step is not None
+                and paused_runtime_step.stop_reason == "WORLD_INFORMATION_MISSING"
+            )
+            if runtime_needs_context:
                 self._seed_runtime_context(db, run, project, chapter_number, planning_task)
                 self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
             elif enum_value(autonomous.status) == "BLOCKED" and autonomous.stop_reason == "AUTONOMY_BASELINE_CHANGED" and int(autonomous.committed_scene_count or 0) == 0:
