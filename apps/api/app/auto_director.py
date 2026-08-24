@@ -666,7 +666,13 @@ class AutoDirectorOrchestrator:
         scene_events: list[dict[str, Any]] = []
         def collect_scene_usage(event: dict[str, Any]) -> None:
             scene_events.append(dict(event))
-        autonomous = AutonomousWorldLoopService().create_run(db, project.id, scene_budget=scene_count, max_turns_per_scene=2, performance_mode="LLM", resolver_mode="LLM", config={"auto_director_run_id": run.id, "plan_id": plan_id, "plan_chapter_id": plan_chapter.id, "chapter_number": chapter_number, "planning_task": planning_task}, client_request_id=f"{run.id}-chapter-{chapter_number}")
+        runtime_request_id = f"{run.id}-chapter-{chapter_number}"
+        existing_autonomous = db.scalar(select(__import__("app.models", fromlist=["AutonomousWorldRun"]).AutonomousWorldRun).where(
+            __import__("app.models", fromlist=["AutonomousWorldRun"]).AutonomousWorldRun.project_id == project.id,
+            __import__("app.models", fromlist=["AutonomousWorldRun"]).AutonomousWorldRun.client_request_id == runtime_request_id,
+        ))
+        requested_scene_budget = existing_autonomous.scene_budget if existing_autonomous else scene_count
+        autonomous = AutonomousWorldLoopService().create_run(db, project.id, scene_budget=requested_scene_budget, max_turns_per_scene=2, performance_mode="LLM", resolver_mode="LLM", config={"auto_director_run_id": run.id, "plan_id": plan_id, "plan_chapter_id": plan_chapter.id, "chapter_number": chapter_number, "planning_task": planning_task}, client_request_id=runtime_request_id)
         db.flush()
         autonomous_run_ids.append(autonomous.id)
         runtime_live = self._live_begin(run, f"第 {chapter_number} 章：角色 Agent 与世界运行", "WORLD_RUNTIME")
