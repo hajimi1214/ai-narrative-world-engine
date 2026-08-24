@@ -283,6 +283,12 @@ def test_assessment_idempotency_skips_second_critic(quality_project, session):
     assert first.id == second.id and provider.calls == 1
 
 
+def test_assessment_repairs_one_invalid_critic_response(quality_project, session):
+    provider = FakeModelProvider(["not-json", critic_response()])
+    assessment = QualityGateService().assess(session, quality_project[3].id, {"client_request_id": "critic-repair"}, provider=provider, model="critic")
+    assert assessment.status.value == "PASS" and provider.calls == 2
+
+
 def test_assessment_request_mismatch_is_rejected(quality_project, session):
     provider = FakeModelProvider(critic_response())
     QualityGateService().assess(session, quality_project[3].id, {"client_request_id": "same"}, provider=provider, model="critic")

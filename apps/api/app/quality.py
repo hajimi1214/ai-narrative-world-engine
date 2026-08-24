@@ -887,7 +887,18 @@ class QualityGateService:
             trace = ExecutionTraceRecorder().start(db, project_id=chapter.project_id, stage="CRITIC", source_type="CHAPTER_QUALITY_ASSESSMENT", source_id=assessment.id, provider=provider_name, model=route_model, input_fingerprint=context["quality_context_fingerprint"])
             try:
                 result = route_provider.generate(prompt, route_model)
-                critic = CriticOutputValidator().parse(result.content, context["prose"], context["renderable_source_refs"])
+                try:
+                    critic = CriticOutputValidator().parse(result.content, context["prose"], context["renderable_source_refs"])
+                except QualityDomainError as first_error:
+                    repair_prompt = prompt + [
+                        {"role": "assistant", "content": result.content},
+                        {"role": "user", "content": json.dumps({
+                            "instruction": "Return exactly one valid JSON object matching the original critic output contract. Do not add Markdown, commentary, revised prose, or extra fields.",
+                            "validation_error": first_error.code,
+                        }, ensure_ascii=False)},
+                    ]
+                    result = route_provider.generate(repair_prompt, route_model)
+                    critic = CriticOutputValidator().parse(result.content, context["prose"], context["renderable_source_refs"])
                 assessment.critic_request_id = result.request_id
                 ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms, request_id=result.request_id, output_fingerprint=_fp(critic, "critic-output-v1"))
             except ModelProviderError as exc:
