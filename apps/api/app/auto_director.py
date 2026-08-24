@@ -31,6 +31,7 @@ from .models import (
     AutoDirectorStepStatus, Chapter, ChapterWriterDraft, ChapterQualityAssessment, ChapterQualityFinding,
     Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, StoryPlanArc, StoryPlanStatus, WriterDraftStatus, Character,
     WorldEntity, StoryThread, CanonFact, StoryArc, EntityType, CanonType, AutonomousRunStatus,
+    AutonomousWorldStep, SceneProposal, ScenePerformance,
 )
 
 
@@ -552,6 +553,19 @@ class AutoDirectorOrchestrator:
             autonomous.start_history_fingerprint = history_fingerprint
         autonomous.current_world_fingerprint = world_fingerprint
         autonomous.current_history_fingerprint = history_fingerprint
+        paused_step = db.scalar(select(AutonomousWorldStep).where(
+            AutonomousWorldStep.run_id == autonomous.id,
+            AutonomousWorldStep.scene_id.is_(None),
+        ).order_by(AutonomousWorldStep.ordinal.desc()))
+        if paused_step and paused_step.status.value == "PAUSED":
+            paused_step.world_fingerprint_before = world_fingerprint
+            proposal = db.get(SceneProposal, paused_step.proposal_id) if paused_step.proposal_id else None
+            performance = db.get(ScenePerformance, paused_step.performance_id) if paused_step.performance_id else None
+            if proposal:
+                from .director import DirectorContextBuilder
+                proposal.context_fingerprint = DirectorContextBuilder().build(db, autonomous.project_id)["fingerprint"]
+            if performance and proposal:
+                performance.proposal_context_fingerprint = proposal.context_fingerprint
         if enum_value(autonomous.status) == "BLOCKED" and autonomous.stop_reason == "AUTONOMY_BASELINE_CHANGED" and autonomous.committed_scene_count == 0:
             autonomous.status = AutonomousRunStatus.PAUSED
             autonomous.active = True
