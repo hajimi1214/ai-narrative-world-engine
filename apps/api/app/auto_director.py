@@ -570,6 +570,13 @@ class AutoDirectorOrchestrator:
             proposal = db.get(SceneProposal, paused_step.proposal_id) if paused_step.proposal_id else None
             performance = db.get(ScenePerformance, paused_step.performance_id) if paused_step.performance_id else None
             if proposal:
+                if not proposal.location_id:
+                    anchor = db.scalar(select(WorldEntity).where(
+                        WorldEntity.project_id == autonomous.project_id,
+                        WorldEntity.active.is_(True),
+                    ).order_by(WorldEntity.created_at, WorldEntity.id))
+                    if anchor:
+                        proposal.location_id = anchor.id
                 from .director import DirectorContextBuilder
                 proposal.context_fingerprint = DirectorContextBuilder().build(db, autonomous.project_id)["fingerprint"]
             if performance and proposal:
