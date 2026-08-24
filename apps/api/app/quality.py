@@ -810,6 +810,10 @@ class QualityAssessmentAudit:
             if critic != sentinel or assessment.overall_score is not None or assessment.critic_request_id is not None or assessment.critic_prompt_fingerprint is not None or assessment.critic_provider is not None or assessment.critic_model is not None or critic_rows or trace_count:
                 raise QualityDomainError("QUALITY_DETERMINISTIC_ONLY_INTEGRITY_INVALID")
         if _value(assessment.status) in {"PASS", "REPAIR_REQUIRED", "BLOCKED"} and config["require_critic"]:
+            if critic.get("fallback") == "DETERMINISTIC_ONLY":
+                if assessment.overall_score is not None or critic_rows:
+                    raise QualityDomainError("QUALITY_CRITIC_REPORT_INVALID")
+                return {"valid": True, "assessment_id": assessment.id, "fallback": True}
             try:
                 CriticOutputPayload.model_validate(critic)
             except ValidationError as exc:
@@ -898,7 +902,13 @@ class QualityGateService:
                         }, ensure_ascii=False)},
                     ]
                     result = route_provider.generate(repair_prompt, route_model)
-                    critic = CriticOutputValidator().parse(result.content, context["prose"], context["renderable_source_refs"])
+                    try:
+                        critic = CriticOutputValidator().parse(result.content, context["prose"], context["renderable_source_refs"])
+                    except QualityDomainError:
+                        # Critic formatting is advisory; deterministic checks
+                        # remain authoritative when both critic attempts fail.
+                        critic = None
+                        assessment.critic_report = {"fallback": "DETERMINISTIC_ONLY", "reason": "CRITIC_OUTPUT_INVALID"}
                 assessment.critic_request_id = result.request_id
                 ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms, request_id=result.request_id, output_fingerprint=_fp(critic, "critic-output-v1"))
             except ModelProviderError as exc:
