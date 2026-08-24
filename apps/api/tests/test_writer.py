@@ -304,6 +304,21 @@ def test_render_malformed_output_marks_failed(writer_project, session):
     assert draft.status == WriterDraftStatus.FAILED and draft.validation_report["issues"][0]["code"] == "MODEL_OUTPUT_INVALID"
 
 
+def test_new_request_key_can_retry_a_failed_writer_draft(writer_project, session):
+    chapter = writer_project[3]
+    failed = WriterProjectionService().render(
+        session, chapter.id, {"pov_mode": "OBJECTIVE", "client_request_id": "writer-attempt-1"},
+        provider=FakeModelProvider("not-json"), model="fake",
+    )
+    recovered = WriterProjectionService().render(
+        session, chapter.id, {"pov_mode": "OBJECTIVE", "client_request_id": "writer-attempt-2"},
+        provider=FakeModelProvider(response(scene_ids=chapter.source_scene_ids)), model="fake",
+    )
+    assert failed.status == WriterDraftStatus.FAILED
+    assert recovered.status == WriterDraftStatus.VALIDATED
+    assert recovered.version == failed.version + 1
+
+
 def test_render_provider_failure_marks_failed(writer_project, session):
     provider = FakeModelProvider(error=ModelProviderError(MODEL_TIMEOUT))
     draft = WriterProjectionService().render(session, writer_project[3].id, {"pov_mode": "OBJECTIVE"}, provider=provider, model="fake")

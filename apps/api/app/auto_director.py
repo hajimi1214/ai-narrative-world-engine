@@ -729,7 +729,11 @@ class AutoDirectorOrchestrator:
             writer_live = self._live_begin(run, f"第 {chapter_number} 章：正文写作", "WRITER", provider=route.provider, model=route.model)
             live_execution_broker.phase(writer_live, "WRITING", "Writer 正在依据角色 Agent 行动和章节任务生成正文")
             try:
-                draft = WriterProjectionService().render(db, chapter.id, {"idempotency_key": f"{run.id}-chapter-{chapter_number}", "pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": pov_character_id}, provider=writer_provider, model=route.model, settings=settings)
+                # A retry must create one new, traceable draft attempt. Reusing
+                # the initial request key would deterministically return its
+                # persisted FAILED draft without making another model call.
+                writer_request_key = f"{run.id}-chapter-{chapter_number}-writer-attempt-{writer_step.attempt}"
+                draft = WriterProjectionService().render(db, chapter.id, {"idempotency_key": writer_request_key, "pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": pov_character_id}, provider=writer_provider, model=route.model, settings=settings)
                 self._live_complete(writer_live, "正文草稿已生成，正在进入质量审计")
             except Exception as exc:
                 self._live_fail(writer_live, exc)
