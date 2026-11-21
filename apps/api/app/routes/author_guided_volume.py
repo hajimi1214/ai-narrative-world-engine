@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, PlotDirectionPayload, VolumeActionPayload, VolumeContinuePayload, VolumeContractUpdatePayload
+from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, BookAutomationSettingsPayload, PlotDirectionPayload, VolumeActionPayload, VolumeContinuePayload, VolumeContractUpdatePayload
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _contract_payload, _enum, _volume_payload, _window_payload
 from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookCompletionProposalStatus, BookContract, ChapterPlanningWindow, ChapterWindowStatus, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
 from ..author_recovery import recovery_payload, revoke_claim
@@ -28,7 +28,12 @@ def _run_payload(db: Session, run: AutoDirectorRun) -> dict:
     window_rows = [item for item in steps if (item.output_payload or {}).get("window_id") == window_id]
     volume_rows = [item for item in steps if (item.output_payload or {}).get("volume_id") == volume_id]
     usage_summary = {"chapter": metrics(chapter_rows), "window": metrics(window_rows), "volume": metrics(volume_rows), "book": metrics(steps)}
-    return {"id": run.id, "project_id": run.project_id, "status": _enum(run.status), "run_mode": run.run_mode, "current_stage": _enum(run.current_stage), "pause_reason": run.pause_reason, "next_action": run.next_action, "idempotency_key": run.idempotency_key, "context": run.context or {}, "settings": run.settings or {}, "token_usage": run.token_usage or {}, "usage_summary": usage_summary, "recovery": recovery_payload(run)}
+    contract = db.get(BookContract, context.get("book_contract_id")) if context.get("book_contract_id") else None
+    policy = contract.length_policy if contract else {}
+    auto_cross = (policy or {}).get("auto_cross_volume")
+    if auto_cross is None:
+        auto_cross = (policy or {}).get("continuous_volume_progression", False)
+    return {"id": run.id, "project_id": run.project_id, "status": _enum(run.status), "run_mode": run.run_mode, "current_stage": _enum(run.current_stage), "pause_reason": run.pause_reason, "next_action": run.next_action, "idempotency_key": run.idempotency_key, "context": run.context or {}, "settings": run.settings or {}, "book_policy": {"auto_cross_volume": bool(auto_cross)}, "token_usage": run.token_usage or {}, "usage_summary": usage_summary, "recovery": recovery_payload(run)}
 
 
 def _volume_or_404(db: Session, project_id: str, volume_id: str) -> VolumeContract:
@@ -196,9 +201,21 @@ def create_author_guided_run(project_id: str, payload: AuthorGuidedRunCreatePayl
         return _run_payload(db, existing)
     contract = AuthorGuidedVolumeService().ensure_contract(db, project, data)
     volume = AuthorGuidedVolumeService().ensure_volume(db, project, contract, data.get("volume") or {})
-    run = AutoDirectorRun(project_id=project_id, idempotency_key=key, status=AutoDirectorRunStatus.RUNNING, current_stage=AutoDirectorStage.BOOK_CONTRACT, run_mode="AUTHOR_GUIDED_VOLUME", settings=data, context={"request": data, "book_contract_id": contract.id, "volume_id": volume.id, "current_volume_number": volume.volume_number, "execute_window": payload.continuous_chapter_progression})
+    auto_cross_volume = bool(data.get("auto_cross_volume") or (data.get("length_policy") or {}).get("auto_cross_volume") or data.get("continuous_volume_progression") or (data.get("length_policy") or {}).get("continuous_volume_progression"))
+    run = AutoDirectorRun(project_id=project_id, idempotency_key=key, status=AutoDirectorRunStatus.RUNNING, current_stage=AutoDirectorStage.BOOK_CONTRACT, run_mode="AUTHOR_GUIDED_VOLUME", settings=data, context={"request": data, "book_contract_id": contract.id, "volume_id": volume.id, "current_volume_number": volume.volume_number, "execute_window": payload.continuous_chapter_progression or auto_cross_volume})
     db.add(run); db.commit(); db.refresh(run)
     return _run_payload(db, run)
+
+
+@router.patch("/projects/{project_id}/book-contract/automation")
+def update_book_automation_settings(project_id: str, payload: BookAutomationSettingsPayload, db: Session = Depends(get_db)):
+    project = require_project(db, project_id)
+    contract = db.scalar(select(BookContract).where(BookContract.project_id == project.id).with_for_update())
+    if not contract:
+        raise HTTPException(status_code=404, detail={"code": "BOOK_CONTRACT_NOT_FOUND"})
+    contract = AuthorGuidedVolumeService().set_auto_cross_volume(db, contract, payload.auto_cross_volume)
+    db.commit()
+    return {"contract": _contract_payload(contract), "auto_cross_volume": bool((contract.length_policy or {}).get("auto_cross_volume", False))}
 
 
 @router.get("/projects/{project_id}/author-guided-volume/runs/{run_id}")

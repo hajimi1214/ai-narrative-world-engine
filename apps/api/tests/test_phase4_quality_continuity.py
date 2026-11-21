@@ -33,7 +33,7 @@ def test_phase4_continuity_checker_catches_task_timeline_location_and_knowledge_
         }
         report = NovelContinuityQualityChecker().evaluate(db, context)
         codes = {item["rule_code"] for item in report["findings"]}
-        assert {"PLAN_REQUIRED_EVENT_MISSING", "PLAN_FORBIDDEN_EVENT_PRESENT", "PLAN_FORBIDDEN_REVEAL_PRESENT", "TIMELINE_ORDER_INVALID", "LOCATION_CONFLICT", "KNOWLEDGE_LEAK"}.issubset(codes)
+        assert {"PLAN_REQUIRED_EVENT_REVIEW_REQUIRED", "PLAN_FORBIDDEN_EVENT_PRESENT", "PLAN_FORBIDDEN_REVEAL_PRESENT", "TIMELINE_ORDER_INVALID", "LOCATION_CONFLICT", "KNOWLEDGE_LEAK"}.issubset(codes)
 
 
 def test_phase4_checker_is_disabled_for_legacy_projects():

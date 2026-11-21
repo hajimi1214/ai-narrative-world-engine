@@ -15,7 +15,7 @@ import app.runtime as runtime_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, Character, CharacterKnowledge, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlan, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, Character, CharacterKnowledge, ChapterWindowStatus, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -62,6 +62,25 @@ def test_author_guided_run_creates_contract_and_bounded_window(monkeypatch):
         assert db.get(AutoDirectorRun, run_id).status.value == "PAUSED"
 
 
+def test_book_auto_cross_volume_setting_is_explicit_and_exposed(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "book-auto-setting"})
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    assert created.json()["book_policy"]["auto_cross_volume"] is False
+    enabled = client.patch(f"/projects/{project_id}/book-contract/automation", json={"auto_cross_volume": True})
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["auto_cross_volume"] is True
+    assert enabled.json()["contract"]["length_policy"]["auto_cross_volume"] is True
+    assert client.get(f"/projects/{project_id}/author-guided-volume/runs/{run_id}").json()["book_policy"]["auto_cross_volume"] is True
+    disabled = client.patch(f"/projects/{project_id}/book-contract/automation", json={"auto_cross_volume": False})
+    assert disabled.status_code == 200
+    with Session() as db:
+        contract = db.scalar(select(BookContract).where(BookContract.project_id == project_id))
+        assert contract.length_policy["auto_cross_volume"] is False
+        assert contract.length_policy["continuous_volume_progression"] is False
+
+
 def test_idempotent_author_guided_run_does_not_duplicate_contract(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     first = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"estimated_chapters": None, "idempotency_key": "same"}).json()
@@ -69,6 +88,26 @@ def test_idempotent_author_guided_run_does_not_duplicate_contract(monkeypatch):
     assert first["id"] == second["id"]
     with Session() as db:
         assert len(db.scalars(select(BookContract).where(BookContract.project_id == project_id)).all()) == 1
+
+
+def test_book_auto_cross_volume_setting_is_work_scoped_and_toggleable(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "book-setting"})
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    assert created.json()["book_policy"]["auto_cross_volume"] is False
+    enabled = client.patch(f"/projects/{project_id}/book-contract/automation", json={"auto_cross_volume": True})
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["auto_cross_volume"] is True
+    with Session() as db:
+        contract = db.scalar(select(BookContract).where(BookContract.project_id == project_id))
+        assert contract.length_policy["auto_cross_volume"] is True
+        assert contract.length_policy["continuous_volume_progression"] is True
+    disabled = client.patch(f"/projects/{project_id}/book-contract/automation", json={"auto_cross_volume": False})
+    assert disabled.status_code == 200, disabled.text
+    state = client.get(f"/projects/{project_id}/author-guided-volume/runs/{run_id}")
+    assert state.status_code == 200
+    assert state.json()["book_policy"]["auto_cross_volume"] is False
 
 
 def test_author_guided_runs_can_continue_across_projects(monkeypatch):
@@ -254,6 +293,147 @@ def test_next_volume_window_inherits_only_sealed_snapshot_reference(monkeypatch)
         assert next_run and next_run.status.value == "RUNNING"
         assert next_run.context["current_volume_number"] == 2
         assert next_run.context["window_id"] == next_window_id
+
+
+def _prepare_auto_cross_boundary(Session, project_id, *, processed=1, chapter_budget=5, token_budget=0, tokens_used=0, include_next_plan=True):
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    with Session() as db:
+        project = db.get(Project, project_id)
+        service = AuthorGuidedVolumeService()
+        contract = service.ensure_contract(db, project, {
+            "title": "自动跨卷测试", "auto_cross_volume": True,
+            "continuous_chapter_progression": True,
+            "operational_run_chapter_budget": chapter_budget,
+            "operational_token_budget": token_budget or None,
+        })
+        volume = service.ensure_volume(db, project, contract, {
+            "volume_goal": "完成当前调查", "core_conflict": "线索带来代价",
+            "target_closing_state": {"case": "closed"},
+        })
+        volume.target_closing_state = {"case": "closed"}
+        volume.actual_chapter_start = 1
+        volume.actual_chapter_end = 1
+        plan = StoryPlan(project_id=project_id, version=1, source_fingerprint="auto-cross-test")
+        db.add(plan); db.flush()
+        task = StoryPlanChapter(project_id=project_id, plan_id=plan.id, number=1, volume_number=1, arc_number=1, title="收束", summary="完成调查", objective="结案", conflict="代价", end_state={"case": "closed"})
+        db.add(task)
+        db.add(Chapter(project_id=project_id, number=1, content="本卷完成", status="QUALITY_APPROVED", active=True))
+        if include_next_plan:
+            db.add(StoryPlanVolume(plan_id=plan.id, number=2, title="第二卷", summary="承接后果", start_chapter=2, end_chapter=3, major_conflict="新的阻力", end_state={"case": "resolved"}))
+        window = ChapterPlanningWindow(project_id=project_id, volume_id=volume.id, start_chapter_number=1, end_chapter_number=1, status=ChapterWindowStatus.ACTIVE, plan_fingerprint="auto-cross-window")
+        db.add(window); db.flush()
+        request = {"auto_cross_volume": True, "continuous_chapter_progression": True, "operational_run_chapter_budget": chapter_budget}
+        run = AutoDirectorRun(
+            project_id=project_id, idempotency_key=f"auto-cross-{processed}-{chapter_budget}-{token_budget}-{tokens_used}-{include_next_plan}",
+            run_mode="AUTHOR_GUIDED_VOLUME", status=AutoDirectorRunStatus.PAUSED,
+            current_stage=AutoDirectorStage.VOLUME_PROGRESS_ASSESSMENT,
+            settings={"operational_run_chapter_budget": chapter_budget, "max_chapters": chapter_budget, "operational_token_budget": token_budget, "max_tokens": token_budget},
+            token_usage={"total_tokens": tokens_used}, total_tokens=tokens_used,
+            context={"request": request, "book_contract_id": contract.id, "volume_id": volume.id, "current_volume_number": 1, "window_id": window.id, "current_chapter_number": 2, "execute_window": True, "window_complete": True, "processed_this_run": processed, "adopted_this_run": processed, "generated_this_run": processed, "last_adopted_chapter_number": 1},
+        )
+        db.add(run)
+        db.commit()
+    return run.id
+
+
+def test_auto_cross_volume_seals_snapshot_and_reuses_run_budget(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5)
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    with Session() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        old_volume_id = run.context["volume_id"]
+        old_context = dict(run.context)
+        result = AuthorGuidedVolumeService().advance_run(db, run)
+        db.commit()
+        db.refresh(run)
+        old_volume = db.get(VolumeContract, old_volume_id)
+        next_volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 2))
+        snapshot = db.get(VolumeContinuitySnapshot, old_volume.sealed_snapshot_id)
+        assert result.id == run.id
+        assert old_volume.status == VolumeContractStatus.SEALED
+        assert snapshot is not None
+        assert next_volume.status == VolumeContractStatus.ACTIVE
+        assert next_volume.opening_state["source_volume_snapshot_id"] == snapshot.id
+        assert run.context["volume_id"] == next_volume.id
+        assert run.context["processed_this_run"] == old_context["processed_this_run"]
+        assert run.status == AutoDirectorRunStatus.RUNNING
+        assert run.pause_reason is None
+
+
+def test_auto_cross_volume_seals_before_chapter_budget_pause(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    run_id = _prepare_auto_cross_boundary(Session, project_id, processed=5, chapter_budget=5)
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    with Session() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        old_volume_id = run.context["volume_id"]
+        AuthorGuidedVolumeService().advance_run(db, run)
+        db.commit()
+        old_volume = db.get(VolumeContract, old_volume_id)
+        next_volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 2))
+        assert old_volume.status == VolumeContractStatus.SEALED
+        assert old_volume.sealed_snapshot_id
+        assert next_volume.status == VolumeContractStatus.ACTIVE
+        assert run.status == AutoDirectorRunStatus.PAUSED
+        assert run.pause_reason == "RUN_CHAPTER_BUDGET_REACHED"
+        assert run.context["volume_id"] == next_volume.id
+
+
+def test_auto_cross_volume_seals_then_pauses_when_token_budget_is_exhausted(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5, token_budget=10, tokens_used=10)
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    with Session() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        old_volume_id = run.context["volume_id"]
+        AuthorGuidedVolumeService().advance_run(db, run)
+        db.commit()
+        old_volume = db.get(VolumeContract, old_volume_id)
+        next_volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 2))
+        assert old_volume.status == VolumeContractStatus.SEALED
+        assert next_volume.status == VolumeContractStatus.ACTIVE
+        assert run.status == AutoDirectorRunStatus.PAUSED
+        assert run.pause_reason == "TOKEN_BUDGET_EXCEEDED"
+        assert "增加预算" in run.next_action
+
+
+def test_auto_cross_volume_missing_successor_plan_blocks_without_creating_empty_volume(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5, include_next_plan=False)
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    with Session() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        old_volume_id = run.context["volume_id"]
+        AuthorGuidedVolumeService().advance_run(db, run)
+        db.commit()
+        old_volume = db.get(VolumeContract, old_volume_id)
+        successor = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 2))
+        assert old_volume.status == VolumeContractStatus.SEALED
+        assert run.status == AutoDirectorRunStatus.BLOCKED
+        assert run.pause_reason == "AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED"
+        assert successor is None
+
+
+def test_auto_cross_volume_transition_is_idempotent(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5)
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    with Session() as db:
+        service = AuthorGuidedVolumeService()
+        run = db.get(AutoDirectorRun, run_id)
+        original_volume = db.get(VolumeContract, run.context["volume_id"])
+        original_context = dict(run.context)
+        service.advance_run(db, run)
+        db.flush()
+        first_snapshot_id = original_volume.sealed_snapshot_id
+        service._transition_auto_cross_volume(db, run, db.get(Project, project_id), db.get(BookContract, run.context["book_contract_id"]), original_volume, original_context.get("request") or {}, original_context, 5)
+        db.commit()
+        snapshots = db.scalars(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == original_volume.id)).all()
+        successors = db.scalars(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 2)).all()
+        assert len(snapshots) == 1
+        assert snapshots[0].id == first_snapshot_id
+        assert len(successors) == 1
 
 
 def test_unseal_reseal_creates_immutable_snapshot_and_replans_next_volume(monkeypatch):

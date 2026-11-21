@@ -153,11 +153,12 @@ class AutoDirectorAdoptionService:
         if report.get("task_forbidden_hits") or report.get("forbidden_event_check", {}).get("forbidden_events"):
             raise AutoDirectorError("AUTO_ADOPTION_FORBIDDEN_EVENT")
         task = (draft.source_manifest or {}).get("planning_task") or {}
-        covered = {str(item) for item in report.get("task_coverage") or []}
-        missing = [str(item) for item in task.get("must_events") or [] if str(item) not in covered]
-        if missing:
-            raise AutoDirectorError("AUTO_ADOPTION_TASK_INCOMPLETE")
-        from .quality import QualityAssessmentAudit
+        from .quality import QualityAssessmentAudit, validate_required_event_evidence
+        evidence_issues = validate_required_event_evidence(
+            draft.content or "", task, assessment.critic_report, draft.content_fingerprint,
+        )
+        if evidence_issues:
+            raise AutoDirectorError("AUTO_ADOPTION_REQUIRED_EVENT_EVIDENCE_INVALID")
         QualityAssessmentAudit().audit(db, assessment.id)
         latest_assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id).order_by(ChapterQualityAssessment.version.desc(), ChapterQualityAssessment.id.desc()))
         if not latest_assessment or latest_assessment.id != assessment.id:
@@ -1099,6 +1100,22 @@ class AutoDirectorOrchestrator:
             assessment.active = True
             WriterProjectionService().adopt(db, draft_id)
             QualityGateService().approve(db, assessment.id)
+        # A foreshadow payoff is promoted only after the same quality
+        # assessment has confirmed its prose evidence and the chapter draft is
+        # formally adopted. This keeps the ledger from advancing on planning
+        # declarations or an unadopted candidate.
+        from .models import ForeshadowingLedger, ForeshadowingStatus
+        task = (draft.source_manifest or {}).get("planning_task") or {}
+        for payoff in task.get("foreshadow_payoff", []) or []:
+            ref = str((payoff or {}).get("foreshadow_ref") if isinstance(payoff, dict) else payoff)
+            item = db.scalar(select(ForeshadowingLedger).where(
+                ForeshadowingLedger.project_id == run.project_id,
+                (ForeshadowingLedger.foreshadow_ref == ref) | (ForeshadowingLedger.id == ref),
+            ).with_for_update())
+            if item and enum_value(item.status) not in {ForeshadowingStatus.PAID_OFF.value, ForeshadowingStatus.CANCELLED.value}:
+                item.status = ForeshadowingStatus.PAID_OFF
+                item.source_chapter_id = draft.chapter_id
+                item.fingerprint = fingerprint({"ref": item.foreshadow_ref, "status": item.status.value, "chapter": draft.chapter_id})
         number = int((run.context or {}).get("current_chapter_number", 1))
         prior_completed = [*(run.context or {}).get("completed_chapters", [])]
         completed = list(prior_completed)

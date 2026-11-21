@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Required chapter events and foreshadowing payoffs now need critic-confirmed, fingerprint-bound excerpts from the exact prose draft before automatic adoption; foreshadowing is marked paid off only after adoption.
+- Added a book-level automatic cross-volume setting, disabled by default. A passing volume is sealed with its continuity snapshot before the same run advances; chapter and token budgets carry across the boundary, and a missing next-volume contract pauses for author action.
+- Added chapter-workspace evidence navigation and a continuity-workspace control for changing the book-level cross-volume setting.
+
 ## 0.3.0 - 2026-11-21
 
 - Added durable worker leases, restart recovery, transient provider backoff, and persisted writing checkpoints.

@@ -23,6 +23,7 @@ from .models import (
     ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus,
     VolumeContinuitySnapshot, StoryPlan, StoryPlanChapter, StoryPlanStatus,
     Character, CharacterKnowledge, KnowledgeStatus, PlanChapterStatus,
+    StoryPlanVolume,
 )
 from .planning import _default_chapter, persist_plan, validate_plan_references
 
@@ -223,6 +224,22 @@ class AuthorGuidedVolumeService:
         length.setdefault("operational_run_chapter_budget", payload.get("operational_run_chapter_budget"))
         length.setdefault("operational_token_budget", payload.get("operational_token_budget"))
         length.setdefault("continuous_chapter_progression", bool(payload.get("continuous_chapter_progression", True)))
+        # Cross-volume progression is deliberately opt-in.  Keep the setting
+        # in the book contract so every run for the work observes the same
+        # boundary policy, while accepting the older descriptive alias from
+        # clients that used it before the field was formalized.
+        # Pydantic includes the canonical field with its default ``False`` in
+        # ``model_dump`` even when an older client sends only the alias.  An
+        # explicit alias opt-in therefore has to win over that default.
+        auto_cross = bool(
+            payload.get("auto_cross_volume", False)
+            or payload.get("continuous_volume_progression", False)
+            or length.get("auto_cross_volume", False)
+            or length.get("continuous_volume_progression", False)
+        )
+        length["auto_cross_volume"] = auto_cross
+        if auto_cross:
+            length["continuous_chapter_progression"] = True
         style = dict(payload.get("style_contract") or {})
         for key in ("tone", "pov", "audience", "genre"):
             if key not in style and payload.get(key) is not None:
@@ -240,6 +257,19 @@ class AuthorGuidedVolumeService:
         }
         values["fingerprint"] = _fingerprint(values)
         contract = BookContract(**values); db.add(contract); db.flush()
+        return contract
+
+    def set_auto_cross_volume(self, db: Session, contract: BookContract, enabled: bool) -> BookContract:
+        policy = dict(contract.length_policy or {})
+        policy["auto_cross_volume"] = bool(enabled)
+        # Keep the pre-release alias in sync so disabling the canonical
+        # setting cannot leave an older client opt-in active.
+        policy["continuous_volume_progression"] = bool(enabled)
+        if enabled:
+            policy["continuous_chapter_progression"] = True
+        contract.length_policy = policy
+        contract.version += 1
+        contract.fingerprint = _fingerprint(_contract_payload(contract))
         return contract
 
     def ensure_volume(self, db: Session, project: Project, contract: BookContract, payload: dict[str, Any] | None = None, number: int = 1) -> VolumeContract:
@@ -605,6 +635,185 @@ class AuthorGuidedVolumeService:
         ready = bool(adopted) and not incomplete and conditions_met and target_reached
         return {"volume_goal_progress": 1.0 if ready else min(0.99, len(adopted) / max(1, len(adopted) + len(incomplete) + 1)), "protagonist_arc_progress": 1.0 if ready else (0.5 if adopted else 0.0), "conflict_progress": 1.0 if ready else (0.5 if adopted else 0.0), "required_events_completed": completed, "incomplete_chapters": incomplete, "unresolved_threads": volume.unresolved_threads or [], "pending_foreshadowings": [], "target_closing_state_reached": target_reached, "should_extend_volume": not ready, "should_prepare_seal": ready, "should_start_next_volume": False, "reason": "本卷仍需继续推进，未满足剧情目标或仍有未通过质量门的章节。" if not ready else "本卷完成条件已满足，等待作者确认封存。"}
 
+    @staticmethod
+    def _auto_cross_volume_enabled(contract: BookContract, request: dict[str, Any] | None = None) -> bool:
+        policy = contract.length_policy or {}
+        request = request or {}
+        # Once a work has a canonical policy, it is authoritative for every
+        # run. This lets an author turn the feature off after a run was
+        # created even if that run still carries an older opt-in in context.
+        if "auto_cross_volume" in policy:
+            return policy.get("auto_cross_volume") is True
+        if "continuous_volume_progression" in policy:
+            return policy.get("continuous_volume_progression") is True
+        return bool(request.get("auto_cross_volume") is True or request.get("continuous_volume_progression") is True)
+
+    def _next_volume_payload(self, db: Session, project: Project, contract: BookContract, volume: VolumeContract, snapshot_id: str) -> dict[str, Any]:
+        """Build the next volume from an existing book plan when available.
+
+        Automatic progression must have a real goal and closing state.  A
+        preplanned StoryPlanVolume supplies those fields; without one we
+        create a bounded continuation contract that starts safely but pauses
+        before another automatic boundary can be crossed.
+        """
+        next_number = volume.volume_number + 1
+        next_start = (volume.actual_chapter_end or volume.estimated_chapter_end or volume.actual_chapter_start or 0) + 1
+        plan = db.scalar(select(StoryPlanVolume).where(
+            StoryPlanVolume.plan_id.in_(select(StoryPlan.id).where(StoryPlan.project_id == project.id)),
+            StoryPlanVolume.number == next_number,
+        ).order_by(StoryPlanVolume.id.desc()))
+        payload: dict[str, Any] = {
+            "title": f"第 {next_number} 卷",
+            "estimated_chapter_start": next_start,
+            "opening_state": {"source_volume_snapshot_id": snapshot_id},
+            "volume_goal": "承接上一卷的后续冲突",
+            "core_conflict": "上一卷的后果继续施加压力",
+            "target_closing_state": {},
+            "completion_conditions": [],
+        }
+        if plan:
+            closing_state = plan.end_state or {}
+            if not closing_state:
+                last_task = db.scalar(select(StoryPlanChapter).where(
+                    StoryPlanChapter.plan_id == plan.plan_id,
+                    StoryPlanChapter.volume_number == next_number,
+                ).order_by(StoryPlanChapter.number.desc()).limit(1))
+                closing_state = (last_task.end_state or {}) if last_task else {}
+            payload.update({
+                "title": plan.title or payload["title"],
+                "estimated_chapter_start": plan.start_chapter or next_start,
+                "estimated_chapter_end": plan.end_chapter,
+                "volume_goal": plan.summary or payload["volume_goal"],
+                "core_conflict": plan.major_conflict or payload["core_conflict"],
+                "target_closing_state": closing_state,
+                "next_volume_hooks": plan.foreshadowing or [],
+            })
+        return payload
+
+    def _prepare_auto_next_volume(self, db: Session, project: Project, contract: BookContract, sealed: VolumeContract) -> tuple[VolumeContract, ChapterPlanningWindow]:
+        """Prepare a successor for a volume already sealed in this transaction."""
+        next_number = sealed.volume_number + 1
+        next_volume = db.scalar(select(VolumeContract).where(
+            VolumeContract.project_id == project.id,
+            VolumeContract.volume_number == next_number,
+        ).with_for_update())
+        payload = self._next_volume_payload(db, project, contract, sealed, sealed.sealed_snapshot_id or "")
+        if next_volume is None:
+            if not payload.get("volume_goal") or not payload.get("target_closing_state"):
+                raise AuthorGuidedVolumeError("AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED")
+            next_volume = self.ensure_volume(db, project, contract, payload, next_number)
+        else:
+            opening = dict(next_volume.opening_state or {})
+            source_snapshot_id = opening.get("source_volume_snapshot_id")
+            if source_snapshot_id and source_snapshot_id != sealed.sealed_snapshot_id:
+                raise AuthorGuidedVolumeError("VOLUME_NEXT_SOURCE_SNAPSHOT_STALE")
+            if next_volume.status == VolumeContractStatus.SEALED:
+                raise AuthorGuidedVolumeError("VOLUME_NEXT_ALREADY_SEALED")
+            if not next_volume.volume_goal and payload.get("volume_goal"):
+                next_volume.volume_goal = payload["volume_goal"]
+            if not next_volume.core_conflict and payload.get("core_conflict"):
+                next_volume.core_conflict = payload["core_conflict"]
+            if not next_volume.target_closing_state and payload.get("target_closing_state"):
+                next_volume.target_closing_state = payload["target_closing_state"]
+            if not next_volume.completion_conditions and payload.get("completion_conditions"):
+                next_volume.completion_conditions = payload["completion_conditions"]
+            if not source_snapshot_id:
+                opening["source_volume_snapshot_id"] = sealed.sealed_snapshot_id
+                next_volume.opening_state = opening
+                next_volume.version += 1
+                next_volume.fingerprint = _fingerprint(_volume_payload(next_volume))
+            if next_volume.estimated_chapter_start is None:
+                next_volume.estimated_chapter_start = payload["estimated_chapter_start"]
+            if next_volume.fingerprint != _fingerprint(_volume_payload(next_volume)):
+                next_volume.version += 1
+                next_volume.fingerprint = _fingerprint(_volume_payload(next_volume))
+            if not next_volume.volume_goal or not (next_volume.target_closing_state or next_volume.completion_conditions):
+                raise AuthorGuidedVolumeError("AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED")
+        next_volume.status = VolumeContractStatus.ACTIVE
+        window = self.ensure_window(db, project, next_volume, size=None)
+        window.status = ChapterWindowStatus.ACTIVE
+        return next_volume, window
+
+    def _transition_auto_cross_volume(self, db: Session, run: AutoDirectorRun, project: Project, contract: BookContract, volume: VolumeContract, request: dict[str, Any], context: dict[str, Any], operational_budget: int, *, progress: dict[str, Any] | None = None) -> bool:
+        """Move a completed volume to its successor without resetting usage."""
+        progress = progress or self.progress(db, volume)
+        if not self._auto_cross_volume_enabled(contract, request) or not progress.get("should_prepare_seal"):
+            return False
+        processed_this_run = max(int(context.get("processed_this_run", 0) or 0), int(context.get("adopted_this_run", 0) or 0), int(context.get("generated_this_run", 0) or 0))
+        seal_savepoint = db.begin_nested()
+        try:
+            previous = db.get(ChapterPlanningWindow, context.get("window_id")) if context.get("window_id") else None
+            if previous and previous.volume_id == volume.id and previous.status != ChapterWindowStatus.COMPLETED:
+                previous.status = ChapterWindowStatus.COMPLETED
+                previous.completed_at = datetime.utcnow()
+            sealed = self.seal(db, volume, author_confirmed=True)
+        except AuthorGuidedVolumeError as exc:
+            seal_savepoint.rollback()
+            run.status = AutoDirectorRunStatus.BLOCKED
+            run.current_stage = AutoDirectorStage.BLOCKED
+            run.pause_reason = exc.code
+            run.next_action = "当前卷达到封存检查点，但连续性快照未能保存；请修复后重试。"
+            run.context = {**context, "window_complete": True, "auto_cross_volume_blocked": exc.code}
+            return True
+        except Exception:
+            seal_savepoint.rollback()
+            raise
+        else:
+            seal_savepoint.commit()
+
+        # Keep a successful seal durable even when successor planning needs
+        # author input. Only the successor preparation is rolled back.
+        savepoint = db.begin_nested()
+        try:
+            next_volume, next_window = self._prepare_auto_next_volume(db, project, contract, sealed)
+            next_tasks = self.ensure_window_tasks(db, project, next_volume, next_window, contract)
+        except AuthorGuidedVolumeError as exc:
+            savepoint.rollback()
+            run.status = AutoDirectorRunStatus.BLOCKED
+            run.current_stage = AutoDirectorStage.BLOCKED
+            run.pause_reason = exc.code
+            run.next_action = "当前卷已满足封存条件，但下一卷准备需要作者检查规划或连续性快照后重试。"
+            run.context = {**context, "window_complete": True, "auto_cross_volume_blocked": exc.code}
+            return True
+        else:
+            savepoint.commit()
+        remaining = max(0, operational_budget - processed_this_run)
+        from .author_recovery import budget_usage, configured_token_budget
+        token_budget = configured_token_budget(run)
+        token_remaining = not token_budget or budget_usage(run) < token_budget
+        can_continue = remaining > 0 and token_remaining
+        run.status = AutoDirectorRunStatus.RUNNING if can_continue else AutoDirectorRunStatus.PAUSED
+        run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION if can_continue else AutoDirectorStage.PAUSED
+        run.pause_reason = None if can_continue else "RUN_CHAPTER_BUDGET_REACHED" if remaining <= 0 else "TOKEN_BUDGET_EXCEEDED"
+        run.next_action = (
+            f"第 {volume.volume_number} 卷已封存并保存连续性快照；正在继续第 {next_volume.volume_number} 卷。"
+            if can_continue else
+            f"第 {volume.volume_number} 卷已封存并保存连续性快照；Token 预算已用完，增加预算后从第 {next_volume.volume_number} 卷继续。"
+            if not token_remaining else
+            f"第 {volume.volume_number} 卷已封存并保存连续性快照；本次运行预算已用完，继续后从第 {next_volume.volume_number} 卷开始。"
+        )
+        run.context = {
+            **context,
+            "volume_id": next_volume.id,
+            "current_volume_number": next_volume.volume_number,
+            "window_id": next_window.id,
+            "current_chapter_number": next_window.start_chapter_number,
+            "window_task_ids": next_tasks,
+            "window_task_count": len(next_tasks),
+            "window_complete": False,
+            "next_window_id": None,
+            "last_adopted_chapter_number": None,
+            "last_adopted_chapter_id": None,
+            "last_adopted_draft_id": None,
+            "auto_cross_volume_transition": {
+                "from_volume_id": volume.id,
+                "to_volume_id": next_volume.id,
+                "snapshot_id": next_volume.opening_state.get("source_volume_snapshot_id"),
+            },
+        }
+        next_window.continuation_decision = "AUTO_CROSS_VOLUME"
+        return True
+
     def create_snapshot(self, db: Session, volume: VolumeContract) -> VolumeContinuitySnapshot:
         if volume.status != VolumeContractStatus.READY_TO_SEAL:
             raise AuthorGuidedVolumeError("VOLUME_NOT_READY_TO_SEAL")
@@ -691,6 +900,14 @@ class AuthorGuidedVolumeService:
             volume = self.ensure_volume(db, project, contract, request.get("volume") or {}, volume_number)
         run.context = {**run.context, "volume_id": volume.id}
         context = dict(run.context or {})
+        # A completed window may be revisited by a retry or by a worker
+        # restart.  Check the volume boundary before allocating another
+        # same-volume window so automatic cross-volume runs do not write an
+        # unnecessary tail after the closing conditions already passed.
+        if context.get("window_complete") and context.get("execute_window"):
+            current_budget = int((contract.length_policy or {}).get("operational_run_chapter_budget") or request.get("operational_run_chapter_budget") or request.get("window_size") or self.WINDOW_SIZE)
+            if self._transition_auto_cross_volume(db, run, project, contract, volume, request, context, current_budget):
+                return run
         if context.get("window_complete") and context.get("execute_window") and context.get("window_id"):
             previous = db.get(ChapterPlanningWindow, context["window_id"])
             if previous and previous.status != ChapterWindowStatus.COMPLETED:
@@ -811,6 +1028,11 @@ class AuthorGuidedVolumeService:
             processed_this_run = max(int(context.get("processed_this_run", 0) or 0), int(context.get("adopted_this_run", 0) or 0), int(context.get("generated_this_run", 0) or 0))
             budget_reached = processed_this_run >= operational_budget
             continuous = bool((contract.length_policy or {}).get("continuous_chapter_progression", request.get("continuous_chapter_progression", False)))
+            if progress["should_prepare_seal"] and self._auto_cross_volume_enabled(contract, request):
+                context["window_complete"] = True
+                if self._transition_auto_cross_volume(db, run, project, contract, volume, request, context, operational_budget, progress=progress):
+                    self._annotate_usage_scope(db, run)
+                    return run
             if progress["should_prepare_seal"]:
                 run.status = AutoDirectorRunStatus.PAUSED
                 run.pause_reason = "WINDOW_COMPLETE"

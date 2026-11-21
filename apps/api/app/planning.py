@@ -96,10 +96,10 @@ def normalize_event_text(value: Any) -> str:
 
 def event_ref(value: Any, field: str) -> str:
     if isinstance(value, dict):
-        explicit = value.get("event_ref") or value.get("canonical_key") or value.get("key")
+        explicit = value.get("event_ref") or value.get("canonical_key") or value.get("key") or value.get("foreshadow_ref") or value.get("id")
         if explicit:
             return str(explicit)
-        label = value.get("label") or value.get("name") or value.get("text") or ""
+        label = value.get("label") or value.get("name") or value.get("text") or value.get("title") or ""
     else:
         label = value
     digest = hashlib.sha256(normalize_event_text(label).encode("utf-8")).hexdigest()[:20]
@@ -108,7 +108,7 @@ def event_ref(value: Any, field: str) -> str:
 
 def event_label(value: Any) -> str:
     if isinstance(value, dict):
-        return str(value.get("label") or value.get("name") or value.get("text") or value.get("event_ref") or "").strip()
+        return str(value.get("label") or value.get("name") or value.get("text") or value.get("title") or value.get("foreshadow_ref") or value.get("event_ref") or "").strip()
     return str(value or "").strip()
 
 
@@ -126,6 +126,19 @@ def task_event_specs(task: dict[str, Any] | None, field: str) -> list[dict[str, 
     if contracts:
         return [dict(item) for item in contracts]
     return [event_spec(item, field) for item in task.get(field, []) or []]
+
+
+def required_event_specs(task: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return the prose events that must be independently reviewed."""
+    result = []
+    for requirement_type in ("must_events", "foreshadow_payoff"):
+        for spec in task_event_specs(task, requirement_type):
+            result.append({
+                **spec,
+                "requirement_type": requirement_type,
+                "requirement_ref": f"{requirement_type}:{spec['event_ref']}",
+            })
+    return result
 
 
 def event_match(spec: dict[str, Any], observed_refs: set[str], text: str) -> str | None:
@@ -190,15 +203,15 @@ def next_chapter_task_context(db: Session, project_id: str) -> dict[str, Any] | 
 
 
 def validate_task_output(output: dict[str, Any], task: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Validate model-declared task completion without pretending prose is structured fact."""
+    """Validate task metadata; required-event coverage is checked against reviewed prose later."""
     if not task:
         return []
     coverage = output.get("task_coverage")
     if not isinstance(coverage, list):
         return [{"code": "PLAN_TASK_COVERAGE_MISSING", "blocking": True}]
+    issues = []
     covered = {str(item) for item in coverage}
     coverage_text = "\n".join(covered)
-    issues = []
     for spec in task_event_specs(task, "must_events"):
         matched = "EVENT_REF" if spec["event_ref"] in covered else event_match(spec, set(), coverage_text)
         if not matched:

@@ -20,10 +20,10 @@ from app.models import (
 )
 from app.narrative_structure import NarrativeStructureService
 from app.quality import (
-    AntiAIBibleResolver, AntiAIStyleRuleEngine, CriticOutputValidator,
+    AntiAIBibleResolver, AntiAIStyleRuleEngine, CriticOutputValidator, build_required_event_evidence,
     NarrativeRepetitionDetector, QualityAssessmentAudit, QualityContextBuilder,
     QualityAssessmentFreshnessChecker, QualityDecisionEngine, QualityDomainError, QualityGateConfigResolver, QualityGateService,
-    QualityRepairService, assessment_payload, finding_fingerprint,
+    QualityRepairService, assessment_payload, finding_fingerprint, validate_required_event_evidence,
 )
 from app.writer import WriterProjectionService
 
@@ -246,6 +246,45 @@ def test_critic_visible_ref_is_accepted():
     finding = {"category": "CONTINUITY", "severity": "INFO", "message": "note", "start_offset": None, "end_offset": None, "excerpt": None, "source_refs": [{"source_type": "SCENE", "source_id": "s"}]}
     value = CriticOutputValidator().parse(critic_response(findings=[finding]), "text", [{"source_type": "SCENE", "source_id": "s"}])
     assert value["findings"][0]["source_refs"][0]["source_id"] == "s"
+
+
+def test_critic_required_event_review_requires_exact_prose_evidence():
+    task = {"must_events": [{"event_ref": "key", "label": "拿到钥匙", "aliases": ["钥匙到手"]}]}
+    review = {"requirement_ref": "must_events:key", "confirmed": True, "start_offset": 3, "end_offset": 7, "excerpt": "拿到钥匙", "reason": "正文明确写出"}
+    payload = critic_response()
+    raw = json.loads(payload)
+    raw["mandatory_event_reviews"] = [review]
+    value = CriticOutputValidator().parse(json.dumps(raw, ensure_ascii=False), "她终于拿到钥匙。", [], task)
+    assert value["mandatory_event_reviews"][0]["event_ref"] == "key"
+
+    raw["mandatory_event_reviews"][0]["excerpt"] = "没有这句话"
+    with pytest.raises(QualityDomainError, match="CRITIC_MANDATORY_EVENT_EVIDENCE_INVALID"):
+        CriticOutputValidator().parse(json.dumps(raw, ensure_ascii=False), "她终于拿到钥匙。", [], task)
+
+
+def test_required_event_evidence_blocks_adoption_without_critic_confirmation(quality_project, session):
+    from app.quality import NovelContinuityQualityChecker
+    draft = quality_project[4]
+    context = {
+        "chapter": quality_project[3], "prose": "她终于拿到钥匙。", "writer_draft": draft,
+        "writer_safe_context": {"planning_task": {"must_events": ["拿到钥匙"], "forbidden_events": [], "scene_beats": []}, "source_manifest": {"scenes": []}},
+    }
+    report = NovelContinuityQualityChecker().evaluate(session, context, reviewer_enabled=True, mandatory_event_reviews=[])
+    assert any(item["rule_code"] == "CRITIC_MANDATORY_EVENT_REVIEW_MISSING" for item in report["findings"])
+
+
+def test_required_event_evidence_is_reviewed_content_bound_and_fail_closed():
+    task = {"must_events": [{"event_ref": "key", "label": "拿到钥匙", "aliases": ["钥匙到手"]}]}
+    prose = "她终于拿到钥匙。"
+    start = prose.index("拿到钥匙")
+    review = {"requirement_ref": "must_events:key", "requirement_type": "must_events", "event_ref": "key", "label": "拿到钥匙", "confirmed": True, "start_offset": start, "end_offset": start + 4, "excerpt": prose[start:start + 4], "reason": "动作已完成。"}
+    report = build_required_event_evidence(prose, task, [review], "writer-content:test")
+    critic = {"mandatory_event_reviews": [review], "mandatory_event_evidence": report}
+    assert report["verified"]
+    assert validate_required_event_evidence(prose, task, critic, "writer-content:test") == []
+    assert validate_required_event_evidence(prose + "她松开手。", task, critic, "writer-content:changed")
+    unconfirmed = {**review, "confirmed": False}
+    assert not build_required_event_evidence(prose, task, [unconfirmed], "writer-content:test")["verified"]
 
 
 def test_quality_context_uses_current_adopted_draft(quality_project, session):
