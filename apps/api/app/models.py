@@ -1746,6 +1746,15 @@ class AutoDirectorRun(TimestampMixin, Base):
     cost_status: Mapped[str] = mapped_column(String(20), default="UNKNOWN", nullable=False)
     settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    worker_claim_token: Mapped[str | None] = mapped_column(String(36))
+    worker_lease_until: Mapped[datetime | None] = mapped_column(DateTime)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime)
+    recovery_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    recovery_key: Mapped[str | None] = mapped_column(String(180))
+    recovery_error_code: Mapped[str | None] = mapped_column(String(100))
+    recovery_usage_uncertain: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    checkpoint_stage: Mapped[str | None] = mapped_column(String(30))
+    checkpoint_saved_at: Mapped[datetime | None] = mapped_column(DateTime)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 

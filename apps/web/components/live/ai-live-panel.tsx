@@ -3,6 +3,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, ChevronDown, CircleDot, Clock3, FileText, Layers3, LoaderCircle, Radio, RefreshCw, X } from "lucide-react";
 import { useProjectLive, type Trace } from "./use-project-live";
+import { directorHref, recoveryLabel, recoveryState, recoveryTime } from "../../app/run-recovery";
 
 const stageLabels: Record<string, string> = { WRITER: "正文写作", CRITIC: "章节审核", REPAIR: "问题修复", DIRECTOR: "导演规划", CHARACTER_ACTOR: "角色行动", WORLD_RESOLVER: "世界裁定", SCENE_COMMIT: "保存场景", AUTONOMOUS_LOOP: "自动推进", FRAMING: "整书方向", CAST_PREPARATION: "人物准备", WORLD_BUILDING: "世界设定", STORY_MACRO: "故事主线", VOLUME_PLANNING: "卷纲规划", CHAPTER_PLANNING: "章节规划", CHAPTER_DETAIL: "章节任务", CHAPTER_EXECUTION: "正文写作", QUALITY_REVIEW: "质量审核", QUALITY_REPAIR: "问题修复", AUTHOR_ADOPTION: "采用正文", AUTHOR_WINDOW_PLANNING: "当前窗口规划" };
 const statusLabels: Record<string, string> = { STARTED: "进行中", RUNNING: "进行中", PENDING: "等待开始", SUCCEEDED: "已完成", FAILED: "失败", BLOCKED: "已暂停", PAUSED: "已暂停" };
@@ -92,6 +93,15 @@ export function AiLivePanel({ projectId }: { projectId: string }) {
         {sync.status === "offline" && <div className="ai-live-connection-note" role="status">暂时无法更新全部记录，已保留上次数据。{sync.retryAt ? `将在 ${timeText(sync.retryAt)} 自动重试，也可点击刷新。` : "可点击刷新重试。"}</div>}
         {streamState === "recovering" && sync.status !== "offline" && <div className="ai-live-connection-note">实时推送正在重连，记录通过定时同步继续更新。</div>}
         {!collapsed && <div id={`${panelId}-records`} className="ai-live-list" aria-busy={!lastUpdatedAt && sync.status === "syncing"}>
+          {autoRuns.map((run) => {
+            const retryAt = recoveryState(run) === "WAITING_RETRY" ? recoveryTime(run.recovery?.next_retry_at) : undefined;
+            const mode = run.run_mode === "AUTHOR_GUIDED_VOLUME" ? "卷创作" : "自动导演";
+            return <article className="ai-live-call run-recovery" key={`run-${run.id}`}>
+              <strong>{mode} · {recoveryLabel(run)}</strong>
+              {retryAt && <p>预计重试 {retryAt}</p>}
+              <a href={directorHref(projectId, run)}>查看{mode}运行</a>
+            </article>;
+          })}
           {liveSessions.map((session) => {
             const start = timestamp(session.started_at);
             const end = session.status === "RUNNING" ? Date.now() : timestamp(session.completed_at || session.updated_at);
@@ -108,7 +118,7 @@ export function AiLivePanel({ projectId }: { projectId: string }) {
             <div className="ai-live-meta"><span><Layers3 size={12} aria-hidden="true" />{trace.validation_report?.live_phase || statusText(trace.status)}</span><span><Clock3 size={12} aria-hidden="true" />{elapsedText(trace)}</span><span><FileText size={12} aria-hidden="true" />{trace.model || "本地整理"}</span></div>
             {trace.validation_report?.generation_warning && <div className="ai-live-note">已保留作者大纲，模型部分可稍后深化</div>}
           </article>)}
-          {!traces.length && !liveSessions.length && <div className="ai-live-empty"><Radio size={20} aria-hidden="true" /><p>{sync.status === "offline" ? "暂时无法读取创作记录" : !lastUpdatedAt ? "正在读取创作记录…" : "还没有 AI 工作记录"}<br /><small>{sync.status === "offline" ? "连接恢复后会自动更新，也可以立即重试。" : "开始生成规划或章节后，这里会自动出现。"}</small></p></div>}
+          {!traces.length && !liveSessions.length && !autoRuns.length && <div className="ai-live-empty"><Radio size={20} aria-hidden="true" /><p>{sync.status === "offline" ? "暂时无法读取创作记录" : !lastUpdatedAt ? "正在读取创作记录…" : "还没有 AI 工作记录"}<br /><small>{sync.status === "offline" ? "连接恢复后会自动更新，也可以立即重试。" : "开始生成规划或章节后，这里会自动出现。"}</small></p></div>}
         </div>}
       </aside>
     </>}

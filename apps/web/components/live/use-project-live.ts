@@ -2,10 +2,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, apiUrl } from "../../app/lib";
+import type { RunSummary } from "../../app/run-recovery";
 import { createLivePoller, type LiveSyncState } from "./live-poller";
 
 export type Trace = { id: string; stage?: string; status?: string; model?: string | null; latency_ms?: number | null; error_code?: string | null; created_at?: string | null; completed_at?: string | null; source_type?: string | null; validation_report?: { live_phase?: string; live_message?: string; generation_warning?: string } };
-export type AutoRun = { id: string; status?: string; current_stage?: string; updated_at?: string; pause_reason?: string; steps?: Array<{ id: string; stage?: string; status?: string; error_code?: string; started_at?: string; completed_at?: string; usage_metrics?: { model?: string; latency_ms?: number } }> };
+export type AutoRun = RunSummary & { updated_at?: string; steps?: Array<{ id: string; stage?: string; status?: string; error_code?: string; started_at?: string; completed_at?: string; usage_metrics?: { model?: string; latency_ms?: number } }> };
 export type LiveSession = { id: string; label: string; model?: string | null; phase: string; message: string; preview: string; total_chars: number; status: string; started_at: string; updated_at: string; completed_at?: string | null; error_code?: string | null };
 
 export function useProjectLive(projectId: string) {

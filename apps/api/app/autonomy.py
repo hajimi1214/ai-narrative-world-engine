@@ -161,6 +161,15 @@ class AutonomousWorldLoopService:
         return {"run": self.run_payload(run), "current_step": self.step_payload(step) if step else None}
 
     def advance(self, db: Session, run_id: str, *, max_scenes: int = 1, request_key: str = "default", request_offset: int = 0, usage_collector=None) -> dict[str, Any]:
+        def commit_scene_transaction():
+            usage_flush = db.info.get("author_scene_usage_flush")
+            if usage_flush:
+                usage_flush(db)
+            fence = db.info.get("author_commit_fence")
+            if fence:
+                fence(db)
+            db.commit()
+
         run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run_id).with_for_update())
         if not run: raise LookupError("AUTONOMY_RUN_NOT_FOUND")
         if max_scenes < 1 or max_scenes > 20: raise ValueError("INVALID_ADVANCE_LIMIT")
@@ -185,7 +194,7 @@ class AutonomousWorldLoopService:
                     steps.append(step)
                     if step.status != AutonomousStepStatus.COMMITTED:
                         break
-                    db.commit()
+                    commit_scene_transaction()
                     continue
                 if step.status == AutonomousStepStatus.PAUSED:
                     if run.status != AutonomousRunStatus.RUNNING:
@@ -203,10 +212,10 @@ class AutonomousWorldLoopService:
                             failed_run.last_error_code = str(exc)
                             failed_run.last_error_detail = {"message": str(exc)}
                             self._refresh_run_fingerprint(db, failed_run)
-                            db.commit()
+                            commit_scene_transaction()
                         raise ValueError(f"AUTONOMY_SCENE_FAILED:{exc}") from exc
                     steps.append(step)
-                    db.flush(); db.commit()
+                    db.flush(); commit_scene_transaction()
                     run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run_id).with_for_update())
                     if step.status != AutonomousStepStatus.COMMITTED or run.status != AutonomousRunStatus.RUNNING:
                         break
@@ -243,12 +252,12 @@ class AutonomousWorldLoopService:
                     failed_run.last_error_code = str(exc)
                     failed_run.last_error_detail = {"message": str(exc)}
                     self._refresh_run_fingerprint(db, failed_run)
-                    db.commit()
+                    commit_scene_transaction()
                 raise ValueError(f"AUTONOMY_SCENE_FAILED:{exc}") from exc
             steps.append(step)
             # Each scene is a durable unit. A later scene can fail without
             # rolling back an already committed scene.
-            db.flush(); db.commit()
+            db.flush(); commit_scene_transaction()
             run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run_id).with_for_update())
             if step.status != AutonomousStepStatus.COMMITTED or run.status != AutonomousRunStatus.RUNNING:
                 break
@@ -257,7 +266,7 @@ class AutonomousWorldLoopService:
         self._refresh_run_fingerprint(db, run)
         db.flush()
         if run.status in self.terminal:
-            db.commit()
+            commit_scene_transaction()
         return {"run": self.run_payload(run), "steps": [self.step_payload(step) for step in steps], "existing": any_existing}
 
     def continue_step(self, db: Session, run: AutonomousWorldRun, step: AutonomousWorldStep, *, usage_collector=None) -> AutonomousWorldStep:

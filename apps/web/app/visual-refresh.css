@@ -55,6 +55,10 @@ html[data-motion=paused] *,html[data-motion=paused] *:before,html[data-motion=pa
   .page-draft-save-label{display:none}
 }
 .token-budget-control{grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:10px}
+.run-recovery{display:grid;gap:6px;min-width:0;overflow-wrap:anywhere}
+.run-recovery p{margin:0}
+.run-recovery-state{font-weight:700;color:#214c94}
+.ai-live-call.run-recovery a{width:fit-content;min-height:36px;display:inline-flex;align-items:center;text-decoration:underline;text-underline-offset:3px;color:#214c94}
 .token-budget-control>button{min-height:42px;max-width:100%;white-space:normal}
 @media(max-width:560px){
   .token-budget-control{grid-template-columns:minmax(0,1fr)}

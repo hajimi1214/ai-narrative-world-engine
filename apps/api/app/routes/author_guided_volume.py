@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, PlotDirectionPayload, VolumeActionPayload, VolumeContinuePayload, VolumeContractUpdatePayload
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _contract_payload, _enum, _volume_payload, _window_payload
 from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookCompletionProposalStatus, BookContract, ChapterPlanningWindow, ChapterWindowStatus, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
+from ..author_recovery import recovery_payload, revoke_claim
 from .common import get_db, require_project
 from .auto_director import _retry_checkpoint, _retry_limit_reached
 
@@ -27,7 +28,7 @@ def _run_payload(db: Session, run: AutoDirectorRun) -> dict:
     window_rows = [item for item in steps if (item.output_payload or {}).get("window_id") == window_id]
     volume_rows = [item for item in steps if (item.output_payload or {}).get("volume_id") == volume_id]
     usage_summary = {"chapter": metrics(chapter_rows), "window": metrics(window_rows), "volume": metrics(volume_rows), "book": metrics(steps)}
-    return {"id": run.id, "project_id": run.project_id, "status": _enum(run.status), "run_mode": run.run_mode, "current_stage": _enum(run.current_stage), "pause_reason": run.pause_reason, "next_action": run.next_action, "idempotency_key": run.idempotency_key, "context": run.context or {}, "settings": run.settings or {}, "token_usage": run.token_usage or {}, "usage_summary": usage_summary}
+    return {"id": run.id, "project_id": run.project_id, "status": _enum(run.status), "run_mode": run.run_mode, "current_stage": _enum(run.current_stage), "pause_reason": run.pause_reason, "next_action": run.next_action, "idempotency_key": run.idempotency_key, "context": run.context or {}, "settings": run.settings or {}, "token_usage": run.token_usage or {}, "usage_summary": usage_summary, "recovery": recovery_payload(run)}
 
 
 def _volume_or_404(db: Session, project_id: str, volume_id: str) -> VolumeContract:
@@ -66,6 +67,7 @@ def _resume_volume_run(db: Session, project_id: str, volume_id: str) -> AutoDire
     elif run.status == AutoDirectorRunStatus.PAUSED:
         # Deliberate author pauses and safe budget pauses have no failed
         # checkpoint; resume without spending a recovery attempt.
+        revoke_claim(run)
         context = dict(run.context or {})
         if run.pause_reason in {"WINDOW_COMPLETE", "RUN_CHAPTER_BUDGET_REACHED"}:
             context["adopted_this_run"] = 0
@@ -219,6 +221,7 @@ def continue_author_guided_run(project_id: str, run_id: str, payload: VolumeCont
     if not run or run.project_id != project_id or run.run_mode != "AUTHOR_GUIDED_VOLUME": raise HTTPException(status_code=404, detail="Author-guided run not found")
     if run.status == AutoDirectorRunStatus.RUNNING:
         return _run_payload(db, run)
+    revoke_claim(run)
     if _retry_checkpoint(db, run) is not None:
         return retry_author_guided_run(project_id, run_id, db)
     _apply_token_budget_increase(db, run, payload)
@@ -269,6 +272,7 @@ def takeover_author_guided_run(project_id: str, run_id: str, db: Session = Depen
     run = db.get(AutoDirectorRun, run_id)
     if not run or run.project_id != project_id or run.run_mode != "AUTHOR_GUIDED_VOLUME":
         raise HTTPException(status_code=404, detail="Author-guided run not found")
+    revoke_claim(run)
     run.context = {**(run.context or {}), "stop_requested": True, "resume_stage": _enum(run.current_stage)}
     run.status = AutoDirectorRunStatus.PAUSED; run.current_stage = AutoDirectorStage.PAUSED; run.pause_reason = "AUTHOR_TAKEOVER"; run.next_action = "作者已接管，可从现有检查点进入手动工作台。"
     db.commit(); return _run_payload(db, run)
@@ -278,6 +282,7 @@ def takeover_author_guided_run(project_id: str, run_id: str, db: Session = Depen
 def pause_author_guided_run(project_id: str, run_id: str, payload: VolumeActionPayload, db: Session = Depends(get_db)):
     require_project(db, project_id); run = db.get(AutoDirectorRun, run_id)
     if not run or run.project_id != project_id or run.run_mode != "AUTHOR_GUIDED_VOLUME": raise HTTPException(status_code=404, detail="Author-guided run not found")
+    revoke_claim(run)
     run.context = {**(run.context or {}), "resume_stage": _enum(run.current_stage), "stop_requested": True}
     run.status = AutoDirectorRunStatus.PAUSED; run.current_stage = AutoDirectorStage.PAUSED; run.pause_reason = payload.reason or "AUTHOR_PAUSED"; run.next_action = "作者可以继续当前卷或接管修改。"
     db.commit(); return _run_payload(db, run)
@@ -345,6 +350,7 @@ def pause_volume(project_id: str, volume_id: str, payload: VolumeActionPayload, 
     volume = _volume_or_404(db, project_id, volume_id)
     run = _wake_volume_run(db, project_id, volume.id)
     if run and run.status in {AutoDirectorRunStatus.CREATED, AutoDirectorRunStatus.RUNNING}:
+        revoke_claim(run)
         context = dict(run.context or {})
         if run.current_stage != AutoDirectorStage.PAUSED:
             context["resume_stage"] = _enum(run.current_stage)

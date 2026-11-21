@@ -397,6 +397,7 @@ def test_dynamic_length_and_window_rollover_do_not_use_estimate_as_completion_li
         other = db.scalar(select(BookContract).where(BookContract.project_id == other_project_id))
         assert other.length_policy["estimated_chapters"] == 300
         assert other.id != contract.id
+    client.post(f"/projects/{other_project_id}/author-guided-volume/runs/{other_response.json()['id']}/pause", json={"reason": "fixture idle"})
 
     import app.auto_director as volume_module
     def fake_advance(self, db, run):
@@ -635,9 +636,9 @@ def test_operational_token_budget_pauses_author_run_at_checkpoint(monkeypatch):
     monkeypatch.setattr(auto_module.AutoDirectorOrchestrator, "advance_to_pause", budget_error)
     client.post(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}/continue")
     assert worker.run_once() is True
-    assert worker.run_once() is True  # Budget is checked after the planning call too.
     state = client.get(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}").json()
     assert state["status"] == "PAUSED" and state["pause_reason"] == "TOKEN_BUDGET_EXCEEDED"
+    assert worker.run_once() is False  # A paused budget checkpoint is no longer claimable.
     denied = client.post(f"/projects/{project_id}/volumes/{state['context']['volume_id']}/continue", json={})
     assert denied.status_code == 409 and denied.json()["detail"]["code"] == "TOKEN_BUDGET_INCREASE_REQUIRED"
     raised = client.post(f"/projects/{project_id}/volumes/{state['context']['volume_id']}/continue", json={"operational_token_budget": 10})

@@ -1,6 +1,6 @@
 // Keep the local default on the same IPv4 loopback as the API launcher.
 export const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
-export class ApiError extends Error { constructor(message: string, public detail?: unknown) { super(message); } }
+export class ApiError extends Error { constructor(message: string, public detail?: unknown, public status?: number) { super(message); } }
 const errorMessages: Record<string, string> = {
   AUTHOR_EDIT_CONFLICT: "当前工作稿已经更新。请保留修改内容，刷新并比较最新版本后再保存。",
   AUTHOR_EDIT_REQUIRES_PAUSE: "自动创作正在运行，请先到导演台暂停，再保存人工修改。",
@@ -13,6 +13,6 @@ const errorMessages: Record<string, string> = {
 };
 export async function api(path: string, options?: RequestInit) {
   const response = await fetch(`${apiUrl}${path}`, { ...options, headers: { "Content-Type": "application/json", ...options?.headers } });
-  if (!response.ok) { const detail = await response.json().catch(() => null); const body = detail?.detail; const code = body?.code; const validation = Array.isArray(body) ? body.map((item: any) => `${item.loc?.filter((part: string) => part !== "body").join(".") || "输入"}：${item.msg || "格式无效"}`).join("；") : ""; const message = errorMessages[code] || body?.message || code || validation || (typeof body === "string" ? body : `请求失败（${response.status}）`); throw new ApiError(message, detail); }
+  if (!response.ok) { const detail = await response.json().catch(() => null); const body = detail?.detail; const code = body?.code; const validation = Array.isArray(body) ? body.map((item: any) => `${item.loc?.filter((part: string) => part !== "body").join(".") || "输入"}：${item.msg || "格式无效"}`).join("；") : ""; const message = errorMessages[code] || body?.message || code || validation || (typeof body === "string" ? body : `请求失败（${response.status}）`); throw new ApiError(message, detail, response.status); }
   return response.status === 204 ? null : response.json();
 }

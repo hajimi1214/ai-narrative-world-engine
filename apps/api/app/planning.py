@@ -303,9 +303,23 @@ def _fallback_chapter_window(framing: dict[str, Any], count: int) -> list[dict[s
     return [_default_chapter(number, framing) for number in range(1, count + 1)]
 
 
-def _model_generate(provider: Any, messages: list[dict[str, str]], model: str, on_delta: Callable[[str], None] | None) -> Any:
+def _model_generate(provider: Any, messages: list[dict[str, str]], model: str,
+                    on_delta: Callable[[str], None] | None, guard=None, on_usage=None) -> Any:
+    # The author worker installs a per-call budget fence in the session.
+    # Planning uses the shared provider directly, so apply the same fence here.
+    # The guard wrapper is intentionally local to avoid changing public model APIs.
+    if guard:
+        guard()
     stream = getattr(provider, "generate_stream", None)
-    return stream(messages, model, on_delta) if on_delta and callable(stream) else provider.generate(messages, model)
+    try:
+        result = stream(messages, model, on_delta) if on_delta and callable(stream) else provider.generate(messages, model)
+    except ModelProviderError as exc:
+        if on_usage:
+            on_usage(exc)
+        raise
+    if on_usage:
+        on_usage(result)
+    return result
 
 
 def _local_macro_fallback(project: Project, framing: dict[str, Any], premise: str | None) -> dict[str, Any]:
@@ -335,7 +349,7 @@ def _local_macro_fallback(project: Project, framing: dict[str, Any], premise: st
     }
 
 
-def generate_plan(db: Session, project: Project, framing: dict[str, Any], premise: str | None, style_guide: dict[str, Any], anti_ai_rules: dict[str, Any], on_phase: Callable[[str, str], None] | None = None, on_delta: Callable[[str], None] | None = None) -> tuple[dict[str, Any], Any]:
+def generate_plan(db: Session, project: Project, framing: dict[str, Any], premise: str | None, style_guide: dict[str, Any], anti_ai_rules: dict[str, Any], on_phase: Callable[[str, str], None] | None = None, on_delta: Callable[[str], None] | None = None, on_usage=None) -> tuple[dict[str, Any], Any]:
     settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
     key = ProviderCredentialResolver().generation_key(db, project.id, settings)
     config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project.id))
@@ -353,14 +367,14 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
         instruction = f"Return exactly one JSON object. Build a coherent Chinese novel plan, not prose. The book has {target_chapters} chapters. Volumes and arcs must cover chapter 1 through chapter {target_chapters}. Every returned chapter must include start/end state, conflict, mandatory and forbidden events, reveal permissions, foreshadowing, character changes, consequences, and 3-6 scene beats. Do not invent UUIDs: use existing IDs only when supplied, otherwise use stable human-readable names. Avoid generic AI phrasing, symmetrical slogans, empty metaphors, and omniscient knowledge leaks. Preserve chronology. Output keys must match the contract."
         messages = [{"role": "system", "content": "你是长篇小说总策划与连续性编辑。"}, {"role": "user", "content": json.dumps({"instruction": instruction, "output_contract": contract, "context": context, "style_guide": style_guide, "anti_ai_rules": anti_ai_rules}, ensure_ascii=False)}]
         if on_phase: on_phase("GENERATING", "正在生成整书结构与章节任务")
-        result = _model_generate(provider, messages, route.model, on_delta)
+        result = _model_generate(provider, messages, route.model, on_delta, db.info.get("author_model_call_guard"), on_usage)
         try:
             if on_phase: on_phase("VALIDATING", "正在校验结构化规划")
             return _extract_single_json_object(result.content), result
         except (ValueError, TypeError, json.JSONDecodeError) as first_error:
             if on_phase: on_phase("REPAIRING", "正在修复模型返回的结构")
             repair_messages = messages + [{"role": "assistant", "content": result.content}, {"role": "user", "content": json.dumps({"instruction": "你的上一条输出不是有效 JSON。只修复 JSON 格式，不改变故事内容；返回完整、可解析的 JSON 对象，不要 Markdown。", "error": str(first_error)[:500], "output_contract": contract}, ensure_ascii=False)}]
-            result = _model_generate(provider, repair_messages, route.model, on_delta)
+            result = _model_generate(provider, repair_messages, route.model, on_delta, db.info.get("author_model_call_guard"), on_usage)
             return _extract_single_json_object(result.content), result
 
     macro_contract = {"framing": "object", "premise": "string", "macro_plan": "object with logline, story_engine, core_conflict, protagonist_endpoint, antagonist_goal, first_thirty_chapter_promise, mid_late_turn and ending_payoff", "style_guide": "object", "anti_ai_rules": "object", "volumes": "concise array covering every chapter; every item requires number, title, summary, theme, core_question, major_conflict, start_state, end_state, main_thread, ending_turn, foreshadowing, start_chapter and end_chapter", "arcs": "concise array covering every chapter; every item requires number, volume_number, title, goal, summary, core_question, start_state, end_state and turning_points"}
@@ -368,10 +382,12 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
     macro_messages = [{"role": "system", "content": "你是长篇小说总策划与连续性编辑。"}, {"role": "user", "content": json.dumps({"instruction": macro_instruction, "output_contract": macro_contract, "context": context, "style_guide": style_guide, "anti_ai_rules": anti_ai_rules}, ensure_ascii=False)}]
     try:
         if on_phase: on_phase("GENERATING_MACRO", "正在生成全书主线、卷纲与故事弧")
-        macro_result = _model_generate(provider, macro_messages, route.model, on_delta)
+        macro_result = _model_generate(provider, macro_messages, route.model, on_delta, db.info.get("author_model_call_guard"), on_usage)
         if on_phase: on_phase("VALIDATING_MACRO", "正在校验全书结构")
         macro = _extract_single_json_object(macro_result.content)
     except (ModelProviderError, ValueError, TypeError, json.JSONDecodeError):
+        if db.info.get("author_recovery"):
+            raise
         if on_phase: on_phase("FALLBACK", "模型未返回可用结构，正在整理作者已保存的十卷大纲")
         return _local_macro_fallback(project, framing, premise), None
 
@@ -380,7 +396,7 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
     detail_messages = [{"role": "system", "content": "你是长篇小说分章策划编辑。"}, {"role": "user", "content": json.dumps({"instruction": detail_instruction, "output_contract": detail_contract, "story_brief": context["story_brief"], "framing": context["framing"], "macro_architecture": {"macro_plan": macro.get("macro_plan") or {}, "volumes": macro.get("volumes") or [], "arcs": macro.get("arcs") or []}}, ensure_ascii=False)}]
     try:
         if on_phase: on_phase("GENERATING_CHAPTERS", f"正在生成第 1-{detailed_chapters} 章任务单")
-        details_result = _model_generate(provider, detail_messages, route.model, on_delta)
+        details_result = _model_generate(provider, detail_messages, route.model, on_delta, db.info.get("author_model_call_guard"), on_usage)
         if on_phase: on_phase("VALIDATING_CHAPTERS", "正在校验章节任务与全书结构的一致性")
         details = _extract_single_json_object(details_result.content)
         macro["chapters"] = (details.get("chapters") or [])[:detailed_chapters]

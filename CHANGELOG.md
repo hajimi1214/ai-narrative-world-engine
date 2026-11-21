@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 - 2026-11-21
+
+- Added durable worker leases, restart recovery, transient provider backoff, and persisted writing checkpoints.
+- Added author-guided stage recovery for world scenes, Writer drafts, quality review, repair, and adoption without duplicate adoption.
+- Added explicit recovery states for waiting retry, budget pause, author action, uncertain provider usage, and API connection loss.
+
 ## 0.2.0 - 2026-11-21
 
 - Added continuous author-guided chapter production across rolling volume windows, with chapter and token budgets that resume from saved checkpoints.

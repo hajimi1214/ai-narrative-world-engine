@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
+from .ai.errors import ModelProviderError
 from .ai.factory import get_model_provider
 from .api_types import AutoDirectorRunCreatePayload
 from .creation import generate_creation_directions
@@ -94,14 +95,29 @@ class AutoDirectorError(RuntimeError):
 class _UsageTrackingProvider:
     """Delegates a model provider while exposing the last real ModelResult."""
 
-    def __init__(self, provider):
+    def __init__(self, provider, guard=None):
         self.provider = provider
         self.name = getattr(provider, "name", None)
         self.last_result = None
+        self.last_error: ModelProviderError | None = None
         self.results = []
+        self.errors = []
+        self.guard = guard
 
     def generate(self, messages, model):
-        result = self.provider.generate(messages, model)
+        if self.guard:
+            try:
+                self.guard()
+            except ModelProviderError as exc:
+                exc.accounted_calls = 0
+                raise
+        try:
+            result = self.provider.generate(messages, model)
+        except ModelProviderError as exc:
+            self.last_error = exc
+            self.errors.append(exc)
+            raise
+        self.last_error = None
         self.last_result = result
         self.results.append(result)
         return result
@@ -179,9 +195,13 @@ class AutoDirectorOrchestrator:
             current = cls._model_usage(result)
             for key in usage:
                 usage[key] += current[key]
-        providers = sorted({str(getattr(result, "provider", "")) for result in results if getattr(result, "provider", None)})
-        models = sorted({str(getattr(result, "model", "")) for result in results if getattr(result, "model", None)})
-        return {"calls": len(results), "latency_ms": sum(int(getattr(result, "latency_ms", 0) or 0) for result in results), "tokens": usage["total_tokens"], "usage": usage, "provider": ",".join(providers) or None, "model": ",".join(models) or None}
+        for error in (error for tracker in trackers for error in tracker.errors):
+            current = cls._model_usage(error)
+            for key in usage:
+                usage[key] += current[key]
+        providers = sorted({str(getattr(item, "provider", "")) for item in [*results, *(error for tracker in trackers for error in tracker.errors)] if getattr(item, "provider", None)})
+        models = sorted({str(getattr(item, "model", "")) for item in [*results, *(error for tracker in trackers for error in tracker.errors)] if getattr(item, "model", None)})
+        return {"calls": len(results) + sum(int(getattr(error, "accounted_calls", 1)) for tracker in trackers for error in tracker.errors), "latency_ms": sum(int(getattr(result, "latency_ms", 0) or 0) for result in results), "tokens": usage["total_tokens"], "usage": usage, "provider": ",".join(providers) or None, "model": ",".join(models) or None}
 
     @staticmethod
     def _steps(db: Session, run: AutoDirectorRun) -> list[AutoDirectorStep]:
@@ -428,6 +448,11 @@ class AutoDirectorOrchestrator:
                 return run
             self._plan_and_first_chapter(db, run, project)
         except Exception as exc:
+            if db.info.get("author_recovery") and run.run_mode == "AUTHOR_GUIDED_VOLUME":
+                from .author_recovery import LostRunClaim, provider_failure
+                if isinstance(exc, LostRunClaim) or getattr(exc, "code", None) == "TOKEN_BUDGET_EXCEEDED":
+                    raise
+                exc = provider_failure(exc) or exc
             active_step = db.get(AutoDirectorStep, (run.context or {}).get("active_step_id")) if (run.context or {}).get("active_step_id") else None
             failed_step = active_step if active_step and active_step.status != AutoDirectorStepStatus.COMMITTED else locals().get("step")
             if failed_step is None:
@@ -619,6 +644,7 @@ class AutoDirectorOrchestrator:
         runtime.resume(db, autonomous.id)
 
     def _plan_and_first_chapter(self, db: Session, run: AutoDirectorRun, project: Project) -> None:
+        durable_stages = bool(db.info.get("author_recovery") and run.run_mode == "AUTHOR_GUIDED_VOLUME")
         direction = run.context["selected_direction"]
         framing = dict(run.context.get("request") or {})
         # Book length defines the macro plan. max_chapters only defines how
@@ -679,9 +705,42 @@ class AutoDirectorOrchestrator:
             if detail_step.status != AutoDirectorStepStatus.COMMITTED:
                 self._commit_step(detail_step, {"plan_id": plan_id, "chapter_number": chapter_number, "chapter_task_id": plan_chapter.id}, plan_chapter.id, calls=1, latency_ms=detail_result.latency_ms, tokens=self._model_tokens(detail_result), usage=self._model_usage(detail_result), provider=detail_result.provider, model=detail_result.model)
                 self._add_usage(run, detail_step)
-        # The runtime owns formal scenes and chapter formation. Do not create a
-        # placeholder Chapter here; SceneCommitService will form it from the
-        # committed scene and preserve the existing structure invariants.
+        world_identity = {"plan_id": plan_id, "chapter_number": chapter_number, "plan_chapter_id": plan_chapter.id}
+        world_step = self._step(db, run, AutoDirectorStage.CHAPTER_WINDOW_EXECUTION, world_identity) if durable_stages else None
+        if world_step is not None and world_step.status == AutoDirectorStepStatus.COMMITTED:
+            chapter = db.get(Chapter, world_step.output_artifact_id)
+            if not chapter or not chapter.active or chapter.project_id != project.id or chapter.number != chapter_number:
+                raise AutoDirectorError("CHAPTER_CHECKPOINT_INVALID")
+        else:
+            try:
+                chapter = self._advance_chapter_world(db, run, project, plan_id, plan_chapter, detail_step, chapter_number, durable_stages=durable_stages)
+            except Exception as exc:
+                if not durable_stages:
+                    raise
+                from .author_recovery import LostRunClaim, provider_failure
+                if isinstance(exc, LostRunClaim) or getattr(exc, "code", None) == "TOKEN_BUDGET_EXCEEDED":
+                    raise
+                # The runtime owns scene transactions and may already have
+                # rolled back the first attempt to write this checkpoint.
+                checkpoint = db.get(AutoDirectorStep, world_step.id) if world_step.id else None
+                if checkpoint is None:
+                    checkpoint = self._step(db, run, AutoDirectorStage.CHAPTER_WINDOW_EXECUTION, world_identity)
+                self._fail(run, checkpoint, provider_failure(exc) or exc)
+                return
+            if chapter is None:
+                return
+            if world_step is not None:
+                self._commit_step(world_step, {"chapter_id": chapter.id, "chapter_number": chapter_number}, chapter.id)
+                run.current_chapter_id = chapter.id
+                run.current_stage = AutoDirectorStage.CHAPTER_EXECUTION
+                run.next_action = "本章场景已保存，下一检查点生成正文。"
+                db.info["author_checkpoint_stage"] = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION.value
+                return
+
+        self._advance_chapter_prose(db, run, project, plan_id, chapter, chapter_number, durable_stages=durable_stages)
+
+    def _advance_chapter_world(self, db: Session, run: AutoDirectorRun, project: Project, plan_id: str, plan_chapter: StoryPlanChapter, detail_step: AutoDirectorStep, chapter_number: int, *, durable_stages: bool) -> Chapter | None:
+        # SceneCommitService owns the formal chapter structure.
         planning_task = chapter_task_context(db, project.id, chapter_number, required=True)
         existing_chapter = db.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.number == chapter_number, Chapter.active.is_(True)))
         # A recovered chapter that already has a committed scene can proceed
@@ -698,11 +757,37 @@ class AutoDirectorOrchestrator:
         scene_events: list[dict[str, Any]] = []
         def collect_scene_usage(event: dict[str, Any]) -> None:
             scene_events.append(dict(event))
+            if db.info.get("author_recovery"):
+                db.info["author_pending_total_tokens"] = int(db.info.get("author_pending_total_tokens") or 0) + int(event.get("total_tokens") or 0)
+
+        def persist_scene_usage(session: Session) -> None:
+            if not scene_events:
+                return
+            metrics = {
+                "calls": sum(int(item.get("calls", 0) or 0) for item in scene_events),
+                "prompt_tokens": sum(int(item.get("prompt_tokens", 0) or 0) for item in scene_events),
+                "completion_tokens": sum(int(item.get("completion_tokens", 0) or 0) for item in scene_events),
+                "total_tokens": sum(int(item.get("total_tokens", 0) or 0) for item in scene_events),
+                "latency_ms": sum(int(item.get("latency_ms", 0) or 0) for item in scene_events),
+                "provider": ",".join(sorted({str(item.get("provider")) for item in scene_events if item.get("provider")})),
+                "model": ",".join(sorted({str(item.get("model")) for item in scene_events if item.get("model")})),
+            }
+            self._merge_step_usage(detail_step, metrics)
+            self._add_usage_metrics(run, metrics)
+            scene_events.clear()
+            if session.info.get("author_recovery"):
+                session.info["author_pending_total_tokens"] = 0
+
+        if durable_stages:
+            db.info["author_scene_usage_flush"] = persist_scene_usage
         runtime_request_id = f"{run.id}-chapter-{chapter_number}"
         existing_autonomous = db.scalar(select(AutonomousWorldRun).where(
             AutonomousWorldRun.project_id == project.id,
             AutonomousWorldRun.client_request_id == runtime_request_id,
         ))
+        if durable_stages and existing_autonomous:
+            # An interrupted chapter may already have a partial scene prefix.
+            scene_count = existing_autonomous.scene_budget
         autonomous = existing_autonomous or AutonomousWorldLoopService().create_run(db, project.id, scene_budget=scene_count, max_turns_per_scene=2, performance_mode="LLM", resolver_mode="LLM", config={"auto_director_run_id": run.id, "plan_id": plan_id, "plan_chapter_id": plan_chapter.id, "chapter_number": chapter_number, "planning_task": planning_task}, client_request_id=runtime_request_id)
         db.flush()
         autonomous_run_ids.append(autonomous.id)
@@ -728,6 +813,13 @@ class AutoDirectorOrchestrator:
                 self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
             elif enum_value(autonomous.status) == "BLOCKED" and autonomous.stop_reason == "AUTONOMY_BASELINE_CHANGED" and int(autonomous.committed_scene_count or 0) == 0:
                 self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
+            elif durable_stages and enum_value(autonomous.status) == "PAUSED":
+                from .author_recovery import recoverable_provider_failure
+                last_error = self._runtime_provider_error(autonomous.last_error_code, autonomous.last_error_detail)
+                if last_error and last_error.code == "TOKEN_BUDGET_EXCEEDED":
+                    raise last_error
+                if last_error and recoverable_provider_failure(last_error):
+                    runtime.resume(db, autonomous.id)
             result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
             if result.get("run", {}).get("stop_reason") == "WORLD_INFORMATION_MISSING":
                 self._seed_runtime_context(db, run, project, chapter_number, planning_task)
@@ -735,20 +827,35 @@ class AutoDirectorOrchestrator:
                 result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
             self._live_complete(runtime_live, "角色行动与世界裁定已提交，正在形成章节")
         except Exception as exc:
+            if durable_stages:
+                db.info.pop("author_scene_usage_flush", None)
             self._live_fail(runtime_live, exc)
             raise
-        if scene_events:
-            metrics = {"calls": sum(int(item.get("calls", 0) or 0) for item in scene_events), "prompt_tokens": sum(int(item.get("prompt_tokens", 0) or 0) for item in scene_events), "completion_tokens": sum(int(item.get("completion_tokens", 0) or 0) for item in scene_events), "total_tokens": sum(int(item.get("total_tokens", 0) or 0) for item in scene_events), "latency_ms": sum(int(item.get("latency_ms", 0) or 0) for item in scene_events), "provider": ",".join(sorted({str(item.get("provider")) for item in scene_events if item.get("provider")})), "model": ",".join(sorted({str(item.get("model")) for item in scene_events if item.get("model")}))}
-            self._merge_step_usage(detail_step, metrics)
-            self._add_usage_metrics(run, metrics)
+        else:
+            if durable_stages:
+                persist_scene_usage(db)
+                db.info.pop("author_scene_usage_flush", None)
         committed_scene_steps = [item for item in result.get("steps", []) if item.get("scene_id")]
         scene_step = committed_scene_steps[-1] if committed_scene_steps else None
         if len(committed_scene_steps) < scene_count:
+            if durable_stages:
+                runtime_error = self._runtime_provider_error((result.get("run") or {}).get("last_error_code"), autonomous.last_error_detail)
+                if runtime_error:
+                    raise runtime_error
             raise AutoDirectorError("CHAPTER_SCENE_NOT_COMMITTED", str(result))
-        run.context = {**(run.context or {}), "autonomous_run_ids": [*(run.context or {}).get("autonomous_run_ids", []), *autonomous_run_ids]}
+        run.context = {**(run.context or {}), "autonomous_run_ids": list(dict.fromkeys([*(run.context or {}).get("autonomous_run_ids", []), *autonomous_run_ids]))}
         chapter = db.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.number == chapter_number, Chapter.active.is_(True)))
         if not chapter:
             raise AutoDirectorError("CHAPTER_FORMATION_FAILED")
+        return chapter
+
+    @staticmethod
+    def _runtime_provider_error(code: str | None, detail: dict[str, Any] | None) -> ModelProviderError | None:
+        if code in {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "TOKEN_BUDGET_EXCEEDED"}:
+            return ModelProviderError(code, upstream_status=(detail or {}).get("upstream_status"))
+        return None
+
+    def _advance_chapter_prose(self, db: Session, run: AutoDirectorRun, project: Project, plan_id: str, chapter: Chapter, chapter_number: int, *, durable_stages: bool) -> None:
         run.current_chapter_id = chapter.id
         run.current_stage = AutoDirectorStage.CHAPTER_EXECUTION
         writer_step = self._step(db, run, AutoDirectorStage.CHAPTER_EXECUTION, {"chapter_id": chapter.id, "plan_id": plan_id})
@@ -757,7 +864,7 @@ class AutoDirectorOrchestrator:
             settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "WRITER")
             key = ProviderCredentialResolver().generation_key(db, project.id, settings)
             pov_character_id = (run.context.get("foundation") or {}).get("character_ids", [None])[0]
-            writer_provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key))
+            writer_provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key), db.info.get("author_model_call_guard"))
             writer_live = self._live_begin(run, f"第 {chapter_number} 章：正文写作", "WRITER", provider=route.provider, model=route.model)
             live_execution_broker.phase(writer_live, "WRITING", "Writer 正在依据角色 Agent 行动和章节任务生成正文")
             try:
@@ -771,11 +878,36 @@ class AutoDirectorOrchestrator:
                 self._live_fail(writer_live, exc)
                 raise
             if draft.status not in {WriterDraftStatus.VALIDATED, WriterDraftStatus.ADOPTED}:
-                self._fail(run, writer_step, AutoDirectorError("WRITER_DRAFT_FAILED", str(draft.validation_report)))
+                failure = writer_provider.last_error if durable_stages else None
+                if durable_stages:
+                    failure_metrics = self._tracked_metrics(writer_provider)
+                    self._merge_step_usage(writer_step, failure_metrics)
+                    self._add_usage_metrics(run, failure_metrics)
+                message = "正文稿未通过 Writer 验证。" if durable_stages else str(draft.validation_report)
+                self._fail(run, writer_step, failure or AutoDirectorError("WRITER_DRAFT_FAILED", message))
                 return
             metrics = self._tracked_metrics(writer_provider)
             self._commit_step(writer_step, {"draft_id": draft.id, "chapter_id": chapter.id}, draft.id, **metrics); self._add_usage(run, writer_step)
+            if durable_stages:
+                run.current_stage = AutoDirectorStage.QUALITY_REVIEW
+                run.next_action = "正文草稿已保存，下一检查点运行质量审核。"
+                db.info["author_checkpoint_stage"] = AutoDirectorStage.CHAPTER_EXECUTION.value
+                return
         draft_id = writer_step.output_payload["draft_id"]
+        assessment, review_completed = self._review_chapter_draft(db, run, project, chapter, chapter_number, draft_id, durable_stages=durable_stages)
+        if assessment is None:
+            return
+        if durable_stages:
+            if review_completed:
+                run.current_stage = AutoDirectorStage.QUALITY_REPAIR if enum_value(assessment.status) == "REPAIR_REQUIRED" else AutoDirectorStage.AUTHOR_ADOPTION
+                run.next_action = "质量报告已保存，下一检查点处理审核结果。"
+                db.info["author_checkpoint_stage"] = AutoDirectorStage.QUALITY_REVIEW.value
+                return
+            self._finish_recovered_chapter(db, run, project, chapter, chapter_number, assessment)
+            return
+        self._finish_chapter(db, run, project, chapter_number, assessment)
+
+    def _review_chapter_draft(self, db: Session, run: AutoDirectorRun, project: Project, chapter: Chapter, chapter_number: int, draft_id: str, *, durable_stages: bool, repair_of: ChapterQualityAssessment | None = None) -> tuple[ChapterQualityAssessment | None, bool]:
         run.current_stage = AutoDirectorStage.QUALITY_REVIEW
         quality_step = self._step(db, run, AutoDirectorStage.QUALITY_REVIEW, {"draft_id": draft_id})
         existing_assessment_id = (quality_step.output_payload or {}).get("assessment_id")
@@ -786,29 +918,110 @@ class AutoDirectorOrchestrator:
             quality_step.status = AutoDirectorStepStatus.RUNNING
             quality_step.attempt += 1
             quality_step.started_at = datetime.utcnow()
-        if quality_step.status != AutoDirectorStepStatus.COMMITTED:
+        review_completed = quality_step.status != AutoDirectorStepStatus.COMMITTED
+        provider_error = None
+        if review_completed:
             self._check_budget(run)
             settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "CRITIC")
             key = ProviderCredentialResolver().generation_key(db, project.id, settings)
             draft = db.get(ChapterWriterDraft, draft_id)
             if not draft:
                 raise AutoDirectorError("WRITER_DRAFT_NOT_FOUND")
-            critic_provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key))
+            critic_provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key), db.info.get("author_model_call_guard"))
             critic_live = self._live_begin(run, f"第 {chapter_number} 章：质量审计", "CRITIC", provider=route.provider, model=route.model)
             live_execution_broker.phase(critic_live, "REVIEWING", "质量 Agent 正在审计任务覆盖、连续性和正文问题")
             try:
-                assessment = QualityGateService().assess(db, chapter.id, {"idempotency_key": f"{run.id}-quality-{chapter_number}-attempt-{quality_step.attempt}"}, provider=critic_provider, model=route.model, settings=settings, draft=draft, require_current=False)
+                request = {"idempotency_key": f"{run.id}-quality-{chapter_number}-attempt-{quality_step.attempt}"}
+                if repair_of is not None:
+                    from .quality import _assessment_explicit_overrides
+                    request = {"idempotency_key": f"{run.id}-quality-repair-{chapter_number}-attempt-{quality_step.attempt}", "config": _assessment_explicit_overrides(repair_of.quality_config)}
+                assessment = QualityGateService().assess(db, chapter.id, request, provider=critic_provider, model=route.model, settings=settings, draft=draft, require_current=False)
                 self._live_complete(critic_live, f"质量审计完成：{enum_value(assessment.status)}")
             except Exception as exc:
                 self._live_fail(critic_live, exc)
                 raise
             metrics = self._tracked_metrics(critic_provider)
             self._commit_step(quality_step, {"assessment_id": assessment.id, "status": enum_value(assessment.status)}, assessment.id, **metrics); self._add_usage(run, quality_step)
+            provider_error = critic_provider.last_error if durable_stages else None
         assessment = db.get(ChapterQualityAssessment, quality_step.output_payload["assessment_id"])
+        if assessment is None:
+            raise AutoDirectorError("QUALITY_CHECKPOINT_INVALID")
         if assessment and enum_value(assessment.status) == "FAILED":
             reason = (assessment.decision_reason_codes or ["QUALITY_ASSESSMENT_FAILED"])[0]
-            self._fail(run, quality_step, AutoDirectorError(reason, "质量审核未完成，请重试当前审核检查点。"))
+            self._fail(run, quality_step, provider_error or AutoDirectorError(reason, "质量审核未完成，请重试当前审核检查点。"))
+            return None, False
+        return assessment, review_completed
+
+    def _finish_recovered_chapter(self, db: Session, run: AutoDirectorRun, project: Project, chapter: Chapter, chapter_number: int, assessment: ChapterQualityAssessment) -> None:
+        if enum_value(assessment.status) == "REPAIR_REQUIRED":
+            original = assessment
+            repair_step = self._prepare_recovered_repair(db, run, project, chapter_number, original)
+            if repair_step is None:
+                return
+            repair_draft_id = (repair_step.output_payload or {}).get("draft_id")
+            if repair_draft_id:
+                assessment, review_completed = self._review_chapter_draft(db, run, project, chapter, chapter_number, repair_draft_id, durable_stages=True, repair_of=original)
+                if assessment is None:
+                    return
+                if review_completed:
+                    run.current_stage = AutoDirectorStage.AUTHOR_ADOPTION
+                    run.next_action = "修复稿审核已保存，下一检查点处理审核结果。"
+                    db.info["author_checkpoint_stage"] = AutoDirectorStage.QUALITY_REVIEW.value
+                    return
+
+        run.current_stage = AutoDirectorStage.AUTHOR_ADOPTION
+        if enum_value(assessment.status) != "PASS":
+            run.status = AutoDirectorRunStatus.PAUSED
+            run.pause_reason = "QUALITY_REVIEW_REQUIRED"
+            run.next_action = "本章未通过审核，请查看质量报告并处理后继续。"
             return
+        adoption_step = self._step(db, run, AutoDirectorStage.AUTHOR_ADOPTION, {"assessment_id": assessment.id, "draft_id": assessment.writer_draft_id})
+        if adoption_step.status != AutoDirectorStepStatus.COMMITTED:
+            with db.begin_nested():
+                run.context = {**(run.context or {}), "adopt_draft_id": assessment.writer_draft_id}
+                self.adopt_chapter(db, run)
+                self._commit_step(adoption_step, {"draft_id": assessment.writer_draft_id, "assessment_id": assessment.id, "chapter_id": chapter.id}, chapter.id)
+                context = dict(run.context or {})
+                context.pop("adopt_draft_id", None)
+                run.context = context
+            db.info["author_checkpoint_stage"] = AutoDirectorStage.AUTHOR_ADOPTION.value
+
+    def _prepare_recovered_repair(self, db: Session, run: AutoDirectorRun, project: Project, chapter_number: int, assessment: ChapterQualityAssessment) -> AutoDirectorStep | None:
+        run.current_stage = AutoDirectorStage.QUALITY_REPAIR
+        step = self._step(db, run, AutoDirectorStage.QUALITY_REPAIR, {"assessment_id": assessment.id})
+        if step.status == AutoDirectorStepStatus.COMMITTED:
+            return step
+        repair_count = sum(1 for item in self._steps(db, run) if item.stage == AutoDirectorStage.QUALITY_REPAIR and item.status == AutoDirectorStepStatus.COMMITTED and (item.output_payload or {}).get("draft_id"))
+        if repair_count >= int((run.settings or {}).get("max_repairs", 0) or 0):
+            self._commit_step(step, {"skipped": True, "debt": "MAX_REPAIRS_REACHED"})
+            return step
+        self._check_budget(run)
+        settings = get_settings()
+        route = ModelRouter().resolve(db, project.id, settings, "REPAIR")
+        key = ProviderCredentialResolver().generation_key(db, project.id, settings)
+        provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key), db.info.get("author_model_call_guard"))
+        try:
+            draft, _ = QualityRepairService().repair(db, assessment.id, {"idempotency_key": f"{run.id}-chapter-{chapter_number}-repair-{repair_count + 1}-attempt-{step.attempt}"}, repair_provider=provider, repair_model=route.model, settings=settings, assess_child=False)
+        except Exception as exc:
+            if getattr(exc, "code", None) != "QUALITY_REPAIR_LIMIT_REACHED":
+                raise
+            self._commit_step(step, {"skipped": True, "debt": "MAX_REPAIRS_REACHED"})
+            return step
+        metrics = self._tracked_metrics(provider)
+        if provider.last_error:
+            self._merge_step_usage(step, metrics)
+            self._add_usage_metrics(run, metrics)
+            self._fail(run, step, provider.last_error)
+            return None
+        valid = enum_value(draft.status) == "VALIDATED"
+        self._commit_step(step, {"draft_id": draft.id if valid else None, "rejected_draft_id": None if valid else draft.id}, draft.id, **metrics)
+        self._add_usage(run, step)
+        db.info["author_checkpoint_stage"] = AutoDirectorStage.QUALITY_REPAIR.value
+        run.current_stage = AutoDirectorStage.QUALITY_REVIEW if valid else AutoDirectorStage.AUTHOR_ADOPTION
+        run.next_action = "修复稿已保存，下一检查点处理修复结果。"
+        return None
+
+    def _finish_chapter(self, db: Session, run: AutoDirectorRun, project: Project, chapter_number: int, assessment: ChapterQualityAssessment) -> None:
         if assessment and enum_value(assessment.status) == "REPAIR_REQUIRED":
             run.current_stage = AutoDirectorStage.QUALITY_REPAIR
             repair_step = self._step(db, run, AutoDirectorStage.QUALITY_REPAIR, {"assessment_id": assessment.id})
@@ -821,8 +1034,8 @@ class AutoDirectorOrchestrator:
                     try:
                         self._check_budget(run)
                         settings = get_settings(); repair_route = ModelRouter().resolve(db, project.id, settings, "REPAIR"); critic_route = ModelRouter().resolve(db, project.id, settings, "CRITIC"); key = ProviderCredentialResolver().generation_key(db, project.id, settings)
-                        repair_provider = _UsageTrackingProvider(get_model_provider(settings, repair_route.provider, repair_route.base_url, key))
-                        repair_critic_provider = _UsageTrackingProvider(get_model_provider(settings, critic_route.provider, critic_route.base_url, key))
+                        repair_provider = _UsageTrackingProvider(get_model_provider(settings, repair_route.provider, repair_route.base_url, key), db.info.get("author_model_call_guard"))
+                        repair_critic_provider = _UsageTrackingProvider(get_model_provider(settings, critic_route.provider, critic_route.base_url, key), db.info.get("author_model_call_guard"))
                         draft, repaired = QualityRepairService().repair(db, assessment.id, {"idempotency_key": f"{run.id}-chapter-{chapter_number}-repair-{repair_count + 1}"}, repair_provider=repair_provider, repair_model=repair_route.model, critic_provider=repair_critic_provider, critic_model=critic_route.model, settings=settings)
                         metrics = self._tracked_metrics(repair_provider, repair_critic_provider)
                         self._commit_step(repair_step, {"draft_id": draft.id, "assessment_id": repaired.id if repaired else None}, draft.id, **metrics); self._add_usage(run, repair_step)
@@ -922,6 +1135,9 @@ class AutoDirectorOrchestrator:
         route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
         key = ProviderCredentialResolver().generation_key(db, project.id, settings)
         provider = get_model_provider(settings, route.provider, route.base_url, key)
+        if db.info.get("author_model_call_guard"):
+            from .author_recovery import guarded_provider
+            provider = guarded_provider(provider, db.info["author_model_call_guard"])
         volume = db.scalar(select(StoryPlanVolume).where(StoryPlanVolume.plan_id == plan.id, StoryPlanVolume.start_chapter <= chapter_number, StoryPlanVolume.end_chapter >= chapter_number))
         arc = db.scalar(select(StoryPlanArc).where(StoryPlanArc.plan_id == plan.id, StoryPlanArc.volume_number == (volume.number if volume else 1)).order_by(StoryPlanArc.number))
         previous = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id, StoryPlanChapter.number == chapter_number - 1))

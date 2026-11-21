@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from ..auto_director import AutoDirectorError, AutoDirectorOrchestrator, enum_value, fingerprint, score_direction
 from ..api_types import AutoDirectorRunCreatePayload, DirectionSelectionPayload
 from ..models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, Project
+from ..author_recovery import recovery_payload, revoke_claim
 from .common import get_db, require_project
 
 router = APIRouter(tags=["auto-director"])
@@ -63,6 +64,7 @@ def _payload(db: Session, run: AutoDirectorRun, *, step_limit: int | None = None
         "id": run.id, "project_id": run.project_id, "status": enum_value(run.status), "current_stage": enum_value(run.current_stage),
         "current_chapter_id": run.current_chapter_id, "run_mode": run.run_mode, "pause_reason": run.pause_reason,
         "next_action": run.next_action, "idempotency_key": run.idempotency_key, "token_usage": run.token_usage or {},
+        "recovery": recovery_payload(run),
         "usage_metrics": {"calls": run.total_calls, "prompt_tokens": run.prompt_tokens, "completion_tokens": run.completion_tokens, "total_tokens": run.total_tokens, "latency_ms": run.latency_ms, "provider": ",".join(run.token_usage.get("providers", [])) or None, "model": ",".join(run.token_usage.get("models", [])) or None, "estimated_cost": run.estimated_cost, "cost_status": run.cost_status},
         "settings": run.settings or {}, "context": run.context or {}, "created_at": run.created_at.isoformat() if run.created_at else None,
         "updated_at": run.updated_at.isoformat() if run.updated_at else None, "completed_at": run.completed_at.isoformat() if run.completed_at else None,
@@ -101,7 +103,7 @@ def list_runs(project_id: str, limit: int = Query(default=20, ge=1, le=50), step
 
 @router.post("/projects/{project_id}/auto-director/runs/{run_id}/pause")
 def pause_run(project_id: str, run_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
-    run = _run_or_404(db, project_id, run_id); run.context = {**(run.context or {}), "resume_stage": enum_value(run.current_stage), "stop_requested": True}; run.status = AutoDirectorRunStatus.PAUSED; run.current_stage = AutoDirectorStage.PAUSED; run.pause_reason = (payload or {}).get("reason", "USER_PAUSED"); run.next_action = "点击继续恢复自动导演。"; db.commit(); return _payload(db, run)
+    run = _run_or_404(db, project_id, run_id); revoke_claim(run); run.context = {**(run.context or {}), "resume_stage": enum_value(run.current_stage), "stop_requested": True}; run.status = AutoDirectorRunStatus.PAUSED; run.current_stage = AutoDirectorStage.PAUSED; run.pause_reason = (payload or {}).get("reason", "USER_PAUSED"); run.next_action = "点击继续恢复自动导演。"; db.commit(); return _payload(db, run)
 
 
 @router.post("/projects/{project_id}/auto-director/runs/{run_id}/resume")
@@ -109,6 +111,7 @@ def resume_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
     run = _run_or_404(db, project_id, run_id)
     if run.status == AutoDirectorRunStatus.RUNNING:
         return _payload(db, run)
+    revoke_claim(run)
     if _retry_checkpoint(db, run) is not None:
         return retry_run(project_id, run_id, db)
     if run.current_stage == AutoDirectorStage.PAUSED:
@@ -130,6 +133,7 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail={"code": "RUN_ALREADY_COMPLETED", "message": "已采用正文的运行不可重新生成。"})
     if run.status == AutoDirectorRunStatus.RUNNING:
         return _payload(db, run)
+    revoke_claim(run)
     checkpoint = _retry_checkpoint(db, run)
     retry_stage = checkpoint.stage if checkpoint else None
     if _retry_limit_reached(run, checkpoint):
@@ -149,7 +153,7 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
 
 @router.post("/projects/{project_id}/auto-director/runs/{run_id}/takeover")
 def takeover_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
-    run = _run_or_404(db, project_id, run_id); run.context = {**(run.context or {}), "stop_requested": True, "resume_stage": enum_value(run.current_stage)}; run.status = AutoDirectorRunStatus.PAUSED; run.current_stage = AutoDirectorStage.PAUSED; run.pause_reason = "AUTHOR_TAKEOVER"; run.next_action = "作者已接管，可从现有检查点进入手动工作台。"; db.commit(); return _payload(db, run)
+    run = _run_or_404(db, project_id, run_id); revoke_claim(run); run.context = {**(run.context or {}), "stop_requested": True, "resume_stage": enum_value(run.current_stage)}; run.status = AutoDirectorRunStatus.PAUSED; run.current_stage = AutoDirectorStage.PAUSED; run.pause_reason = "AUTHOR_TAKEOVER"; run.next_action = "作者已接管，可从现有检查点进入手动工作台。"; db.commit(); return _payload(db, run)
 
 
 @router.post("/projects/{project_id}/auto-director/runs/{run_id}/select-direction")

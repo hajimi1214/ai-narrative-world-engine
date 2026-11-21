@@ -38,6 +38,33 @@ from .world_resolution import (
 )
 
 
+def _guarded_provider(db: Session, provider):
+    guard = db.info.get("author_model_call_guard")
+    if not guard:
+        return provider
+
+    class GuardedProvider:
+        name = getattr(provider, "name", None)
+
+        def generate(self, messages, model):
+            try:
+                guard()
+            except ModelProviderError as exc:
+                exc.accounted_calls = 0
+                raise
+            return provider.generate(messages, model)
+
+        def generate_stream(self, messages, model, on_delta):
+            try:
+                guard()
+            except ModelProviderError as exc:
+                exc.accounted_calls = 0
+                raise
+            return provider.generate_stream(messages, model, on_delta)
+
+    return GuardedProvider()
+
+
 def _emit_usage(
     collector: Callable[[dict[str, Any]], None] | None,
     result: Any = None,
@@ -51,7 +78,7 @@ def _emit_usage(
     usage = getattr(result, "usage", None) if result is not None else getattr(error, "usage", None)
     usage = usage if isinstance(usage, dict) else {}
     collector({
-        "calls": 1,
+        "calls": int(getattr(error, "accounted_calls", 1) if error is not None else 1),
         "provider": getattr(result, "provider", None) or getattr(error, "provider", None) or fallback_provider,
         "model": getattr(result, "model", None) or getattr(error, "model", None) or fallback_model,
         "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
@@ -157,6 +184,7 @@ class PerformanceRuntimeService:
                 route_provider, route_model = route.provider, route.model
                 trace.provider, trace.model = route.provider, route.model
                 provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
+                provider = _guarded_provider(db, provider)
                 performer = LLMCharacterPerformer(provider, route.model)
                 try:
                     raw, model_result = performer.perform(ActorPerceptionSanitizer().sanitize(context))
@@ -263,6 +291,7 @@ class WorldResolutionRuntimeService:
                 route_provider, route_model = route.provider, route.model
                 trace.provider, trace.model = route.provider, route.model
                 provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
+                provider = _guarded_provider(db, provider)
                 resolver = LLMWorldResolver(provider, route.model)
                 try:
                     raw, model_result = resolver.resolve(context)

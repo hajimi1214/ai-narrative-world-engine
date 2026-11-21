@@ -1052,7 +1052,7 @@ class QualityRepairService:
             parent_draft_id=source.id,
         )
 
-    def repair(self, db: Session, assessment_id: str, request: dict[str, Any] | None = None, *, repair_provider=None, repair_model: str | None = None, critic_provider=None, critic_model: str | None = None, settings=None) -> tuple[ChapterWriterDraft, ChapterQualityAssessment | None]:
+    def repair(self, db: Session, assessment_id: str, request: dict[str, Any] | None = None, *, repair_provider=None, repair_model: str | None = None, critic_provider=None, critic_model: str | None = None, settings=None, assess_child: bool = True) -> tuple[ChapterWriterDraft, ChapterQualityAssessment | None]:
         request = dict(request or {})
         assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.id == assessment_id).with_for_update())
         if not assessment:
@@ -1119,6 +1119,8 @@ class QualityRepairService:
             draft.status = WriterDraftStatus.VALIDATED
             ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms, request_id=result.request_id, output_fingerprint=draft.content_fingerprint)
             db.flush()
+            if not assess_child:
+                return draft, None
             child_request = {"client_request_id": f"repair-assessment:{draft.id}", "config": _assessment_explicit_overrides(assessment.quality_config)}
             child = QualityGateService().assess(db, chapter.id, child_request, provider=critic_provider, model=critic_model, settings=settings, draft=draft, require_current=False)
             return draft, child

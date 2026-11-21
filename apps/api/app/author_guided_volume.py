@@ -389,11 +389,14 @@ class AuthorGuidedVolumeService:
 
         def record_usage(result: Any) -> None:
             nonlocal recorded
+            calls = max(0, int(getattr(result, "accounted_calls", 1) or 0))
+            if calls == 0:
+                return
             usage = orchestrator._model_usage(result)
-            metrics = {**usage, "calls": 1, "latency_ms": int(getattr(result, "latency_ms", 0) or 0), "provider": getattr(result, "provider", None), "model": getattr(result, "model", None)}
+            metrics = {**usage, "calls": calls, "latency_ms": int(getattr(result, "latency_ms", 0) or 0), "provider": getattr(result, "provider", None), "model": getattr(result, "model", None)}
             previous = step.token_usage or {}
             cumulative = {key: int(previous.get(key, 0) or 0) + usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
-            orchestrator._commit_step(step, {"window_id": window.id, "volume_id": volume.id}, plan.id, calls=int(previous.get("calls", 0) or 0) + 1, latency_ms=int(previous.get("latency_ms", 0) or 0) + metrics["latency_ms"], tokens=cumulative["total_tokens"], usage=cumulative, provider=metrics["provider"], model=metrics["model"])
+            orchestrator._commit_step(step, {"window_id": window.id, "volume_id": volume.id}, plan.id, calls=int(previous.get("calls", 0) or 0) + calls, latency_ms=int(previous.get("latency_ms", 0) or 0) + metrics["latency_ms"], tokens=cumulative["total_tokens"], usage=cumulative, provider=metrics["provider"], model=metrics["model"])
             orchestrator._add_usage_metrics(run, metrics)
             recorded = True
 
@@ -402,10 +405,11 @@ class AuthorGuidedVolumeService:
             step = orchestrator._step(db, run, AutoDirectorStage.CHAPTER_WINDOW_PLANNING, identity)
             run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_PLANNING
             live_session = orchestrator._live_begin(run, f"第 {volume.volume_number} 卷：细化当前章节窗口", "AUTHOR_WINDOW_PLANNING")
-            generated, result = auto_module.generate_plan(db, project, framing, contract.premise or project.story_seed, style, {}, on_phase=lambda phase, message: auto_module.live_execution_broker.phase(live_session, phase, message), on_delta=lambda text: auto_module.live_execution_broker.append(live_session, text))
+            generated, result = auto_module.generate_plan(db, project, framing, contract.premise or project.story_seed, style, {}, on_phase=lambda phase, message: auto_module.live_execution_broker.phase(live_session, phase, message), on_delta=lambda text: auto_module.live_execution_broker.append(live_session, text), on_usage=record_usage if db.info.get("author_recovery") else None)
             if result is None:
                 raise AuthorGuidedVolumeError("AUTHOR_WINDOW_PLAN_MODEL_REQUIRED", "模型未返回窗口规划；请重试，不会采用占位任务写作。")
-            record_usage(result)
+            if not recorded:
+                record_usage(result)
             rows = generated.get("chapters") if isinstance(generated, dict) else None
             if not isinstance(rows, list) or not rows or len(rows) > count or any(not isinstance(row, dict) for row in rows):
                 raise AuthorGuidedVolumeError("AUTHOR_WINDOW_PLAN_INCOMPLETE", "模型需要返回当前窗口内的完整章节任务。")
@@ -458,13 +462,26 @@ class AuthorGuidedVolumeService:
             run.pause_reason = None
             run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION
             run.next_action = "当前章节窗口规划已保存，下一检查点开始角色行动与正文生产。"
+            if db.info.get("author_recovery"):
+                db.info["author_checkpoint_stage"] = AutoDirectorStage.CHAPTER_WINDOW_PLANNING.value
             return "PLANNED"
         except Exception as exc:
+            if db.info.get("author_recovery"):
+                from .author_recovery import LostRunClaim, provider_failure
+                if isinstance(exc, LostRunClaim):
+                    raise
+                exc = provider_failure(exc) or exc
             code = getattr(exc, "code", None) or "AUTHOR_WINDOW_PLANNING_FAILED"
             window.error_code = str(code); window.error_summary = str(exc)[:1000]
             if live_session:
                 orchestrator._live_fail(live_session, exc)
             if code == "TOKEN_BUDGET_EXCEEDED":
+                if step is not None and step.status == AutoDirectorStepStatus.COMMITTED:
+                    # Usage callbacks may have saved partial planning usage
+                    # before a later call hit the per-call budget fence.
+                    step.status = AutoDirectorStepStatus.RUNNING
+                    step.completed_at = None
+                    step.output_payload = {}
                 run.status = AutoDirectorRunStatus.PAUSED; run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_PLANNING; run.pause_reason = str(code); run.next_action = "增加本次 token 预算后继续窗口规划。"
             elif step is not None:
                 if not recorded:
@@ -813,7 +830,7 @@ class AuthorGuidedVolumeService:
             run.current_stage = AutoDirectorStage.VOLUME_PROGRESS_ASSESSMENT
             run.context = context
             window.continuation_decision = "ASSESS_VOLUME"
-        elif run.status == AutoDirectorRunStatus.RUNNING:
+        elif run.status == AutoDirectorRunStatus.RUNNING and not db.info.get("author_recovery"):
             run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION
             run.next_action = "正在执行当前章节窗口。"
         return run
