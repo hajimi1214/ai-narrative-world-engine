@@ -67,7 +67,7 @@ class ChapterStructureStatus(str, enum.Enum): LEGACY="LEGACY"; PROVISIONAL="PROV
 class NarrativeArcStatus(str, enum.Enum): OPEN="OPEN"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
 class NarrativeVolumeStatus(str, enum.Enum): OPEN="OPEN"; SEALED="SEALED"; SUPERSEDED="SUPERSEDED"
 class WriterDraftStatus(str, enum.Enum): GENERATING="GENERATING"; VALIDATED="VALIDATED"; ADOPTED="ADOPTED"; REJECTED="REJECTED"; FAILED="FAILED"; STALE="STALE"; SUPERSEDED="SUPERSEDED"
-class WriterDraftOrigin(str, enum.Enum): WRITER="WRITER"; QUALITY_REPAIR="QUALITY_REPAIR"
+class WriterDraftOrigin(str, enum.Enum): WRITER="WRITER"; QUALITY_REPAIR="QUALITY_REPAIR"; AUTHOR_EDIT="AUTHOR_EDIT"
 class QualityAssessmentStatus(str, enum.Enum): RUNNING="RUNNING"; PASS="PASS"; REPAIR_REQUIRED="REPAIR_REQUIRED"; BLOCKED="BLOCKED"; FAILED="FAILED"; STALE="STALE"; SUPERSEDED="SUPERSEDED"
 class QualityFindingSeverity(str, enum.Enum): BLOCKING="BLOCKING"; MAJOR="MAJOR"; MINOR="MINOR"; INFO="INFO"
 class QualityFindingSource(str, enum.Enum): DETERMINISTIC="DETERMINISTIC"; CRITIC="CRITIC"
@@ -193,7 +193,10 @@ class ChapterPlanningWindow(TimestampMixin, Base):
 
 class VolumeContinuitySnapshot(Base):
     __tablename__ = "volume_continuity_snapshots"
-    __table_args__ = (UniqueConstraint("volume_id", name="uq_volume_continuity_snapshot_volume"), Index("ix_volume_snapshot_project", "project_id"))
+    __table_args__ = (
+        Index("uq_volume_continuity_snapshot_volume_version", "volume_id", "snapshot_version", unique=True),
+        Index("ix_volume_snapshot_project", "project_id"),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
     book_contract_id: Mapped[str | None] = mapped_column(ForeignKey("book_contracts.id"))

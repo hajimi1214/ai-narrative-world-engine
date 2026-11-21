@@ -1,7 +1,7 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState, type ComponentType, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { Archive, BookOpen, BrainCircuit, ChevronLeft, ChevronRight, CircleDot, Compass, FileText, Landmark, Menu, PlayCircle, Save, Settings, ShieldAlert, Sparkles, Users, Workflow, Wrench, History, PenLine } from "lucide-react";
 import { api } from "../../app/lib";
 import { displayStatus } from "../../app/terminology";
@@ -21,7 +21,22 @@ const groups: readonly NavGroup[] = [
 
 export function ProjectShell({ projectId, children }: { projectId: string; children: ReactNode }) {
   const pathname = usePathname(); const [collapsed, setCollapsed] = useState(false); const [drawer, setDrawer] = useState(false); const [project, setProject] = useState<any>(); const [savedAt, setSavedAt] = useState<number | null>(null);
-  useEffect(() => { setCollapsed(localStorage.getItem("nwe-sidebar-collapsed") === "true"); api(`/projects/${projectId}`).then(setProject).catch(() => undefined); }, [projectId]);
+  const menuRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    setCollapsed(localStorage.getItem("nwe-sidebar-collapsed") === "true");
+    setProject(undefined);
+    api(`/projects/${projectId}`, { signal: controller.signal }).then((value) => { if (!controller.signal.aborted) setProject(value); }).catch(() => undefined);
+    return () => controller.abort();
+  }, [projectId]);
+  useEffect(() => {
+    if (!drawer) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); setDrawer(false); menuRef.current?.focus(); }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [drawer]);
   const draftKey = () => `nwe-page-draft:${projectId}:${pathname}`;
   const editableFields = () => Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(".main-content input, .main-content textarea, .main-content select")).filter((field) => {
     const inputType = field instanceof HTMLInputElement ? field.type : "";
@@ -69,6 +84,6 @@ export function ProjectShell({ projectId, children }: { projectId: string; child
     return () => { window.clearTimeout(timer); window.removeEventListener("beforeunload", saveBeforeExit); };
   }, [pathname, projectId, project]);
   function toggle() { const next = !collapsed; setCollapsed(next); localStorage.setItem("nwe-sidebar-collapsed", String(next)); }
-  const nav = <nav className="sidebar-nav">{groups.map((group) => <div className="nav-group" key={group.label}><span className="nav-label">{group.label}</span>{group.items.map(([name, route, Icon, disabled]) => { const href = `/projects/${projectId}${route ? `/${route}` : ""}`; const active = pathname === href; return disabled ? <span className="nav-item disabled" title="规划中" key={route}><Icon size={18} /><b>{name}</b></span> : <Link className={`nav-item ${active ? "active" : ""}`} href={href} key={route} aria-current={active ? "page" : undefined} onClick={() => { savePageDraft(); setDrawer(false); }}><Icon size={18} /><b>{name}</b></Link>; })}</div>)}</nav>;
-  return <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}><aside className={`sidebar ${drawer ? "drawer-open" : ""}`}><div className="brand-lockup"><BrainCircuit size={24} /><div><strong>AI 自演小说世界引擎</strong><small>Narrative World Engine</small></div></div>{nav}<button className="collapse-button" title={collapsed ? "展开侧边栏" : "收起侧边栏"} onClick={toggle} aria-label="收起侧边栏">{collapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}</button></aside>{drawer && <button className="drawer-backdrop" aria-label="关闭菜单" onClick={() => setDrawer(false)} /> }<div className="work-area"><header className="workspace-topbar"><button className="mobile-menu" aria-label="打开导航" onClick={() => setDrawer(true)}><Menu size={20} /></button><div className="breadcrumb"><Link href="/">项目</Link><span>/</span><strong>{project?.name || "加载项目…"}</strong></div><div className="workspace-topbar-actions"><div className="world-status"><span><CircleDot size={14} /> {displayStatus(project?.status)}</span><span>世界时间：{project?.current_world_time || "尚未建立世界时间"}</span></div><button className="secondary page-draft-save" onClick={savePageDraft} title="将本页尚未提交的表单保存到本地和当前项目"><Save size={15} />{savedAt ? "已保存" : "保存此页"}</button><AiLivePanel projectId={projectId} /></div></header><main className="main-content">{children}</main></div></div>;
+  const nav = <nav className="sidebar-nav" aria-label="项目导航">{groups.map((group) => <div className="nav-group" key={group.label}><span className="nav-label">{group.label}</span>{group.items.map(([name, route, Icon, disabled]) => { const href = `/projects/${projectId}${route ? `/${route}` : ""}`; const active = pathname === href; return disabled ? <span className="nav-item disabled" title="规划中" key={route}><Icon size={18} /><b>{name}</b></span> : <Link className={`nav-item ${active ? "active" : ""}`} href={href} key={route} aria-label={name} title={name} aria-current={active ? "page" : undefined} onClick={() => { savePageDraft(); setDrawer(false); }}><Icon size={18} aria-hidden="true" /><b>{name}</b></Link>; })}</div>)}</nav>;
+  return <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}><aside id="project-navigation" className={`sidebar ${drawer ? "drawer-open" : ""}`}><div className="brand-lockup"><BrainCircuit size={24} /><div><strong>AI 自演小说世界引擎</strong><small>Narrative World Engine</small></div></div>{nav}<button className="collapse-button" title={collapsed ? "展开侧边栏" : "收起侧边栏"} onClick={toggle} aria-label={collapsed ? "展开侧边栏" : "收起侧边栏"}>{collapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}</button></aside>{drawer && <button className="drawer-backdrop" aria-label="关闭菜单" onClick={() => setDrawer(false)} /> }<div className="work-area"><header className="workspace-topbar"><button ref={menuRef} className="mobile-menu" aria-label={drawer ? "关闭导航" : "打开导航"} aria-expanded={drawer} aria-controls="project-navigation" onClick={() => setDrawer((value) => !value)}><Menu size={20} /></button><div className="breadcrumb"><Link href="/">项目</Link><span>/</span><strong>{project?.name || "加载项目…"}</strong></div><div className="workspace-topbar-actions"><div className="world-status"><span><CircleDot size={14} /> {displayStatus(project?.status)}</span><span>世界时间：{project?.current_world_time || "尚未建立世界时间"}</span></div><button className="secondary page-draft-save" onClick={savePageDraft} title="将本页尚未提交的表单保存到本地和当前项目" aria-label="保存本页表单草稿"><Save size={15} aria-hidden="true" /><span className="page-draft-save-label">{savedAt ? "已保存" : "保存此页"}</span></button><AiLivePanel projectId={projectId} /></div></header><main className="main-content">{children}</main></div></div>;
 }

@@ -7,10 +7,15 @@ import shutil
 import json
 import enum
 
+from alembic.operations import Operations
+from alembic.runtime.migration import MigrationContext
 from sqlalchemy import inspect, text
 
 from .db import Base, engine
 from . import models  # noqa: F401 - register every model with Base.metadata
+
+
+SNAPSHOT_HISTORY_REVISION = "0043_versioned_volume_snapshots"
 
 
 def _sqlite_default(column) -> str | None:
@@ -66,13 +71,23 @@ def prepare_sqlite_database() -> str | None:
         version = connection.scalar(text("SELECT version_num FROM alembic_version LIMIT 1")) if "alembic_version" in tables else None
     from alembic import command
     from alembic.config import Config
+    from alembic.script import ScriptDirectory
     config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", str(engine.url))
+
+    def upgrade_snapshot_history(connection) -> None:
+        snapshot_revision = ScriptDirectory.from_config(config).get_revision(SNAPSHOT_HISTORY_REVISION)
+        operations = Operations(MigrationContext.configure(connection))
+        snapshot_revision.module.upgrade_snapshot_history(operations)
 
     if version:
         backup = database_file.with_name(f"{database_file.stem}.migration-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}{database_file.suffix}")
         if database_file.exists():
             shutil.copy2(database_file, backup)
+        if version == SNAPSHOT_HISTORY_REVISION:
+            # Some early 0043 previews still retained the ORM uniqueness constraint.
+            with engine.begin() as connection:
+                upgrade_snapshot_history(connection)
         command.upgrade(config, "head")
         return None
 
@@ -111,6 +126,8 @@ def prepare_sqlite_database() -> str | None:
                 connection.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column.name}" {type_sql}{nullable}'))
             for index in table.indexes:
                 index.create(connection, checkfirst=True)
+        # The additive schema upgrade cannot remove the outdated uniqueness rule.
+        upgrade_snapshot_history(connection)
         # The migration chain cannot run against a legacy database without an
         # Alembic revision row. Reproduce the non-destructive legacy mapping
         # here before stamping the verified additive schema.

@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 import json
 import re
+import pytest
 from types import SimpleNamespace
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -14,7 +15,7 @@ import app.runtime as runtime_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, Character, CharacterKnowledge, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, Character, CharacterKnowledge, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlan, StoryPlanChapter, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
 
 
 def _setup(monkeypatch):
@@ -25,7 +26,21 @@ def _setup(monkeypatch):
         project = Project(name="作者卷级测试", story_seed="主角寻找失踪的记忆")
         db.add(project); db.commit(); project_id = project.id
     monkeypatch.setattr(api_module, "SessionLocal", Session)
+    def plan_window(db, project, framing, premise, style_guide, anti_ai_rules, **kwargs):
+        return ({"chapters": [{"number": number, "title": f"档案调查{number}", "summary": "修复师核对失踪档案中的线索", "objective": "核对档案上的旧印记", "conflict": "档案管理员拒绝提供原件", "scene_beats": ["检查档案并比对旧印记", "向管理员追问原件去向"], "must_events": [], "forbidden_events": []} for number in range(1, framing["target_chapters"] + 1)]}, SimpleNamespace(provider="fake", model="fake", request_id="window-plan", latency_ms=0, usage={"total_tokens": 4}))
+    monkeypatch.setattr(auto_module, "generate_plan", plan_window)
     return TestClient(app), Session, project_id
+
+
+def _advance_until_paused(worker, session_factory, run_id, *, max_polls=20, expected_status="PAUSED"):
+    for _ in range(max_polls):
+        assert worker.run_once() is True
+        with session_factory() as db:
+            run = db.get(AutoDirectorRun, run_id)
+            assert run.status.value in {"RUNNING", "CREATED", expected_status}, (run.pause_reason, (run.context or {}).get("worker_error"), (run.context or {}).get("current_chapter_number"), (run.context or {}).get("worker_stage"))
+            if run.status.value == expected_status:
+                return
+    pytest.fail(f"Author-guided run did not pause within {max_polls} worker polls")
 
 
 def test_author_guided_run_creates_contract_and_bounded_window(monkeypatch):
@@ -54,6 +69,41 @@ def test_idempotent_author_guided_run_does_not_duplicate_contract(monkeypatch):
     assert first["id"] == second["id"]
     with Session() as db:
         assert len(db.scalars(select(BookContract).where(BookContract.project_id == project_id)).all()) == 1
+
+
+def test_author_guided_runs_can_continue_across_projects(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    with Session() as db:
+        other_project = Project(name="第二部小说")
+        db.add(other_project)
+        db.commit()
+        other_project_id = other_project.id
+    first_runs_url = f"/projects/{project_id}/author-guided-volume/runs"
+    other_runs_url = f"/projects/{other_project_id}/author-guided-volume/runs"
+    payload = {"idempotency_key": "author-run"}
+    first = client.post(first_runs_url, json=payload)
+    assert first.status_code == 201, first.text
+    duplicate = client.post(first_runs_url, json=payload)
+    assert duplicate.status_code == 201 and duplicate.json()["id"] == first.json()["id"]
+    second = client.post(other_runs_url, json=payload)
+    assert second.status_code == 201, second.text
+    first_id, second_id = first.json()["id"], second.json()["id"]
+    assert first_id != second_id
+    assert first.json()["context"]["volume_id"] != second.json()["context"]["volume_id"]
+
+    first_url = f"{first_runs_url}/{first_id}"
+    other_url = f"{other_runs_url}/{second_id}"
+    paused = client.post(f"{first_url}/pause", json={"reason": "作者暂停"})
+    assert paused.status_code == 200 and paused.json()["status"] == "PAUSED"
+    assert client.get(other_url).json()["status"] == "RUNNING"
+    assert client.post(f"{other_runs_url}/{first_id}/continue").status_code == 404
+    assert client.get(first_url).json()["status"] == "PAUSED"
+
+    resumed = client.post(f"{first_url}/continue")
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["status"] == "RUNNING"
+    assert resumed.json()["context"]["volume_id"] == first.json()["context"]["volume_id"]
+    assert client.get(other_url).json()["context"] == second.json()["context"]
 
 
 def test_existing_auto_director_endpoint_accepts_author_guided_mode(monkeypatch):
@@ -152,6 +202,29 @@ def test_author_run_takeover_and_retry_are_durable(monkeypatch):
         assert db.get(AutoDirectorRun, run_id).context["execute_window"] is True
 
 
+@pytest.mark.parametrize("attempt,maximum,expected", [(1, 2, "RUNNING"), (3, 2, "BLOCKED"), (1, 0, "BLOCKED")])
+def test_author_retry_uses_current_checkpoint_budget(monkeypatch, attempt, maximum, expected):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "author-retry-budget"}).json()
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        old = AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.CHAPTER_EXECUTION, status=AutoDirectorStepStatus.FAILED, attempt=99, input_fingerprint="old-chapter")
+        current = AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.QUALITY_REVIEW, status=AutoDirectorStepStatus.FAILED, attempt=attempt, input_fingerprint="current-critic")
+        db.add_all([old, current]); db.flush()
+        run.status = "FAILED"; run.current_stage = AutoDirectorStage.FAILED
+        run.context = {**run.context, "failed_step_id": current.id}
+        run.settings = {**run.settings, "max_retries": maximum}
+        db.commit()
+    url = f"/projects/{project_id}/author-guided-volume/runs/{created['id']}"
+    body = client.post(f"{url}/retry").json()
+    assert body["status"] == expected
+    duplicate = client.post(f"{url}/retry").json()
+    assert duplicate["status"] == expected
+    if expected == "BLOCKED":
+        assert body["pause_reason"] == "MAX_RETRIES_REACHED"
+        assert client.post(f"{url}/continue").json()["status"] == "BLOCKED"
+
+
 def test_next_volume_window_inherits_only_sealed_snapshot_reference(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "next-volume"})
@@ -168,9 +241,95 @@ def test_next_volume_window_inherits_only_sealed_snapshot_reference(monkeypatch)
     response = client.post(f"/projects/{project_id}/volumes/{current_id}/next")
     assert response.status_code == 200, response.text
     next_window_id = response.json()["window"]["id"]
+    next_volume_id = response.json()["volume"]["id"]
     with Session() as db:
         window = db.get(ChapterPlanningWindow, next_window_id)
         assert window.source_volume_snapshot_id == response.json()["source_snapshot_id"]
+        assert window.start_chapter_number == 2
+    started = client.post(f"/projects/{project_id}/volumes/{next_volume_id}/start")
+    assert started.status_code == 200, started.text
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        next_run = db.scalar(select(AutoDirectorRun).where(AutoDirectorRun.project_id == project_id, AutoDirectorRun.context["volume_id"].as_string() == next_volume_id))
+        assert next_run and next_run.status.value == "RUNNING"
+        assert next_run.context["current_volume_number"] == 2
+        assert next_run.context["window_id"] == next_window_id
+
+
+def test_unseal_reseal_creates_immutable_snapshot_and_replans_next_volume(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "reseal-snapshot"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+
+    from app.author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService
+    service = AuthorGuidedVolumeService()
+    with Session() as db:
+        project = db.get(Project, project_id)
+        contract = db.scalar(select(BookContract).where(BookContract.project_id == project_id))
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 1))
+        actor = Character(project_id=project_id, name="主角", current_state={"location_id": "old-location", "stance": "第一版"})
+        db.add(actor); db.flush()
+        db.add(CharacterKnowledge(character_id=actor.id, proposition="第一版已知事实", status=KnowledgeStatus.KNOWN))
+        volume.actual_chapter_start = 1; volume.actual_chapter_end = 1
+        volume.target_closing_state = {"case": "closed"}
+        db.add(Chapter(project_id=project_id, number=1, content="本卷结束", status="QUALITY_APPROVED", active=True))
+        task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
+        task.end_state = {"case": "closed"}
+        db.flush()
+
+        first = service.seal(db, volume, author_confirmed=True)
+        first_snapshot = db.get(VolumeContinuitySnapshot, first.sealed_snapshot_id)
+        first_payload = {"character_states": dict(first_snapshot.character_states), "fingerprint": first_snapshot.source_fingerprint, "id": first_snapshot.id}
+        next_volume = service.ensure_volume(db, project, contract, {"opening_state": {"source_volume_snapshot_id": first_snapshot.id}}, 2)
+        old_window = service.ensure_window(db, project, next_volume, size=2)
+        service.ensure_window_tasks(db, project, next_volume, old_window, contract)
+        old_plan_id = next((item.id for item in db.scalars(select(StoryPlan).where(StoryPlan.project_id == project_id)).all() if (item.generation_report or {}).get("author_window_id") == old_window.id), None)
+        db.commit()
+
+        service.unseal(db, volume, "作者修正封存状态")
+        character = db.get(Character, actor.id)
+        character.current_state = {"location_id": "new-location", "stance": "修订版"}
+        db.add(CharacterKnowledge(character_id=actor.id, proposition="修订版新事实", status=KnowledgeStatus.KNOWN))
+        with pytest.raises(AuthorGuidedVolumeError, match="VOLUME_SOURCE_SNAPSHOT_STALE"):
+            service.continuity_context(db, next_volume)
+        db.refresh(old_window)
+        assert old_window.status.value == "STALE" and old_window.error_code == "SOURCE_VOLUME_UNSEALED"
+        assert first_snapshot.character_states == first_payload["character_states"]
+        db.commit()
+
+        resealed = service.seal(db, volume, author_confirmed=True)
+        second_snapshot = db.get(VolumeContinuitySnapshot, resealed.sealed_snapshot_id)
+        assert second_snapshot.id != first_snapshot.id
+        assert second_snapshot.snapshot_version == 2
+        assert second_snapshot.character_states[actor.id]["current_state"]["stance"] == "修订版"
+        assert "修订版新事实" in second_snapshot.character_states[actor.id]["known_facts_at_seal"]
+        assert first_snapshot.id == first_payload["id"] and first_snapshot.source_fingerprint == first_payload["fingerprint"]
+        assert first_snapshot.character_states == first_payload["character_states"]
+
+        db.refresh(next_volume)
+        assert next_volume.opening_state["source_volume_snapshot_id"] == second_snapshot.id
+        db.refresh(old_window)
+        assert old_window.status.value == "STALE"
+        assert old_window.error_code == "SOURCE_VOLUME_SNAPSHOT_CHANGED"
+        # The stale window retains its old source as an audit record. Continue
+        # reuses its chapter range, binds the new snapshot, and creates a fresh
+        # author plan whose continuity input has the updated character state.
+        continuity = service.continuity_context(db, next_volume)
+        assert continuity["source_snapshot_id"] == second_snapshot.id
+        assert continuity["character_states"][actor.id]["current_state"]["stance"] == "修订版"
+        resumed_window = service.ensure_window(db, project, next_volume, size=2)
+        assert resumed_window.id == old_window.id
+        assert resumed_window.source_volume_snapshot_id == second_snapshot.id
+        assert resumed_window.status.value == "ACTIVE" and resumed_window.error_code is None
+        new_task_ids = service.ensure_window_tasks(db, project, next_volume, resumed_window, contract)
+        new_plans = db.scalars(select(StoryPlan).where(StoryPlan.project_id == project_id)).all()
+        new_plan = next(item for item in new_plans if (item.generation_report or {}).get("author_window_id") == resumed_window.id and (item.generation_report or {}).get("author_window_source_snapshot_id") == second_snapshot.id)
+        assert new_plan.id != old_plan_id
+        assert new_plan.framing["continuity_constraints"]["source_snapshot_id"] == second_snapshot.id
+        assert new_plan.framing["continuity_constraints"]["character_states"][actor.id]["current_state"]["stance"] == "修订版"
+        assert len(new_task_ids) == 2
+        snapshots = db.scalars(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.volume_id == volume.id).order_by(VolumeContinuitySnapshot.snapshot_version)).all()
+        assert [(item.snapshot_version, item.id) for item in snapshots] == [(1, first_snapshot.id), (2, second_snapshot.id)]
 
 
 def test_sealed_snapshot_does_not_expose_future_character_secret(monkeypatch):
@@ -248,7 +407,9 @@ def test_dynamic_length_and_window_rollover_do_not_use_estimate_as_completion_li
     client.post(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}/continue")
     with Session() as db:
         db.expire_all()
-    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    worker = AutoDirectorWorker(Session, poll_seconds=0)
+    worker.run_once()  # Persist the semantic planning checkpoint.
+    worker.run_once()  # Execute the mocked runtime checkpoint.
     with Session() as db:
         windows = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id).order_by(ChapterPlanningWindow.start_chapter_number)).all()
         assert len(windows) == 2 and windows[1].start_chapter_number == 6
@@ -273,6 +434,124 @@ def test_next_window_is_not_planned_until_two_chapters_remain(monkeypatch):
         volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
         windows = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id)).all()
         assert len(windows) == 1
+
+
+def test_preplanned_followup_window_is_reused_without_skipping_its_chapters(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"window_size": 5, "continuous_chapter_progression": False, "idempotency_key": "reuse-next-window"}).json()
+    worker = AutoDirectorWorker(Session, poll_seconds=0)
+    worker.run_once()  # Build the first bounded window and wait for the author.
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume_id = volume.id
+    assert client.post(f"/projects/{project_id}/volumes/{volume_id}/continue").status_code == 200
+
+    state = {"adopted": 3, "status": "RUNNING"}
+    import app.auto_director as volume_module
+
+    def fake_advance(self, db, run):
+        run.context = {**(run.context or {}), "last_adopted_chapter_number": state["adopted"], "adopted_this_run": state["adopted"]}
+        run.status = state["status"]
+        return run
+
+    monkeypatch.setattr(volume_module.AutoDirectorOrchestrator, "advance_to_pause", fake_advance)
+    worker.run_once()  # Semantically plan the current window.
+    worker.run_once()  # With two chapters left, pre-plan chapters 6–10.
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        assert "next_window_id" in run.context, {"status": run.status, "pause": run.pause_reason, "stage": run.current_stage, "last": run.context.get("last_adopted_chapter_number"), "window": run.context.get("window_id"), "execute": run.context.get("execute_window"), "next": run.next_action}
+        planned_id = run.context["next_window_id"]
+        planned = db.get(ChapterPlanningWindow, planned_id)
+        assert (planned.start_chapter_number, planned.end_chapter_number) == (6, 10)
+
+    state.update(adopted=5, status="PAUSED")
+    worker.run_once()  # Finish chapters 1–5 and stop at this window boundary.
+    assert client.post(f"/projects/{project_id}/volumes/{volume_id}/continue").status_code == 200
+    state.update(adopted=5, status="RUNNING")
+    worker.run_once()
+
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        windows = db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume_id).order_by(ChapterPlanningWindow.start_chapter_number)).all()
+        task_numbers = [db.get(StoryPlanChapter, task_id).number for task_id in run.context["window_task_ids"]]
+        assert run.context["window_id"] == planned_id
+        assert run.context["current_chapter_number"] == 6
+        assert task_numbers == [6, 7, 8, 9, 10]
+        assert [(item.start_chapter_number, item.end_chapter_number) for item in windows] == [(1, 5), (6, 10)]
+
+
+def test_continuous_mode_automatically_moves_to_the_next_window(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"window_size": 5, "operational_run_chapter_budget": 10, "continuous_chapter_progression": True, "idempotency_key": "continuous-windows"}).json()
+    state = {"adopted": 5, "status": "PAUSED"}
+    import app.auto_director as volume_module
+
+    def fake_advance(self, db, run):
+        run.context = {**(run.context or {}), "last_adopted_chapter_number": state["adopted"], "adopted_this_run": state["adopted"]}
+        run.status = state["status"]
+        return run
+
+    monkeypatch.setattr(volume_module.AutoDirectorOrchestrator, "advance_to_pause", fake_advance)
+    worker = AutoDirectorWorker(Session, poll_seconds=0)
+    worker.run_once()  # Semantically plan the first window.
+    worker.run_once()  # First window is executed immediately by the new-book workflow.
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        assert run.context.get("window_complete") is True, {"status": run.status, "pause": run.pause_reason, "stage": run.current_stage, "last": run.context.get("last_adopted_chapter_number"), "window": run.context.get("window_id"), "execute": run.context.get("execute_window"), "next": run.next_action}
+        assert run.status.value == "RUNNING"
+        assert run.pause_reason is None
+        assert run.context["window_complete"] is True
+
+    state.update(adopted=5, status="RUNNING")
+    worker.run_once()  # The worker opens and begins the next contiguous window.
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        window = db.get(ChapterPlanningWindow, run.context["window_id"])
+        assert window.start_chapter_number == 6
+        assert run.context["current_chapter_number"] == 6
+        assert run.status.value == "RUNNING"
+
+    state.update(adopted=10, status="PAUSED")
+    worker.run_once()  # Respect the run budget after the second window.
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        assert run.status.value == "PAUSED", {"status": run.status, "pause": run.pause_reason, "window_complete": run.context.get("window_complete"), "last_processed": run.context.get("last_processed_chapter_number"), "last_adopted": run.context.get("last_adopted_chapter_number"), "processed_this_run": run.context.get("processed_this_run"), "window_id": run.context.get("window_id"), "stage": run.current_stage}
+        assert run.pause_reason == "RUN_CHAPTER_BUDGET_REACHED"
+        assert run.context["window_complete"] is True
+
+
+def test_quality_debt_on_last_window_chapter_still_stops_at_run_budget(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"window_size": 5, "operational_run_chapter_budget": 5, "continuous_chapter_progression": False, "idempotency_key": "quality-debt-budget"}).json()
+    worker = AutoDirectorWorker(Session, poll_seconds=0)
+    worker.run_once()
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        contract = db.get(BookContract, run.context["book_contract_id"])
+        contract_policy = {**contract.length_policy, "continuous_chapter_progression": True}
+        contract.length_policy = contract_policy
+        run_request = {**run.context["request"], "continuous_chapter_progression": True, "length_policy": contract_policy}
+        run.context = {**run.context, "request": run_request}
+        db.commit()
+    assert client.post(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}/continue").status_code == 200
+    import app.auto_director as volume_module
+
+    def fake_advance(self, db, run):
+        run.context = {**(run.context or {}), "last_adopted_chapter_number": 4, "last_processed_chapter_number": 5, "current_chapter_number": 6, "adopted_this_run": 4, "generated_this_run": 5, "processed_this_run": 5, "quality_debts": ["QUALITY_GATE_NOT_PASS"]}
+        run.status = "PAUSED"
+        run.pause_reason = "RUN_CHAPTER_BUDGET_REACHED"
+        run.next_action = "第五章保留质量债务"
+        return run
+
+    monkeypatch.setattr(volume_module.AutoDirectorOrchestrator, "advance_to_pause", fake_advance)
+    worker.run_once()  # Complete semantic planning for the continuous window.
+    worker.run_once()  # Last chapter is processed but remains quality debt.
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        assert run.status.value == "PAUSED", {"status": run.status, "pause": run.pause_reason, "window_complete": run.context.get("window_complete"), "last_processed": run.context.get("last_processed_chapter_number"), "last_adopted": run.context.get("last_adopted_chapter_number"), "processed_this_run": run.context.get("processed_this_run"), "window_id": run.context.get("window_id"), "stage": run.current_stage}
+        assert run.pause_reason == "RUN_CHAPTER_BUDGET_REACHED"
+        assert run.context["window_complete"] is True
+        assert run.context["last_processed_chapter_number"] == 5
 
 
 def test_single_chapter_window_does_not_preplan_duplicate_followup(monkeypatch):
@@ -343,13 +622,30 @@ def test_operational_token_budget_pauses_author_run_at_checkpoint(monkeypatch):
         assert run.settings.get("max_tokens") == 1
     import app.auto_director as auto_module
     from app.auto_director import AutoDirectorError
+    observed_budgets = []
     def budget_error(self, db, run):
-        raise AutoDirectorError("TOKEN_BUDGET_EXCEEDED")
+        observed_budgets.append(int((run.settings or {}).get("max_tokens") or 0))
+        if observed_budgets[-1] <= 1:
+            raise AutoDirectorError("TOKEN_BUDGET_EXCEEDED")
+        run.status = "PAUSED"
+        run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION
+        run.pause_reason = "TEST_STOP_AFTER_BUDGET_INCREASE"
+        run.next_action = "test checkpoint retained"
+        return run
     monkeypatch.setattr(auto_module.AutoDirectorOrchestrator, "advance_to_pause", budget_error)
     client.post(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}/continue")
     assert worker.run_once() is True
+    assert worker.run_once() is True  # Budget is checked after the planning call too.
     state = client.get(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}").json()
     assert state["status"] == "PAUSED" and state["pause_reason"] == "TOKEN_BUDGET_EXCEEDED"
+    denied = client.post(f"/projects/{project_id}/volumes/{state['context']['volume_id']}/continue", json={})
+    assert denied.status_code == 409 and denied.json()["detail"]["code"] == "TOKEN_BUDGET_INCREASE_REQUIRED"
+    raised = client.post(f"/projects/{project_id}/volumes/{state['context']['volume_id']}/continue", json={"operational_token_budget": 10})
+    assert raised.status_code == 200, raised.text
+    assert worker.run_once() is True
+    resumed = client.get(f"/projects/{project_id}/author-guided-volume/runs/{created['id']}").json()
+    assert observed_budgets[-1] == 10
+    assert resumed["status"] == "PAUSED" and resumed["pause_reason"] == "TEST_STOP_AFTER_BUDGET_INCREASE"
 
 
 def test_new_worker_instance_resumes_persisted_author_checkpoint_without_duplicate_window(monkeypatch):
@@ -455,11 +751,12 @@ def test_volume_progress_requires_structured_closing_state(monkeypatch):
     assert blocked.json()["detail"]["code"] == "VOLUME_COMPLETION_CONDITIONS_UNMET"
 
 
-def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkeypatch):
+@pytest.mark.parametrize("critic_mode", ["disabled", "invalid_then_valid"])
+def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkeypatch, critic_mode):
     client, Session, project_id = _setup(monkeypatch)
     with Session() as db:
         project = db.get(Project, project_id)
-        project.autonomy_settings = {"quality_gate": {"require_critic": False}}
+        project.autonomy_settings = {"quality_gate": {"require_critic": critic_mode != "disabled"}}
         db.commit()
 
     plan_payload = {
@@ -470,7 +767,7 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
             "number": 1, "volume_number": 1, "arc_number": 1,
             "title": "回声", "summary": "档案首次回应",
             "objective": "接受调查", "conflict": "回应带来代价",
-            "scene_beats": [], "must_events": [], "forbidden_events": [],
+            "scene_beats": ["检查档案"], "must_events": [], "forbidden_events": [],
             "end_state": {"case": "open"},
         }],
     }
@@ -487,6 +784,7 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
 
         def __init__(self):
             self.calls = 0
+            self.invalid_critic_responses = 2 if critic_mode == "invalid_then_valid" else 0
 
         def generate(self, messages, model):
             from app.ai.provider import ModelResult
@@ -504,11 +802,13 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
                 action = {"visibility": "PUBLIC", "observable_action": "检查档案", "spoken_content": None,
                           "requires_world_resolution": False, "world_resolution_request": None,
                           "disclosure_knowledge_ids": [], "scene_beat_refs": [], "target_character_id": None}
-                beats = re.search(r'"scene_beats"\s*:\s*\[(.*?)\]', prompt)
-                if beats:
-                    action["scene_beat_refs"] = re.findall(r'"([^\"]+)"', beats.group(1))
+                actor_view = json.loads(messages[1]["content"])["actor_view"]
+                action["scene_beat_refs"] = (actor_view.get("planning_task") or {}).get("scene_beats", [])
                 payload = {"decision": payload, "action": action}
             elif "quality_context" in prompt:
+                if self.invalid_critic_responses:
+                    self.invalid_critic_responses -= 1
+                    return ModelResult(content="not-json", latency_ms=0, request_id=f"author-fake-{self.calls}", provider="fake", model=model, usage={"total_tokens": 3})
                 payload = {"decision": "PASS", "scores": {key: 95 for key in [
                     "factual_grounding", "pov_compliance", "reveal_safety", "style_naturalness",
                     "repetition", "pacing", "voice_consistency", "overall",
@@ -538,7 +838,20 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
     assert worker.run_once() is True
     assert client.get(f"/projects/{project_id}/author-guided-volume/runs/{run_id}").json()["status"] == "PAUSED"
     assert client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/continue").status_code == 200
-    assert worker.run_once() is True
+    if critic_mode == "invalid_then_valid":
+        _advance_until_paused(worker, Session, run_id, expected_status="FAILED")
+        with Session() as db:
+            failed_run = db.get(AutoDirectorRun, run_id)
+            checkpoint = db.get(AutoDirectorStep, failed_run.context["failed_step_id"])
+            assert failed_run.pause_reason == "CRITIC_OUTPUT_INVALID"
+            assert checkpoint.stage == AutoDirectorStage.QUALITY_REVIEW and checkpoint.attempt == 1
+            pending_draft = db.scalar(select(ChapterWriterDraft).where(ChapterWriterDraft.project_id == project_id))
+            assert pending_draft.status.value == "VALIDATED"
+            pending_draft_id = pending_draft.id
+            assert not db.scalar(select(Chapter.id).where(Chapter.project_id == project_id, Chapter.status == "QUALITY_APPROVED"))
+        retried = client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/retry")
+        assert retried.json()["status"] == "RUNNING"
+    _advance_until_paused(worker, Session, run_id)
 
     with Session() as db:
         chapter = db.scalar(select(Chapter).where(Chapter.project_id == project_id, Chapter.number == 1, Chapter.active.is_(True)))
@@ -549,6 +862,10 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
         assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.active.is_(True)))
         run = db.get(AutoDirectorRun, run_id)
         assert draft and draft.status.value == "ADOPTED"
+        if critic_mode == "invalid_then_valid":
+            assert draft.id == pending_draft_id
+            checkpoint = db.get(AutoDirectorStep, run.context["failed_step_id"])
+            assert checkpoint.status == AutoDirectorStepStatus.COMMITTED and checkpoint.attempt == 2
         assert assessment and assessment.status.value == "PASS"
         assert run.status.value == "PAUSED"
         assert run.current_stage.value == "VOLUME_PROGRESS_ASSESSMENT"

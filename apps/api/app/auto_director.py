@@ -70,6 +70,21 @@ def enum_value(value: Any) -> str:
     return value.value if hasattr(value, "value") else str(value)
 
 
+def _safe_style_guide(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    safe = {key: value[key] for key in ("tone", "pov", "audience", "genre") if isinstance(value.get(key), str) and value[key].strip()}
+    for key in ("style_samples", "forbidden_content"):
+        if isinstance(value.get(key), list):
+            safe[key] = list(dict.fromkeys(item.strip() for item in value[key] if isinstance(item, str) and item.strip()))
+    return safe
+
+
+def _merge_forbidden_events(events: Any, forbidden: list[str]) -> list[Any]:
+    merged = list(events) if isinstance(events, list) else []
+    return merged + [item for item in forbidden if item not in merged]
+
+
 class AutoDirectorError(RuntimeError):
     def __init__(self, code: str, message: str = ""):
         self.code = code
@@ -206,16 +221,21 @@ class AutoDirectorOrchestrator:
         if existing and existing.status == AutoDirectorStepStatus.COMMITTED:
             return existing
         if existing:
-            existing.attempt += 1
+            if existing.status in {AutoDirectorStepStatus.FAILED, AutoDirectorStepStatus.BLOCKED}:
+                existing.attempt += 1
             existing.status = AutoDirectorStepStatus.RUNNING
             existing.started_at = datetime.utcnow()
+            run.context = {**(run.context or {}), "active_step_id": existing.id}
             return existing
         step = AutoDirectorStep(run_id=run.id, stage=stage, input_fingerprint=fp, status=AutoDirectorStepStatus.RUNNING, started_at=datetime.utcnow())
         db.add(step); db.flush()
+        run.context = {**(run.context or {}), "active_step_id": step.id}
         return step
 
     def _commit_step(self, step: AutoDirectorStep, payload: dict[str, Any], artifact_id: str | None = None, *, calls: int = 0, latency_ms: int = 0, tokens: int = 0, usage: dict[str, int] | None = None, provider: str | None = None, model: str | None = None) -> None:
         step.status = AutoDirectorStepStatus.COMMITTED
+        step.error_code = None
+        step.error_summary = None
         step.output_payload = payload
         step.output_artifact_id = artifact_id
         token_usage = {**(usage or {}), "calls": calls, "tokens": tokens, "latency_ms": latency_ms, "provider": provider, "model": model, "estimated_cost": None, "cost_status": "UNKNOWN"}
@@ -243,6 +263,7 @@ class AutoDirectorOrchestrator:
         run.status = AutoDirectorRunStatus.BLOCKED if blocked else AutoDirectorRunStatus.FAILED
         run.current_stage = AutoDirectorStage.BLOCKED if blocked else AutoDirectorStage.FAILED
         run.pause_reason = str(code)
+        run.context = {**(run.context or {}), "failed_step_id": step.id, "failed_stage": enum_value(step.stage)}
         run.next_action = "检查错误后重试或接管运行。"
 
     def _add_usage(self, run: AutoDirectorRun, step: AutoDirectorStep) -> None:
@@ -407,7 +428,11 @@ class AutoDirectorOrchestrator:
                 return run
             self._plan_and_first_chapter(db, run, project)
         except Exception as exc:
-            self._fail(run, locals().get("step") or self._step(db, run, run.current_stage, run.context), exc, blocked=getattr(exc, "code", None) in {"DIRECTION_REPAIR_FAILED", "CHAPTER_TASK_CONTRACT_FAILED", "AUTO_ADOPTION_QUALITY_NOT_PASS"})
+            active_step = db.get(AutoDirectorStep, (run.context or {}).get("active_step_id")) if (run.context or {}).get("active_step_id") else None
+            failed_step = active_step if active_step and active_step.status != AutoDirectorStepStatus.COMMITTED else locals().get("step")
+            if failed_step is None:
+                failed_step = self._step(db, run, run.current_stage, run.context)
+            self._fail(run, failed_step, exc, blocked=getattr(exc, "code", None) in {"DIRECTION_REPAIR_FAILED", "CHAPTER_TASK_CONTRACT_FAILED", "AUTO_ADOPTION_QUALITY_NOT_PASS"})
         return run
 
     def select_direction(self, db: Session, run: AutoDirectorRun, index: int | None = None, direction: dict[str, Any] | None = None) -> AutoDirectorRun:
@@ -599,6 +624,7 @@ class AutoDirectorOrchestrator:
         # Book length defines the macro plan. max_chapters only defines how
         # many finished chapters this unattended run should produce.
         framing.update({"target_chapters": int(framing.get("target_chapters") or 10), "target_words_per_chapter": int(framing.get("target_words_per_chapter") or project.target_chapter_words), "pov": framing.get("pov") or "THIRD_PERSON_LIMITED"})
+        author_style = {**_safe_style_guide({"tone": direction.get("style_advice")}), **_safe_style_guide(framing.get("style_guide")), **_safe_style_guide(framing)}
         step = self._step(db, run, AutoDirectorStage.CHAPTER_PLANNING, {"direction": direction, "framing": framing})
         if step.status != AutoDirectorStepStatus.COMMITTED:
             self._check_budget(run)
@@ -607,12 +633,18 @@ class AutoDirectorOrchestrator:
             def update_plan_phase(phase: str, message: str) -> None:
                 live_execution_broker.phase(live_session, phase, message)
             try:
-                generated, result = generate_plan(db, project, framing, direction.get("premise"), {"tone": direction.get("style_advice", "")}, {"forbidden_patterns": []}, on_phase=update_plan_phase, on_delta=lambda content: live_execution_broker.append(live_session, content))
+                generated, result = generate_plan(db, project, framing, direction.get("premise"), author_style, {"forbidden_patterns": []}, on_phase=update_plan_phase, on_delta=lambda content: live_execution_broker.append(live_session, content))
                 self._live_complete(live_session, "整书主线、卷纲、故事弧和首批章节任务已生成")
             except Exception as exc:
                 self._live_fail(live_session, exc)
                 raise
-            generated.setdefault("framing", framing); generated.setdefault("premise", direction.get("premise")); generated.setdefault("style_guide", {"tone": direction.get("style_advice", "")}); generated.setdefault("anti_ai_rules", {"forbidden_patterns": []})
+            generated["framing"] = {**(generated.get("framing") or {}), **framing}
+            generated.setdefault("premise", direction.get("premise"))
+            generated["style_guide"] = {**_safe_style_guide(generated.get("style_guide")), **author_style}
+            generated.setdefault("anti_ai_rules", {"forbidden_patterns": []})
+            forbidden_content = generated["style_guide"].get("forbidden_content", [])
+            chapters = generated.get("chapters") or [_default_chapter(number, framing) for number in range(1, framing["target_chapters"] + 1)]
+            generated["chapters"] = [{**chapter, "forbidden_events": _merge_forbidden_events(chapter.get("forbidden_events"), forbidden_content)} for chapter in chapters]
             errors = validate_plan_references(db, project.id, generated)
             if errors: raise AutoDirectorError("PLAN_REFERENCE_INVALID", str(errors))
             plan = persist_plan(db, project, generated, provider=result.provider, model=result.model, request_id=result.request_id, report={"auto_director": True, "latency_ms": result.latency_ms})
@@ -739,7 +771,8 @@ class AutoDirectorOrchestrator:
                 self._live_fail(writer_live, exc)
                 raise
             if draft.status not in {WriterDraftStatus.VALIDATED, WriterDraftStatus.ADOPTED}:
-                raise AutoDirectorError("WRITER_DRAFT_FAILED", str(draft.validation_report))
+                self._fail(run, writer_step, AutoDirectorError("WRITER_DRAFT_FAILED", str(draft.validation_report)))
+                return
             metrics = self._tracked_metrics(writer_provider)
             self._commit_step(writer_step, {"draft_id": draft.id, "chapter_id": chapter.id}, draft.id, **metrics); self._add_usage(run, writer_step)
         draft_id = writer_step.output_payload["draft_id"]
@@ -772,6 +805,10 @@ class AutoDirectorOrchestrator:
             metrics = self._tracked_metrics(critic_provider)
             self._commit_step(quality_step, {"assessment_id": assessment.id, "status": enum_value(assessment.status)}, assessment.id, **metrics); self._add_usage(run, quality_step)
         assessment = db.get(ChapterQualityAssessment, quality_step.output_payload["assessment_id"])
+        if assessment and enum_value(assessment.status) == "FAILED":
+            reason = (assessment.decision_reason_codes or ["QUALITY_ASSESSMENT_FAILED"])[0]
+            self._fail(run, quality_step, AutoDirectorError(reason, "质量审核未完成，请重试当前审核检查点。"))
+            return
         if assessment and enum_value(assessment.status) == "REPAIR_REQUIRED":
             run.current_stage = AutoDirectorStage.QUALITY_REPAIR
             repair_step = self._step(db, run, AutoDirectorStage.QUALITY_REPAIR, {"assessment_id": assessment.id})
@@ -816,17 +853,18 @@ class AutoDirectorOrchestrator:
             existing_debts.append(debt)
         number = int(context.get("current_chapter_number", 1))
         generated_this_run = int(context.get("generated_this_run", 0)) + 1
+        processed_this_run = int(context.get("processed_this_run", max(int(context.get("adopted_this_run", 0) or 0), int(context.get("generated_this_run", 0) or 0)))) + 1
         generated_chapters = [*context.get("generated_chapters", [])]
         if number not in generated_chapters:
             generated_chapters.append(number)
         configured_budget = int((run.settings or {}).get("max_chapters") or (run.settings or {}).get("operational_run_chapter_budget") or 10)
-        run.context = {**context, "quality_debts": existing_debts, "generated_this_run": generated_this_run, "generated_chapters": generated_chapters, "current_chapter_number": number + 1, "current_chapter_id": None}
+        run.context = {**context, "quality_debts": existing_debts, "generated_this_run": generated_this_run, "processed_this_run": processed_this_run, "generated_chapters": generated_chapters, "last_processed_chapter_number": number, "current_chapter_number": number + 1, "current_chapter_id": None}
         run.current_chapter_id = None
-        if generated_this_run >= configured_budget:
+        if processed_this_run >= configured_budget:
             run.status = AutoDirectorRunStatus.PAUSED
             run.current_stage = AutoDirectorStage.NEXT_CHAPTER
             run.pause_reason = "RUN_CHAPTER_BUDGET_REACHED"
-            run.next_action = f"本次运行已生成 {generated_this_run} 章；第 {number} 章保留质量债务，继续运行可推进下一章。"
+            run.next_action = f"本次运行已处理 {processed_this_run} 章；第 {number} 章保留质量债务，继续运行可推进下一章。"
             run.context = {**run.context, "run_budget_reached": True}
         else:
             run.status = AutoDirectorRunStatus.RUNNING
@@ -853,7 +891,9 @@ class AutoDirectorOrchestrator:
         completed = list(prior_completed)
         if number not in completed: completed.append(number)
         adopted_this_run = int((run.context or {}).get("adopted_this_run", 0)) + (0 if number in prior_completed else 1)
-        run.context = {**(run.context or {}), "completed_chapters": completed, "adopted_chapters": int((run.context or {}).get("adopted_chapters", 0)) + (0 if number in prior_completed else 1), "adopted_this_run": adopted_this_run, "last_adopted_chapter_number": number, "last_adopted_chapter_id": draft.chapter_id, "last_adopted_draft_id": draft.id}
+        generated_this_run = int((run.context or {}).get("generated_this_run", 0)) + (0 if number in prior_completed else 1)
+        processed_this_run = int((run.context or {}).get("processed_this_run", max(int((run.context or {}).get("adopted_this_run", 0) or 0), int((run.context or {}).get("generated_this_run", 0) or 0)))) + (0 if number in prior_completed else 1)
+        run.context = {**(run.context or {}), "completed_chapters": completed, "adopted_chapters": int((run.context or {}).get("adopted_chapters", 0)) + (0 if number in prior_completed else 1), "adopted_this_run": adopted_this_run, "generated_this_run": generated_this_run, "processed_this_run": processed_this_run, "last_processed_chapter_number": number, "last_adopted_chapter_number": number, "last_adopted_chapter_id": draft.chapter_id, "last_adopted_draft_id": draft.id}
         if run.run_mode == "FULL_AUTO" and (run.context or {}).get("volume_id"):
             from .models import VolumeContract, VolumeContractStatus
             volume = db.get(VolumeContract, run.context["volume_id"])
@@ -865,11 +905,11 @@ class AutoDirectorOrchestrator:
         # never evidence that the book itself has ended. The next request can
         # resume from the persisted chapter number without creating a duplicate.
         configured_budget = int((run.settings or {}).get("max_chapters") or (run.settings or {}).get("operational_run_chapter_budget") or 10)
-        if adopted_this_run >= configured_budget:
+        if processed_this_run >= configured_budget:
             run.status = AutoDirectorRunStatus.PAUSED
             run.current_stage = AutoDirectorStage.NEXT_CHAPTER
             run.pause_reason = "RUN_CHAPTER_BUDGET_REACHED"
-            run.next_action = f"本次运行已完成 {adopted_this_run} 章；继续运行以推进第 {number + 1} 章。"
+            run.next_action = f"本次运行已处理 {processed_this_run} 章；继续运行以推进第 {number + 1} 章。"
             run.context = {**run.context, "current_chapter_number": number + 1, "run_budget_reached": True}
             run.current_chapter_id = None
         else:
@@ -887,6 +927,9 @@ class AutoDirectorOrchestrator:
         previous = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id, StoryPlanChapter.number == chapter_number - 1))
         contract = {"chapter": {"number": chapter_number, "volume_number": "integer", "arc_number": "integer", "title": "string", "summary": "string", "pov_mode": "string", "objective": "string", "conflict": "string", "start_state": "object", "end_state": "object", "must_events": ["string"], "forbidden_events": ["string"], "allowed_reveals": ["string"], "forbidden_reveals": ["string"], "foreshadow_create": ["string"], "foreshadow_payoff": ["string"], "character_changes": ["string"], "consequences": ["string"], "scene_beats": ["string"]}}
         context = {"book": plan.macro_plan or {}, "volume": {"number": volume.number, "title": volume.title, "summary": volume.summary, "theme": volume.theme, "core_question": volume.core_question, "major_conflict": volume.major_conflict, "main_thread": volume.main_thread, "ending_turn": volume.ending_turn} if volume else {}, "arc": {"number": arc.number, "title": arc.title, "goal": arc.goal, "summary": arc.summary} if arc else {}, "previous_chapter": {"title": previous.title, "summary": previous.summary, "end_state": previous.end_state} if previous else {}, "direction": {"premise": (run.context.get("selected_direction") or {}).get("premise"), "core_conflict": (run.context.get("selected_direction") or {}).get("core_conflict")}}
+        style = {**_safe_style_guide(plan.style_guide), **_safe_style_guide(framing)}
+        context["style_guide"] = style
+        context["planning_input"] = {key: framing[key] for key in ("mode", "source_material") if key in framing}
         messages = [{"role": "system", "content": "你是长篇小说分章策划编辑。"}, {"role": "user", "content": json.dumps({"instruction": f"只输出一个 JSON 对象。为第 {chapter_number} 章生成可执行章节任务单，必须延续已给出的全书、卷纲、故事弧和上一章后果。所有字段都必须具体，禁止空字段、模板话和正文。", "output_contract": contract, "context": context}, ensure_ascii=False)}]
         result = provider.generate(messages, route.model)
         try:
@@ -900,6 +943,7 @@ class AutoDirectorOrchestrator:
         task["number"] = chapter_number
         task["volume_number"] = volume.number if volume else int(task.get("volume_number") or 1)
         task["arc_number"] = arc.number if arc else int(task.get("arc_number") or 1)
+        task["forbidden_events"] = _merge_forbidden_events(task["forbidden_events"], style.get("forbidden_content", []))
         row = StoryPlanChapter(project_id=project.id, plan_id=plan.id, **task)
         db.add(row); db.flush()
         return row, result

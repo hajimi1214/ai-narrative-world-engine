@@ -54,6 +54,7 @@ from .routes import state_history as state_history_routes
 from .routes import writer as writer_routes
 from .routes import auto_director as auto_director_routes
 from .routes import author_guided_volume as author_guided_volume_routes
+from .routes import manuscript as manuscript_routes
 
 router = APIRouter()
 router.include_router(research_routes.router)
@@ -62,6 +63,7 @@ router.include_router(state_history_routes.router)
 router.include_router(writer_routes.router)
 router.include_router(auto_director_routes.router)
 router.include_router(author_guided_volume_routes.router)
+router.include_router(manuscript_routes.router)
 
 class Payload(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -546,7 +548,10 @@ def list_projects(db: Session = Depends(get_db)):
 @router.get("/projects/{project_id}/backup/export")
 def export_project_backup(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
-    archive = ProjectBackupService().export(db, project_id)
+    try:
+        archive = ProjectBackupService().export(db, project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"code": str(exc), "message": "该作品包含当前 JSON 备份尚不支持的历史，请先保留完整数据库备份。"}) from exc
     body = json.dumps(archive, ensure_ascii=False, separators=(",", ":"))
     return Response(content=body, media_type="application/json", headers={
         "Content-Disposition": f'attachment; filename="novel-backup-{project_id}.json"',

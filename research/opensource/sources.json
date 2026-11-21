@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "retrieved_at": "2026-11-21",
+  "purpose": "Study public product workflows and architecture concepts; do not import upstream source into the product.",
+  "repositories": [
+    {
+      "id": "pagekin",
+      "name": "Pagekin / 书童",
+      "url": "https://github.com/EthanYoQ/Pagekin",
+      "clone_path": "research/opensource-downloads/Pagekin",
+      "commit": "d786159d1371bfd38938e1a7c74422458b3247ff",
+      "upstream_release_observed": "1.5.0",
+      "license": "GPL-3.0",
+      "license_source": "https://github.com/EthanYoQ/Pagekin/blob/d786159d1371bfd38938e1a7c74422458b3247ff/LICENSE",
+      "product_source": "https://github.com/EthanYoQ/Pagekin/blob/d786159d1371bfd38938e1a7c74422458b3247ff/README.md",
+      "git_pack_bytes": 114092904,
+      "checkout_method": "shallow clone at verified HEAD; no dependencies installed",
+      "tracked_source_bytes": 182630955,
+      "checkout_bytes_including_git": 297339832,
+      "default_branch": "master"
+    },
+    {
+      "id": "novelwriter",
+      "name": "novelWriter",
+      "url": "https://github.com/vkbo/novelWriter",
+      "clone_path": "research/opensource-downloads/novelWriter",
+      "commit": "dc483f9c881dadbc847b90ccf8ecf67658dc30e2",
+      "license": "GPL-3.0-or-later AND Apache-2.0 AND ISC AND MIT (declared package license expression)",
+      "license_source": "https://github.com/vkbo/novelWriter/blob/dc483f9c881dadbc847b90ccf8ecf67658dc30e2/pyproject.toml",
+      "product_source": "https://github.com/vkbo/novelWriter/blob/dc483f9c881dadbc847b90ccf8ecf67658dc30e2/README.md",
+      "git_pack_bytes": 5302957,
+      "checkout_method": "shallow clone at verified HEAD; no dependencies installed",
+      "tracked_source_bytes": 15240064,
+      "checkout_bytes_including_git": 20667796,
+      "default_branch": "main"
+    },
+    {
+      "id": "bookstack",
+      "name": "BookStack",
+      "url": "https://github.com/BookStackApp/BookStack",
+      "clone_path": "research/opensource-downloads/BookStack",
+      "commit": "34edd552294e4ba0603e55542ae5fafef28b96e7",
+      "license": "MIT",
+      "license_source": "https://github.com/BookStackApp/BookStack/blob/34edd552294e4ba0603e55542ae5fafef28b96e7/LICENSE",
+      "product_source": "https://github.com/BookStackApp/BookStack/blob/34edd552294e4ba0603e55542ae5fafef28b96e7/README.md",
+      "git_pack_bytes": 4421406,
+      "checkout_method": "shallow, blob-filtered clone at verified HEAD; no dependencies installed",
+      "tracked_source_bytes": 16668458,
+      "checkout_bytes_including_git": 21704609,
+      "default_branch": "development"
+    },
+    {
+      "id": "ragflow",
+      "name": "RAGFlow",
+      "url": "https://github.com/infiniflow/ragflow",
+      "clone_path": "research/opensource-downloads/ragflow",
+      "commit": "91c702e86be3dcb3cabc9f6d81e485d02241bef8",
+      "upstream_release_observed": "1.0.0",
+      "license": "Apache-2.0",
+      "license_source": "https://github.com/infiniflow/ragflow/blob/91c702e86be3dcb3cabc9f6d81e485d02241bef8/LICENSE",
+      "product_source": "https://github.com/infiniflow/ragflow/blob/91c702e86be3dcb3cabc9f6d81e485d02241bef8/README.md",
+      "git_pack_bytes": 22336088,
+      "checkout_method": "shallow, blob-filtered clone at verified HEAD; no dependencies installed",
+      "tracked_source_bytes": 66312171,
+      "checkout_bytes_including_git": 90160275,
+      "default_branch": "main"
+    },
+    {
+      "id": "logseq",
+      "name": "Logseq (documentation only)",
+      "url": "https://github.com/logseq/logseq",
+      "commit": null,
+      "license": "AGPL-3.0",
+      "license_source": "https://github.com/logseq/logseq/blob/master/LICENSE",
+      "checkout_bytes_including_git": null,
+      "checkout_method": "no clone; GitHub reports roughly 463 MiB for the repository, so only concept-level public material is relevant"
+    }
+  ],
+  "license_notice": "This manifest records upstream terms for research provenance. It is not legal advice. Upstream source remains outside the product source and dependency graph.",
+  "installed_skills": [
+    {
+      "id": "playwright",
+      "name": "Playwright CLI browser automation skill",
+      "source_repository": "https://github.com/openai/skills",
+      "source_path": "skills/.curated/playwright",
+      "source_branch_commit": "49f948faa9258a0c61caceaf225e179651397431",
+      "distribution_license": "Apache-2.0 (see skill LICENSE.txt)",
+      "skill_file_sha256": "0ffaabcc8e0990627c4725f18bf1c7955534a796c1c199e872909de2013ce6a8",
+      "installed_license_sha256": "9a7110fc2d2f964038e5dc49128f908f29f47a574c961cba16085914e879cbda",
+      "playwright_cli_package": "@playwright/cli@0.1.25 (Apache-2.0)",
+      "derived_material_notice": "The installed NOTICE.txt attributes derived workflow text to Microsoft. Upstream repository: https://github.com/microsoft/playwright-cli; inspected HEAD c872a33cec77fa03c28fa7c6d1ad99d15d04ce42. See the installed NOTICE.txt for attribution.",
+      "install_path": "C:/Users/30317/.codex/skills/playwright",
+      "used_for": "Real-browser workflow verification of restored chapter drafts and viewport QA; available to future sessions."
+    }
+  ]
+}

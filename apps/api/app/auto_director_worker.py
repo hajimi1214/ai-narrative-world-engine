@@ -1,4 +1,4 @@
-"""Persistent local worker for FULL_AUTO runs.
+"""Persistent local worker for FULL_AUTO and author-guided volume runs.
 
 The worker is deliberately small: the database checkpoint is the queue and the
 existing orchestrator remains the domain owner of each stage.

@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..ai.errors import ModelProviderError
 from ..model_router import ModelRouter
@@ -11,6 +12,14 @@ from ..writer import WriterDomainError, WriterProjectionService
 from .common import Payload, get_db, record_dict, require_project, routed_provider, serialize
 
 router = APIRouter(tags=["writer"])
+
+
+class AuthorEditPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=500_000)
+    base_draft_id: str = Field(min_length=1, max_length=36)
+    expected_current_draft_id: str | None = Field(..., max_length=36)
+    client_request_id: str = Field(min_length=1, max_length=200)
 
 
 def writer_draft_payload(draft: ChapterWriterDraft, *, include_content: bool = False) -> dict:
@@ -53,6 +62,22 @@ def _draft_or_404(db: Session, project_id: str, draft_id: str, chapter_id: str |
     if not draft or draft.project_id != project_id or (chapter_id and draft.chapter_id != chapter_id):
         raise HTTPException(status_code=404, detail="Writer draft not found")
     return draft
+
+
+@router.post("/projects/{project_id}/chapters/{chapter_id}/writer/edit", status_code=201)
+def writer_author_edit(project_id: str, chapter_id: str, payload: AuthorEditPayload, db: Session = Depends(get_db)):
+    from ..authoring import AuthorDraftService
+
+    _chapter_or_404(db, project_id, chapter_id)
+    _draft_or_404(db, project_id, payload.base_draft_id, chapter_id)
+    try:
+        draft = AuthorDraftService().save(db, chapter_id, payload.model_dump())
+        db.commit()
+        db.refresh(draft)
+        return writer_draft_payload(draft, include_content=True)
+    except WriterDomainError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": exc.code, "detail": exc.detail}) from exc
 
 
 @router.post("/projects/{project_id}/chapters/{chapter_id}/writer/preview")

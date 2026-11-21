@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Check, CircleAlert, Pause, Play, RotateCcw, UserRoundCog, Eye } from "lucide-react";
+import { Check, CircleAlert, CircleDot, LoaderCircle, Pause, Play, RefreshCw, RotateCcw, UserRoundCog, Eye } from "lucide-react";
 import { api, ApiError } from "../../../../lib";
+import { createLivePoller, type LiveSyncState } from "../../../../../components/live/live-poller";
 
 type UsageMetrics = { calls?: number; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; latency_ms?: number; estimated_cost?: number | null; cost_status?: string; provider?: string; model?: string };
 type Step = { id: string; stage: string; status: string; attempt: number; output_artifact_id?: string; output_payload?: Record<string, any>; error_code?: string; error_summary?: string; token_usage?: Record<string, any>; usage_metrics?: UsageMetrics };
@@ -13,19 +14,82 @@ const stages = ["IDEA", "FRAMING", "CAST_PREPARATION", "WORLD_BUILDING", "STORY_
 const labels: Record<string, string> = { IDEA: "灵感", FRAMING: "方向评分", CAST_PREPARATION: "角色准备", WORLD_BUILDING: "世界边界", STORY_MACRO: "故事主线", VOLUME_PLANNING: "卷纲", CHAPTER_PLANNING: "章节任务", CHAPTER_DETAIL: "章节详情", CHAPTER_EXECUTION: "章节正文", QUALITY_REVIEW: "质量审核", QUALITY_REPAIR: "自动修复", AUTHOR_ADOPTION: "自动采用", NEXT_CHAPTER: "下一章", COMPLETED: "整本完成", PAUSED: "已暂停", FAILED: "失败", BLOCKED: "已阻塞" };
 
 export default function AutoDirectorPage({ params }: { params: { id: string } }) {
-  const [run, setRun] = useState<Run>(); const [draft, setDraft] = useState<Record<string, any>>(); const [quality, setQuality] = useState<Record<string, any>>(); const [task, setTask] = useState<Record<string, any>>(); const [chapters, setChapters] = useState<Array<Record<string, any>>>([]); const [directionOpen, setDirectionOpen] = useState(false); const [showStarter, setShowStarter] = useState(false); const [error, setError] = useState(""); const [busy, setBusy] = useState(false); const [start, setStart] = useState({ inspiration: "", target_chapters: 450, max_chapters: 10, target_words_per_chapter: 2800, tone: "" });
-  useEffect(() => { void api(`/projects/${params.id}/auto-director/runs`).then((items: unknown) => { const runs = items as Run[]; const active = runs.filter((item) => ["RUNNING", "PAUSED", "BLOCKED"].includes(item.status)); const current = [...active, ...runs.filter((item) => !active.includes(item))].sort((a, b) => String(b.updated_at || b.id).localeCompare(String(a.updated_at || a.id)))[0]; if (current) setRun(current); }).catch(() => undefined); void api(`/projects/${params.id}/chapters`).then((items: unknown) => setChapters((items as Array<Record<string, any>>).filter((item) => item.active !== false).sort((a, b) => Number(a.number || 0) - Number(b.number || 0)))).catch(() => undefined); }, [params.id]);
-  useEffect(() => { if (!run || ["COMPLETED", "FAILED", "BLOCKED"].includes(run.status)) return; const refresh = () => { void api(`/projects/${params.id}/auto-director/runs/${run.id}`).then(setRun).catch(() => undefined); void api(`/projects/${params.id}/chapters`).then((items: unknown) => setChapters((items as Array<Record<string, any>>).filter((item) => item.active !== false).sort((a, b) => Number(a.number || 0) - Number(b.number || 0)))).catch(() => undefined); }; const timer = window.setInterval(refresh, 2000); return () => window.clearInterval(timer); }, [params.id, run?.id, run?.status]);
+  const [run, setRun] = useState<Run>(); const [draft, setDraft] = useState<Record<string, any>>(); const [quality, setQuality] = useState<Record<string, any>>(); const [task, setTask] = useState<Record<string, any>>(); const [chapters, setChapters] = useState<Array<Record<string, any>>>([]); const [directionOpen, setDirectionOpen] = useState(false); const [showStarter, setShowStarter] = useState(false); const [error, setError] = useState(""); const [busy, setBusy] = useState(false); const [sync, setSync] = useState<LiveSyncState>({ status: "paused", lastUpdatedAt: null, retryAt: null, failures: 0 }); const pollerRef = useRef<ReturnType<typeof createLivePoller> | null>(null); const [start, setStart] = useState({ inspiration: "", target_chapters: 450, max_chapters: 10, target_words_per_chapter: 2800, tone: "" });
+  const draftGeneration = useRef(0);
+  const chapterDetailGeneration = useRef(0);
+  useEffect(() => {
+    const controller = new AbortController(); let alive = true;
+    void Promise.all([
+      api(`/projects/${params.id}/auto-director/runs`, { signal: controller.signal }) as Promise<Run[]>,
+      api(`/projects/${params.id}/chapters`, { signal: controller.signal }) as Promise<Array<Record<string, any>>>,
+    ]).then(([runs, items]) => {
+      if (!alive) return;
+      const active = runs.filter((item) => ["RUNNING", "PAUSED", "BLOCKED"].includes(item.status));
+      const current = [...active, ...runs.filter((item) => !active.includes(item))].sort((a, b) => String(b.updated_at || b.id).localeCompare(String(a.updated_at || a.id)))[0];
+      if (current) setRun(current);
+      setChapters(items.filter((item) => item.active !== false).sort((a, b) => Number(a.number || 0) - Number(b.number || 0)));
+    }).catch((reason: unknown) => { if (alive && !controller.signal.aborted) setError(reason instanceof ApiError ? reason.message : "无法读取自动导演状态"); });
+    return () => { alive = false; controller.abort(); };
+  }, [params.id]);
+  useEffect(() => {
+    if (!run || ["COMPLETED", "FAILED"].includes(run.status)) { setSync((state) => ({ ...state, status: "paused", retryAt: null })); return; }
+    const poller = createLivePoller({
+      intervalMs: 2000,
+      onState: setSync,
+      load: async (signal) => {
+        const [latest, items] = await Promise.all([
+          api(`/projects/${params.id}/auto-director/runs/${run.id}`, { signal }) as Promise<Run>,
+          api(`/projects/${params.id}/chapters`, { signal }) as Promise<Array<Record<string, any>>>,
+        ]);
+        if (signal.aborted) return;
+        setRun(latest);
+        setChapters(items.filter((item) => item.active !== false).sort((a, b) => Number(a.number || 0) - Number(b.number || 0)));
+        setError("");
+      },
+    });
+    pollerRef.current = poller;
+    const visibility = () => poller.setPaused(document.hidden);
+    visibility(); document.addEventListener("visibilitychange", visibility);
+    return () => { poller.dispose(); if (pollerRef.current === poller) pollerRef.current = null; document.removeEventListener("visibilitychange", visibility); };
+  }, [params.id, run?.id, ["COMPLETED", "FAILED"].includes(run?.status || "")]);
   useEffect(() => { void api(`/projects/${params.id}`).then((project: any) => setStart((current) => ({ ...current, inspiration: project.story_seed || current.inspiration, target_words_per_chapter: project.target_chapter_words || current.target_words_per_chapter }))).catch(() => undefined); }, [params.id]);
-  useEffect(() => { const id = [...(run?.steps || [])].reverse().find((step) => step.stage === "CHAPTER_EXECUTION" && step.status === "COMMITTED")?.output_artifact_id; if (id) void api(`/projects/${params.id}/writer-drafts/${id}`).then((value: unknown) => setDraft(value as Record<string, any>)).catch(() => undefined); }, [params.id, run?.steps]);
-  useEffect(() => { if (!run?.current_chapter_id) return; void api(`/projects/${params.id}/chapters/${run.current_chapter_id}/quality`).then((value: unknown) => setQuality(value as Record<string, any>)).catch(() => undefined); void api(`/projects/${params.id}/chapters/${run.current_chapter_id}/planning-task`).then((value: any) => setTask(value?.task || value)).catch(() => undefined); }, [params.id, run?.current_chapter_id, run?.current_stage]);
+  const displayedChapter = run?.status === "COMPLETED" ? (run.context?.last_adopted_chapter_number || run.context?.current_chapter_number || 1) : (run?.context?.current_chapter_number || 1);
+  const draftTargetChapterId = run?.status === "COMPLETED" ? run.context?.last_adopted_chapter_id : run?.current_chapter_id;
+  const latestDraftStep = draftTargetChapterId ? [...(run?.steps || [])].reverse().find((step) => step.stage === "CHAPTER_EXECUTION" && step.status === "COMMITTED" && step.output_payload?.chapter_id === draftTargetChapterId) : undefined;
+  const latestDraftId = latestDraftStep?.output_artifact_id;
+  useEffect(() => {
+    const generation = ++draftGeneration.current;
+    const controller = new AbortController();
+    if (!latestDraftId) { setDraft(undefined); return () => controller.abort(); }
+    setDraft(undefined);
+    void api(`/projects/${params.id}/writer-drafts/${latestDraftId}`, { signal: controller.signal }).then((value: unknown) => {
+      if (!controller.signal.aborted && generation === draftGeneration.current) setDraft(value as Record<string, any>);
+    }).catch(() => undefined);
+    return () => { controller.abort(); };
+  }, [params.id, latestDraftId]);
+  useEffect(() => {
+    const chapterId = run?.current_chapter_id;
+    const generation = ++chapterDetailGeneration.current;
+    const controller = new AbortController();
+    setQuality(undefined); setTask(undefined);
+    if (!chapterId) return () => controller.abort();
+    void Promise.allSettled([
+      api(`/projects/${params.id}/chapters/${chapterId}/quality`, { signal: controller.signal }),
+      api(`/projects/${params.id}/chapters/${chapterId}/planning-task`, { signal: controller.signal }),
+    ]).then(([qualityResult, taskResult]) => {
+      if (controller.signal.aborted || generation !== chapterDetailGeneration.current || run?.current_chapter_id !== chapterId) return;
+      if (qualityResult.status === "fulfilled") setQuality(qualityResult.value as Record<string, any>);
+      if (taskResult.status === "fulfilled") { const value = taskResult.value as any; setTask(value?.task || value); }
+    });
+    return () => { controller.abort(); };
+  }, [params.id, run?.current_chapter_id, run?.current_stage]);
   async function action(name: string, body?: unknown) { if (!run) return; setBusy(true); setError(""); try { const next = await api(`/projects/${params.id}/auto-director/runs/${run.id}/${name}`, { method: "POST", body: body ? JSON.stringify(body) : undefined }) as Run; setRun(next); if (name === "takeover") window.location.href = `/projects/${params.id}/director`; } catch (reason: unknown) { setError(reason instanceof ApiError ? reason.message : "操作失败"); } finally { setBusy(false); } }
   async function startRun() { setBusy(true); setError(""); try { const next = await api(`/projects/${params.id}/auto-director/runs`, { method: "POST", body: JSON.stringify({ ...start, max_tokens: 0, max_repairs: 2, max_retries: 2, require_direction_confirmation: true, idempotency_key: `auto-ui-${params.id}-${Date.now()}` }) }) as Run; setRun(next); setShowStarter(false); } catch (reason: unknown) { setError(reason instanceof ApiError ? reason.message : "无法启动自动导演"); } finally { setBusy(false); } }
   const directions = (run?.context?.directions || []) as Array<Record<string, any>>; const selectedDirection = run?.context?.selected_direction as Record<string, any> | undefined;
   const currentStep = run?.steps?.find((step) => step.stage === run.current_stage);
-  const draftStep = [...(run?.steps || [])].reverse().find((step) => step.stage === "CHAPTER_EXECUTION" && step.status === "COMMITTED");
-  const displayedChapter = run?.status === "COMPLETED" ? (run.context?.last_adopted_chapter_number || run.context?.current_chapter_number || 1) : (run?.context?.current_chapter_number || 1);
-  return <main className="stack"><header className="page-header"><div><p className="eyebrow">AUTO DIRECTOR · LOCAL</p><h1>自动导演</h1><p>从整本方向到指定数量的正文、审核与修复，进度会持续自动刷新。</p></div><div className="row"><button className="secondary" onClick={() => setShowStarter((value) => !value)} disabled={busy}>{showStarter ? "返回当前运行" : "新建自动运行"}</button><button className="secondary" onClick={() => action("pause")} disabled={busy || run?.status !== "RUNNING"}><Pause size={15} />暂停</button><button onClick={() => action("resume")} disabled={busy || run?.status !== "PAUSED"}><Play size={15} />继续</button></div></header>
+  const draftStep = latestDraftStep;
+  const syncLabel = sync.status === "syncing" ? "同步中" : sync.status === "offline" ? "连接暂断" : sync.status === "paused" ? "已暂停同步" : "已同步";
+  return <main className="stack"><header className="page-header"><div><p className="eyebrow">AUTO DIRECTOR · LOCAL</p><h1>自动导演</h1><p>从整本方向到指定数量的正文、审核与修复，进度会持续自动刷新。</p></div><div className="row"><span className={`ai-live-sync ai-live-sync-${sync.status}`} role="status" aria-live="polite">{sync.status === "syncing" ? <LoaderCircle size={13} className="ai-live-spin" /> : <CircleDot size={13} />}{syncLabel}{sync.lastUpdatedAt ? ` · ${new Date(sync.lastUpdatedAt).toLocaleTimeString("zh-CN")}` : ""}</span><button className="ai-live-refresh" onClick={() => pollerRef.current?.refresh()} disabled={sync.status === "paused" || sync.status === "syncing"} aria-label="刷新自动导演状态"><RefreshCw size={13} />刷新</button><button className="secondary" onClick={() => setShowStarter((value) => !value)} disabled={busy}>{showStarter ? "返回当前运行" : "新建自动运行"}</button><button className="secondary" onClick={() => action("pause")} disabled={busy || run?.status !== "RUNNING"}><Pause size={15} />暂停</button><button onClick={() => action("resume")} disabled={busy || run?.status !== "PAUSED"}><Play size={15} />继续</button></div></header>
     {error && <section className="section-card"><CircleAlert size={16} />{error}</section>}
     {(!run || showStarter) ? <section className="section-card auto-start-card"><div><p className="eyebrow">START AUTO DIRECTOR</p><h2>让 AI 从这本小说继续创作</h2><p className="muted">系统会自动生成方向、人物、世界边界、整本卷纲、章节任务、正文、审核与可修复问题。你只需随时观看、暂停或接管修改。</p></div><div className="form-grid"><label className="field full"><span>小说灵感 / 已有设定</span><textarea value={start.inspiration} onChange={(event) => setStart({ ...start, inspiration: event.target.value })} placeholder="输入一句灵感，或保留项目中已保存的设定。" /></label><label className="field"><span>整本规划章节数</span><input type="number" min={1} max={100000} value={start.target_chapters} onChange={(event) => setStart({ ...start, target_chapters: Number(event.target.value) })} /></label><label className="field"><span>本次自动生成正文</span><input type="number" min={1} max={100000} value={start.max_chapters} onChange={(event) => setStart({ ...start, max_chapters: Number(event.target.value) })} /></label><label className="field"><span>每章目标字数</span><input type="number" min={500} max={20000} value={start.target_words_per_chapter} onChange={(event) => setStart({ ...start, target_words_per_chapter: Number(event.target.value) })} /></label><label className="field"><span>整体文风</span><input value={start.tone} onChange={(event) => setStart({ ...start, tone: event.target.value })} placeholder="可选，例如克制、悬疑、短句" /></label></div><div className="planning-save-bar"><span>本地运行不设 token 上限；正文数量以“本次自动生成正文”为准。</span><button onClick={() => void startRun()} disabled={busy || !start.inspiration.trim()}><Play size={15} />{busy ? "正在启动…" : "启动自动导演"}</button></div></section> : <><section className="section-card"><div className="section-card-header"><div><p className="eyebrow">CURRENT CHECKPOINT</p><h2>{labels[run.current_stage] || run.current_stage}</h2></div><strong>{labels[run.status] || run.status}</strong></div><p>{run.next_action || "系统正在准备下一步。"}</p>{run.pause_reason && <p className="muted">暂停原因：{run.pause_reason}</p>}<div className="run-metrics"><span>当前章节：第 {run.context?.current_chapter_number || 1} 章</span><span>已完成：{(run.context?.completed_chapters as unknown[] | undefined)?.length || 0} 章</span><span>自动采用：{run.context?.adopted_chapters || 0} 次</span><span>本次目标：{run.settings?.max_chapters || run.settings?.target_chapters || 0} 章</span><span>整本规划：{run.settings?.target_chapters || 0} 章</span><span>当前阶段 token：{currentStep?.usage_metrics?.total_tokens || currentStep?.token_usage?.total_tokens || currentStep?.token_usage?.tokens || 0}</span><span>累计 token：{run.usage_metrics?.total_tokens || run.token_usage?.total_tokens || 0}</span><span>输入/输出：{run.usage_metrics?.prompt_tokens || 0} / {run.usage_metrics?.completion_tokens || 0}</span><span>调用次数：{run.usage_metrics?.calls || run.token_usage?.total_calls || 0}</span><span>失败/重试：{run.steps.filter((step) => ["FAILED", "BLOCKED"].includes(step.status)).length}</span><span>估算成本：{run.usage_metrics?.cost_status === "UNKNOWN" ? "未知" : (run.usage_metrics?.estimated_cost || "-")}</span></div></section>
       <section className="section-card"><p className="eyebrow">STAGE TIMELINE</p><div className="stage-timeline">{stages.map((stage) => { const done = run.steps.some((step) => step.stage === stage && step.status === "COMMITTED"); const active = stage === run.current_stage; return <div className={`stage-item ${done ? "done" : ""} ${active ? "active" : ""}`} key={stage}><span>{done ? <Check size={13} /> : active ? "●" : "○"}</span><small>{labels[stage]}</small></div>; })}</div></section>

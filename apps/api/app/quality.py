@@ -669,6 +669,8 @@ class QualityDecisionEngine:
         config_value = _resolved_quality_config(config)
         severities = [_value(item.get("severity")) for item in findings]
         reasons: list[str] = []
+        if config_value["require_critic"] and (critic_decision is None or overall_score is None):
+            return QualityAssessmentStatus.FAILED, ["CRITIC_REQUIRED"]
         if critic_decision == "BLOCKED":
             reasons.append("CRITIC_BLOCKED")
         if "BLOCKING" in severities:
@@ -811,9 +813,9 @@ class QualityAssessmentAudit:
                 raise QualityDomainError("QUALITY_DETERMINISTIC_ONLY_INTEGRITY_INVALID")
         if _value(assessment.status) in {"PASS", "REPAIR_REQUIRED", "BLOCKED"} and config["require_critic"]:
             if critic.get("fallback") == "DETERMINISTIC_ONLY":
-                if assessment.overall_score is not None or critic_rows:
-                    raise QualityDomainError("QUALITY_CRITIC_REPORT_INVALID")
-                return {"valid": True, "assessment_id": assessment.id, "fallback": True}
+                # Historical fallback reports remain stored for inspection,
+                # but cannot authorize adoption when a critic was required.
+                raise QualityDomainError("QUALITY_CRITIC_REQUIRED")
             try:
                 CriticOutputPayload.model_validate(critic)
             except ValidationError as exc:
@@ -868,7 +870,7 @@ class QualityGateService:
                     raise QualityDomainError("QUALITY_REQUEST_MISMATCH")
                 return existing
         existing = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.chapter_id == chapter.id, ChapterQualityAssessment.writer_draft_id == context["writer_draft"].id, ChapterQualityAssessment.active.is_(True), ChapterQualityAssessment.quality_context_fingerprint == context["quality_context_fingerprint"]))
-        if existing:
+        if existing and (existing.critic_report or {}).get("fallback") != "DETERMINISTIC_ONLY":
             QualityAssessmentAudit().audit(db, existing.id)
             return existing
         version = (db.scalar(select(func.max(ChapterQualityAssessment.version)).where(ChapterQualityAssessment.chapter_id == chapter.id)) or 0) + 1
@@ -904,11 +906,10 @@ class QualityGateService:
                     result = route_provider.generate(repair_prompt, route_model)
                     try:
                         critic = CriticOutputValidator().parse(result.content, context["prose"], context["renderable_source_refs"])
-                    except QualityDomainError:
-                        # Critic formatting is advisory; deterministic checks
-                        # remain authoritative when both critic attempts fail.
-                        critic = None
-                        assessment.critic_report = {"fallback": "DETERMINISTIC_ONLY", "reason": "CRITIC_OUTPUT_INVALID"}
+                    except QualityDomainError as second_error:
+                        assessment.critic_request_id = result.request_id
+                        assessment.critic_report = {"failed": True, "reason": "CRITIC_OUTPUT_INVALID", "validation_error": second_error.code, "attempts": 2}
+                        raise QualityDomainError("CRITIC_OUTPUT_INVALID") from second_error
                 assessment.critic_request_id = result.request_id
                 ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms, request_id=result.request_id, output_fingerprint=_fp(critic, "critic-output-v1"))
             except ModelProviderError as exc:
@@ -1137,6 +1138,11 @@ class QualityRepairService:
             return chapter
         if _value(draft.status) != "VALIDATED":
             raise QualityDomainError("QUALITY_REPAIR_DRAFT_NOT_VALIDATED")
+        from .authoring import ensure_chapter_unsealed
+        try:
+            ensure_chapter_unsealed(db, chapter)
+        except WriterDomainError as exc:
+            raise QualityDomainError(exc.code, exc.detail) from exc
         assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.writer_draft_id == draft.id, ChapterQualityAssessment.status == QualityAssessmentStatus.PASS).order_by(ChapterQualityAssessment.version.desc()))
         if not assessment or not self._source_is_repairable(db, chapter, assessment, draft):
             raise QualityDomainError("QUALITY_REPAIR_ASSESSMENT_NOT_PASS")

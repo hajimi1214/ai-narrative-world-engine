@@ -16,7 +16,7 @@ from app.main import app
 from app.models import (
     AntiAIBible, Chapter, ChapterQualityAssessment, ChapterQualityFinding,
     ChapterWriterDraft, Character, ExecutionTrace, Project, Scene,
-    ProjectModelConfig, WriterDraftOrigin, WriterDraftStatus,
+    ProjectModelConfig, VolumeContract, VolumeContractStatus, WriterDraftOrigin, WriterDraftStatus,
 )
 from app.narrative_structure import NarrativeStructureService
 from app.quality import (
@@ -289,10 +289,41 @@ def test_assessment_repairs_one_invalid_critic_response(quality_project, session
     assert assessment.status.value == "PASS" and provider.calls == 2
 
 
-def test_assessment_uses_deterministic_fallback_after_two_invalid_critic_responses(quality_project, session):
+def test_required_critic_failure_never_passes_and_can_be_retried(quality_project, session):
+    chapter = quality_project[3]
     provider = FakeModelProvider(["not-json", "still-not-json"])
-    assessment = QualityGateService().assess(session, quality_project[3].id, {"client_request_id": "critic-fallback"}, provider=provider, model="critic")
-    assert assessment.status.value == "PASS" and assessment.critic_report["fallback"] == "DETERMINISTIC_ONLY"
+    request = {"client_request_id": "critic-invalid"}
+    assessment = QualityGateService().assess(session, chapter.id, request, provider=provider, model="critic")
+    assert assessment.status.value == "FAILED" and not assessment.active
+    assert assessment.decision_reason_codes == ["CRITIC_OUTPUT_INVALID"]
+    assert assessment.critic_report["attempts"] == 2 and assessment.overall_score is None
+    trace = session.scalar(select(ExecutionTrace).where(ExecutionTrace.source_id == assessment.id))
+    assert trace.status == "FAILED"
+    with pytest.raises(QualityDomainError, match="QUALITY_ASSESSMENT_NOT_PASS"):
+        QualityGateService().approve(session, assessment.id)
+    assert QualityGateService().assess(session, chapter.id, request, provider=provider, model="critic").id == assessment.id
+    assert provider.calls == 2
+    retry = QualityGateService().assess(session, chapter.id, {"client_request_id": "critic-retry"}, provider=FakeModelProvider(critic_response()), model="critic")
+    assert retry.status.value == "PASS" and retry.id != assessment.id
+
+
+def test_legacy_required_critic_fallback_cannot_authorize_adoption(quality_project, session):
+    chapter = quality_project[3]
+    legacy = assess_pass(session, chapter)
+    legacy.critic_report = {"fallback": "DETERMINISTIC_ONLY", "reason": "CRITIC_OUTPUT_INVALID"}
+    legacy.overall_score = None
+    session.flush()
+    with pytest.raises(QualityDomainError, match="QUALITY_CRITIC_REQUIRED"):
+        QualityGateService().approve(session, legacy.id)
+    assert chapter.status != "QUALITY_APPROVED"
+    replacement = assess_pass(session, chapter)
+    assert replacement.id != legacy.id and replacement.status.value == "PASS"
+    assert legacy.status.value == "SUPERSEDED"
+
+
+def test_decision_engine_requires_critic_evidence_when_enabled():
+    status, reasons = QualityDecisionEngine.decide([], None, {"require_critic": True}, None)
+    assert status.value == "FAILED" and reasons == ["CRITIC_REQUIRED"]
 
 
 def test_assessment_request_mismatch_is_rejected(quality_project, session):
@@ -403,6 +434,25 @@ def test_repair_is_candidate_only(quality_project, session):
     draft, child = QualityRepairService().repair(session, assessment.id, {}, repair_provider=repair, repair_model="repair", critic_provider=FakeModelProvider(critic_response()), critic_model="critic")
     assert draft.origin.value == "QUALITY_REPAIR" and draft.status.value == "VALIDATED" and child.status.value == "PASS"
     assert chapter.current_writer_draft_id == original.id and chapter.content == original.content
+
+
+@pytest.mark.parametrize("seal_before_adoption", [True, False])
+def test_repair_adoption_respects_sealed_volume_and_idempotency(quality_project, session, seal_before_adoption):
+    project, _, _, chapter, original = quality_project
+    assessment = QualityGateService().assess(session, chapter.id, {}, provider=FakeModelProvider(critic_response(overall=1)), model="critic")
+    draft, child = QualityRepairService().repair(session, assessment.id, {}, repair_provider=FakeModelProvider(writer_response(chapter, "Fixed before sealing.")), repair_model="repair", critic_provider=FakeModelProvider(critic_response()), critic_model="critic")
+    if not seal_before_adoption:
+        QualityRepairService().adopt(session, draft.id)
+    session.add(VolumeContract(project_id=project.id, volume_number=1, status=VolumeContractStatus.SEALED, actual_chapter_start=chapter.number, actual_chapter_end=chapter.number))
+    session.flush()
+    if seal_before_adoption:
+        with pytest.raises(QualityDomainError, match="VOLUME_SEALED"):
+            QualityRepairService().adopt(session, draft.id)
+        assert chapter.content == original.content and chapter.current_writer_draft_id == original.id
+        assert draft.status.value == "VALIDATED" and not child.active
+    else:
+        assert QualityRepairService().adopt(session, draft.id).id == chapter.id
+        assert chapter.content == draft.content and chapter.current_quality_assessment_id == child.id
 
 
 def test_repair_provenance_is_auditable(quality_project, session):

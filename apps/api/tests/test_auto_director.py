@@ -19,7 +19,7 @@ from app.models import (
     VolumeContractStatus,
 )
 from app.auto_director_worker import AutoDirectorWorker
-from app.auto_director import AutoDirectorOrchestrator
+from app.auto_director import AutoDirectorError, AutoDirectorOrchestrator, fingerprint
 from app.autonomy import AutonomousWorldLoopService
 from app.planning import validate_task_output
 from app.planning import persist_plan
@@ -54,6 +54,66 @@ def test_auto_director_creates_and_pauses_for_direction(monkeypatch):
     assert duplicate.json()["id"] == body["id"]
 
 
+def test_auto_runs_are_idempotent_within_each_project(monkeypatch):
+    directions = [{"title": f"方向 {i}", "premise": "可兑现的主线", "core_conflict": "目标与代价"} for i in range(3)]
+    client, project_id = _client(monkeypatch, directions)
+    first = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "第一条运行", "idempotency_key": "serial-1"})
+    assert first.status_code == 201, first.text
+    duplicate = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "修改过的重复请求", "idempotency_key": "serial-1"})
+    assert duplicate.status_code == 201 and duplicate.json()["id"] == first.json()["id"]
+    with api_module.SessionLocal() as db:
+        other_project = Project(name="第二部小说")
+        db.add(other_project); db.commit(); other_project_id = other_project.id
+    across_projects = client.post(f"/projects/{other_project_id}/auto-director/runs", json={"inspiration": "另一部小说", "idempotency_key": "serial-1"})
+    assert across_projects.status_code == 201, across_projects.text
+    assert across_projects.json()["id"] != first.json()["id"]
+    assert across_projects.json()["project_id"] == other_project_id
+    assert across_projects.json()["status"] == "RUNNING"
+    assert [item["id"] for item in client.get(f"/projects/{project_id}/auto-director/runs").json()] == [first.json()["id"]]
+
+
+def test_auto_pause_and_resume_leave_other_projects_running(monkeypatch):
+    directions = [{"title": f"方向 {i}", "premise": "可兑现的主线", "core_conflict": "目标与代价"} for i in range(3)]
+    client, project_id = _client(monkeypatch, directions)
+    with api_module.SessionLocal() as db:
+        other_project = Project(name="第二部小说")
+        db.add(other_project); db.commit(); other_project_id = other_project.id
+    first = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "第一部小说", "idempotency_key": "resume-serial-1"})
+    assert first.status_code == 201, first.text
+    second = client.post(f"/projects/{other_project_id}/auto-director/runs", json={"inspiration": "第二部小说", "idempotency_key": "resume-serial-2"})
+    assert second.status_code == 201, second.text
+    first_id, second_id = first.json()["id"], second.json()["id"]
+    first_url = f"/projects/{project_id}/auto-director/runs/{first_id}"
+    other_url = f"/projects/{other_project_id}/auto-director/runs/{second_id}"
+    paused = client.post(f"{first_url}/pause")
+    assert paused.status_code == 200 and paused.json()["status"] == "PAUSED"
+    assert client.get(other_url).json()["status"] == "RUNNING"
+
+    assert client.post(f"/projects/{other_project_id}/auto-director/runs/{first_id}/resume").status_code == 404
+    assert client.get(first_url).json()["status"] == "PAUSED"
+    resumed = client.post(f"{first_url}/resume")
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["status"] == "RUNNING"
+    assert resumed.json()["current_stage"] == first.json()["current_stage"]
+    assert client.get(other_url).json()["status"] == "RUNNING"
+
+
+def test_live_run_list_bounds_runs_and_step_history(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    with api_module.SessionLocal() as db:
+        for index in range(3):
+            run = AutoDirectorRun(project_id=project_id, idempotency_key=f"live-list-{index}", status="PAUSED")
+            db.add(run); db.flush()
+            db.add_all([AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.FRAMING, status=AutoDirectorStepStatus.COMMITTED, input_fingerprint=f"step-{number}") for number in range(5)])
+        db.commit()
+    url = f"/projects/{project_id}/auto-director/runs"
+    response = client.get(url, params={"limit": 2, "step_limit": 2})
+    assert response.status_code == 200
+    assert len(response.json()) == 2 and all(len(run["steps"]) == 2 for run in response.json())
+    for params in ({"limit": 0}, {"limit": 51}, {"step_limit": 0}, {"step_limit": 101}):
+        assert client.get(url, params=params).status_code == 422
+
+
 def test_retry_ignores_failures_from_recovered_stages(monkeypatch):
     directions = [{"title": f"方向 {i}", "premise": "主线", "core_conflict": "代价"} for i in range(3)]
     client, project_id = _client(monkeypatch, directions)
@@ -69,6 +129,56 @@ def test_retry_ignores_failures_from_recovered_stages(monkeypatch):
     assert retried.status_code == 200, retried.text
     assert retried.json()["status"] == "RUNNING"
     assert retried.json()["current_stage"] == "CHAPTER_EXECUTION"
+
+
+def test_retry_budget_tracks_checkpoint_attempts_and_duplicate_requests(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={"max_retries": 2, "idempotency_key": "bounded-retry"}).json()
+    checkpoint_input = {"chapter_id": "current-chapter", "plan_id": "current-plan"}
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        historical = AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.CHAPTER_EXECUTION, status=AutoDirectorStepStatus.FAILED, attempt=99, input_fingerprint="previous-chapter")
+        current = AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.CHAPTER_EXECUTION, status=AutoDirectorStepStatus.FAILED, attempt=1, input_fingerprint=fingerprint(checkpoint_input))
+        db.add_all([historical, current]); db.flush()
+        run.status = "FAILED"; run.current_stage = AutoDirectorStage.FAILED
+        run.context = {"selected_direction": {"title": "方向"}, "foundation": {"ready": True}, "failed_step_id": current.id}
+        db.commit(); checkpoint_id = current.id
+
+    def fail_current_checkpoint(self, db, run, project):
+        self._step(db, run, AutoDirectorStage.CHAPTER_EXECUTION, checkpoint_input)
+        raise AutoDirectorError("WRITER_DRAFT_FAILED")
+
+    monkeypatch.setattr(AutoDirectorOrchestrator, "_plan_and_first_chapter", fail_current_checkpoint)
+    url = f"/projects/{project_id}/auto-director/runs/{created['id']}"
+    worker = AutoDirectorWorker(api_module.SessionLocal, poll_seconds=0)
+    for attempt in (2, 3):
+        queued = client.post(f"{url}/retry").json()
+        assert queued["status"] == "RUNNING" and queued["pause_reason"] is None
+        duplicate = client.post(f"{url}/retry").json()
+        assert duplicate["status"] == "RUNNING"
+        assert next(s for s in duplicate["steps"] if s["id"] == checkpoint_id)["attempt"] == attempt - 1
+        assert worker.run_once()
+        failed = client.get(url).json()
+        assert failed["status"] == "FAILED"
+        assert failed["context"]["failed_step_id"] == checkpoint_id
+        assert next(s for s in failed["steps"] if s["id"] == checkpoint_id)["attempt"] == attempt
+    blocked = client.post(f"{url}/retry").json()
+    assert blocked["status"] == "BLOCKED" and blocked["pause_reason"] == "MAX_RETRIES_REACHED"
+    assert client.post(f"{url}/resume").json()["status"] == "BLOCKED"
+
+
+def test_zero_retry_budget_blocks_first_recovery(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={"max_retries": 0, "idempotency_key": "no-retries"}).json()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        step = AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.FRAMING, status=AutoDirectorStepStatus.FAILED, attempt=1, input_fingerprint="first")
+        db.add(step); db.flush()
+        run.status = "FAILED"; run.current_stage = AutoDirectorStage.FAILED
+        run.context = {"failed_step_id": step.id}
+        db.commit()
+    body = client.post(f"/projects/{project_id}/auto-director/runs/{created['id']}/retry").json()
+    assert body["status"] == "BLOCKED" and body["pause_reason"] == "MAX_RETRIES_REACHED"
 
 
 def test_auto_director_uses_target_chapters_when_maximum_is_omitted(monkeypatch):
@@ -100,6 +210,31 @@ def test_auto_director_keeps_full_book_plan_when_run_writes_fewer_chapters(monke
         assert captured["framing"]["target_chapters"] == 450
 
 
+def test_auto_plan_preserves_author_style_and_forbidden_content(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    author_request = {"tone": "克制", "style_samples": ["作者样本"], "forbidden_content": ["不得伤害证人"], "mode": "outline", "source_material": "仅规划器可见的结局资料", "target_chapters": 3}
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={**author_request, "idempotency_key": "author-style"}).json()
+    captured = {}
+    def generate(_db, _project, framing, premise, style, anti_ai, **kwargs):
+        captured.update({"framing": framing, "style": style})
+        return {"framing": {"source_material": "模型覆盖"}, "style_guide": {"tone": "模型覆盖", "style_samples": [], "forbidden_content": [], "source_material": "泄露资料", "mode": "outline", "direction": {"secret": "hidden"}}, "chapters": [{"number": 1, "forbidden_events": ["提前揭晓终局"]}]}, SimpleNamespace(provider="fake", model="fake", request_id="plan", latency_ms=0, usage={})
+    monkeypatch.setattr(auto_module, "generate_plan", generate)
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        run.context = {**run.context, "selected_direction": {"premise": "调查", "style_advice": "模型建议"}, "foundation": {"ready": True}}
+        AutoDirectorOrchestrator()._plan_and_first_chapter(db, run, db.get(Project, project_id))
+        plan = db.get(auto_module.StoryPlan, run.context["plan_id"])
+        assert captured["framing"]["mode"] == "outline" and captured["framing"]["source_material"] == author_request["source_material"]
+        assert captured["style"]["style_samples"] == ["作者样本"]
+        assert plan.style_guide["tone"] == "克制"
+        assert plan.style_guide["style_samples"] == ["作者样本"]
+        assert plan.style_guide["forbidden_content"] == ["不得伤害证人"]
+        assert not {"mode", "source_material", "direction"}.intersection(plan.style_guide)
+        assert plan.framing["source_material"] == author_request["source_material"]
+        task = db.scalar(select(auto_module.StoryPlanChapter).where(auto_module.StoryPlanChapter.plan_id == plan.id))
+        assert task.forbidden_events == ["提前揭晓终局", "不得伤害证人"]
+
+
 def test_auto_director_generates_missing_long_plan_chapter_task(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
@@ -111,13 +246,18 @@ def test_auto_director_generates_missing_long_plan_chapter_task(monkeypatch):
         run = AutoDirectorRun(project_id=project.id, idempotency_key="long-task", settings={}, context={"selected_direction": {"premise": "主线", "core_conflict": "冲突"}})
         db.add(run); db.flush()
         from app.ai.provider import ModelResult
+        captured = {}
         class TaskProvider:
             name = "fake"
             def generate(self, _messages, model):
+                captured.update(json.loads(_messages[-1]["content"])["context"])
                 return ModelResult(content=json.dumps({"chapter": {"title": "第十三章", "summary": "主线升级", "objective": "取得关键证据", "conflict": "对手先一步行动", "must_events": ["取得证据"], "forbidden_events": ["揭开最终真相"], "scene_beats": ["追查", "受阻", "反转"]}}, ensure_ascii=False), latency_ms=1, request_id="task", provider="fake", model=model)
         monkeypatch.setattr(auto_module, "get_model_provider", lambda *args, **kwargs: TaskProvider())
-        row, result = AutoDirectorOrchestrator()._generate_next_chapter_task(db, run, project, plan, 13, {"target_words_per_chapter": 2400})
+        row, result = AutoDirectorOrchestrator()._generate_next_chapter_task(db, run, project, plan, 13, {"target_words_per_chapter": 2400, "forbidden_content": ["不得伤害证人"], "mode": "outline", "source_material": "结局资料"})
         assert row.number == 13 and row.title == "第十三章"
+        assert row.forbidden_events == ["揭开最终真相", "不得伤害证人"]
+        assert captured["planning_input"] == {"mode": "outline", "source_material": "结局资料"}
+        assert "source_material" not in captured["style_guide"]
         assert result.provider == "fake"
 
 
@@ -136,6 +276,19 @@ def test_quality_debt_does_not_block_next_chapter():
     orchestrator._record_quality_debt_and_advance(run)
     assert run.status.value == "PAUSED"
     assert run.pause_reason == "RUN_CHAPTER_BUDGET_REACHED"
+    assert run.context["processed_this_run"] == 2
+
+
+def test_quality_debt_counts_against_chapter_budget():
+    run = AutoDirectorRun(
+        settings={"max_chapters": 2},
+        context={"current_chapter_number": 4, "generated_this_run": 0, "adopted_this_run": 1, "processed_this_run": 1, "generated_chapters": []},
+    )
+    AutoDirectorOrchestrator()._record_quality_debt_and_advance(run)
+    assert run.status.value == "PAUSED"
+    assert run.pause_reason == "RUN_CHAPTER_BUDGET_REACHED"
+    assert run.context["processed_this_run"] == 2
+    assert run.context["current_chapter_number"] == 5
 
 
 def test_full_auto_creates_volume_boundary_and_blocks_sealed_volume(monkeypatch):

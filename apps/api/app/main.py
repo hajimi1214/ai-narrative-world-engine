@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api import router
 from .auto_director_worker import AutoDirectorWorker
 
-app = FastAPI(title="AI Narrative World Engine API", version="0.1.0")
+app = FastAPI(title="AI Narrative World Engine API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:4300", "http://127.0.0.1:4300"],
@@ -26,4 +26,4 @@ def stop_local_workers() -> None:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "service": "ai-narrative-world-engine"}

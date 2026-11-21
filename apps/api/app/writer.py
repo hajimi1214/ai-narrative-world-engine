@@ -330,6 +330,18 @@ class WriterContextBuilder:
             planning_task = chapter_task_context(db, chapter.project_id, chapter.number, required=True)
         except ValueError as exc:
             raise WriterDomainError(str(exc)) from exc
+        if planning_task:
+            from .models import StoryPlan
+            plan = db.get(StoryPlan, planning_task["plan_id"])
+            guide = plan.style_guide if plan and isinstance(plan.style_guide, dict) else {}
+            safe_style = {key: guide[key] for key in ("tone", "pov", "audience", "genre", "style_samples", "forbidden_content") if key in guide}
+            if safe_style:
+                bible_rules = dict(rules)
+                rules = {**safe_style, **bible_rules}
+                for key in ("style_samples", "forbidden_content"):
+                    values = [*(safe_style.get(key) or []), *(bible_rules.get(key) or [])]
+                    if values:
+                        rules[key] = list(dict.fromkeys(str(item) for item in values if str(item).strip()))
         manifest = dict(source["manifest"])
         manifest["scenes"] = safe_scenes
         manifest["rendering_config"] = {**config, "pov_mode": mode.value, "pov_character_id": pov_character_id}
@@ -499,6 +511,8 @@ class WriterProjectionService:
         locked_chapter = db.scalar(select(Chapter).where(Chapter.id == chapter_id).with_for_update())
         if not locked_chapter:
             raise WriterDomainError("CHAPTER_NOT_FOUND")
+        from .authoring import ensure_chapter_unsealed
+        ensure_chapter_unsealed(db, locked_chapter)
         source = WriterChapterSourceBuilder().build(db, chapter_id)
         context = WriterContextBuilder().build(db, source, request)
         request_fp = self.request_fingerprint(request, context)
@@ -585,7 +599,11 @@ class WriterProjectionService:
                 return chapter
         if _value(draft.status) != WriterDraftStatus.VALIDATED.value:
             raise WriterDomainError("WRITER_DRAFT_STALE" if _value(draft.status) == WriterDraftStatus.STALE.value else "WRITER_DRAFT_NOT_VALIDATED")
-        db.scalar(select(Chapter).where(Chapter.id == draft.chapter_id).with_for_update())
+        locked_chapter = db.scalar(select(Chapter).where(Chapter.id == draft.chapter_id).with_for_update())
+        if not locked_chapter:
+            raise WriterDomainError("CHAPTER_NOT_FOUND")
+        from .authoring import ensure_chapter_unsealed
+        ensure_chapter_unsealed(db, locked_chapter)
         try:
             current = WriterChapterSourceBuilder().build(db, draft.chapter_id)
         except WriterDomainError as exc:

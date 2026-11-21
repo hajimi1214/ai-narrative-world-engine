@@ -43,8 +43,9 @@ class AuthorGuidedRunCreatePayload(BaseModel):
     length_policy: dict[str, Any] = Field(default_factory=dict)
     estimated_chapters: int | None = Field(default=None, ge=1)
     estimated_volumes: int | None = Field(default=None, ge=1)
-    operational_run_chapter_budget: int | None = Field(default=10, ge=1, le=100)
+    operational_run_chapter_budget: int | None = Field(default=20, ge=1, le=100)
     operational_token_budget: int | None = Field(default=None, ge=1)
+    continuous_chapter_progression: bool = False
     volume: dict[str, Any] = Field(default_factory=dict)
     window_size: int = Field(default=5, ge=1, le=10)
     author_note: str | None = Field(default=None, max_length=4000)
@@ -97,3 +98,10 @@ class VolumeActionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: str | None = Field(default=None, max_length=4000)
     author_confirmed: bool = False
+
+
+class VolumeContinuePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    author_note: str | None = Field(default=None, max_length=4000)
+    window_size: int | None = Field(default=None, ge=1, le=10)
+    operational_token_budget: int | None = Field(default=None, ge=1, le=10000000)
