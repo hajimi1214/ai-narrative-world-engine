@@ -20,7 +20,9 @@ from app.models import (
     PerformanceMode, PerformanceStatus, ProposalStatus, ResolutionOutcome, ResolutionStatus,
     ResolverMode, Scene, SceneCommit, SceneExecutionBinding, ScenePerformance,
     RetconImpactItem, ScenePerformanceTurn, SceneStateCheckpoint, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent,
-    FormalStateLeaf, StoryThread, ThreadStatus, WorldEntity, WorldResolution, WorldSnapshot,
+    ForeshadowingLedger, ForeshadowingStatus, FormalStateLeaf, StoryThread,
+    ThreadStatus, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot,
+    WorldEntity, WorldResolution, WorldSnapshot,
 )
 from app.formal_state import FormalStateIdentityAudit, FormalStateIdentityService
 from app.character_mind import ActiveCharacterCognitionReader, CharacterContextBuilder
@@ -103,8 +105,8 @@ def prepared_commit(session, monkeypatch, *, effects=None, objective_facts=None,
     resolution = None
     batch = None
     if requires_resolution:
-        resolved_effects = effects(project, location, actor) if callable(effects) else effects if effects is not None else [effect(location.id)]
-        resolved_facts = objective_facts(project, location, actor) if callable(objective_facts) else objective_facts
+        resolved_effects = effects(project, location, actor, other) if callable(effects) else effects if effects is not None else [effect(location.id)]
+        resolved_facts = objective_facts(project, location, actor, other) if callable(objective_facts) else objective_facts
         payload = WorldResolutionPayload.model_validate({
             "outcome": outcome, "outcome_summary": "The entity opens.",
             "objective_facts": resolved_facts if resolved_facts is not None else [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "opened", "value": True}],
@@ -554,11 +556,11 @@ def test_chapter_branch_keeps_later_scenes_and_writer_on_one_candidate_world(ses
     project, location, actor, _other, proposal, first_performance, first_turn, _resolution, _batch, _client = prepared_commit(
         session,
         monkeypatch,
-        effects=lambda _project, entity, character: [
+        effects=lambda _project, entity, character, _other: [
             effect(entity.id),
             structured_effect("CHARACTER", character.id, "CHARACTER_CURRENT_STATE", "UPSERT", "/current_state/trust", "opened-file"),
         ],
-        objective_facts=lambda _project, entity, character: [
+        objective_facts=lambda _project, entity, character, _other: [
             {"subject_type": "ENTITY", "subject_id": entity.id, "predicate": "opened", "value": True},
             {"subject_type": "CHARACTER", "subject_id": character.id, "predicate": "trust", "value": "opened-file"},
         ],
@@ -663,6 +665,100 @@ def test_chapter_branch_publish_rejects_expired_formal_baseline(session, monkeyp
     assert staged.scene.history_status == "STAGED"
     assert session.scalar(select(SceneCommit.id).where(SceneCommit.project_id == project.id)) is None
     assert session.scalar(select(SceneStateCheckpoint.id).where(SceneStateCheckpoint.project_id == project.id)) is None
+
+
+def test_sealed_volume_snapshot_cites_adopted_chapter_and_published_world(session, monkeypatch):
+    project, location, actor, other, _proposal, performance, _turn, _resolution, prepared_batch, _client = prepared_commit(
+        session,
+        monkeypatch,
+        effects=lambda _project, entity, character, other_character: [
+            effect(entity.id),
+            structured_effect("CHARACTER", character.id, "CHARACTER_RELATIONSHIP", "UPSERT", f"/relationships/{other_character.id}/trust", 0.75),
+        ],
+        objective_facts=lambda _project, entity, character, _other: [
+            {"subject_type": "ENTITY", "subject_id": entity.id, "predicate": "opened", "value": True},
+            {"subject_type": "CHARACTER", "subject_id": character.id, "predicate": "trust", "value": 0.75},
+        ],
+    )
+    assert prepared_batch.status == StateDeltaBatchStatus.VALIDATED, prepared_batch.validation_report.get("issues")
+    result = SceneCommitService().commit(session, project.id, performance.id)
+    item = WorldEntity(project_id=project.id, entity_type=EntityType.ITEM, name="铜钥匙", profile={"owner": actor.id})
+    thread = StoryThread(project_id=project.id, title="密室调查", type="MYSTERY", status=ThreadStatus.OPEN, progress=0.6, state={"lead": "key"})
+    session.add_all([item, thread]); session.flush()
+    chapter = next((row for row in session.scalars(select(Chapter).where(
+        Chapter.project_id == project.id,
+        Chapter.active.is_(True),
+    )).all() if result.scene.id in (row.source_scene_ids or [])), None)
+    assert chapter is not None
+    chapter.status = "QUALITY_APPROVED"
+    chapter.content = "林舟打开了密室。"
+    volume = VolumeContract(
+        project_id=project.id,
+        volume_number=1,
+        title="回声",
+        status=VolumeContractStatus.READY_TO_SEAL,
+        actual_chapter_start=chapter.number,
+        actual_chapter_end=chapter.number,
+        target_closing_state={"case": "closed"},
+        foreshadowing_payoff_refs=[{"foreshadow_ref": "letter-mark", "label": "回收信件缺口"}],
+    )
+    session.add(volume); session.flush()
+    ledger = ForeshadowingLedger(
+        project_id=project.id,
+        foreshadow_ref="letter-mark",
+        title="回收信件缺口",
+        status=ForeshadowingStatus.PAID_OFF,
+        source_chapter_id=chapter.id,
+        target_payoff_volume=1,
+    )
+    session.add(ledger); session.flush()
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    service = AuthorGuidedVolumeService()
+    evidence = {"assessment_id": "assessment-proof", "draft_id": "draft-proof", "content_fingerprint": "content-proof", "planning_task": {"must_events": ["打开密室"], "foreshadow_payoff": [{"foreshadow_ref": "letter-mark", "label": "回收信件缺口"}]}, "evidence": [
+        {"requirement_ref": "must_events:must_events:legacy", "requirement_type": "must_events", "event_ref": "must_events:legacy", "label": "打开密室", "start_offset": 3, "end_offset": 8, "excerpt": "打开了密室", "content_fingerprint": "content-proof", "verified": True},
+        {"requirement_ref": "foreshadow_payoff:letter-mark", "requirement_type": "foreshadow_payoff", "event_ref": "letter-mark", "label": "回收信件缺口", "start_offset": 9, "end_offset": 13, "excerpt": "找到线索", "content_fingerprint": "content-proof", "verified": True},
+    ]}
+    monkeypatch.setattr(service, "_chapter_evidence", lambda db, current: evidence)
+    monkeypatch.setattr(service, "_formal_world_matches_target", lambda db, current: True)
+
+    sealed = service.seal(session, volume, author_confirmed=True)
+    snapshot = session.get(VolumeContinuitySnapshot, sealed.sealed_snapshot_id)
+    assert snapshot.confirmed_facts[0]["chapter_id"] == chapter.id
+    assert snapshot.confirmed_facts[0]["assessment_id"] == "assessment-proof"
+    assert snapshot.confirmed_facts[0]["content_fingerprint"] == "content-proof"
+    assert snapshot.confirmed_facts[0]["excerpt"] == "打开了密室"
+    assert snapshot.source_fingerprint
+    assert snapshot.timeline_end["adopted_chapters"][0]["assessment_id"] == "assessment-proof"
+    scene_row = snapshot.timeline_end["published_scenes"][0]
+    assert scene_row["scene_commit_id"] == result.commit.id
+    assert scene_row["checkpoint_id"] == result.checkpoint.id
+    assert scene_row["post_world_fingerprint"] == result.commit.post_world_fingerprint
+    assert snapshot.timeline_end["formal_world_fingerprint"]
+    assert snapshot.relationship_changes[0]["character_id"] == actor.id
+    assert snapshot.relationship_changes[0]["event_id"]
+    assert item.id in snapshot.item_states
+    assert thread.id in {row["thread_id"] for row in snapshot.active_threads}
+    assert snapshot.paid_off_foreshadowings[0]["foreshadowing_id"] == ledger.id
+    assert snapshot.paid_off_foreshadowings[0]["assessment_id"] == "assessment-proof"
+    assert snapshot.unresolved_foreshadowings == []
+
+    from app.backup import ProjectBackupService
+    archive = ProjectBackupService().export(session, project.id)
+    restored_project = ProjectBackupService().restore(session, archive)
+    session.flush()
+    restored_volume = session.scalar(select(VolumeContract).where(
+        VolumeContract.project_id == restored_project.id,
+        VolumeContract.volume_number == volume.volume_number,
+    ))
+    restored_snapshot = session.get(VolumeContinuitySnapshot, restored_volume.sealed_snapshot_id)
+    restored_scene_row = restored_snapshot.timeline_end["published_scenes"][0]
+    assert restored_scene_row["scene_id"] != result.scene.id
+    assert restored_scene_row["scene_commit_id"] != result.commit.id
+    assert restored_scene_row["checkpoint_id"] != result.checkpoint.id
+    assert restored_scene_row["scene_id"] in {item.id for item in session.scalars(select(Scene).where(Scene.project_id == restored_project.id)).all()}
+    assert restored_scene_row["scene_commit_id"] in {item.id for item in session.scalars(select(SceneCommit).where(SceneCommit.project_id == restored_project.id)).all()}
+    assert restored_scene_row["checkpoint_id"] in {item.id for item in session.scalars(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == restored_project.id)).all()}
+    assert restored_snapshot.source_fingerprint == __import__("app.author_guided_volume", fromlist=["AuthorGuidedVolumeService"]).AuthorGuidedVolumeService.snapshot_source_fingerprint(restored_volume, restored_snapshot)
 
 
 def test_normal_checkpoint_uses_anchor_then_reference_and_compact_delta(session, monkeypatch):

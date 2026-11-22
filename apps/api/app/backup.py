@@ -80,6 +80,10 @@ JSON_REFERENCES = {
     "location_id": {"world_entities"}, "entity_id": {"world_entities"},
     "scene_id": {"scenes"}, "source_scene_id": {"scenes"},
     "source_scene_ids": {"scenes"}, "scene_coverage": {"scenes"},
+    "subject_id": {"characters", "world_entities", "scenes"},
+    # Several append-only ledgers share a polymorphic source_id whose target
+    # table is declared by a sibling source_type field.
+    "source_id": AUTHOR_TABLES,
     "chapter_id": {"chapters"}, "source_chapter_id": {"chapters"},
     "evidence_chapter_ids": {"chapters"}, "chapter_ids": {"chapters"},
     "book_contract_id": {"book_contracts"},
@@ -87,6 +91,11 @@ JSON_REFERENCES = {
     "source_volume_id": {"volume_contracts"},
     "window_id": {"chapter_planning_windows"}, "author_window_id": {"chapter_planning_windows"},
     "source_volume_snapshot_id": {"volume_continuity_snapshots"},
+    "draft_id": {"chapter_writer_drafts"}, "assessment_id": {"chapter_quality_assessments"},
+    "scene_commit_id": {"scene_commits"}, "checkpoint_id": {"scene_state_checkpoints"},
+    "timeline_event_id": {"timeline_events"}, "event_id": {"timeline_events"},
+    "timeline_event_ids": {"timeline_events"}, "source_resolution_ids": {"world_resolutions"},
+    "foreshadowing_id": {"foreshadowing_ledger"}, "thread_id": {"story_threads"},
     "knowledge_id": {"character_knowledge"}, "memory_id": {"character_memories"},
     "fact_id": {"canon_facts"}, "related_fact_ids": {"canon_facts"},
     "canon_fact_ids_used": {"canon_facts"}, "world_entity_ids_used": {"world_entities"},
@@ -443,7 +452,7 @@ class ProjectBackupService:
         return db.get(Project, new_project_id)
 
     def _finish_restore(self, db: Session, project_id: str) -> None:
-        from .author_guided_volume import _fingerprint as author_fingerprint, _contract_payload, _volume_payload
+        from .author_guided_volume import AuthorGuidedVolumeService, _fingerprint as author_fingerprint, _contract_payload, _volume_payload
         from .models import (BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment,
                              ChapterQualityFinding, ChapterWriterDraft, ForeshadowingLedger, StoryPlan,
                              VolumeContract, VolumeContinuitySnapshot, WriterDraftStatus)
@@ -486,8 +495,11 @@ class ProjectBackupService:
         volume_by_id = {volume.id: volume for volume in volumes}
         for snapshot in db.scalars(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.project_id == project_id)).all():
             volume = volume_by_id[snapshot.volume_id]
-            chapter_ids = [chapter.id for chapter in sorted(chapters, key=lambda item: item.number) if chapter.active and chapter.number >= (volume.actual_chapter_start or 1) and chapter.number <= (volume.actual_chapter_end or 2**31 - 1)]
-            snapshot.source_fingerprint = author_fingerprint({"volume": volume.fingerprint, "chapters": chapter_ids, "characters": snapshot.character_states})
+            if (snapshot.timeline_end or {}).get("protocol") == "published-volume-history-v1":
+                snapshot.source_fingerprint = AuthorGuidedVolumeService.snapshot_source_fingerprint(volume, snapshot)
+            else:
+                chapter_ids = [chapter.id for chapter in sorted(chapters, key=lambda item: item.number) if chapter.active and chapter.number >= (volume.actual_chapter_start or 1) and chapter.number <= (volume.actual_chapter_end or 2**31 - 1)]
+                snapshot.source_fingerprint = author_fingerprint({"volume": volume.fingerprint, "chapters": chapter_ids, "characters": snapshot.character_states})
         plans = db.scalars(select(StoryPlan).where(StoryPlan.project_id == project_id)).all()
         for plan in plans:
             plan.source_fingerprint = author_fingerprint({key: value for key, value in _row(_mapper_by_table()["story_plans"], plan).items() if key not in {"source_fingerprint", "created_at", "updated_at"}})
@@ -612,11 +624,18 @@ class ProjectBackupService:
         for item in db.scalars(select(TimelineEvent).where(TimelineEvent.project_id == project_id)).all():
             checkpoint = db.get(SceneStateCheckpoint, item.checkpoint_id) if item.checkpoint_id else None
             item.structured_payload = ProjectBackupService._remap_json(item.structured_payload, fingerprints)
+            old_fingerprint = item.event_fingerprint
             item.event_fingerprint = stable_fingerprint({"event_type": _json(item.event_type), "source_type": item.source_type, "source_id": item.source_id, "source_key": item.source_key, "scene_id": item.scene_id, "sequence": item.sequence, "ordinal": item.ordinal, "world_time": item.world_time, "origin": _json(item.origin), "checkpoint_id": item.checkpoint_id, "checkpoint_fingerprint": checkpoint.checkpoint_fingerprint if checkpoint else None, "target_type": item.target_type, "target_id": item.target_id, "path": item.path, "before": item.before_value, "after": item.after_value, "payload": item.structured_payload}, "timeline-event-v1")
+            fingerprints[old_fingerprint] = item.event_fingerprint
         for link in db.scalars(select(CausalLink).where(CausalLink.project_id == project_id)).all():
             link.evidence = ProjectBackupService._remap_json(link.evidence, fingerprints)
             link.source_key = f"{_json(link.relation_type)}:{_json(link.cause_type)}:{link.cause_id}:{_json(link.effect_type)}:{link.effect_id}"
             link.link_fingerprint = stable_fingerprint({"cause_type": _json(link.cause_type), "cause_id": link.cause_id, "effect_type": _json(link.effect_type), "effect_id": link.effect_id, "edge_kind": _json(link.edge_kind), "relation_type": _json(link.relation_type), "evidence": link.evidence, "replay_session_id": link.replay_session_id}, "causal-link-v1")
+        from .models import VolumeContinuitySnapshot
+        for snapshot in db.scalars(select(VolumeContinuitySnapshot).where(VolumeContinuitySnapshot.project_id == project_id)).all():
+            snapshot.confirmed_facts = ProjectBackupService._remap_json(snapshot.confirmed_facts, fingerprints)
+            snapshot.relationship_changes = ProjectBackupService._remap_json(snapshot.relationship_changes, fingerprints)
+            snapshot.timeline_end = ProjectBackupService._remap_json(snapshot.timeline_end, fingerprints)
         db.flush()
         resolver = SnapshotPayloadResolver()
         for snapshot in snapshots:

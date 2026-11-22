@@ -424,7 +424,7 @@ def get_volume_snapshot(project_id: str, volume_id: str, db: Session = Depends(g
 @router.get("/projects/{project_id}/volumes/{volume_id}/continuity")
 def get_volume_continuity(project_id: str, volume_id: str, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id); snapshot = _current_snapshot(db, volume)
-    return {"volume": _volume_payload(volume), "snapshot": {"id": snapshot.id, "summary": snapshot.summary, "confirmed_facts": snapshot.confirmed_facts, "character_states": snapshot.character_states, "active_threads": snapshot.active_threads, "unresolved_foreshadowings": snapshot.unresolved_foreshadowings, "forbidden_future_reveals": snapshot.forbidden_future_reveals, "next_volume_hooks": snapshot.next_volume_hooks} if snapshot else None}
+    return {"volume": _volume_payload(volume), "snapshot": {key: getattr(snapshot, key) for key in ("id", "snapshot_version", "summary", "confirmed_facts", "character_states", "relationship_changes", "timeline_end", "location_states", "item_states", "active_threads", "unresolved_foreshadowings", "paid_off_foreshadowings", "forbidden_future_reveals", "next_volume_hooks", "source_fingerprint")} if snapshot else None}
 
 
 @router.get("/projects/{project_id}/foreshadowings")

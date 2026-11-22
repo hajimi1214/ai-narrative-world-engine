@@ -60,6 +60,21 @@ def _author_project(db, monkeypatch):
         "_formal_world_matches_target",
         lambda self, session, volume: True,
     )
+    monkeypatch.setattr(
+        AuthorGuidedVolumeService,
+        "_published_snapshot_projection",
+        lambda self, session, volume, chapters, evidence: {
+            "confirmed_facts": [],
+            "relationship_changes": [],
+            "timeline_end": {"chapter_start": chapters[0].number if chapters else None, "chapter_end": chapters[-1].number if chapters else None, "scene_count": 1, "formal_world_fingerprint": "fixture-world", "adopted_chapters": [{"chapter_id": chapter.id} for chapter in chapters]},
+            "location_states": {},
+            "item_states": {},
+            "active_threads": [],
+            "formal_world_fingerprint": "fixture-world",
+            "scene_ids": ["fixture-scene"],
+            "chapter_rows": [{"chapter_id": chapter.id} for chapter in chapters],
+        },
+    )
     project = Project(name="卷级恢复", story_seed="渡口的秘密")
     db.add(project); db.flush()
     location = WorldEntity(project_id=project.id, entity_type="LOCATION", name="渡口")

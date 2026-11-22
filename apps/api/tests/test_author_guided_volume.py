@@ -15,7 +15,7 @@ import app.runtime as runtime_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, ChapterWorldBranch, Character, CharacterKnowledge, ChapterWindowStatus, EntityType, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus, WorldEntity
+from app.models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, ChapterWorldBranch, Character, CharacterKnowledge, ChapterWindowStatus, EntityType, ForeshadowingLedger, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus, WorldEntity
 
 
 def _setup(monkeypatch):
@@ -49,7 +49,7 @@ def _trust_seeded_chapters_for_volume_lifecycle(monkeypatch):
     monkeypatch.setattr(
         AuthorGuidedVolumeService,
         "_chapter_evidence",
-        lambda self, db, chapter: {"assessment_id": "fixture", "evidence": []},
+        lambda self, db, chapter: {"assessment_id": "fixture", "draft_id": "fixture-draft", "content_fingerprint": "fixture-content", "planning_task": {}, "evidence": []},
     )
     monkeypatch.setattr(
         AuthorGuidedVolumeService,
@@ -61,8 +61,21 @@ def _trust_seeded_chapters_for_volume_lifecycle(monkeypatch):
         "_formal_world_matches_target",
         lambda self, db, volume: True,
     )
-
-
+    monkeypatch.setattr(
+        AuthorGuidedVolumeService,
+        "_published_snapshot_projection",
+        lambda self, db, volume, chapters, evidence: {
+            "confirmed_facts": [],
+            "relationship_changes": [],
+            "timeline_end": {"chapter_start": chapters[0].number if chapters else None, "chapter_end": chapters[-1].number if chapters else None, "scene_count": 1, "formal_world_fingerprint": "fixture-world", "adopted_chapters": [{"chapter_id": chapter.id} for chapter in chapters]},
+            "location_states": {},
+            "item_states": {},
+            "active_threads": [],
+            "formal_world_fingerprint": "fixture-world",
+            "scene_ids": ["fixture-scene"],
+            "chapter_rows": [{"chapter_id": chapter.id} for chapter in chapters],
+        },
+    )
 def test_author_guided_run_creates_contract_and_bounded_window(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     response = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"title": "长夜记", "theme": "记忆与选择", "premise": "追查失踪记忆", "estimated_chapters": 600, "estimated_volumes": 12, "window_size": 5, "idempotency_key": "book-1"})
@@ -510,7 +523,7 @@ def test_unseal_reseal_creates_immutable_snapshot_and_replans_next_volume(monkey
         assert second_snapshot.id != first_snapshot.id
         assert second_snapshot.snapshot_version == 2
         assert second_snapshot.character_states[actor.id]["current_state"]["stance"] == "修订版"
-        assert "修订版新事实" in second_snapshot.character_states[actor.id]["known_facts_at_seal"]
+        assert any(item["proposition"] == "修订版新事实" and item["knowledge_id"] for item in second_snapshot.character_states[actor.id]["known_facts_at_seal"])
         assert first_snapshot.id == first_payload["id"] and first_snapshot.source_fingerprint == first_payload["fingerprint"]
         assert first_snapshot.character_states == first_payload["character_states"]
 
@@ -556,7 +569,7 @@ def test_sealed_snapshot_does_not_expose_future_character_secret(monkeypatch):
         db.add(CharacterKnowledge(character_id=character.id, proposition="未来才揭示的秘密", status=KnowledgeStatus.KNOWN, source="future-scene"))
         db.commit()
         assert "secrets" not in snapshot.character_states[character.id]
-        assert "未来才揭示的秘密" not in snapshot.character_states[character.id]["known_facts_at_seal"]
+        assert not any(item["proposition"] == "未来才揭示的秘密" for item in snapshot.character_states[character.id]["known_facts_at_seal"])
 
 
 def test_author_can_update_unsealed_volume_contract_but_not_sealed_volume(monkeypatch):
@@ -951,6 +964,62 @@ def test_volume_progress_uses_formal_world_and_ignores_candidate_branch(monkeypa
         assert report["target_closing_state_reached"] is False
         assert report["adopted_chapter_ids"] == []
         assert report["should_prepare_seal"] is False
+
+
+def test_due_foreshadowing_blocks_seal_until_adopted_review_evidence(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
+    client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "foreshadow-evidence-seal"})
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    from app.author_guided_volume import AuthorGuidedVolumeService
+
+    with Session() as db:
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume.actual_chapter_start = 1
+        volume.actual_chapter_end = 1
+        volume.target_closing_state = {"case": "closed"}
+        chapter = Chapter(project_id=project_id, number=1, content="她交出信件", status="QUALITY_APPROVED", active=True)
+        db.add(chapter); db.flush()
+        ledger = ForeshadowingLedger(
+            project_id=project_id,
+            foreshadow_ref="letter-mark",
+            title="回收信件缺口",
+            status=ForeshadowingStatus.PAID_OFF,
+            source_chapter_id=chapter.id,
+            target_payoff_volume=1,
+        )
+        forbidden = ForeshadowingLedger(
+            project_id=project_id,
+            foreshadow_ref="hidden-name",
+            title="尚未允许揭示的姓名",
+            status=ForeshadowingStatus.FORBIDDEN_TO_REVEAL,
+        )
+        db.add_all([ledger, forbidden])
+        volume.foreshadowing_payoff_refs = [{"foreshadow_ref": ledger.foreshadow_ref, "label": "回收信件缺口"}]
+        evidence = {"assessment_id": "assessment", "draft_id": "draft", "content_fingerprint": "prose-fp", "planning_task": {"foreshadow_payoff": [{"foreshadow_ref": ledger.foreshadow_ref, "label": "回收信件缺口"}]}, "evidence": []}
+        service = AuthorGuidedVolumeService()
+        monkeypatch.setattr(service, "_chapter_evidence", lambda _db, _chapter: evidence)
+
+        report = service.progress(db, volume)
+        assert report["should_prepare_seal"] is False
+        assert report["pending_foreshadowing_payoffs"][0]["evidence_status"] == "MISSING_OR_UNVERIFIED"
+        assert ledger.foreshadow_ref in {item["foreshadow_ref"] for item in report["pending_foreshadowings"]}
+
+        evidence["evidence"].append({
+            "requirement_ref": "foreshadow_payoff:letter-mark",
+            "requirement_type": "foreshadow_payoff",
+            "event_ref": "letter-mark",
+            "label": "回收信件缺口",
+            "start_offset": 2,
+            "end_offset": 6,
+            "excerpt": "交出信件",
+            "content_fingerprint": "prose-fp",
+            "verified": True,
+        })
+        report = service.progress(db, volume)
+        assert report["should_prepare_seal"] is True
+        assert report["paid_off_foreshadowings"][0]["evidence"]["excerpt"] == "交出信件"
+        assert forbidden.foreshadow_ref in {item["foreshadow_ref"] for item in report["pending_foreshadowings"]}
 
 
 def test_completion_proposal_waits_for_global_contract_events(monkeypatch):

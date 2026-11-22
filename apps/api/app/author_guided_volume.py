@@ -20,14 +20,17 @@ from .models import (
     AutoDirectorStep, AutoDirectorStepStatus,
     BookCompletionProposal, BookCompletionProposalStatus, BookContract,
     Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWorldBranch,
-    ChapterWindowStatus, ChapterWriterDraft, ForeshadowingLedger,
-    ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus,
+    ChapterWindowStatus, ChapterWriterDraft, EntityType, ForeshadowingLedger,
+    ForeshadowingStatus, Project, SceneCommit, SceneCommitStatus,
+    SceneStateCheckpoint, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem,
+    ThreadStatus, TimelineEvent, TimelineEventType, VolumeContract, VolumeContractStatus,
     VolumeContinuitySnapshot, StoryPlan, StoryPlanChapter, StoryPlanStatus,
     Character, CharacterKnowledge, KnowledgeStatus, PlanChapterStatus, Scene,
     StoryThread, WorldEntity,
     StoryPlanVolume,
 )
-from .planning import _default_chapter, event_spec, persist_plan, validate_plan_references
+from .formal_state import FormalStateIdentityService
+from .planning import _default_chapter, event_spec, normalize_event_text, persist_plan, task_event_specs, validate_plan_references
 from .revision import _record
 
 
@@ -144,6 +147,22 @@ class AuthorGuidedVolumeService:
         return actual == expected
 
     @staticmethod
+    def _active_thread_snapshot(db: Session, project_id: str) -> list[dict[str, Any]]:
+        return [{
+            "id": thread.id,
+            "title": thread.title,
+            "type": thread.type,
+            "status": _enum(thread.status),
+            "weight": thread.weight,
+            "goal": thread.goal,
+            "progress": thread.progress,
+            "state": thread.state or {},
+        } for thread in db.scalars(select(StoryThread).where(
+            StoryThread.project_id == project_id,
+            StoryThread.status.in_([ThreadStatus.OPEN, ThreadStatus.PAUSED]),
+        ).order_by(StoryThread.id)).all()]
+
+    @staticmethod
     def _event_requirement_ref(requirement: Any) -> str:
         return f"must_events:{event_spec(requirement, 'must_events')['event_ref']}"
 
@@ -198,6 +217,9 @@ class AuthorGuidedVolumeService:
         event_evidence = (assessment.critic_report or {}).get("mandatory_event_evidence") or {}
         return {
             "assessment_id": assessment.id,
+            "draft_id": draft.id,
+            "content_fingerprint": draft.content_fingerprint,
+            "planning_task": task,
             "evidence": [
                 item for item in event_evidence.get("evidence", [])
                 if item.get("verified") is True
@@ -223,11 +245,27 @@ class AuthorGuidedVolumeService:
             Scene.project_id == chapter.project_id,
             Scene.id.in_(scene_ids),
         )).all()
-        return len(scenes) == len(scene_ids) and all(
+        commits = db.scalars(select(SceneCommit).where(
+            SceneCommit.project_id == chapter.project_id,
+            SceneCommit.scene_id.in_(scene_ids),
+            SceneCommit.status == SceneCommitStatus.COMMITTED,
+        )).all()
+        checkpoints = db.scalars(select(SceneStateCheckpoint.scene_id).where(
+            SceneStateCheckpoint.project_id == chapter.project_id,
+            SceneStateCheckpoint.scene_id.in_(scene_ids),
+            SceneStateCheckpoint.active.is_(True),
+            SceneStateCheckpoint.capture_protocol_version >= 3,
+        )).all()
+        return (
+            len(scenes) == len(scene_ids)
+            and {item.scene_id for item in commits} == set(scene_ids)
+            and set(checkpoints) == set(scene_ids)
+            and all(
             scene.history_status == "ACTIVE"
             and _enum(scene.status) == "OCCURRED"
             and scene.world_branch_id is None
             for scene in scenes
+            )
         )
 
     def _formal_world_matches_target(self, db: Session, volume: VolumeContract) -> bool:
@@ -272,6 +310,326 @@ class AuthorGuidedVolumeService:
             for chapter in evidence_by_chapter.values()
             for item in chapter["evidence"]
         )
+
+    def _foreshadowing_review(
+        self,
+        db: Session,
+        item: ForeshadowingLedger,
+        adopted: list[Chapter],
+        evidence_by_chapter: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        chapter_by_id = {chapter.id: chapter for chapter in adopted}
+        ordered_chapter_ids = [chapter.id for chapter in adopted]
+        if _enum(item.status) == ForeshadowingStatus.PAID_OFF.value and item.source_chapter_id:
+            if item.source_chapter_id not in chapter_by_id:
+                prior_payoff_chapter = db.get(Chapter, item.source_chapter_id)
+                if prior_payoff_chapter and prior_payoff_chapter.project_id == item.project_id:
+                    chapter_by_id[prior_payoff_chapter.id] = prior_payoff_chapter
+            ordered_chapter_ids = [item.source_chapter_id, *ordered_chapter_ids]
+        expected_refs = {item.id, item.foreshadow_ref}
+        expected_labels = {normalize_event_text(item.title), *(normalize_event_text(alias) for alias in (item.aliases or []))}
+        for chapter_id in ordered_chapter_ids:
+            if chapter_id not in chapter_by_id:
+                continue
+            chapter_evidence = evidence_by_chapter.get(chapter_id)
+            if chapter_evidence is None:
+                chapter = chapter_by_id[chapter_id]
+                chapter_evidence = self._chapter_evidence(db, chapter)
+                if chapter_evidence and self._chapter_scenes_published(db, chapter):
+                    evidence_by_chapter = {**evidence_by_chapter, chapter_id: chapter_evidence}
+            if not chapter_evidence:
+                continue
+            task = chapter_evidence.get("planning_task") or {}
+            for spec in task_event_specs(task, "foreshadow_payoff"):
+                spec_refs = {str(spec.get("event_ref") or "")}
+                spec_labels = {
+                    normalize_event_text(spec.get("label")),
+                    *(normalize_event_text(alias) for alias in (spec.get("aliases") or [])),
+                }
+                if not (spec_refs & expected_refs or (spec_labels - {""}) & (expected_labels - {""})):
+                    continue
+                requirement_ref = f"foreshadow_payoff:{spec['event_ref']}"
+                evidence = next((
+                    row for row in chapter_evidence["evidence"]
+                    if row.get("requirement_ref") == requirement_ref
+                    and row.get("content_fingerprint") == chapter_evidence.get("content_fingerprint")
+                    and row.get("verified") is True
+                ), None)
+                if evidence:
+                    return {"chapter_id": chapter_id, "chapter_number": chapter_by_id[chapter_id].number, "assessment_id": chapter_evidence["assessment_id"], "draft_id": chapter_evidence["draft_id"], "content_fingerprint": chapter_evidence["content_fingerprint"], "requirement_ref": requirement_ref, "evidence": evidence}
+        return None
+
+    def _foreshadowing_projection(
+        self,
+        db: Session,
+        volume: VolumeContract,
+        adopted: list[Chapter],
+        evidence_by_chapter: dict[str, dict[str, Any]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        rows = db.scalars(select(ForeshadowingLedger).where(
+            ForeshadowingLedger.project_id == volume.project_id,
+        ).order_by(ForeshadowingLedger.id)).all()
+        by_ref = {key: row for row in rows for key in (row.id, row.foreshadow_ref)}
+        explicit_refs = []
+        for raw in volume.foreshadowing_payoff_refs or []:
+            ref = str((raw.get("foreshadow_ref") or raw.get("id") or raw.get("event_ref") or "") if isinstance(raw, dict) else raw)
+            if ref and ref not in explicit_refs:
+                explicit_refs.append(ref)
+
+        required = {by_ref[ref].id: by_ref[ref] for ref in explicit_refs if ref in by_ref}
+        missing_entries = [{"missing_ref": ref, "foreshadow_ref": ref, "status": "MISSING_LEDGER_ENTRY"} for ref in explicit_refs if ref not in by_ref]
+        required.update((row.id, row) for row in rows if _enum(row.status) == ForeshadowingStatus.PAID_OFF.value)
+        due = [row for row in rows if _enum(row.status) not in {
+            ForeshadowingStatus.CANCELLED.value,
+            ForeshadowingStatus.FORBIDDEN_TO_REVEAL.value,
+        } and (
+            row.earliest_payoff_volume is None or row.earliest_payoff_volume <= volume.volume_number
+        ) and (row.target_payoff_volume is None or row.target_payoff_volume <= volume.volume_number)]
+        required.update((row.id, row) for row in due)
+
+        paid_off: list[dict[str, Any]] = []
+        pending_payoffs: list[dict[str, Any]] = list(missing_entries)
+        for row in required.values():
+            review = self._foreshadowing_review(db, row, adopted, evidence_by_chapter)
+            payload = {"foreshadowing_id": row.id, "foreshadow_ref": row.foreshadow_ref, "title": row.title, "status": _enum(row.status), "source_chapter_id": row.source_chapter_id, "payoff_chapter_id": review.get("chapter_id") if review else None}
+            if _enum(row.status) == ForeshadowingStatus.PAID_OFF.value and review:
+                paid_off.append({**payload, **review})
+            else:
+                pending_payoffs.append({**payload, "evidence_status": "MISSING_OR_UNVERIFIED" if not review else "LEDGER_NOT_PAID_OFF"})
+
+        unresolved = []
+        for row in rows:
+            review = self._foreshadowing_review(db, row, adopted, evidence_by_chapter) if _enum(row.status) == ForeshadowingStatus.PAID_OFF.value else None
+            if _enum(row.status) != ForeshadowingStatus.CANCELLED.value and not review:
+                unresolved.append({"foreshadowing_id": row.id, "foreshadow_ref": row.foreshadow_ref, "title": row.title, "status": _enum(row.status), "source_volume_id": row.source_volume_id, "source_chapter_id": row.source_chapter_id, "target_payoff_volume": row.target_payoff_volume, "evidence_status": "MISSING_OR_UNVERIFIED" if _enum(row.status) == ForeshadowingStatus.PAID_OFF.value else "UNRESOLVED"})
+        return {"paid_off": paid_off, "pending_payoffs": pending_payoffs, "unresolved": unresolved}
+
+    def _snapshot_facts(self, chapters: list[Chapter], evidence_by_chapter: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        facts = []
+        for chapter in chapters:
+            evidence = evidence_by_chapter.get(chapter.id)
+            if not evidence:
+                raise AuthorGuidedVolumeError("VOLUME_CHAPTER_EVIDENCE_STALE")
+            facts.extend({
+                "chapter_id": chapter.id,
+                "chapter_number": chapter.number,
+                "assessment_id": evidence["assessment_id"],
+                "draft_id": evidence["draft_id"],
+                "content_fingerprint": evidence["content_fingerprint"],
+                **item,
+            } for item in evidence["evidence"])
+        return facts
+
+    @staticmethod
+    def snapshot_source_payload(volume: VolumeContract, snapshot: VolumeContinuitySnapshot) -> dict[str, Any]:
+        timeline = snapshot.timeline_end or {}
+        return {
+            "protocol": "volume-continuity-snapshot-v2",
+            "project_id": snapshot.project_id,
+            "book_contract_id": snapshot.book_contract_id,
+            "volume_id": snapshot.volume_id,
+            "volume_number": volume.volume_number,
+            "volume_fingerprint": volume.fingerprint,
+            "volume_contract": {
+                key: value for key, value in _volume_payload(volume).items()
+                if key not in {"status", "sealed_at", "sealed_snapshot_id", "fingerprint"}
+            },
+            "source_volume_snapshot_id": (volume.opening_state or {}).get("source_volume_snapshot_id"),
+            "snapshot_version": snapshot.snapshot_version,
+            "summary": snapshot.summary,
+            "confirmed_facts": snapshot.confirmed_facts or [],
+            "character_states": snapshot.character_states or {},
+            "relationship_changes": snapshot.relationship_changes or [],
+            "timeline_end": timeline,
+            "location_states": snapshot.location_states or {},
+            "item_states": snapshot.item_states or {},
+            "active_threads": snapshot.active_threads or [],
+            "unresolved_foreshadowings": snapshot.unresolved_foreshadowings or [],
+            "paid_off_foreshadowings": snapshot.paid_off_foreshadowings or [],
+            "forbidden_future_reveals": snapshot.forbidden_future_reveals or [],
+            "next_volume_hooks": snapshot.next_volume_hooks or [],
+            "formal_world_fingerprint": timeline.get("formal_world_fingerprint"),
+            "scene_ids": [row.get("scene_id") for row in timeline.get("published_scenes", []) if row.get("scene_id")],
+        }
+
+    @classmethod
+    def snapshot_source_fingerprint(cls, volume: VolumeContract, snapshot: VolumeContinuitySnapshot) -> str:
+        return _fingerprint(cls.snapshot_source_payload(volume, snapshot))
+
+    def _published_snapshot_projection(
+        self,
+        db: Session,
+        volume: VolumeContract,
+        chapters: list[Chapter],
+        evidence_by_chapter: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        scene_ids = [scene_id for chapter in chapters for scene_id in (chapter.source_scene_ids or [])]
+        scenes = db.scalars(select(Scene).where(
+            Scene.project_id == volume.project_id,
+            Scene.id.in_(scene_ids),
+            Scene.history_status == "ACTIVE",
+        ).order_by(Scene.sequence, Scene.id)).all() if scene_ids else []
+        scene_by_id = {scene.id: scene for scene in scenes}
+        chapter_by_scene = {scene_id: chapter for chapter in chapters for scene_id in (chapter.source_scene_ids or [])}
+        if len(scenes) != len(scene_ids) or len(scene_by_id) != len(scene_ids):
+            raise AuthorGuidedVolumeError("VOLUME_PUBLISHED_HISTORY_INCOMPLETE")
+
+        commits = db.scalars(select(SceneCommit).where(
+            SceneCommit.project_id == volume.project_id,
+            SceneCommit.scene_id.in_(scene_ids),
+            SceneCommit.status == SceneCommitStatus.COMMITTED,
+        )).all() if scene_ids else []
+        checkpoints = db.scalars(select(SceneStateCheckpoint).where(
+            SceneStateCheckpoint.project_id == volume.project_id,
+            SceneStateCheckpoint.scene_id.in_(scene_ids),
+            SceneStateCheckpoint.active.is_(True),
+            SceneStateCheckpoint.capture_protocol_version >= 3,
+        )).all() if scene_ids else []
+        commit_by_scene = {item.scene_id: item for item in commits}
+        checkpoint_by_scene = {item.scene_id: item for item in checkpoints}
+        if set(commit_by_scene) != set(scene_ids) or set(checkpoint_by_scene) != set(scene_ids):
+            raise AuthorGuidedVolumeError("VOLUME_PUBLISHED_HISTORY_INCOMPLETE")
+
+        timeline_events = db.scalars(select(TimelineEvent).where(
+            TimelineEvent.project_id == volume.project_id,
+            TimelineEvent.scene_id.in_(scene_ids),
+            TimelineEvent.active.is_(True),
+        ).order_by(TimelineEvent.sequence, TimelineEvent.ordinal, TimelineEvent.id)).all() if scene_ids else []
+        event_ids_by_scene: dict[str, list[str]] = {}
+        timeline_rows = []
+        relationship_changes = []
+        for event in timeline_events:
+            if event.scene_id:
+                event_ids_by_scene.setdefault(event.scene_id, []).append(event.id)
+            row = {
+                "timeline_event_id": event.id,
+                "event_type": _enum(event.event_type),
+                "source_type": event.source_type,
+                "source_id": event.source_id,
+                "source_key": event.source_key,
+                "scene_id": event.scene_id,
+                "sequence": event.sequence,
+                "ordinal": event.ordinal,
+                "world_time": event.world_time.isoformat() if event.world_time else None,
+                "target_type": event.target_type,
+                "target_id": event.target_id,
+                "path": event.path,
+                "before_value": event.before_value,
+                "after_value": event.after_value,
+                "structured_payload": event.structured_payload or {},
+                "event_fingerprint": event.event_fingerprint,
+                "checkpoint_id": event.checkpoint_id,
+            }
+            timeline_rows.append(row)
+            if event.target_type == "CHARACTER" and event.path and (event.path == "/relationships" or event.path.startswith("/relationships/")):
+                chapter = chapter_by_scene.get(event.scene_id)
+                relationship_changes.append({
+                    "event_id": event.id,
+                    "scene_id": event.scene_id,
+                    "chapter_id": chapter.id if chapter else None,
+                    "chapter_number": chapter.number if chapter else None,
+                    "character_id": event.target_id,
+                    "path": event.path,
+                    "before_value": event.before_value,
+                    "after_value": event.after_value,
+                    "event_fingerprint": event.event_fingerprint,
+                })
+
+        scene_rows = []
+        confirmed_facts = self._snapshot_facts(chapters, evidence_by_chapter)
+        for scene in scenes:
+            chapter = chapter_by_scene[scene.id]
+            commit = commit_by_scene[scene.id]
+            checkpoint = checkpoint_by_scene[scene.id]
+            scene_facts = [
+                fact for fact in (scene.facts or [])
+                if isinstance(fact, dict)
+            ]
+            scene_fact_rows = [{
+                "scene_id": scene.id,
+                "chapter_id": chapter.id,
+                "chapter_number": chapter.number,
+                "fact": fact,
+                "source_resolution_ids": [resolution.get("resolution_id") for resolution in ((scene.result or {}).get("resolutions") or []) if resolution.get("resolution_id")],
+                "scene_commit_id": commit.id,
+                "checkpoint_id": checkpoint.id,
+            } for fact in scene_facts]
+            confirmed_facts.extend(scene_fact_rows)
+            scene_rows.append({
+                "scene_id": scene.id,
+                "chapter_id": chapter.id,
+                "chapter_number": chapter.number,
+                "sequence": scene.sequence,
+                "world_time": scene.world_time.isoformat() if scene.world_time else None,
+                "location_id": scene.location,
+                "participant_ids": list(scene.participants or []),
+                "story_thread_ids": list(scene.story_threads or []),
+                "objective_fact_count": len(scene_fact_rows),
+                "timeline_event_ids": event_ids_by_scene.get(scene.id, []),
+                "scene_commit_id": commit.id,
+                "scene_commit_fingerprint": commit.commit_fingerprint,
+                "pre_world_fingerprint": commit.pre_world_fingerprint,
+                "post_world_fingerprint": commit.post_world_fingerprint,
+                "checkpoint_id": checkpoint.id,
+                "checkpoint_fingerprint": checkpoint.checkpoint_fingerprint,
+                "pre_state_fingerprint": checkpoint.pre_state_fingerprint,
+                "post_state_fingerprint": checkpoint.post_state_fingerprint,
+            })
+
+        final_entities = db.scalars(select(WorldEntity).where(
+            WorldEntity.project_id == volume.project_id,
+            WorldEntity.active.is_(True),
+            WorldEntity.entity_type.in_([EntityType.LOCATION, EntityType.ITEM]),
+        ).order_by(WorldEntity.entity_type, WorldEntity.id)).all()
+        location_states = {}
+        item_states = {}
+        for entity in final_entities:
+            payload = {"id": entity.id, "name": entity.name, "profile": entity.profile or {}, "active": entity.active}
+            if _enum(entity.entity_type) == EntityType.LOCATION.value:
+                location_states[entity.id] = payload
+            elif _enum(entity.entity_type) == EntityType.ITEM.value:
+                item_states[entity.id] = payload
+
+        active_threads = self._active_thread_snapshot(db, volume.project_id)
+        active_threads = [{"thread_id": item.pop("id"), **item} for item in active_threads]
+
+        last_scene = scenes[-1] if scenes else None
+        first_scene = scenes[0] if scenes else None
+        formal_world_fingerprint = checkpoint_by_scene[last_scene.id].post_state_fingerprint if last_scene else None
+        chapter_rows = [{
+            "chapter_id": chapter.id,
+            "chapter_number": chapter.number,
+            "draft_id": evidence_by_chapter[chapter.id]["draft_id"],
+            "assessment_id": evidence_by_chapter[chapter.id]["assessment_id"],
+            "content_fingerprint": evidence_by_chapter[chapter.id]["content_fingerprint"],
+            "scene_ids": list(chapter.source_scene_ids or []),
+        } for chapter in chapters]
+        timeline_end = {
+            "protocol": "published-volume-history-v1",
+            "chapter_start": chapters[0].number if chapters else None,
+            "chapter_end": chapters[-1].number if chapters else None,
+            "first_scene_id": first_scene.id if first_scene else None,
+            "last_scene_id": last_scene.id if last_scene else None,
+            "start_sequence": first_scene.sequence if first_scene else None,
+            "end_sequence": last_scene.sequence if last_scene else None,
+            "world_time": last_scene.world_time.isoformat() if last_scene and last_scene.world_time else None,
+            "scene_count": len(scenes),
+            "formal_world_fingerprint": formal_world_fingerprint,
+            "adopted_chapters": chapter_rows,
+            "published_scenes": scene_rows,
+            "timeline_events": timeline_rows,
+        }
+        return {
+            "confirmed_facts": confirmed_facts,
+            "relationship_changes": relationship_changes,
+            "timeline_end": timeline_end,
+            "location_states": location_states,
+            "item_states": item_states,
+            "active_threads": active_threads,
+            "formal_world_fingerprint": formal_world_fingerprint,
+            "scene_ids": scene_ids,
+            "chapter_rows": chapter_rows,
+        }
 
     def _volume_chapters_and_evidence(
         self, db: Session, volume: VolumeContract,
@@ -800,9 +1158,10 @@ class AuthorGuidedVolumeService:
         conditions = list(volume.completion_conditions or [])
         completed_conditions = [condition for condition in conditions if self._has_event_evidence(condition, evidence_by_chapter)]
         conditions_met = len(completed_conditions) == len(conditions)
+        foreshadowing = self._foreshadowing_projection(db, volume, adopted, evidence_by_chapter)
         target_reached = bool(adopted) and self._formal_world_matches_target(db, volume)
-        ready = bool(adopted) and not incomplete and len(completed) == len(required) and conditions_met and target_reached
-        return {"volume_goal_progress": 1.0 if ready else min(0.99, len(adopted) / max(1, len(adopted) + len(incomplete) + 1)), "protagonist_arc_progress": 1.0 if ready else (0.5 if adopted else 0.0), "conflict_progress": 1.0 if ready else (0.5 if adopted else 0.0), "required_events_completed": completed, "missing_required_events": [event for event in required if event not in completed], "completed_conditions": completed_conditions, "missing_completion_conditions": [condition for condition in conditions if condition not in completed_conditions], "adopted_chapter_ids": [item.id for item in adopted], "incomplete_chapters": incomplete, "unresolved_threads": volume.unresolved_threads or [], "pending_foreshadowings": [], "target_closing_state_reached": target_reached, "should_extend_volume": not ready, "should_prepare_seal": ready, "should_start_next_volume": False, "reason": "本卷仍需继续推进，未满足已采用章节、正式世界状态或剧情证据要求。" if not ready else "本卷完成条件已满足，等待作者确认封存。"}
+        ready = bool(adopted) and not incomplete and len(completed) == len(required) and conditions_met and not foreshadowing["pending_payoffs"] and target_reached
+        return {"volume_goal_progress": 1.0 if ready else min(0.99, len(adopted) / max(1, len(adopted) + len(incomplete) + 1)), "protagonist_arc_progress": 1.0 if ready else (0.5 if adopted else 0.0), "conflict_progress": 1.0 if ready else (0.5 if adopted else 0.0), "required_events_completed": completed, "missing_required_events": [event for event in required if event not in completed], "completed_conditions": completed_conditions, "missing_completion_conditions": [condition for condition in conditions if condition not in completed_conditions], "adopted_chapter_ids": [item.id for item in adopted], "incomplete_chapters": incomplete, "unresolved_threads": self._active_thread_snapshot(db, volume.project_id), "pending_foreshadowings": foreshadowing["unresolved"], "pending_foreshadowing_payoffs": foreshadowing["pending_payoffs"], "paid_off_foreshadowings": foreshadowing["paid_off"], "target_closing_state_reached": target_reached, "should_extend_volume": not ready, "should_prepare_seal": ready, "should_start_next_volume": False, "reason": "本卷仍需继续推进，未满足已采用章节、正式世界状态、剧情证据或伏笔回收要求。" if not ready else "本卷完成条件已满足，等待作者确认封存。"}
 
     @staticmethod
     def _auto_cross_volume_enabled(contract: BookContract, request: dict[str, Any] | None = None) -> bool:
@@ -998,9 +1357,77 @@ class AuthorGuidedVolumeService:
         ).order_by(Chapter.number)).all() if adopted_chapter_ids else []
         character_states = {}
         for character in db.scalars(select(Character).where(Character.project_id == volume.project_id, Character.active.is_(True))).all():
-            known = db.scalars(select(CharacterKnowledge.proposition).where(CharacterKnowledge.character_id == character.id, CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED]))).all()
-            character_states[character.id] = {"character_id": character.id, "name": character.name, "profile": character.profile or {}, "goals": character.goals or {}, "current_state": character.current_state or {}, "physical_state": character.physical_state or {}, "emotional_state": character.emotional_state or {}, "relationships": character.relationships or {}, "known_facts_at_seal": list(known)}
-        snapshot = VolumeContinuitySnapshot(project_id=volume.project_id, book_contract_id=volume.book_contract_id, volume_id=volume.id, snapshot_version=snapshot_version, summary=f"第 {volume.volume_number} 卷已完成，共 {len(chapters)} 章。", confirmed_facts=[], character_states=character_states, relationship_changes=[], timeline_end={"chapter": volume.actual_chapter_end}, location_states={}, item_states={}, active_threads=volume.unresolved_threads or [], unresolved_foreshadowings=[], paid_off_foreshadowings=list(volume.foreshadowing_payoff_refs or []), forbidden_future_reveals=volume.forbidden_reveals or [], next_volume_hooks=volume.next_volume_hooks or [], source_fingerprint=_fingerprint({"volume": volume.fingerprint, "snapshot_version": snapshot_version, "chapters": [item.id for item in chapters], "characters": character_states}))
+            known = db.scalars(select(CharacterKnowledge).where(
+                CharacterKnowledge.character_id == character.id,
+                CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED]),
+            ).order_by(CharacterKnowledge.id)).all()
+            character_states[character.id] = {
+                "character_id": character.id,
+                "name": character.name,
+                "profile": character.profile or {},
+                "goals": character.goals or {},
+                "current_state": character.current_state or {},
+                "physical_state": character.physical_state or {},
+                "emotional_state": character.emotional_state or {},
+                "relationships": character.relationships or {},
+                "known_facts_at_seal": [{
+                    "knowledge_id": item.id,
+                    "proposition": item.proposition,
+                    "status": _enum(item.status),
+                    "source_scene_id": item.source,
+                    "confidence": item.confidence,
+                } for item in known],
+            }
+
+        snapshot_chapters, snapshot_adopted, evidence_by_chapter = self._volume_chapters_and_evidence(db, volume)
+        if [chapter.id for chapter in snapshot_adopted] != adopted_chapter_ids:
+            raise AuthorGuidedVolumeError("VOLUME_ADOPTED_HISTORY_CHANGED")
+        foreshadowing = self._foreshadowing_projection(db, volume, chapters, evidence_by_chapter)
+        projection = self._published_snapshot_projection(db, volume, chapters, evidence_by_chapter)
+        if not projection["scene_ids"] or not projection["timeline_end"]["formal_world_fingerprint"]:
+            raise AuthorGuidedVolumeError("VOLUME_PUBLISHED_HISTORY_INCOMPLETE")
+        snapshot_payload = {
+            "protocol": "volume-continuity-snapshot-v2",
+            "project_id": volume.project_id,
+            "book_contract_id": volume.book_contract_id,
+            "volume_id": volume.id,
+            "volume_number": volume.volume_number,
+            "volume_fingerprint": volume.fingerprint,
+            "source_volume_snapshot_id": (volume.opening_state or {}).get("source_volume_snapshot_id"),
+            "snapshot_version": snapshot_version,
+            "summary": f"第 {volume.volume_number} 卷已完成，共采用 {len(chapters)} 章。",
+            "confirmed_facts": projection["confirmed_facts"],
+            "character_states": character_states,
+            "relationship_changes": projection["relationship_changes"],
+            "timeline_end": projection["timeline_end"],
+            "location_states": projection["location_states"],
+            "item_states": projection["item_states"],
+            "active_threads": projection["active_threads"],
+            "unresolved_foreshadowings": foreshadowing["unresolved"],
+            "paid_off_foreshadowings": foreshadowing["paid_off"],
+            "forbidden_future_reveals": volume.forbidden_reveals or [],
+            "next_volume_hooks": volume.next_volume_hooks or [],
+        }
+        snapshot = VolumeContinuitySnapshot(
+            project_id=volume.project_id,
+            book_contract_id=volume.book_contract_id,
+            volume_id=volume.id,
+            snapshot_version=snapshot_version,
+            summary=snapshot_payload["summary"],
+            confirmed_facts=snapshot_payload["confirmed_facts"],
+            character_states=character_states,
+            relationship_changes=snapshot_payload["relationship_changes"],
+            timeline_end=snapshot_payload["timeline_end"],
+            location_states=snapshot_payload["location_states"],
+            item_states=snapshot_payload["item_states"],
+            active_threads=snapshot_payload["active_threads"],
+            unresolved_foreshadowings=snapshot_payload["unresolved_foreshadowings"],
+            paid_off_foreshadowings=snapshot_payload["paid_off_foreshadowings"],
+            forbidden_future_reveals=snapshot_payload["forbidden_future_reveals"],
+            next_volume_hooks=snapshot_payload["next_volume_hooks"],
+            source_fingerprint="",
+        )
+        snapshot.source_fingerprint = self.snapshot_source_fingerprint(volume, snapshot)
         db.add(snapshot); db.flush(); return snapshot
 
     def seal(self, db: Session, volume: VolumeContract, author_confirmed: bool = False) -> VolumeContract:
@@ -1047,7 +1474,7 @@ class AuthorGuidedVolumeService:
         forbidden_global = [str(item) for item in contract.global_forbidden_events or [] if str(item) in content]
         policy = contract.length_policy or {}
         allowed = policy.get("allow_completion_proposal", True)
-        ready = allowed and report["should_prepare_seal"] and not volume.unresolved_threads and not missing_global and not forbidden_global
+        ready = allowed and report["should_prepare_seal"] and not report["unresolved_threads"] and not missing_global and not forbidden_global
         status = BookCompletionProposalStatus.PROPOSED if ready else BookCompletionProposalStatus.NOT_READY
         reason = report["reason"] if ready else ("书籍合同的全书结局条件尚未满足。" if allowed else "当前书籍合同未允许 AI 提出完结建议。")
         proposal = BookCompletionProposal(project_id=contract.project_id, book_contract_id=contract.id, status=status, reason=reason, unresolved_threads=report["unresolved_threads"], unresolved_foreshadowings=report["pending_foreshadowings"], protagonist_arc_status={"progress": report["protagonist_arc_progress"]}, main_conflict_status={"progress": report["conflict_progress"], "missing_global_required_events": missing_global, "forbidden_global_events": forbidden_global}, ending_requirements=contract.global_required_events or [], evidence_chapter_ids=evidence_ids)
