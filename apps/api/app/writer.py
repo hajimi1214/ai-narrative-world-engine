@@ -224,6 +224,14 @@ class WriterPOVResolver:
 
     @staticmethod
     def _chapter_scenes(db: Session, chapter: Chapter) -> list[Scene]:
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch_service = ChapterWorldBranchService()
+        branch = branch_service.for_chapter(db, chapter)
+        if branch and branch.status.value in {"OPEN", "READY"}:
+            bound_ids = [item.scene_id for item in db.scalars(select(ChapterSceneBinding).where(ChapterSceneBinding.chapter_id == chapter.id).order_by(ChapterSceneBinding.ordinal)).all()]
+            branch_rows = branch_service.branch_scene_rows(db, branch)
+            by_id = {row.id: row for row in [*(db.scalars(select(Scene).where(Scene.id.in_(bound_ids), Scene.project_id == chapter.project_id)).all() if bound_ids else []), *branch_rows]}
+            return [by_id[scene_id] for scene_id in [*bound_ids, *(row.id for row in branch_rows)] if scene_id in by_id]
         ids = [item.scene_id for item in db.scalars(select(ChapterSceneBinding).where(ChapterSceneBinding.chapter_id == chapter.id).order_by(ChapterSceneBinding.ordinal)).all()]
         return db.scalars(select(Scene).where(Scene.id.in_(ids), Scene.project_id == chapter.project_id, Scene.status == "OCCURRED", Scene.history_status == "ACTIVE").order_by(Scene.sequence, Scene.id)).all() if ids else []
 
@@ -235,25 +243,47 @@ class WriterChapterSourceBuilder:
         chapter = chapter_id if isinstance(chapter_id, Chapter) else db.get(Chapter, chapter_id)
         if not chapter:
             raise WriterDomainError("CHAPTER_NOT_FOUND")
-        if not chapter.active or _value(chapter.structure_status) not in {ChapterStructureStatus.SEALED.value, ChapterStructureStatus.PROVISIONAL.value}:
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch_service = ChapterWorldBranchService()
+        branch = branch_service.for_chapter(db, chapter)
+        branch_chapter = bool(branch and branch.chapter_id == chapter.id and branch.status.value in {"OPEN", "READY"})
+        if branch_chapter and not branch_service.active(db):
+            branch_service.activate(db, branch)
+        if (not chapter.active and not branch_chapter) or _value(chapter.structure_status) not in {ChapterStructureStatus.SEALED.value, ChapterStructureStatus.PROVISIONAL.value}:
             raise WriterDomainError("NARRATIVE_STRUCTURE_REQUIRED")
+        if branch and branch.writer_source_manifest:
+            manifest = dict(branch.writer_source_manifest)
+            frozen_ids = [item.get("scene_id") for item in manifest.get("scenes", [])]
+            if chapter.source_world_branch_id == branch.id:
+                current_bindings = [item.scene_id for item in db.scalars(select(ChapterSceneBinding).where(ChapterSceneBinding.chapter_id == chapter.id).order_by(ChapterSceneBinding.ordinal)).all()]
+                if current_bindings != frozen_ids:
+                    raise WriterDomainError("WRITER_SOURCE_CHANGED")
+            revision = db.scalar(select(__import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision).where(
+                __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.project_id == chapter.project_id,
+                __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.active.is_(True)))
+            source_fp = str(manifest.get("source_fingerprint") or branch.source_fingerprint or "")
+            if not source_fp:
+                raise WriterDomainError("WRITER_SOURCE_CHANGED")
+            scenes = list(manifest.get("scenes") or [])
+            return {"chapter": chapter, "revision": revision, "source_scene_ids": frozen_ids, "scenes": scenes, "manifest": manifest, "source_fingerprint": source_fp, "structure_fingerprint": manifest.get("chapter_structure_fingerprint")}
         revision = db.scalar(select(__import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision).where(
             __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.project_id == chapter.project_id,
             __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.active.is_(True)))
-        if not revision:
+        if not revision and not branch_chapter:
             raise WriterDomainError("NARRATIVE_STRUCTURE_REQUIRED")
         if has_pending_replay(db, chapter.project_id):
             raise WriterDomainError("RETCON_REPLAY_REQUIRED")
-        if run_audit:
+        if run_audit and not branch_chapter:
             try:
                 NarrativeStructureAudit().audit(db, chapter.project_id)
             except ValueError as exc:
                 raise WriterDomainError(str(exc)) from exc
         bindings = db.scalars(select(ChapterSceneBinding).where(ChapterSceneBinding.chapter_id == chapter.id).order_by(ChapterSceneBinding.ordinal)).all()
-        if not bindings:
+        staged_scenes = branch_service.branch_scene_rows(db, branch) if branch_chapter else []
+        if not bindings and not staged_scenes:
             raise WriterDomainError("WRITER_SOURCE_EMPTY")
         scenes: list[dict[str, Any]] = []
-        for binding in bindings:
+        for ordinal, binding in enumerate(bindings, 1):
             scene = db.get(Scene, binding.scene_id)
             if not scene or scene.project_id != chapter.project_id or _value(scene.status) != "OCCURRED" or scene.history_status != "ACTIVE":
                 raise WriterDomainError("WRITER_SOURCE_SCENE_INVALID")
@@ -261,19 +291,32 @@ class WriterChapterSourceBuilder:
             if db.scalar(select(SceneExecutionBinding.id).where(SceneExecutionBinding.project_id == scene.project_id, SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True))) and len(checkpoint_rows) != 1:
                 raise WriterDomainError("WRITER_SCENE_CHECKPOINT_REQUIRED")
             scenes.append(self._scene(db, scene, binding.ordinal))
+        next_ordinal = len(scenes) + 1
+        for scene in staged_scenes:
+            if scene.project_id != chapter.project_id or _value(scene.status) != "OCCURRED" or scene.id not in (branch.scene_ids or []) or scene.world_branch_id not in {None, branch.id} or scene.history_status not in {"STAGED", "ACTIVE"}:
+                raise WriterDomainError("WRITER_SOURCE_SCENE_INVALID")
+            scenes.append(self._scene(db, scene, next_ordinal, branch_id=branch.id))
+            next_ordinal += 1
         manifest = {
             "protocol": self.protocol,
             "chapter_id": chapter.id,
-            "chapter_structure_fingerprint": chapter.structure_fingerprint,
+            "chapter_structure_fingerprint": branch.chapter_structure_fingerprint if branch_chapter and branch.chapter_structure_fingerprint else chapter.structure_fingerprint,
             "structure_status": _value(chapter.structure_status),
+            "world_branch_id": branch.id if branch_chapter else None,
             "scenes": scenes,
         }
         source_fp = _fp(manifest, self.protocol)
-        return {"chapter": chapter, "revision": revision, "source_scene_ids": [row["scene_id"] for row in scenes], "scenes": scenes, "manifest": manifest, "source_fingerprint": source_fp, "structure_fingerprint": chapter.structure_fingerprint}
+        if branch_chapter:
+            manifest["source_fingerprint"] = source_fp
+            branch.writer_source_manifest = manifest
+            branch.source_fingerprint = source_fp
+        return {"chapter": chapter, "revision": revision, "source_scene_ids": [row["scene_id"] for row in scenes], "scenes": scenes, "manifest": manifest, "source_fingerprint": source_fp, "structure_fingerprint": manifest["chapter_structure_fingerprint"]}
 
-    def _scene(self, db: Session, scene: Scene, ordinal: int) -> dict[str, Any]:
+    def _scene(self, db: Session, scene: Scene, ordinal: int, *, branch_id: str | None = None) -> dict[str, Any]:
         checkpoint = db.scalar(select(SceneStateCheckpoint).where(SceneStateCheckpoint.project_id == scene.project_id, SceneStateCheckpoint.scene_id == scene.id, SceneStateCheckpoint.active.is_(True), SceneStateCheckpoint.capture_protocol_version >= 3).order_by(SceneStateCheckpoint.version.desc(), SceneStateCheckpoint.id))
         binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.project_id == scene.project_id, SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
+        if not binding and branch_id:
+            binding = db.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.project_id == scene.project_id, SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(False)))
         performance = db.get(ScenePerformance, binding.performance_id) if binding else None
         turns: list[dict[str, Any]] = []
         resolutions: list[dict[str, Any]] = []
@@ -291,11 +334,20 @@ class WriterChapterSourceBuilder:
                 turns.append(turn_row)
                 if resolution:
                     resolutions.append({"id": resolution.id, "turn_id": turn.id, "actor_character_id": turn.actor_character_id, "recipient_character_ids": _ids(resolution.recipient_character_ids), "objective_facts": resolution.objective_facts or [], "actor_observation": resolution.actor_observation, "public_observation": resolution.public_observation})
-        batches = db.scalars(select(StateDeltaBatch).where(StateDeltaBatch.project_id == scene.project_id, StateDeltaBatch.applied_scene_id == scene.id, StateDeltaBatch.status == StateDeltaBatchStatus.APPLIED).order_by(StateDeltaBatch.id)).all()
+        staged_batch_ids = ((scene.result or {}).get("state_delta_batch_ids") or []) if branch_id else []
+        batches_query = select(StateDeltaBatch).where(StateDeltaBatch.project_id == scene.project_id, StateDeltaBatch.applied_scene_id == scene.id, StateDeltaBatch.status == StateDeltaBatchStatus.APPLIED)
+        if staged_batch_ids:
+            batches_query = select(StateDeltaBatch).where(StateDeltaBatch.project_id == scene.project_id, StateDeltaBatch.id.in_(staged_batch_ids), StateDeltaBatch.status == StateDeltaBatchStatus.VALIDATED)
+        batches = db.scalars(batches_query.order_by(StateDeltaBatch.id)).all()
         delta_items = []
         for batch in batches:
             for item in db.scalars(select(StateDeltaItem).where(StateDeltaItem.batch_id == batch.id).order_by(StateDeltaItem.ordinal, StateDeltaItem.id)).all():
                 delta_items.append({"id": item.id, "batch_id": batch.id, "ordinal": item.ordinal, "target_type": _value(item.target_type), "target_id": item.target_id, "domain": _value(item.domain), "operation": _value(item.operation), "path": item.path, "before_value": item.before_value, "after_value": item.after_value, "semantic_fingerprint": item.semantic_fingerprint})
+        if branch_id:
+            from .chapter_world_branch import ChapterWorldBranchService
+            from .models import ChapterWorldBranch
+            branch = db.get(ChapterWorldBranch, branch_id)
+            state_changes = [item for item in ((branch.state_changes if branch else []) or []) if item.get("scene_id") == scene.id]
         row = {"ordinal": ordinal, "scene_id": scene.id, "sequence": scene.sequence, "world_time": scene.world_time.isoformat() if scene.world_time else None, "location": scene.location, "participants": _ids(scene.participants), "story_threads": _ids(scene.story_threads), "checkpoint_id": checkpoint.id if checkpoint else None, "checkpoint_fingerprint": checkpoint.checkpoint_fingerprint if checkpoint else None, "binding_id": binding.id if binding else None, "performance_id": performance.id if performance else None, "legacy_source": binding is None, "turns": turns, "resolutions": resolutions, "state_delta_items": delta_items, "state_changes": sorted(state_changes, key=lambda item: (item["target_type"] or "", item["target_id"] or "", item["path"] or "", item["id"]))}
         if binding is None:
             row["legacy_facts"] = scene.facts or []
@@ -345,9 +397,11 @@ class WriterContextBuilder:
         manifest = dict(source["manifest"])
         manifest["scenes"] = safe_scenes
         manifest["rendering_config"] = {**config, "pov_mode": mode.value, "pov_character_id": pov_character_id}
+        if manifest.get("world_branch_id"):
+            manifest["source_fingerprint"] = source["source_fingerprint"]
         context = {
             "writing_rules": rules,
-            "chapter": {"id": chapter.id, "number": chapter.number, "title": chapter.title, "structure_status": _value(chapter.structure_status)},
+            "chapter": {"id": chapter.id, "number": chapter.number, "title": chapter.title, "structure_status": source["manifest"].get("structure_status", _value(chapter.structure_status))},
             "formal_history": {"scenes": safe_scenes},
             "pov_subjective_context": self._subjective(db, safe_scenes, pov_character_id, mode, chapter.project_id, set(allowed_reveals)),
             "planning_task": planning_task,
@@ -602,6 +656,8 @@ class WriterProjectionService:
         locked_chapter = db.scalar(select(Chapter).where(Chapter.id == draft.chapter_id).with_for_update())
         if not locked_chapter:
             raise WriterDomainError("CHAPTER_NOT_FOUND")
+        if locked_chapter.pending_world_branch_id:
+            raise WriterDomainError("CHAPTER_WORLD_BRANCH_REQUIRES_REVIEW_ADOPTION")
         from .authoring import ensure_chapter_unsealed
         ensure_chapter_unsealed(db, locked_chapter)
         try:

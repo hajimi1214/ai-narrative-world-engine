@@ -135,11 +135,45 @@ class ProjectBackupService:
             return self._export(db, project_id)
 
     def _export(self, db: Session, project_id: str) -> dict[str, Any]:
+        from .models import ChapterWorldBranch, ChapterWorldBranchStatus
         project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
         if not project:
             raise ValueError("PROJECT_NOT_FOUND")
         mappers = _mapper_by_table()
         tables: dict[str, list[dict[str, Any]]] = {}
+        candidate_branches = db.scalars(select(ChapterWorldBranch).where(
+            ChapterWorldBranch.project_id == project_id,
+            ChapterWorldBranch.status != ChapterWorldBranchStatus.ADOPTED,
+        )).all()
+        candidate_branch_ids = {item.id for item in candidate_branches}
+        candidate_chapter_ids = {item.chapter_id for item in candidate_branches if item.chapter_id}
+        candidate_scene_ids = {scene_id for item in candidate_branches for scene_id in (item.scene_ids or [])}
+        candidate_performance_ids = {performance_id for item in candidate_branches for performance_id in (item.performance_ids or [])}
+        candidate_proposal_ids = set(db.scalars(select(mappers["scene_performances"].class_.scene_proposal_id).where(
+            mappers["scene_performances"].class_.id.in_(candidate_performance_ids),
+        )).all()) if candidate_performance_ids else set()
+        candidate_turn_ids = set(db.scalars(select(mappers["scene_performance_turns"].class_.id).where(
+            mappers["scene_performance_turns"].class_.performance_id.in_(candidate_performance_ids),
+        )).all()) if candidate_performance_ids else set()
+        candidate_resolution_ids = set(db.scalars(select(mappers["world_resolutions"].class_.id).where(
+            mappers["world_resolutions"].class_.performance_id.in_(candidate_performance_ids),
+        )).all()) if candidate_performance_ids else set()
+        candidate_batch_ids = set(db.scalars(select(mappers["state_delta_batches"].class_.id).where(
+            mappers["state_delta_batches"].class_.source_performance_id.in_(candidate_performance_ids),
+        )).all()) if candidate_performance_ids else set()
+        if candidate_resolution_ids:
+            candidate_batch_ids.update(db.scalars(select(mappers["state_delta_batches"].class_.id).where(
+                mappers["state_delta_batches"].class_.source_resolution_id.in_(candidate_resolution_ids),
+            )).all())
+        candidate_draft_ids = set()
+        for draft in db.scalars(select(mappers["chapter_writer_drafts"].class_).where(
+            mappers["chapter_writer_drafts"].class_.project_id == project_id,
+        )).all():
+            if draft.chapter_id in candidate_chapter_ids or (draft.source_manifest or {}).get("world_branch_id") in candidate_branch_ids:
+                candidate_draft_ids.add(draft.id)
+        candidate_assessment_ids = set(db.scalars(select(mappers["chapter_quality_assessments"].class_.id).where(
+            mappers["chapter_quality_assessments"].class_.writer_draft_id.in_(candidate_draft_ids),
+        )).all()) if candidate_draft_ids else set()
         # Direct project ownership is the authoritative inclusion rule.
         for table_name in sorted(AUTHOR_TABLES):
             mapper = mappers.get(table_name)
@@ -149,7 +183,32 @@ class ProjectBackupService:
             if table_name == "projects":
                 rows = [project]
             elif "project_id" in mapper.local_table.c:
-                rows = db.scalars(select(model).where(model.project_id == project_id).order_by(model.id)).all()
+                query = select(model).where(model.project_id == project_id)
+                if table_name in {"scenes", "chapters"} and "world_branch_id" in mapper.local_table.c:
+                    query = query.where(model.world_branch_id.is_(None))
+                if table_name == "scene_proposals" and candidate_proposal_ids:
+                    query = query.where(model.id.not_in(candidate_proposal_ids))
+                if table_name == "scene_performances" and candidate_performance_ids:
+                    query = query.where(model.id.not_in(candidate_performance_ids))
+                if table_name == "scene_performance_turns" and candidate_performance_ids:
+                    query = query.where(model.performance_id.not_in(candidate_performance_ids))
+                if table_name == "character_decisions" and candidate_proposal_ids:
+                    query = query.where(model.scene_proposal_id.not_in(candidate_proposal_ids))
+                if table_name == "world_resolutions" and candidate_performance_ids:
+                    query = query.where(model.performance_id.not_in(candidate_performance_ids))
+                if table_name == "scene_execution_bindings" and candidate_scene_ids:
+                    query = query.where(model.scene_id.not_in(candidate_scene_ids))
+                if table_name == "state_delta_batches" and candidate_batch_ids:
+                    query = query.where(model.id.not_in(candidate_batch_ids))
+                if table_name == "state_delta_items" and candidate_batch_ids:
+                    query = query.where(model.batch_id.not_in(candidate_batch_ids))
+                if table_name == "chapter_writer_drafts" and candidate_draft_ids:
+                    query = query.where(model.id.not_in(candidate_draft_ids))
+                if table_name == "chapter_quality_assessments" and candidate_assessment_ids:
+                    query = query.where(model.id.not_in(candidate_assessment_ids))
+                if table_name == "chapter_quality_findings" and candidate_assessment_ids:
+                    query = query.where(model.assessment_id.not_in(candidate_assessment_ids))
+                rows = db.scalars(query.order_by(model.id)).all()
             elif table_name in OWNERSHIP_PARENTS:
                 column_name, parent_name = OWNERSHIP_PARENTS[table_name]
                 parent = mappers[parent_name].class_
@@ -158,7 +217,12 @@ class ProjectBackupService:
             else:
                 continue
             if rows:
-                tables[table_name] = [_row(mapper, item) for item in rows]
+                serialized = [_row(mapper, item) for item in rows]
+                if table_name == "chapters":
+                    for item in serialized:
+                        item["pending_world_branch_id"] = None
+                        item["source_world_branch_id"] = None
+                tables[table_name] = serialized
         archive = {
             "format": ARCHIVE_FORMAT,
             "schema_version": SCHEMA_VERSION,

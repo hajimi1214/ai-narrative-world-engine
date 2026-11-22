@@ -82,6 +82,7 @@ class NarrativeStructureProjectionService:
     @staticmethod
     def _feature_values(feature: dict[str, Any], source_fingerprint: str) -> dict[str, Any]:
         return {
+            "chapter_boundary_id": feature.get("chapter_boundary_id"),
             "sequence": feature["sequence"], "world_time": feature.get("world_time"),
             "location_id": feature.get("location_id"), "participant_ids": list(feature.get("participant_ids") or []),
             "thread_ids": list(feature.get("thread_ids") or []), "primary_thread_id": feature.get("primary_thread_id"),
@@ -96,7 +97,7 @@ class NarrativeStructureProjectionService:
     @staticmethod
     def _feature_payload(row: NarrativeStructureSceneFeature) -> dict[str, Any]:
         return {
-            "scene_id": row.scene_id, "sequence": row.sequence, "world_time": row.world_time,
+            "scene_id": row.scene_id, "chapter_boundary_id": row.chapter_boundary_id, "sequence": row.sequence, "world_time": row.world_time,
             "location_id": row.location_id, "participant_ids": list(row.participant_ids or []),
             "thread_ids": list(row.thread_ids or []), "primary_thread_id": row.primary_thread_id,
             "proposal_type": row.proposal_type, "state_change_count": row.state_change_count,
@@ -139,7 +140,7 @@ class NarrativeStructureProjectionService:
             "path": item.path, "sequence": scene.sequence, "ordinal": item.ordinal,
         } for item in sorted(items, key=lambda row: (row.ordinal, row.id))]
         return {
-            "scene_id": scene.id, "sequence": scene.sequence,
+            "scene_id": scene.id, "chapter_boundary_id": (scene.result or {}).get("chapter_boundary_id") or (scene.result or {}).get("world_branch_id"), "sequence": scene.sequence,
             "world_time": scene.world_time.isoformat() if scene.world_time else None,
             "location_id": scene.location, "participant_ids": sorted(set(scene.participants or [])),
             "thread_ids": sorted(set(scene.story_threads or [])), "status": _value(scene.status),
@@ -229,7 +230,7 @@ class NarrativeStructureProjectionService:
         projection.structure_fingerprint = _structure_fingerprint(source_fingerprint, projection.config_fingerprint)
         projection.active_revision_id = revision.id
         projection.built_through_sequence = max((item["sequence"] for item in features), default=0)
-        projection.sealed_through_sequence = max((item.end_sequence or 0 for item in db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.structure_status == ChapterStructureStatus.SEALED)).all()), default=0)
+        projection.sealed_through_sequence = max((item.end_sequence or 0 for item in db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None), Chapter.structure_status == ChapterStructureStatus.SEALED)).all()), default=0)
         projection.tail_start_sequence = projection.sealed_through_sequence + 1
         projection.dirty_from_sequence = None; projection.dirty_reason = None; projection.last_rebuilt_at = datetime.utcnow()
         return projection
@@ -364,16 +365,71 @@ class NarrativeStructureProjectionService:
         db.add(next_arc); db.flush(); db.add(NarrativeArcChapterBinding(narrative_arc_id=next_arc.id, chapter_id=new_chapter.id, ordinal=1)); db.flush(); self._update_open_volume(db, project_id, revision, arc, next_arc, config)
 
     def _append_structure(self, db: Session, project_id: str, revision: NarrativeStructureRevision, feature: dict[str, Any], config: NarrativeStructureConfig) -> int | None:
-        chapter = db.scalar(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.structure_status == ChapterStructureStatus.PROVISIONAL).order_by(Chapter.number.desc()).limit(1))
+        chapter = db.scalar(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None), Chapter.structure_status == ChapterStructureStatus.PROVISIONAL).order_by(Chapter.number.desc()).limit(1))
+        branch = db.info.get("publishing_chapter_world_branch")
+        expected_boundary = f"auto:{branch.run_id}:{branch.chapter_number}" if branch and branch.project_id == project_id else None
+        if feature.get("chapter_boundary_id") != expected_boundary:
+            branch = None
+        target_chapter = db.get(Chapter, branch.chapter_id) if branch and branch.chapter_id else None
+        if (
+            branch
+            and target_chapter
+            and chapter
+            and chapter.id == target_chapter.id
+            and not (target_chapter.source_scene_ids or [])
+        ):
+            previous_open = db.scalar(select(Chapter).where(
+                Chapter.project_id == project_id,
+                Chapter.active.is_(True),
+                Chapter.world_branch_id.is_(None),
+                Chapter.structure_status == ChapterStructureStatus.PROVISIONAL,
+                Chapter.number < target_chapter.number,
+            ).order_by(Chapter.number.desc()).limit(1))
+            if previous_open:
+                prior_features = self._chapter_features(db, previous_open)
+                if prior_features:
+                    boundary = {"reason_codes": ["WORLD_BRANCH_BOUNDARY"], "score": config.chapter_boundary_threshold, "components": {"WORLD_BRANCH_BOUNDARY": config.chapter_boundary_threshold}}
+                    self._assign_chapter(previous_open, self._chapter_plan(previous_open.number, prior_features, "SEALED", boundary))
+                    self._assign_chapter(target_chapter, self._chapter_plan(target_chapter.number, [feature], "PROVISIONAL", boundary))
+                    target_chapter.structure_revision_id = target_chapter.structure_revision_id or revision.id
+                    db.add(ChapterSceneBinding(chapter_id=target_chapter.id, scene_id=feature["scene_id"], ordinal=1, scene_sequence=feature["sequence"]))
+                    self._update_open_arc(db, project_id, revision, previous_open, target_chapter, config)
+                    db.flush()
+                    return previous_open.end_sequence
+        if target_chapter and target_chapter.project_id == project_id and target_chapter.active:
+            if chapter and chapter.id != target_chapter.id and chapter.number < target_chapter.number:
+                prior_features = self._chapter_features(db, chapter)
+                if prior_features:
+                    boundary = {"reason_codes": ["WORLD_BRANCH_BOUNDARY"], "score": config.chapter_boundary_threshold, "components": {"WORLD_BRANCH_BOUNDARY": config.chapter_boundary_threshold}}
+                    self._assign_chapter(chapter, self._chapter_plan(chapter.number, prior_features, "SEALED", boundary))
+                    new_features = self._chapter_features(db, target_chapter)
+                    if not new_features:
+                        new_features = [feature]
+                        self._assign_chapter(target_chapter, self._chapter_plan(target_chapter.number, new_features, "PROVISIONAL", boundary))
+                        target_chapter.structure_revision_id = target_chapter.structure_revision_id or revision.id
+                        db.add(ChapterSceneBinding(chapter_id=target_chapter.id, scene_id=feature["scene_id"], ordinal=1, scene_sequence=feature["sequence"]))
+                    self._update_open_arc(db, project_id, revision, chapter, target_chapter, config)
+                    db.flush()
+                    return chapter.end_sequence
+                chapter = target_chapter
         if chapter is None:
             plan = self._chapter_plan(1, [feature], "PROVISIONAL", {"reason_codes": ["HISTORY_START"], "score": 0.0, "components": {}})
             chapter = Chapter(project_id=project_id, number=1, title=None, source_scene_ids=plan["scene_ids"], content=None, word_count=0, quality_report={}, status="DRAFT", structure_revision_id=revision.id, active=True, structure_status=ChapterStructureStatus.PROVISIONAL, start_sequence=plan["start_sequence"], end_sequence=plan["end_sequence"], structure_fingerprint=plan["structure_fingerprint"], boundary_metadata=plan["boundary_metadata"])
             db.add(chapter); db.flush(); db.add(ChapterSceneBinding(chapter_id=chapter.id, scene_id=feature["scene_id"], ordinal=1, scene_sequence=feature["sequence"])); db.flush(); self._update_open_arc(db, project_id, revision, chapter, None, config); return None
         features = self._chapter_features(db, chapter)
+        if not features:
+            boundary = {"reason_codes": ["CHAPTER_BRANCH_ADOPTED"], "score": 0.0, "components": {}}
+            self._assign_chapter(chapter, self._chapter_plan(chapter.number, [feature], "PROVISIONAL", boundary))
+            chapter.structure_revision_id = chapter.structure_revision_id or revision.id
+            db.add(ChapterSceneBinding(chapter_id=chapter.id, scene_id=feature["scene_id"], ordinal=1, scene_sequence=feature["sequence"]))
+            db.flush()
+            self._update_open_arc(db, project_id, revision, chapter, None, config)
+            return None
         boundary = ChapterBoundaryScorer().score(features[-1], feature, len(features), config)
         hard = len(features) >= config.chapter_max_scenes
+        forced = "WORLD_BRANCH_BOUNDARY" in boundary["reason_codes"]
         soft = len(features) >= config.chapter_min_scenes and boundary["score"] >= config.chapter_boundary_threshold
-        if not hard and not soft:
+        if not hard and not soft and not forced:
             features.append(feature); self._assign_chapter(chapter, self._chapter_plan(chapter.number, features, "PROVISIONAL", chapter.boundary_metadata or {})); db.add(ChapterSceneBinding(chapter_id=chapter.id, scene_id=feature["scene_id"], ordinal=len(features), scene_sequence=feature["sequence"])); db.flush(); self._update_open_arc(db, project_id, revision, chapter, None, config); return None
         if hard and "HARD_MAX_SCENES" not in boundary["reason_codes"]: boundary["reason_codes"] = sorted([*boundary["reason_codes"], "HARD_MAX_SCENES"])
         self._assign_chapter(chapter, self._chapter_plan(chapter.number, features, "SEALED", chapter.boundary_metadata or {}))
@@ -449,7 +505,7 @@ class NarrativeStructureProjectionService:
                     self.mark_dirty(db, project_id, scene.sequence, "APPEND_BOUNDARY_INVALID")
                     return []
                 prior_open_chapter_id = db.scalar(select(Chapter.id).where(
-                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None),
                     Chapter.structure_status == ChapterStructureStatus.PROVISIONAL,
                 ).order_by(Chapter.number.desc()).limit(1))
                 source = self._provisional_source(db, scene, items)
@@ -474,7 +530,7 @@ class NarrativeStructureProjectionService:
                 projection.dirty_reason = None
                 db.flush()
                 current_open_chapter_id = db.scalar(select(Chapter.id).where(
-                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None),
                     Chapter.structure_status == ChapterStructureStatus.PROVISIONAL,
                 ).order_by(Chapter.number.desc()).limit(1))
                 # The only formal D2 writes in a normal append are the prior
@@ -663,7 +719,7 @@ class NarrativeStructureProjectionService:
                 ).order_by(NarrativeVolume.number).limit(1))
                 tail_start = volume.start_sequence if volume else from_sequence
                 affected_chapters = db.scalars(select(Chapter).where(
-                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None),
                     Chapter.end_sequence >= tail_start,
                 )).all()
                 affected_arcs = db.scalars(select(NarrativeArc).where(
@@ -685,7 +741,7 @@ class NarrativeStructureProjectionService:
                     self.mark_dirty(db, project_id, tail_start, "HISTORY_REBUILD_TOUCHES_SEALED")
                     return False
                 prefix_chapters = db.scalars(select(Chapter).where(
-                    Chapter.project_id == project_id, Chapter.active.is_(True),
+                    Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None),
                     Chapter.end_sequence < tail_start,
                 ).order_by(Chapter.number)).all()
                 prefix_arcs = db.scalars(select(NarrativeArc).where(
@@ -773,7 +829,7 @@ class NarrativeStructureProjectionService:
                         "narrative-volume-v1",
                     )
 
-                old_chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.start_sequence >= tail_start)).all()
+                old_chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None), Chapter.start_sequence >= tail_start)).all()
                 old_arcs = db.scalars(select(NarrativeArc).where(NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True), NarrativeArc.start_sequence >= tail_start)).all()
                 old_volumes = db.scalars(select(NarrativeVolume).where(NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True), NarrativeVolume.start_sequence >= tail_start)).all()
                 for row in old_chapters: row.active = False; row.structure_status = ChapterStructureStatus.SUPERSEDED
@@ -817,7 +873,7 @@ class NarrativeStructureProjectionService:
                 projection.feature_accumulator = accumulator; projection.source_feature_fingerprint = source_root
                 projection.config_fingerprint = _config_fingerprint(config); projection.structure_fingerprint = next_revision.structure_fingerprint
                 projection.active_revision_id = next_revision.id; projection.built_through_sequence = scenes[-1].sequence
-                projection.sealed_through_sequence = db.scalar(select(func.max(Chapter.end_sequence)).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.structure_status == ChapterStructureStatus.SEALED)) or 0
+                projection.sealed_through_sequence = db.scalar(select(func.max(Chapter.end_sequence)).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None), Chapter.structure_status == ChapterStructureStatus.SEALED)) or 0
                 projection.tail_start_sequence = projection.sealed_through_sequence + 1
                 projection.dirty_from_sequence = None; projection.dirty_reason = None; projection.last_rebuilt_at = datetime.utcnow()
                 from .formal_state import FormalStateIdentityService

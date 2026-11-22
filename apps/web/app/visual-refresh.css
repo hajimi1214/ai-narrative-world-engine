@@ -65,3 +65,4 @@ html[data-motion=paused] *,html[data-motion=paused] *:before,html[data-motion=pa
   .token-budget-control>button{width:100%}
   body:has(input:focus,textarea:focus,select:focus) .motion-control{visibility:hidden;opacity:0;pointer-events:none}
 }
+@media(max-width:900px){.sidebar:not(.drawer-open){visibility:hidden}.sidebar.drawer-open{visibility:visible}}

@@ -1121,6 +1121,8 @@ class QualityGateService:
         if not assessment:
             raise QualityDomainError("QUALITY_ASSESSMENT_NOT_FOUND")
         chapter = db.scalar(select(Chapter).where(Chapter.id == assessment.chapter_id).with_for_update())
+        if chapter and chapter.pending_world_branch_id:
+            raise QualityDomainError("QUALITY_WORLD_BRANCH_REQUIRES_REVIEW_ADOPTION")
         # Audit first: a tampered PASS row must never touch Chapter state.
         QualityAssessmentAudit().audit(db, assessment.id)
         if _value(assessment.status) != "PASS" or not assessment.active:

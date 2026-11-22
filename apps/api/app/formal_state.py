@@ -10,7 +10,7 @@ import json
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import delete, select, event
+from sqlalchemy import delete, select, event, inspect
 from sqlalchemy.orm import Session
 
 from .execution_trace import stable_fingerprint
@@ -54,6 +54,12 @@ def _row_payload(row: Any) -> dict[str, Any]:
     value.pop("updated_at", None)
     if isinstance(row, Chapter):
         value.pop("content", None)
+    # Branch ownership is storage metadata, not a formal-world fact. Keeping
+    # it out of the frozen identity preserves the v2 fingerprint for existing
+    # rows after the additive branch migration.
+    value.pop("world_branch_id", None)
+    value.pop("pending_world_branch_id", None)
+    value.pop("source_world_branch_id", None)
     return _canonical(value)
 
 
@@ -177,6 +183,12 @@ class FormalStateIdentityService:
         return identity
 
     def current(self, db: Session, project_id: str, *, sequence: int | None = None) -> tuple[str, str]:
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch = ChapterWorldBranchService.active(db)
+        if branch:
+            if branch.project_id != project_id:
+                raise ValueError("CHAPTER_WORLD_BRANCH_SCOPE_MISMATCH")
+            return branch.current_fingerprint, "chapter-world-branch-v1"
         identity = self._identity(db, project_id)
         if identity and identity.status == FormalStateIdentityStatus.READY and identity.protocol_version == self.protocol and identity.state_fingerprint:
             if sequence is None or identity.built_through_sequence is None or identity.built_through_sequence <= sequence:
@@ -304,6 +316,17 @@ def _mark_formal_identity_dirty(session: Session, flush_context, instances=None)
     cognition_rows: list[CharacterKnowledge | CharacterMemory] = []
     character_owners: dict[str, str] = {}
     for row in pending:
+        if getattr(row, "world_branch_id", None):
+            continue
+        if isinstance(row, Chapter):
+            row_state = inspect(row)
+            changed_fields = {
+                attribute.key
+                for attribute in row_state.attrs
+                if attribute.history.has_changes()
+            }
+            if changed_fields and changed_fields.issubset({"pending_world_branch_id", "source_world_branch_id"}):
+                continue
         if isinstance(row, Character) and row.project_id:
             character_owners[row.id] = row.project_id
         if type(row) in tracked and getattr(row, "project_id", None):

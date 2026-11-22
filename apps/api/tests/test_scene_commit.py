@@ -14,11 +14,12 @@ from app.db import Base
 from app.director import DirectorContextBuilder
 from app.main import app
 from app.models import (
-    ActionVisibility, Chapter, ChapterStructureStatus, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType,
+    ActionVisibility, AutoDirectorRun, Chapter, ChapterStructureStatus, ChapterWorldBranch,
+    ChapterWorldBranchStatus, CharacterDecision, CharacterDecisionStatus, CharacterDecisionType,
     Character, CharacterKnowledge, CharacterMemory, EntityType, ExecutionStage, ExecutionStatus, ExecutionTrace,
     PerformanceMode, PerformanceStatus, ProposalStatus, ResolutionOutcome, ResolutionStatus,
     ResolverMode, Scene, SceneCommit, SceneExecutionBinding, ScenePerformance,
-    RetconImpactItem, ScenePerformanceTurn, SceneStateCheckpoint, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem,
+    RetconImpactItem, ScenePerformanceTurn, SceneStateCheckpoint, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem, TimelineEvent,
     FormalStateLeaf, StoryThread, ThreadStatus, WorldEntity, WorldResolution, WorldSnapshot,
 )
 from app.formal_state import FormalStateIdentityAudit, FormalStateIdentityService
@@ -27,8 +28,9 @@ from app.narrative_structure import NarrativeStructureAudit
 from app.narrative_structure_projection import NarrativeStructureProjectionService
 from app.historical import SceneCheckpointIntegrityValidator
 from app.snapshot_storage import CompactSnapshotAudit, ProjectWorldSnapshotHeadService, SnapshotPayloadResolver
-from app.state_delta import StateDeltaCandidateBuilder
+from app.state_delta import FormalWorldStateReader, StateDeltaCandidateBuilder
 from app.state_delta_validation import StateDeltaValidator
+from app.versioning import WorldSnapshotBuilder
 from app.world_resolution import WorldResolutionPayload
 from test_character_mind import seed
 
@@ -436,6 +438,113 @@ def test_commit_checkpoint_contains_pre_and_post_formal_world(session, monkeypat
     SceneCheckpointIntegrityValidator().validate_integrity(session, checkpoint)
 
 
+def prepare_chapter_branch(session, project):
+    from app.chapter_world_branch import ChapterWorldBranchService
+
+    run = AutoDirectorRun(
+        project_id=project.id,
+        idempotency_key=f"chapter-branch-{project.id}",
+        run_mode="AUTHOR_GUIDED_VOLUME",
+    )
+    session.add(run); session.flush()
+    history_fingerprint = DirectorContextBuilder().build(session, project.id)["current_history_fingerprint"]
+    branch = ChapterWorldBranchService().get_or_create(
+        session, project.id, run.id, 1,
+        history_fingerprint=history_fingerprint,
+    )
+    return run, branch
+
+
+def test_chapter_branch_stages_world_delta_and_cognition_outside_formal_history(session, monkeypatch):
+    project, location, actor, _other, _proposal, performance, _turn, _resolution, batch, _client = prepared_commit(session, monkeypatch)
+    before_profile = copy.deepcopy(location.profile)
+    before_world_fingerprint = FormalStateIdentityService().current(session, project.id)[0]
+    run, branch = prepare_chapter_branch(session, project)
+    from app.chapter_world_branch import ChapterWorldBranchService
+    branch_service = ChapterWorldBranchService()
+    branch_service.activate(session, branch)
+
+    staged = SceneCommitService().stage(session, project.id, performance.id)
+    session.flush()
+
+    session.refresh(location); session.refresh(batch); session.refresh(performance)
+    assert location.profile == before_profile
+    assert batch.status == StateDeltaBatchStatus.VALIDATED and batch.applied_scene_id is None
+    assert performance.status == PerformanceStatus.COMPLETED and performance.stop_reason == "SCENE_STAGED"
+    assert staged.scene.history_status == "STAGED" and staged.scene.world_branch_id == branch.id
+    assert session.scalar(select(SceneCommit.id).where(SceneCommit.project_id == project.id)) is None
+    assert session.scalar(select(SceneStateCheckpoint.id).where(SceneStateCheckpoint.project_id == project.id)) is None
+    assert session.scalar(select(TimelineEvent.id).where(TimelineEvent.project_id == project.id)) is None
+    assert session.scalar(select(CharacterKnowledge.id).where(CharacterKnowledge.character_id == actor.id)) is None
+    assert session.scalar(select(CharacterMemory.id).where(CharacterMemory.character_id == actor.id)) is None
+
+    branch_service.clear(session)
+    formal_payload, _ = WorldSnapshotBuilder().build(session, project.id)
+    formal_fingerprint = FormalStateIdentityService().current(session, project.id)[0]
+    assert before_world_fingerprint == formal_fingerprint
+    assert not any(row["id"] == staged.scene.id for row in formal_payload["scenes"])
+    assert not any(row["id"] == branch.chapter_id for row in formal_payload["chapters"])
+
+    branch_service.activate(session, branch)
+    batch_item = session.scalar(select(StateDeltaItem).where(StateDeltaItem.batch_id == batch.id))
+    assert FormalWorldStateReader().before_value(
+        session, project.id,
+        __import__("app.state_effect_contract", fromlist=["StateEffectPayload"]).StateEffectPayload.model_validate(
+            batch_item.evidence["state_effect"]
+        ),
+    ) == (True, True)
+
+
+def test_chapter_branch_publish_is_atomic_and_reuses_staged_scene(session, monkeypatch):
+    project, location, actor, _other, _proposal, performance, _turn, _resolution, batch, _client = prepared_commit(session, monkeypatch)
+    from app.chapter_world_branch import ChapterWorldBranchService
+    service = ChapterWorldBranchService()
+    run, branch = prepare_chapter_branch(session, project)
+    service.activate(session, branch)
+    staged = SceneCommitService().stage(session, project.id, performance.id)
+    branch.status = ChapterWorldBranchStatus.READY
+    session.flush()
+    original_profile = copy.deepcopy(location.profile)
+    baseline = branch.base_world_fingerprint
+
+    def fail_after_materialization(stage):
+        if stage == "AFTER_SCENE_COMMIT_MATERIALIZATION":
+            raise RuntimeError("INJECTED_BRANCH_PUBLISH_FAILURE")
+
+    monkeypatch.setattr(SceneCommitService, "failure_injector", staticmethod(fail_after_materialization))
+    savepoint = session.begin_nested()
+    with pytest.raises(RuntimeError, match="INJECTED_BRANCH_PUBLISH_FAILURE"):
+        service.publish(session, branch)
+    savepoint.rollback()
+    session.expire_all()
+    branch = session.get(ChapterWorldBranch, branch.id)
+    location = session.get(WorldEntity, location.id)
+    assert branch.status == ChapterWorldBranchStatus.READY
+    assert branch.scene_ids == [staged.scene.id]
+    assert location.profile == original_profile
+    assert session.scalar(select(SceneCommit.id).where(SceneCommit.project_id == project.id)) is None
+    assert FormalStateIdentityService().current(session, project.id)[0] == baseline
+    assert session.get(Scene, staged.scene.id).history_status == "STAGED"
+
+    monkeypatch.setattr(SceneCommitService, "failure_injector", None)
+    service.activate(session, branch)
+    published = service.publish(session, branch)
+    branch.status = ChapterWorldBranchStatus.ADOPTED
+    session.flush()
+    session.expire_all()
+    location = session.get(WorldEntity, location.id)
+    session.refresh(batch)
+    scene = session.get(Scene, staged.scene.id)
+    assert len(published) == 1 and published[0].id == staged.scene.id
+    assert scene.history_status == "ACTIVE" and scene.world_branch_id is None
+    assert location.profile["opened"] is True
+    assert batch.status == StateDeltaBatchStatus.APPLIED and batch.applied_scene_id == scene.id
+    assert session.scalar(select(SceneCommit.id).where(SceneCommit.project_id == project.id)) is not None
+    assert session.scalar(select(SceneStateCheckpoint.id).where(SceneStateCheckpoint.scene_id == scene.id)) is not None
+    assert session.scalar(select(TimelineEvent.id).where(TimelineEvent.scene_id == scene.id)) is not None
+    assert session.scalar(select(CharacterKnowledge.id).where(CharacterKnowledge.character_id == actor.id)) is not None
+
+
 def test_normal_checkpoint_uses_anchor_then_reference_and_compact_delta(session, monkeypatch):
     project, _location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, client = prepared_commit(session, monkeypatch)
     body = client.post(f"/projects/{project.id}/performances/{performance.id}/commit-scene").json()
@@ -733,7 +842,6 @@ def test_two_performances_commit_to_distinct_active_scene_sequences(session, mon
     # The first commit deliberately performs the one-time D1 identity
     # transition.  A steady-state Scene 2 must instead use the incremental
     # identity and compact delta paths, even while D2 advances its open tail.
-    from app.versioning import WorldSnapshotBuilder
     build_calls = 0
     original_build = WorldSnapshotBuilder.build
 

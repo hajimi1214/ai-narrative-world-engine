@@ -159,13 +159,16 @@ class StoryGravityContextBuilder:
         project = session.get(Project, project_id)
         if not project:
             raise ValueError("Project not found")
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch_service = ChapterWorldBranchService()
+        branch = branch_service.active(session)
         # Phase 16A projections are optional accelerators.  Their service is
         # read-only here; missing or dirty rows deliberately use this frozen
         # formal-history path instead of repairing data during a Director read.
         from .scaling import ProjectHistoryProjectionService
         projection_service = ProjectHistoryProjectionService()
         try:
-            fast = projection_service.fast_context(session, project_id, self)
+            fast = None if branch else projection_service.fast_context(session, project_id, self)
         except Exception as exc:
             # A corrupt/unsupported derived projection must never be mistaken
             # for a successful fast read.  The formal-history reader remains
@@ -180,11 +183,22 @@ class StoryGravityContextBuilder:
             self.last_route = "LEGACY_FORMAL_HISTORY"
             self.last_fallback_reason = "HISTORY_PROJECTION_UNAVAILABLE_OR_STALE"
         scenes = session.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == SceneStatus.OCCURRED, Scene.history_status == "ACTIVE").order_by(Scene.sequence, Scene.id)).all()
+        if branch:
+            scenes.extend(branch_service.branch_scene_rows(session, branch))
+            scenes.sort(key=lambda row: (row.sequence, row.id))
         current_sequence = max((scene.sequence for scene in scenes), default=0)
-        characters = session.scalars(select(Character).where(Character.project_id == project_id, Character.active.is_(True)).order_by(Character.id)).all()
-        threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status.in_((ThreadStatus.OPEN, ThreadStatus.PAUSED))).order_by(StoryThread.id)).all()
+        characters = [branch_service.effective_object(session, row) for row in session.scalars(select(Character).where(Character.project_id == project_id, Character.active.is_(True)).order_by(Character.id)).all()]
+        threads = []
+        for row in session.scalars(select(StoryThread).where(StoryThread.project_id == project_id).order_by(StoryThread.id)).all():
+            effective = branch_service.effective_object(session, row)
+            status = getattr(effective.status, "value", effective.status)
+            if status in {ThreadStatus.OPEN.value, ThreadStatus.PAUSED.value}:
+                effective.status = ThreadStatus(status)
+                threads.append(effective)
+        threads.sort(key=lambda row: row.id)
         arc = session.scalar(select(StoryArc).where(StoryArc.project_id == project_id, StoryArc.status == "ACTIVE").order_by(StoryArc.id).limit(1))
-        locations = session.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True), WorldEntity.entity_type == EntityType.LOCATION).order_by(WorldEntity.id)).all()
+        locations = [branch_service.effective_object(session, row) for row in session.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.entity_type == EntityType.LOCATION).order_by(WorldEntity.id)).all()]
+        locations = [row for row in locations if row.active]
         signatures = [self._signature(session, scene) for scene in scenes[-RECENT_SCENE_LIMIT:]]
         knowledge = []
         knowledge_rows_by_character = {}
@@ -205,6 +219,8 @@ class StoryGravityContextBuilder:
             if key not in current_events or (event.sequence or -1, event.ordinal or -1, event.id) > (current_events[key].sequence or -1, current_events[key].ordinal or -1, current_events[key].id):
                 current_events[key] = event
         state_changes = [{"id": event.id, "sequence": event.sequence, "ordinal": event.ordinal, "scene_id": event.scene_id, "target_type": event.target_type, "target_id": event.target_id, "path": event.path, "before_value": event.before_value, "after_value": event.after_value, "event_fingerprint": event.event_fingerprint} for event in current_events.values()]
+        if branch:
+            state_changes.extend(branch.state_changes or [])
         state_changes.sort(key=lambda item: (item["sequence"] or -1, item["ordinal"] or -1, item["target_type"] or "", item["target_id"] or "", item["path"] or ""))
         links = session.scalars(select(CausalLink).where(CausalLink.project_id == project_id, CausalLink.active.is_(True)).order_by(CausalLink.link_fingerprint, CausalLink.id)).all()
         valid_links = []
@@ -225,7 +241,10 @@ class StoryGravityContextBuilder:
         return str(code) if isinstance(code, str) and code else type(exc).__name__
 
     def _signature(self, session, scene):
-        binding = session.scalar(select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True)))
+        binding_query = select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id, SceneExecutionBinding.active.is_(True))
+        if scene.history_status == "STAGED" and scene.world_branch_id:
+            binding_query = select(SceneExecutionBinding).where(SceneExecutionBinding.scene_id == scene.id)
+        binding = session.scalar(binding_query)
         performance = session.get(ScenePerformance, binding.performance_id) if binding else None
         proposal = session.get(SceneProposal, performance.scene_proposal_id) if performance else None
         return {"scene_id": scene.id, "sequence": scene.sequence, "proposal_type": getattr(proposal.proposal_type, "value", proposal.proposal_type) if proposal else None, "primary_thread_id": proposal.primary_thread_id if proposal else None, "participants": sorted(str(value) for value in (proposal.participants if proposal else scene.participants or [])), "location_id": proposal.location_id if proposal else scene.location}
@@ -507,19 +526,36 @@ class ValidationReport:
 
 class DirectorContextBuilder:
     def build(self, session: Session, project_id: str, include_secret_canon: bool = True, planning_task: dict[str, Any] | None = None) -> dict[str, Any]:
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch_service = ChapterWorldBranchService()
+        branch = branch_service.active(session)
         project = session.get(Project, project_id)
         if not project:
             raise ValueError("Project not found")
-        characters = session.scalars(select(Character).where(Character.project_id == project_id, Character.active.is_(True)).order_by(Character.id)).all()
+        characters = [branch_service.effective_object(session, row) for row in session.scalars(select(Character).where(Character.project_id == project_id, Character.active.is_(True)).order_by(Character.id)).all()]
         character_ids = [character.id for character in characters]
-        open_threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status == ThreadStatus.OPEN).order_by(StoryThread.weight.desc(), StoryThread.id)).all()
-        paused_threads = session.scalars(select(StoryThread).where(StoryThread.project_id == project_id, StoryThread.status == ThreadStatus.PAUSED).order_by(StoryThread.weight.desc(), StoryThread.id)).all()
+        open_threads, paused_threads = [], []
+        for row in session.scalars(select(StoryThread).where(StoryThread.project_id == project_id).order_by(StoryThread.id)).all():
+            thread = branch_service.effective_object(session, row)
+            status = getattr(thread.status, "value", thread.status)
+            if status == ThreadStatus.OPEN.value:
+                thread.status = ThreadStatus.OPEN
+                open_threads.append(thread)
+            elif status == ThreadStatus.PAUSED.value:
+                thread.status = ThreadStatus.PAUSED
+                paused_threads.append(thread)
+        open_threads.sort(key=lambda item: (-item.weight, item.id))
+        paused_threads.sort(key=lambda item: (-item.weight, item.id))
         recent_scenes = session.scalars(select(Scene).where(Scene.project_id == project_id, Scene.status == SceneStatus.OCCURRED, Scene.history_status == "ACTIVE").order_by(Scene.sequence.desc(), Scene.id.desc()).limit(RECENT_SCENE_LIMIT)).all()
+        if branch:
+            recent_scenes.extend(reversed(branch_service.branch_scene_rows(session, branch)))
+            recent_scenes = sorted({row.id: row for row in recent_scenes}.values(), key=lambda row: (row.sequence, row.id))[-RECENT_SCENE_LIMIT:]
         active_arc = session.scalar(select(StoryArc).where(StoryArc.project_id == project_id, StoryArc.status == "ACTIVE").order_by(StoryArc.id.desc()))
         reader = ActiveCharacterCognitionReader()
         knowledge = [item for character in characters for item in reader.knowledge(session, project_id, character.id)] if character_ids else []
         related_ids = self._related_entity_ids(characters, open_threads + paused_threads, recent_scenes)
-        entities = session.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id, WorldEntity.active.is_(True)).order_by(WorldEntity.id)).all()
+        entities = [branch_service.effective_object(session, row) for row in session.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id).order_by(WorldEntity.id)).all()]
+        entities = [entity for entity in entities if entity.active]
         selected_entities = [entity for entity in entities if entity.id in related_ids or entity.name in related_ids]
         canon = session.scalars(select(CanonFact).where(CanonFact.project_id == project_id).order_by(CanonFact.id)).all()
         selected_canon = [fact for fact in canon if fact.fact_type == CanonType.CORE_CANON or (fact.fact_type == CanonType.WORLD_FACT and fact.locked) or fact.id in related_ids]
@@ -527,8 +563,10 @@ class DirectorContextBuilder:
             selected_canon.extend(self._relevant_secret_canon(session, project_id, canon, related_ids, character_ids, [thread.id for thread in open_threads + paused_threads], active_arc.id if active_arc else None))
         writing = session.scalar(select(WritingBible).where(WritingBible.project_id == project_id, WritingBible.active.is_(True)).order_by(WritingBible.version.desc(), WritingBible.id))
         anti_ai = session.scalar(select(AntiAIBible).where(AntiAIBible.project_id == project_id, AntiAIBible.active.is_(True)).order_by(AntiAIBible.version.desc(), AntiAIBible.id))
+        project_state = branch_service.effective_record(session, project)
+        current_world_time = project_state.get("current_world_time")
         context = {
-            "project": {"id": project.id, "creation_mode": project.creation_mode.value, "story_seed": project.story_seed, "autonomy_settings": project.autonomy_settings, "current_world_time": project.current_world_time.isoformat() if project.current_world_time else None, "chapter_words": {"target": project.target_chapter_words, "min": project.min_chapter_words, "max": project.max_chapter_words}},
+            "project": {"id": project.id, "creation_mode": project.creation_mode.value, "story_seed": project.story_seed, "autonomy_settings": project.autonomy_settings, "current_world_time": current_world_time.isoformat() if hasattr(current_world_time, "isoformat") else current_world_time, "chapter_words": {"target": project.target_chapter_words, "min": project.min_chapter_words, "max": project.max_chapter_words}},
             "current_story_arc": self._arc(active_arc),
             "active_story_threads": [self._thread(thread) for thread in open_threads],
             "paused_story_threads": [self._thread(thread) for thread in paused_threads],

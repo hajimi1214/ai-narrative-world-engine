@@ -121,6 +121,7 @@ class NarrativeStructureSourceFingerprintBuilder:
         ).order_by(TimelineEvent.sequence, TimelineEvent.ordinal, TimelineEvent.event_type, TimelineEvent.target_type, TimelineEvent.target_id, TimelineEvent.path, TimelineEvent.event_fingerprint)).all()
         return {
             "scene_id": scene.id,
+            "chapter_boundary_id": (scene.result or {}).get("chapter_boundary_id") or (scene.result or {}).get("world_branch_id"),
             "sequence": scene.sequence,
             "world_time": _iso(scene.world_time),
             "location_id": scene.location,
@@ -158,7 +159,7 @@ class NarrativeSceneFeatureBuilder:
         state = [event for event in row["timeline_events"] if event["event_type"] == "STATE_CHANGE"]
         thread_events = [event["id"] for event in state if event["target_type"] == "STORY_THREAD" and event["path"] in {"/status", "/progress", "/state"}]
         feature = {
-            "scene_id": row["scene_id"], "sequence": row["sequence"], "world_time": row["world_time"],
+            "scene_id": row["scene_id"], "chapter_boundary_id": row.get("chapter_boundary_id"), "sequence": row["sequence"], "world_time": row["world_time"],
             "location_id": row["location_id"], "participant_ids": _ids(row["participant_ids"]), "thread_ids": _ids(row["thread_ids"]),
             "primary_thread_id": row["execution"]["primary_thread_id"], "proposal_type": row["execution"]["proposal_type"],
             "state_change_count": len(state),
@@ -181,6 +182,12 @@ class ChapterBoundaryScorer:
         return 1.0 - (len(a & b) / len(a | b))
 
     def score(self, left: dict[str, Any], right: dict[str, Any], current_size: int, config: NarrativeStructureConfig) -> dict[str, Any]:
+        left_boundary = left.get("chapter_boundary_id")
+        right_boundary = right.get("chapter_boundary_id")
+        if left_boundary or right_boundary:
+            if left_boundary == right_boundary:
+                return {"score": 0.0, "reason_codes": [], "components": {}}
+            return {"score": config.chapter_boundary_threshold, "reason_codes": ["WORLD_BRANCH_BOUNDARY"], "components": {"WORLD_BRANCH_BOUNDARY": config.chapter_boundary_threshold}}
         signals: dict[str, float] = {}
         if left["primary_thread_id"] != right["primary_thread_id"] and (left["primary_thread_id"] or right["primary_thread_id"]): signals["PRIMARY_THREAD_CHANGE"] = self.weights.primary_thread_change
         td = self._discontinuity(left["thread_ids"], right["thread_ids"])
@@ -209,7 +216,8 @@ class ChapterFormationEngine:
             boundary = scorer.score(current[-1], feature, len(current), config)
             hard = len(current) >= config.chapter_max_scenes
             soft = len(current) >= config.chapter_min_scenes and boundary["score"] >= config.chapter_boundary_threshold
-            if hard or soft:
+            forced = "WORLD_BRANCH_BOUNDARY" in boundary["reason_codes"]
+            if hard or soft or forced:
                 if hard and "HARD_MAX_SCENES" not in boundary["reason_codes"]: boundary["reason_codes"] = sorted([*boundary["reason_codes"], "HARD_MAX_SCENES"])
                 groups.append((current, current_boundary)); current, current_boundary = [feature], boundary
             else: current.append(feature)
@@ -398,7 +406,7 @@ class NarrativeStructureService:
         if rechecked_source_fingerprint != preview["source_fingerprint"]:
             raise ValueError("NARRATIVE_STRUCTURE_SOURCE_CHANGED")
 
-        old_chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True)).order_by(Chapter.number)).all()
+        old_chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None)).order_by(Chapter.number)).all()
         old_arcs = db.scalars(select(NarrativeArc).where(NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True)).order_by(NarrativeArc.number)).all()
         old_volumes = db.scalars(select(NarrativeVolume).where(NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True)).order_by(NarrativeVolume.number)).all()
         semantic_rebuild = bool(current and (
@@ -482,7 +490,7 @@ class NarrativeStructureService:
         return self.payload(db, revision) | {"stale": revision.source_history_fingerprint != source_fingerprint, "source_fingerprint": source_fingerprint}
 
     def payload(self, db: Session, revision: NarrativeStructureRevision) -> dict[str, Any]:
-        chapters = db.scalars(select(Chapter).where(Chapter.project_id == revision.project_id, Chapter.active.is_(True)).order_by(Chapter.number)).all()
+        chapters = db.scalars(select(Chapter).where(Chapter.project_id == revision.project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None)).order_by(Chapter.number)).all()
         arcs = db.scalars(select(NarrativeArc).where(NarrativeArc.project_id == revision.project_id, NarrativeArc.active.is_(True)).order_by(NarrativeArc.number)).all()
         volumes = db.scalars(select(NarrativeVolume).where(NarrativeVolume.project_id == revision.project_id, NarrativeVolume.active.is_(True)).order_by(NarrativeVolume.number)).all()
         arc_chapter_ids = {item.id: db.scalars(select(NarrativeArcChapterBinding.chapter_id).where(NarrativeArcChapterBinding.narrative_arc_id == item.id).order_by(NarrativeArcChapterBinding.ordinal)).all() for item in arcs}
@@ -498,7 +506,7 @@ class NarrativeStructureAudit:
     def audit(self, db: Session, project_id: str) -> None:
         revisions = db.scalars(select(NarrativeStructureRevision).where(NarrativeStructureRevision.project_id == project_id, NarrativeStructureRevision.active.is_(True))).all()
         if len(revisions) != 1: raise ValueError("NARRATIVE_STRUCTURE_REVISION_INVALID")
-        chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True)).order_by(Chapter.number)).all()
+        chapters = db.scalars(select(Chapter).where(Chapter.project_id == project_id, Chapter.active.is_(True), Chapter.world_branch_id.is_(None)).order_by(Chapter.number)).all()
         arcs = db.scalars(select(NarrativeArc).where(NarrativeArc.project_id == project_id, NarrativeArc.active.is_(True)).order_by(NarrativeArc.number)).all()
         volumes = db.scalars(select(NarrativeVolume).where(NarrativeVolume.project_id == project_id, NarrativeVolume.active.is_(True)).order_by(NarrativeVolume.number)).all()
         revision = revisions[0]

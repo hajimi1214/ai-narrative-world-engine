@@ -15,7 +15,7 @@ import app.runtime as runtime_module
 from app.auto_director_worker import AutoDirectorWorker
 from app.db import Base
 from app.main import app
-from app.models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, Character, CharacterKnowledge, ChapterWindowStatus, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus
+from app.models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, BookContract, Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWriterDraft, ChapterWorldBranch, Character, CharacterKnowledge, ChapterWindowStatus, EntityType, ForeshadowingStatus, KnowledgeStatus, Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, VolumeContinuitySnapshot, VolumeContract, VolumeContractStatus, WorldEntity
 
 
 def _setup(monkeypatch):
@@ -41,6 +41,26 @@ def _advance_until_paused(worker, session_factory, run_id, *, max_polls=20, expe
             if run.status.value == expected_status:
                 return
     pytest.fail(f"Author-guided run did not pause within {max_polls} worker polls")
+
+
+def _trust_seeded_chapters_for_volume_lifecycle(monkeypatch):
+    from app.author_guided_volume import AuthorGuidedVolumeService
+
+    monkeypatch.setattr(
+        AuthorGuidedVolumeService,
+        "_chapter_evidence",
+        lambda self, db, chapter: {"assessment_id": "fixture", "evidence": []},
+    )
+    monkeypatch.setattr(
+        AuthorGuidedVolumeService,
+        "_chapter_scenes_published",
+        staticmethod(lambda db, chapter: True),
+    )
+    monkeypatch.setattr(
+        AuthorGuidedVolumeService,
+        "_formal_world_matches_target",
+        lambda self, db, volume: True,
+    )
 
 
 def test_author_guided_run_creates_contract_and_bounded_window(monkeypatch):
@@ -154,6 +174,7 @@ def test_existing_auto_director_endpoint_accepts_author_guided_mode(monkeypatch)
 
 def test_sealed_volume_requires_author_confirmation_and_snapshot(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"volume": {"target_closing_state": {"case": "closed"}}, "idempotency_key": "seal"}).json()
     AutoDirectorWorker(Session, poll_seconds=0).run_once()
     with Session() as db:
@@ -266,6 +287,7 @@ def test_author_retry_uses_current_checkpoint_budget(monkeypatch, attempt, maxim
 
 def test_next_volume_window_inherits_only_sealed_snapshot_reference(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "next-volume"})
     AutoDirectorWorker(Session, poll_seconds=0).run_once()
     with Session() as db:
@@ -338,6 +360,7 @@ def _prepare_auto_cross_boundary(Session, project_id, *, processed=1, chapter_bu
 
 def test_auto_cross_volume_seals_snapshot_and_reuses_run_budget(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5)
     from app.author_guided_volume import AuthorGuidedVolumeService
     with Session() as db:
@@ -363,6 +386,7 @@ def test_auto_cross_volume_seals_snapshot_and_reuses_run_budget(monkeypatch):
 
 def test_auto_cross_volume_seals_before_chapter_budget_pause(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     run_id = _prepare_auto_cross_boundary(Session, project_id, processed=5, chapter_budget=5)
     from app.author_guided_volume import AuthorGuidedVolumeService
     with Session() as db:
@@ -382,6 +406,7 @@ def test_auto_cross_volume_seals_before_chapter_budget_pause(monkeypatch):
 
 def test_auto_cross_volume_seals_then_pauses_when_token_budget_is_exhausted(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5, token_budget=10, tokens_used=10)
     from app.author_guided_volume import AuthorGuidedVolumeService
     with Session() as db:
@@ -400,6 +425,7 @@ def test_auto_cross_volume_seals_then_pauses_when_token_budget_is_exhausted(monk
 
 def test_auto_cross_volume_missing_successor_plan_blocks_without_creating_empty_volume(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5, include_next_plan=False)
     from app.author_guided_volume import AuthorGuidedVolumeService
     with Session() as db:
@@ -417,6 +443,7 @@ def test_auto_cross_volume_missing_successor_plan_blocks_without_creating_empty_
 
 def test_auto_cross_volume_transition_is_idempotent(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5)
     from app.author_guided_volume import AuthorGuidedVolumeService
     with Session() as db:
@@ -438,6 +465,7 @@ def test_auto_cross_volume_transition_is_idempotent(monkeypatch):
 
 def test_unseal_reseal_creates_immutable_snapshot_and_replans_next_volume(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "reseal-snapshot"}).json()
     AutoDirectorWorker(Session, poll_seconds=0).run_once()
 
@@ -514,6 +542,7 @@ def test_unseal_reseal_creates_immutable_snapshot_and_replans_next_volume(monkey
 
 def test_sealed_snapshot_does_not_expose_future_character_secret(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "cognition"})
     AutoDirectorWorker(Session, poll_seconds=0).run_once()
     with Session() as db:
@@ -551,6 +580,7 @@ def test_author_can_update_unsealed_volume_contract_but_not_sealed_volume(monkey
 
 def test_dynamic_length_and_window_rollover_do_not_use_estimate_as_completion_limit(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"estimated_chapters": 600, "window_size": 5, "idempotency_key": "dynamic-length"}).json()
     AutoDirectorWorker(Session, poll_seconds=0).run_once()
     with Session() as db:
@@ -862,7 +892,7 @@ def test_quality_failed_chapter_blocks_volume_seal(monkeypatch):
     assert response.json()["detail"]["code"] == "VOLUME_COMPLETION_CONDITIONS_UNMET"
 
 
-def test_completion_proposal_contains_adopted_evidence_and_honors_policy(monkeypatch):
+def test_completion_proposal_ignores_unverified_chapter_body(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"length_policy": {"allow_completion_proposal": True}, "idempotency_key": "completion-evidence"}).json()
     AutoDirectorWorker(Session, poll_seconds=0).run_once()
@@ -873,11 +903,54 @@ def test_completion_proposal_contains_adopted_evidence_and_honors_policy(monkeyp
         db.add(chapter)
         task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
         task.end_state = {"done": True}
-        db.commit(); volume_id = volume.id; chapter_id = chapter.id
+        db.commit(); volume_id = volume.id
     proposal = client.get(f"/projects/{project_id}/volumes/{volume_id}/completion-proposal")
     assert proposal.status_code == 200
-    assert proposal.json()["status"] == "PROPOSED"
-    assert proposal.json()["evidence_chapter_ids"] == [chapter_id]
+    assert proposal.json()["status"] == "NOT_READY"
+    assert proposal.json()["evidence_chapter_ids"] == []
+
+
+def test_volume_progress_uses_formal_world_and_ignores_candidate_branch(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "branch-cannot-seal"}).json()
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
+        volume.actual_chapter_start = 1
+        volume.actual_chapter_end = 1
+        volume.target_closing_state = {"case": "closed"}
+        entity = WorldEntity(project_id=project_id, entity_type=EntityType.ITEM, name="卷宗", profile={"case": "open"})
+        db.add(entity)
+        task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
+        task.end_state = {"case": "closed"}
+        branch = ChapterWorldBranch(
+            project_id=project_id, run_id=run.id, chapter_number=1,
+            base_world_fingerprint="formal-before", base_history_fingerprint="history-before",
+            current_fingerprint="candidate-after",
+        )
+        db.add(branch); db.flush()
+        candidate = Chapter(
+            project_id=project_id, number=1, content="终局证据已经找到",
+            status="QUALITY_APPROVED", active=True,
+            world_branch_id=branch.id, pending_world_branch_id=branch.id,
+        )
+        db.add(candidate); db.flush()
+        branch.chapter_id = candidate.id
+
+        service = __import__("app.author_guided_volume", fromlist=["AuthorGuidedVolumeService"]).AuthorGuidedVolumeService()
+        report = service.progress(db, volume)
+        assert report["target_closing_state_reached"] is False
+        assert report["adopted_chapter_ids"] == []
+        assert report["incomplete_chapters"] == [1]
+        assert report["should_prepare_seal"] is False
+
+        entity.profile = {"case": "closed"}
+        assert service._formal_world_matches_target(db, volume) is True
+        report = service.progress(db, volume)
+        assert report["target_closing_state_reached"] is False
+        assert report["adopted_chapter_ids"] == []
+        assert report["should_prepare_seal"] is False
 
 
 def test_completion_proposal_waits_for_global_contract_events(monkeypatch):
@@ -887,7 +960,7 @@ def test_completion_proposal_waits_for_global_contract_events(monkeypatch):
     with Session() as db:
         volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id))
         volume.actual_chapter_start = 1; volume.actual_chapter_end = 1; volume.target_closing_state = {"done": True}
-        db.add(Chapter(project_id=project_id, number=1, content="已采用正文", status="QUALITY_APPROVED", active=True))
+        db.add(Chapter(project_id=project_id, number=1, content="终局证据", status="QUALITY_APPROVED", active=True))
         task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == project_id, StoryPlanChapter.number == 1))
         task.end_state = {"done": True}
         db.commit(); volume_id = volume.id
@@ -898,6 +971,7 @@ def test_completion_proposal_waits_for_global_contract_events(monkeypatch):
 
 def test_completion_confirmation_only_auto_completes_when_enabled(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
     created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"length_policy": {"allow_completion_proposal": True, "allow_auto_complete": True}, "idempotency_key": "auto-complete"}).json()
     AutoDirectorWorker(Session, poll_seconds=0).run_once()
     with Session() as db:
@@ -1030,6 +1104,13 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
             assert pending_draft.status.value == "VALIDATED"
             pending_draft_id = pending_draft.id
             assert not db.scalar(select(Chapter.id).where(Chapter.project_id == project_id, Chapter.status == "QUALITY_APPROVED"))
+            from app.models import ChapterWorldBranch, Scene, SceneCommit, SceneStateCheckpoint, TimelineEvent
+            branch = db.get(ChapterWorldBranch, failed_run.context["chapter_world_branch_id"])
+            assert branch and branch.status.value == "READY"
+            assert branch.scene_ids and all(db.get(Scene, scene_id).history_status == "STAGED" for scene_id in branch.scene_ids)
+            assert db.scalar(select(SceneCommit.id).where(SceneCommit.project_id == project_id)) is None
+            assert db.scalar(select(SceneStateCheckpoint.id).where(SceneStateCheckpoint.project_id == project_id)) is None
+            assert db.scalar(select(TimelineEvent.id).where(TimelineEvent.project_id == project_id)) is None
         retried = client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/retry")
         assert retried.json()["status"] == "RUNNING"
     _advance_until_paused(worker, Session, run_id)
@@ -1051,6 +1132,19 @@ def test_author_guided_fake_provider_executes_writer_quality_and_adoption(monkey
         assert run.status.value == "PAUSED"
         assert run.current_stage.value == "VOLUME_PROGRESS_ASSESSMENT"
         assert run.token_usage["total_tokens"] > 0
+        from app.models import ChapterWorldBranch, Scene, SceneCommit, TimelineEvent
+        from sqlalchemy import func
+        branch = db.get(ChapterWorldBranch, run.context["chapter_world_branch_id"])
+        assert branch and branch.status.value == "ADOPTED"
+        assert chapter.source_world_branch_id == branch.id and chapter.pending_world_branch_id is None
+        assert chapter.source_scene_ids == branch.scene_ids
+        assert all(db.get(Scene, scene_id).history_status == "ACTIVE" for scene_id in branch.scene_ids)
+        assert db.scalar(select(func.count(SceneCommit.id)).where(SceneCommit.project_id == project_id)) == len(branch.scene_ids)
+        assert db.scalar(select(func.count(TimelineEvent.id)).where(TimelineEvent.project_id == project_id)) > 0
+        from app.author_guided_volume import AuthorGuidedVolumeService
+        progress = AuthorGuidedVolumeService().progress(db, db.get(VolumeContract, run.context["volume_id"]))
+        assert progress["adopted_chapter_ids"] == [chapter.id]
+        assert progress["incomplete_chapters"] == []
 
     retry = client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/retry")
     assert retry.status_code == 200 and retry.json()["status"] == "PAUSED"

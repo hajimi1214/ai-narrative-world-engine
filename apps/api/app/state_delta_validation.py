@@ -17,7 +17,7 @@ from .models import (
     StateDeltaBatchStatus, StateDeltaDomain, StateDeltaItem, StateDeltaTargetType,
     StoryThread, ThreadStatus, WorldEntity, WorldResolution,
 )
-from .revision import _pointer, _record
+from .revision import _pointer
 from .state_delta import (
     DERIVATION_VERSION, FormalWorldStateReader, StateDeltaCandidateBuilder,
     StateDeltaInputFingerprintBuilder, WorldResolutionStateDeltaTranslator,
@@ -42,10 +42,12 @@ class StateDeltaValidationWorldView:
     """A deep-copied candidate overlay. It has no ORM mutation authority."""
 
     def __init__(self, db: Session, project_id: str):
-        self.project = _record(db.get(Project, project_id))
-        self.characters = {row.id: _record(row) for row in db.scalars(select(Character).where(Character.project_id == project_id)).all()}
-        self.entities = {row.id: _record(row) for row in db.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id)).all()}
-        self.threads = {row.id: _record(row) for row in db.scalars(select(StoryThread).where(StoryThread.project_id == project_id)).all()}
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch = ChapterWorldBranchService()
+        self.project = branch.effective_record(db, db.get(Project, project_id))
+        self.characters = {row.id: branch.effective_record(db, row) for row in db.scalars(select(Character).where(Character.project_id == project_id)).all()}
+        self.entities = {row.id: branch.effective_record(db, row) for row in db.scalars(select(WorldEntity).where(WorldEntity.project_id == project_id)).all()}
+        self.threads = {row.id: branch.effective_record(db, row) for row in db.scalars(select(StoryThread).where(StoryThread.project_id == project_id)).all()}
 
     def document(self, target_type: StateDeltaTargetType, target_id: str) -> dict[str, Any] | None:
         if target_type == StateDeltaTargetType.PROJECT:

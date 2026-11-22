@@ -222,12 +222,18 @@ class ActiveCharacterCognitionReader:
     def knowledge(self, session: Session, project_id: str, character_id: str) -> list[CharacterKnowledge]:
         hidden = self._hidden(session, project_id, character_id, "KNOWLEDGE")
         rows = session.scalars(select(CharacterKnowledge).where(CharacterKnowledge.character_id == character_id, CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF])).order_by(CharacterKnowledge.id)).all()
-        return [row for row in rows if row.id not in hidden]
+        result = [row for row in rows if row.id not in hidden]
+        from .chapter_world_branch import ChapterWorldBranchService
+        result.extend(ChapterWorldBranchService().cognition_rows(session, character_id, "KNOWLEDGE"))
+        return result
 
     def memories(self, session: Session, project_id: str, character_id: str) -> list[CharacterMemory]:
         hidden = self._hidden(session, project_id, character_id, "MEMORY")
         rows = session.scalars(select(CharacterMemory).where(CharacterMemory.character_id == character_id).order_by(CharacterMemory.id)).all()
-        return [row for row in rows if row.id not in hidden]
+        result = [row for row in rows if row.id not in hidden]
+        from .chapter_world_branch import ChapterWorldBranchService
+        result.extend(ChapterWorldBranchService().cognition_rows(session, character_id, "MEMORY"))
+        return result
 
 
 class _CognitionUsage:
@@ -251,7 +257,13 @@ def _cue_hits(identity: dict[str, Any] | None, cues: dict[str, tuple[str, ...]])
 
 def _scene_metadata(session: Session, project_id: str, scene_id: str | None) -> Scene | None:
     scene = session.get(Scene, scene_id) if scene_id else None
-    return scene if scene and scene.project_id == project_id and scene.history_status == "ACTIVE" else None
+    if not scene or scene.project_id != project_id:
+        return None
+    if scene.history_status == "ACTIVE":
+        return scene
+    from .chapter_world_branch import ChapterWorldBranchService
+    branch = ChapterWorldBranchService.active(session)
+    return scene if branch and scene.world_branch_id == branch.id else None
 
 
 class CharacterKnowledgeRetriever:
@@ -396,6 +408,9 @@ class CharacterMindViewBuilder:
             raise ValueError("Character not found in project")
         if proposal.project_id != project_id:
             raise ValueError("Scene Proposal not found in project")
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch_service = ChapterWorldBranchService()
+        character_state = branch_service.effective_record(session, character)
         cues = self.cues.extract(proposal, character_id)
         # Current-history retrieval uses the derived PostgreSQL projection for
         # both deterministic and hybrid recall. Replay keeps its independent
@@ -403,7 +418,7 @@ class CharacterMindViewBuilder:
         config = session.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
         try:
             from .retrieval_index import CognitionRetrievalProjectionService, CurrentCharacterCognitionFastRetriever
-            if CognitionRetrievalProjectionService().fast_path_available(session, project_id):
+            if not branch_service.active(session) and CognitionRetrievalProjectionService().fast_path_available(session, project_id):
                 fast = CurrentCharacterCognitionFastRetriever()
                 recalled_knowledge, conflicts = fast.knowledge(session, project_id, character_id, cues)
                 recalled_memories = fast.memories(session, project_id, character_id, cues)
@@ -411,7 +426,7 @@ class CharacterMindViewBuilder:
                     recalled_memories = self._fast_hybrid_memories(session, project_id, character_id, cues, recalled_memories, character, proposal, config, fast)
                 else:
                     self.last_route = "FAST_DETERMINISTIC"
-                identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
+                identity = {key: character_state.get(key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
                 identity["agent_id"] = character.id; identity["agent_enabled"] = character.agent_enabled; identity["agent_profile"] = character.agent_profile or {}
                 result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "unknown_facts": self._unknown_facts(session, project_id, character_id), "memories": recalled_memories, "belief_conflicts": conflicts}
                 result["retrieval_evidence"] = self._retrieval_evidence(self.last_route, recalled_knowledge, recalled_memories, self.last_fallback_reason)
@@ -434,7 +449,7 @@ class CharacterMindViewBuilder:
         location = session.get(WorldEntity, proposal.location_id) if proposal.location_id else None
         participants = session.scalars(select(Character).where(Character.project_id == project_id, Character.id.in_(proposal.participants or [])).order_by(Character.id)).all() if proposal.participants else []
         recalled_memories = self._hybrid_memories(session, project_id, character_id, cues, memory_records, memory_entries, recalled_memories, character, proposal, location, participants)
-        identity = {key: getattr(character, key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
+        identity = {key: character_state.get(key) for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "relationships", "inventory")}
         identity["agent_id"] = character.id; identity["agent_enabled"] = character.agent_enabled; identity["agent_profile"] = character.agent_profile or {}
         result = {"character_id": character.id, "protocol_version": MIND_RETRIEVAL_PROTOCOL_VERSION, "character": identity, "proposal_id": proposal.id, "cues": cues, "knowledge": recalled_knowledge, "unknown_facts": self._unknown_facts(session, project_id, character_id), "memories": recalled_memories, "belief_conflicts": conflicts}
         result["retrieval_evidence"] = self._retrieval_evidence(self.last_route, recalled_knowledge, recalled_memories, self.last_fallback_reason)
@@ -443,7 +458,7 @@ class CharacterMindViewBuilder:
 
     def _unknown_facts(self, session: Session, project_id: str, character_id: str) -> list[dict[str, Any]]:
         """Expose unknowns as opaque fact IDs, never as hidden canon text."""
-        known_propositions = set(session.scalars(select(CharacterKnowledge.proposition).where(CharacterKnowledge.character_id == character_id, CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED, KnowledgeStatus.FALSE_BELIEF]))).all())
+        known_propositions = {row.proposition for row in self.reader.knowledge(session, project_id, character_id)}
         facts = session.scalars(select(CanonFact).where(CanonFact.project_id == project_id).order_by(CanonFact.id)).all()
         return [{"canon_fact_id": fact.id, "status": KnowledgeStatus.UNKNOWN.value, "fact_type": _enum(fact.fact_type)} for fact in facts if fact.proposition not in known_propositions][:64]
 
@@ -672,9 +687,12 @@ class CharacterContextBuilder:
 
     def build(self, session: Session, project_id: str, character_id: str, proposal: SceneProposal) -> dict[str, Any]:
         mind = self.mind_builder.build(session, project_id, character_id, proposal); character = session.get(Character, character_id)
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch_view = ChapterWorldBranchService()
+        character = branch_view.effective_object(session, character)
         participants = session.scalars(select(Character).where(Character.project_id == project_id, Character.id.in_(proposal.participants or [])).order_by(Character.id)).all() if proposal.participants else []
         others = [{"id": row.id, "name": row.name} for row in participants if row.id != character.id]
-        location = session.get(WorldEntity, proposal.location_id) if proposal.location_id else None
+        location = branch_view.effective_object(session, session.get(WorldEntity, proposal.location_id)) if proposal.location_id else None
         knowledge = {"KNOWN": [], "SUSPECTED": [], "FALSE_BELIEF": []}
         for row in mind["knowledge"]:
             knowledge[row["status"]].append(row)
@@ -688,7 +706,7 @@ class CharacterContextBuilder:
         context = {
             "character": {key: mind["character"][key] for key in ("id", "name", "personality", "core_values", "boundaries", "goals", "current_state", "physical_state", "emotional_state", "agent_id", "agent_enabled", "agent_profile")},
             "scene": {"proposal_id": proposal.id, "location": {"id": location.id, "name": location.name} if location else None, "other_participants": others, "visible_context": (proposal.entry_state or {}).get("visible_context", {}), "actor_visible_context": ((proposal.entry_state or {}).get("actor_visible_context", {}) or {}).get(character.id, {})},
-            "knowledge": knowledge, "memories": memories, "belief_conflicts": mind["belief_conflicts"], "retrieval_evidence": mind.get("retrieval_evidence", {}), "context_budget": budget_report, "relationships": {row["id"]: character.relationships.get(row["id"], {}) for row in others}, "abilities": self._abilities(character.abilities), "inventory": character.inventory, "planning_task": (proposal.entry_state or {}).get("planning_task"), "agent_protocol": "character-agent-v1", "mind_fingerprint": mind["mind_fingerprint"],
+            "knowledge": knowledge, "memories": memories, "belief_conflicts": mind["belief_conflicts"], "retrieval_evidence": mind.get("retrieval_evidence", {}), "context_budget": budget_report, "relationships": {row["id"]: mind["character"]["relationships"].get(row["id"], {}) for row in others}, "abilities": self._abilities(character.abilities), "inventory": mind["character"]["inventory"], "planning_task": (proposal.entry_state or {}).get("planning_task"), "agent_protocol": "character-agent-v1", "mind_fingerprint": mind["mind_fingerprint"],
         }
         context["fingerprint"] = character_context_fingerprint(context); context["version"] = context["fingerprint"]
         return context

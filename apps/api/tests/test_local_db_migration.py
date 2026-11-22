@@ -12,7 +12,7 @@ import app.local_db as local_db
 from app.models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStep, AutoDirectorStepStatus
 
 
-HEAD_REVISION = "0044_auto_director_recovery"
+HEAD_REVISION = "0045_chapter_world_branches"
 
 
 def test_sqlite_migrations_reach_head_with_auto_director_usage(tmp_path: Path):
@@ -27,7 +27,7 @@ def test_sqlite_migrations_reach_head_with_auto_director_usage(tmp_path: Path):
         assert connection.scalar(text("select version_num from alembic_version")) == HEAD_REVISION
     assert {column["name"] for column in inspector.get_columns("auto_director_runs")} >= {"total_tokens", "estimated_cost", "cost_status"}
     assert {column["name"] for column in inspector.get_columns("auto_director_steps")} >= {"provider", "model", "total_tokens", "estimated_cost"}
-    assert {"book_contracts", "volume_contracts", "chapter_planning_windows", "volume_continuity_snapshots", "foreshadowing_ledger", "author_guidance", "book_completion_proposals"} <= set(inspector.get_table_names())
+    assert {"book_contracts", "volume_contracts", "chapter_planning_windows", "volume_continuity_snapshots", "foreshadowing_ledger", "author_guidance", "book_completion_proposals", "chapter_world_branches"} <= set(inspector.get_table_names())
     assert any(item["name"] == "uq_volume_continuity_snapshot_volume_version" and item["unique"] and item["column_names"] == ["volume_id", "snapshot_version"] for item in inspector.get_indexes("volume_continuity_snapshots"))
 
 

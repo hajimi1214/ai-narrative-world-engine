@@ -59,14 +59,16 @@ class PerformanceWorldStateBuilder:
 
 class WorldResolutionContextBuilder:
     def build(self, session: Session, performance: ScenePerformance, turn: ScenePerformanceTurn, proposal: Any, request: dict[str, Any]) -> dict[str, Any]:
-        actor = session.get(Character, turn.actor_character_id)
-        location = session.get(WorldEntity, proposal.location_id) if proposal.location_id else None
-        target_entity = session.get(WorldEntity, request.get("target_entity_id")) if request.get("target_entity_id") else None
-        target_character = session.get(Character, request.get("target_character_id")) if request.get("target_character_id") else None
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch_view = ChapterWorldBranchService()
+        actor = branch_view.effective_object(session, session.get(Character, turn.actor_character_id))
+        location = branch_view.effective_object(session, session.get(WorldEntity, proposal.location_id)) if proposal.location_id else None
+        target_entity = branch_view.effective_object(session, session.get(WorldEntity, request.get("target_entity_id"))) if request.get("target_entity_id") else None
+        target_character = branch_view.effective_object(session, session.get(Character, request.get("target_character_id"))) if request.get("target_character_id") else None
         active = set(performance.active_participant_ids or [])
         if not target_character or target_character.project_id != performance.project_id or target_character.id not in active:
             target_character = None
-        project = session.get(__import__("app.models", fromlist=["Project"]).Project, performance.project_id)
+        project = branch_view.effective_object(session, session.get(__import__("app.models", fromlist=["Project"]).Project, performance.project_id))
         scope = {"project_id": performance.project_id, "performance_id": performance.id, "performance_turn_id": turn.id, "actor_character_id": turn.actor_character_id, "target_character_id": target_character.id if target_character else None, "location_id": location.id if location else None}
         allowed_entities = {item.id for item in (location, target_entity) if item and item.project_id == performance.project_id}
         scope_ids = allowed_entities | {turn.actor_character_id} | ({target_character.id} if target_character else set())
@@ -78,7 +80,10 @@ class WorldResolutionContextBuilder:
             if fact.fact_type == CanonType.SECRET_CANON:
                 return bool(refs & scope_ids) or bool(data.get("global_world_rule"))
             return bool(refs & scope_ids) or bool(data.get("global_world_rule"))
-        context = {"scope": scope, "project": {"current_world_time": project.current_world_time.isoformat() if project and project.current_world_time else None}, "request": request, "attempt": {"actor_character_id": turn.actor_character_id, "observable_action": turn.observable_action, "target_entity_id": request.get("target_entity_id"), "target_character_id": request.get("target_character_id")}, "location": _entity_view(location), "target_entity": _entity_view(target_entity), "target_character": {"id": target_character.id, "current_state": target_character.current_state, "physical_state": target_character.physical_state, "abilities": target_character.abilities, "inventory": target_character.inventory} if target_character else None, "actor": {"id": actor.id, "current_state": actor.current_state, "physical_state": actor.physical_state, "abilities": actor.abilities, "inventory": actor.inventory} if actor else None, "allowed_world_entity_ids": sorted(allowed_entities), "canon": [{"id": item.id, "proposition": item.proposition, "fact_type": item.fact_type.value, "locked": item.locked, "data": item.data} for item in canon if relevant(item)], "take_state": PerformanceWorldStateBuilder().build(session, performance.id)}
+        current_world_time = project.current_world_time if project else None
+        if hasattr(current_world_time, "isoformat"):
+            current_world_time = current_world_time.isoformat()
+        context = {"scope": scope, "project": {"current_world_time": current_world_time}, "request": request, "attempt": {"actor_character_id": turn.actor_character_id, "observable_action": turn.observable_action, "target_entity_id": request.get("target_entity_id"), "target_character_id": request.get("target_character_id")}, "location": _entity_view(location), "target_entity": _entity_view(target_entity), "target_character": {"id": target_character.id, "current_state": target_character.current_state, "physical_state": target_character.physical_state, "abilities": target_character.abilities, "inventory": target_character.inventory} if target_character else None, "actor": {"id": actor.id, "current_state": actor.current_state, "physical_state": actor.physical_state, "abilities": actor.abilities, "inventory": actor.inventory} if actor else None, "allowed_world_entity_ids": sorted(allowed_entities), "canon": [{"id": item.id, "proposition": item.proposition, "fact_type": item.fact_type.value, "locked": item.locked, "data": item.data} for item in canon if relevant(item)], "take_state": PerformanceWorldStateBuilder().build(session, performance.id)}
         canon_by_id = {item.id: item for item in canon}
         forbidden_ids, forbidden_propositions = set(), set()
         for value in proposal.forbidden_reveals or []:

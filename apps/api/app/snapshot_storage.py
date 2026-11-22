@@ -439,7 +439,8 @@ class SceneCommitFormalMutationGuard:
 
     def assert_complete(self, *, project_id: str, items: list[Any], scene: Any,
                         knowledge: list[Any], memories: list[Any],
-                        structure_chapter_ids: list[str] | None = None) -> dict[str, Any]:
+                        structure_chapter_ids: list[str] | None = None,
+                        allow_existing_scene: bool = False) -> dict[str, Any]:
         target_ids: dict[str, set[str]] = {
             "PROJECT": set(), "WORLD_ENTITY": set(), "CHARACTER": set(), "STORY_THREAD": set(),
         }
@@ -479,6 +480,7 @@ class SceneCommitFormalMutationGuard:
                 elif collection in allowed_new:
                     if row_id not in allowed_new[collection] or (
                         collection != "chapters" and not was_new
+                        and not (collection == "scenes" and allow_existing_scene)
                     ):
                         raise ValueError("COMPACT_SNAPSHOT_DELTA_UNEXPECTED_MUTATION")
                 else:

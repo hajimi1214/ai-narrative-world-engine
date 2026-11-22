@@ -741,8 +741,23 @@ class AutoDirectorOrchestrator:
         self._advance_chapter_prose(db, run, project, plan_id, chapter, chapter_number, durable_stages=durable_stages)
 
     def _advance_chapter_world(self, db: Session, run: AutoDirectorRun, project: Project, plan_id: str, plan_chapter: StoryPlanChapter, detail_step: AutoDirectorStep, chapter_number: int, *, durable_stages: bool) -> Chapter | None:
-        # SceneCommitService owns the formal chapter structure.
         planning_task = chapter_task_context(db, project.id, chapter_number, required=True)
+        branch_service = None
+        branch = None
+        branch_enabled = run.run_mode in {"AUTHOR_GUIDED_VOLUME", "FULL_AUTO"}
+        if branch_enabled:
+            from .chapter_world_branch import ChapterWorldBranchService
+            from .director import DirectorContextBuilder
+            branch_service = ChapterWorldBranchService()
+            formal_history_fingerprint = DirectorContextBuilder().build(
+                db, project.id, planning_task=planning_task,
+            )["current_history_fingerprint"]
+            branch = branch_service.get_or_create(
+                db, project.id, run.id, chapter_number,
+                history_fingerprint=formal_history_fingerprint,
+            )
+            branch_service.activate(db, branch)
+            run.context = {**(run.context or {}), "chapter_world_branch_id": branch.id}
         existing_chapter = db.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.number == chapter_number, Chapter.active.is_(True)))
         # A recovered chapter that already has a committed scene can proceed
         # to Writer. A brand-new chapter retains the configured scene budget
@@ -789,7 +804,18 @@ class AutoDirectorOrchestrator:
         if durable_stages and existing_autonomous:
             # An interrupted chapter may already have a partial scene prefix.
             scene_count = existing_autonomous.scene_budget
-        autonomous = existing_autonomous or AutonomousWorldLoopService().create_run(db, project.id, scene_budget=scene_count, max_turns_per_scene=2, performance_mode="LLM", resolver_mode="LLM", config={"auto_director_run_id": run.id, "plan_id": plan_id, "plan_chapter_id": plan_chapter.id, "chapter_number": chapter_number, "planning_task": planning_task}, client_request_id=runtime_request_id)
+        runtime_config = {"auto_director_run_id": run.id, "plan_id": plan_id, "plan_chapter_id": plan_chapter.id, "chapter_number": chapter_number, "planning_task": planning_task}
+        if branch:
+            runtime_config["chapter_world_branch_id"] = branch.id
+        autonomous = existing_autonomous or AutonomousWorldLoopService().create_run(db, project.id, scene_budget=scene_count, max_turns_per_scene=2, performance_mode="LLM", resolver_mode="LLM", config=runtime_config, client_request_id=runtime_request_id)
+        if existing_autonomous and branch:
+            existing_config = dict(existing_autonomous.config or {})
+            existing_branch_id = existing_config.get("chapter_world_branch_id")
+            if existing_branch_id and existing_branch_id != branch.id:
+                raise AutoDirectorError("CHAPTER_WORLD_BRANCH_RUNTIME_MISMATCH")
+            if not existing_branch_id:
+                existing_autonomous.config = {**existing_config, "chapter_world_branch_id": branch.id}
+                AutonomousWorldLoopService()._refresh_run_fingerprint(db, existing_autonomous)
         db.flush()
         autonomous_run_ids.append(autonomous.id)
         runtime_live = self._live_begin(run, f"第 {chapter_number} 章：角色 Agent 与世界运行", "WORLD_RUNTIME")
@@ -810,6 +836,8 @@ class AutoDirectorOrchestrator:
                 and paused_runtime_step.stop_reason == "WORLD_INFORMATION_MISSING"
             )
             if runtime_needs_context:
+                if branch:
+                    raise AutoDirectorError("CHAPTER_WORLD_BRANCH_CONTEXT_REQUIRED", "The chapter branch is waiting for author-confirmed world context.")
                 self._seed_runtime_context(db, run, project, chapter_number, planning_task)
                 self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
             elif enum_value(autonomous.status) == "BLOCKED" and autonomous.stop_reason == "AUTONOMY_BASELINE_CHANGED" and int(autonomous.committed_scene_count or 0) == 0:
@@ -823,10 +851,12 @@ class AutoDirectorOrchestrator:
                     runtime.resume(db, autonomous.id)
             result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
             if result.get("run", {}).get("stop_reason") == "WORLD_INFORMATION_MISSING":
+                if branch:
+                    raise AutoDirectorError("CHAPTER_WORLD_BRANCH_CONTEXT_REQUIRED", "The chapter branch is waiting for author-confirmed world context.")
                 self._seed_runtime_context(db, run, project, chapter_number, planning_task)
                 self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
                 result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
-            self._live_complete(runtime_live, "角色行动与世界裁定已提交，正在形成章节")
+            self._live_complete(runtime_live, "角色行动与世界裁定已暂存，正在形成待审核章节")
         except Exception as exc:
             if durable_stages:
                 db.info.pop("author_scene_usage_flush", None)
@@ -845,7 +875,21 @@ class AutoDirectorOrchestrator:
                     raise runtime_error
             raise AutoDirectorError("CHAPTER_SCENE_NOT_COMMITTED", str(result))
         run.context = {**(run.context or {}), "autonomous_run_ids": list(dict.fromkeys([*(run.context or {}).get("autonomous_run_ids", []), *autonomous_run_ids]))}
-        chapter = db.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.number == chapter_number, Chapter.active.is_(True)))
+        if branch:
+            branch.status = __import__("app.models", fromlist=["ChapterWorldBranchStatus"]).ChapterWorldBranchStatus.READY
+            branch.chapter_structure_fingerprint = fingerprint({
+                "branch_id": branch.id,
+                "chapter_id": branch.chapter_id,
+                "base_world_fingerprint": branch.base_world_fingerprint,
+                "current_fingerprint": branch.current_fingerprint,
+                "scene_ids": branch.scene_ids,
+            })
+            run.context = {**(run.context or {}), "chapter_world_branch_id": branch.id, "chapter_world_branch_status": "READY"}
+            chapter = db.get(Chapter, branch.chapter_id)
+            if chapter and chapter.world_branch_id == branch.id:
+                chapter.structure_fingerprint = branch.chapter_structure_fingerprint
+        else:
+            chapter = db.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.number == chapter_number, Chapter.active.is_(True)))
         if not chapter:
             raise AutoDirectorError("CHAPTER_FORMATION_FAILED")
         return chapter
@@ -857,6 +901,14 @@ class AutoDirectorOrchestrator:
         return None
 
     def _advance_chapter_prose(self, db: Session, run: AutoDirectorRun, project: Project, plan_id: str, chapter: Chapter, chapter_number: int, *, durable_stages: bool) -> None:
+        branch_id = (run.context or {}).get("chapter_world_branch_id")
+        if branch_id:
+            from .chapter_world_branch import ChapterWorldBranchService
+            from .models import ChapterWorldBranch
+            branch = db.get(ChapterWorldBranch, branch_id)
+            if not branch or branch.chapter_id != chapter.id:
+                raise AutoDirectorError("CHAPTER_WORLD_BRANCH_NOT_FOUND")
+            ChapterWorldBranchService().activate(db, branch)
         run.current_chapter_id = chapter.id
         run.current_stage = AutoDirectorStage.CHAPTER_EXECUTION
         writer_step = self._step(db, run, AutoDirectorStage.CHAPTER_EXECUTION, {"chapter_id": chapter.id, "plan_id": plan_id})
@@ -1055,7 +1107,13 @@ class AutoDirectorOrchestrator:
                 run.context = {**(run.context or {}), "adopt_draft_id": repair_payload["draft_id"]}
                 self.adopt_chapter(db, run)
             else:
-                self._record_quality_debt_and_advance(run)
+                if (run.context or {}).get("chapter_world_branch_id"):
+                    run.status = AutoDirectorRunStatus.BLOCKED
+                    run.current_stage = AutoDirectorStage.BLOCKED
+                    run.pause_reason = "QUALITY_REVIEW_REQUIRED"
+                    run.next_action = "本章分支仍未通过审核；请处理质量报告后再发布本章世界变化。"
+                else:
+                    self._record_quality_debt_and_advance(run)
 
     @staticmethod
     def _record_quality_debt_and_advance(run: AutoDirectorRun) -> None:
@@ -1093,13 +1151,38 @@ class AutoDirectorOrchestrator:
         assessment = db.scalar(select(ChapterQualityAssessment).where(ChapterQualityAssessment.writer_draft_id == draft_id).order_by(ChapterQualityAssessment.version.desc()))
         if not draft or not assessment:
             raise AutoDirectorError("AUTO_ADOPTION_LINEAGE_MISSING")
+        branch = None
+        branch_service = None
+        branch_id = (run.context or {}).get("chapter_world_branch_id")
+        if branch_id:
+            from .chapter_world_branch import ChapterWorldBranchService
+            from .models import ChapterWorldBranch
+            branch_service = ChapterWorldBranchService()
+            branch = db.scalar(select(ChapterWorldBranch).where(
+                ChapterWorldBranch.id == branch_id,
+                ChapterWorldBranch.run_id == run.id,
+            ).with_for_update())
+            if not branch or branch.chapter_id != draft.chapter_id:
+                raise AutoDirectorError("AUTO_ADOPTION_WORLD_BRANCH_MISMATCH")
+            if branch.status.value != "READY":
+                raise AutoDirectorError("AUTO_ADOPTION_WORLD_BRANCH_NOT_READY")
+            branch_service.activate(db, branch)
         AutoDirectorAdoptionService().adopt(db, draft, assessment)
+        if branch and branch_service:
+            try:
+                branch_service.publish(db, branch)
+            except ValueError as exc:
+                raise AutoDirectorError(str(exc)) from exc
         from .quality import QualityRepairService
         if enum_value(draft.origin) == "QUALITY_REPAIR": QualityRepairService().adopt(db, draft_id)
         else:
             assessment.active = True
             WriterProjectionService().adopt(db, draft_id)
             QualityGateService().approve(db, assessment.id)
+        if branch:
+            from .models import ChapterWorldBranchStatus
+            branch.status = ChapterWorldBranchStatus.ADOPTED
+            branch.adopted_at = datetime.utcnow()
         # A foreshadow payoff is promoted only after the same quality
         # assessment has confirmed its prose evidence and the chapter draft is
         # formally adopted. This keeps the ledger from advancing on planning
@@ -1123,7 +1206,7 @@ class AutoDirectorOrchestrator:
         adopted_this_run = int((run.context or {}).get("adopted_this_run", 0)) + (0 if number in prior_completed else 1)
         generated_this_run = int((run.context or {}).get("generated_this_run", 0)) + (0 if number in prior_completed else 1)
         processed_this_run = int((run.context or {}).get("processed_this_run", max(int((run.context or {}).get("adopted_this_run", 0) or 0), int((run.context or {}).get("generated_this_run", 0) or 0)))) + (0 if number in prior_completed else 1)
-        run.context = {**(run.context or {}), "completed_chapters": completed, "adopted_chapters": int((run.context or {}).get("adopted_chapters", 0)) + (0 if number in prior_completed else 1), "adopted_this_run": adopted_this_run, "generated_this_run": generated_this_run, "processed_this_run": processed_this_run, "last_processed_chapter_number": number, "last_adopted_chapter_number": number, "last_adopted_chapter_id": draft.chapter_id, "last_adopted_draft_id": draft.id}
+        run.context = {**(run.context or {}), "completed_chapters": completed, "adopted_chapters": int((run.context or {}).get("adopted_chapters", 0)) + (0 if number in prior_completed else 1), "adopted_this_run": adopted_this_run, "generated_this_run": generated_this_run, "processed_this_run": processed_this_run, "last_processed_chapter_number": number, "last_adopted_chapter_number": number, "last_adopted_chapter_id": draft.chapter_id, "last_adopted_draft_id": draft.id, "chapter_world_branch_status": "ADOPTED" if branch else (run.context or {}).get("chapter_world_branch_status")}
         if run.run_mode == "FULL_AUTO" and (run.context or {}).get("volume_id"):
             from .models import VolumeContract, VolumeContractStatus
             volume = db.get(VolumeContract, run.context["volume_id"])

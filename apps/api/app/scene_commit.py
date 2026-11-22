@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from .director import DirectorContextBuilder
 from .execution_trace import ExecutionTraceRecorder, stable_fingerprint
 from .models import (
-    CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory,
+    Chapter, CharacterDecision, CharacterDecisionStatus, CharacterKnowledge, CharacterMemory,
     ExecutionStage, ExecutionStatus, KnowledgeStatus, PerformanceStatus, Project,
     ProposalStatus, ResolutionStatus, Scene, SceneCommit, SceneCommitStatus,
     SceneExecutionBinding, ScenePerformance, ScenePerformanceTurn, SceneProposal,
@@ -37,6 +37,7 @@ from .causal_ledger import CausalLedgerService
 from .scaling import ProjectHistoryProjectionService
 from .formal_state import FormalStateIdentityService
 from .retrieval_index import CognitionRetrievalProjectionService
+from .chapter_world_branch import ChapterWorldBranchService
 
 
 @dataclass
@@ -45,6 +46,14 @@ class SceneCommitResult:
     scene: Scene
     batches: list[StateDeltaBatch]
     checkpoint: SceneStateCheckpoint
+    idempotent: bool
+
+
+@dataclass
+class StagedSceneResult:
+    scene: Scene
+    batches: list[StateDeltaBatch]
+    items: list[StateDeltaItem]
     idempotent: bool
 
 
@@ -281,6 +290,12 @@ class SceneCommitService:
         performance = db.get(ScenePerformance, performance_id)
         if not performance or performance.project_id != project_id:
             raise LookupError("SCENE_COMMIT_PERFORMANCE_NOT_FOUND")
+        publishing_branch = db.info.get("publishing_chapter_world_branch")
+        branch_publish = bool(
+            publishing_branch
+            and publishing_branch.project_id == project_id
+            and performance_id in (publishing_branch.performance_ids or [])
+        )
         existing = db.scalar(select(SceneCommit).where(SceneCommit.project_id == project_id, SceneCommit.performance_id == performance_id))
         if existing and existing.status == SceneCommitStatus.COMMITTED and existing.scene_id:
             scene = db.get(Scene, existing.scene_id)
@@ -291,7 +306,8 @@ class SceneCommitService:
         if existing:
             raise ValueError("SCENE_COMMIT_INVALID_LIFECYCLE")
         allowed_pauses = {"QUIESCENT", "TURN_LIMIT", "INSUFFICIENT_ACTIVE_PARTICIPANTS"}
-        if performance.status != PerformanceStatus.RUNNING and not (performance.status == PerformanceStatus.PAUSED and performance.stop_reason in allowed_pauses):
+        staged_performance = branch_publish and performance.status == PerformanceStatus.COMPLETED and performance.stop_reason == "SCENE_STAGED"
+        if not staged_performance and performance.status != PerformanceStatus.RUNNING and not (performance.status == PerformanceStatus.PAUSED and performance.stop_reason in allowed_pauses):
             raise ValueError("SCENE_COMMIT_PERFORMANCE_NOT_READY")
         proposal = db.get(SceneProposal, performance.scene_proposal_id)
         if not proposal or proposal.project_id != project_id:
@@ -302,7 +318,7 @@ class SceneCommitService:
             raise ValueError("SCENE_COMMIT_PROPOSAL_NOT_APPROVED")
         if proposal.context_fingerprint != performance.proposal_context_fingerprint:
             raise ValueError("SCENE_COMMIT_CONTEXT_STALE")
-        if DirectorContextBuilder().build(db, project_id, planning_task=(proposal.entry_state or {}).get("planning_task"))["fingerprint"] != proposal.context_fingerprint:
+        if not branch_publish and DirectorContextBuilder().build(db, project_id, planning_task=(proposal.entry_state or {}).get("planning_task"))["fingerprint"] != proposal.context_fingerprint:
             raise ValueError("SCENE_COMMIT_CONTEXT_STALE")
         turns = db.scalars(select(ScenePerformanceTurn).where(ScenePerformanceTurn.performance_id == performance.id).order_by(ScenePerformanceTurn.sequence, ScenePerformanceTurn.id)).all()
         if not turns:
@@ -326,12 +342,20 @@ class SceneCommitService:
         # A verified current-history head is the prior formal boundary.  This
         # avoids another full snapshot scan on the normal continuous path.
         current_fingerprint, _ = FormalStateIdentityService().current(db, project_id)
+        if branch_publish:
+            current_fingerprint = publishing_branch.base_world_fingerprint
         batches: list[StateDeltaBatch] = []
         items: list[StateDeltaItem] = []
         for resolution in resolutions:
-            expected_input = StateDeltaInputFingerprintBuilder().build(resolution, next(turn for turn in turns if turn.id == resolution.performance_turn_id), performance, current_fingerprint)
+            resolution_turn = next(turn for turn in turns if turn.id == resolution.performance_turn_id)
             all_batches = db.scalars(select(StateDeltaBatch).where(StateDeltaBatch.project_id == project_id, StateDeltaBatch.source_resolution_id == resolution.id).order_by(StateDeltaBatch.id)).all()
-            current_batches = [batch for batch in all_batches if batch.input_fingerprint == expected_input]
+            if branch_publish:
+                current_batches = [batch for batch in all_batches if StateDeltaInputFingerprintBuilder().build(
+                    resolution, resolution_turn, performance, batch.base_world_fingerprint,
+                ) == batch.input_fingerprint]
+            else:
+                expected_input = StateDeltaInputFingerprintBuilder().build(resolution, resolution_turn, performance, current_fingerprint)
+                current_batches = [batch for batch in all_batches if batch.input_fingerprint == expected_input]
             if not current_batches:
                 source_unchanged = any(
                     StateDeltaInputFingerprintBuilder().build(resolution, next(turn for turn in turns if turn.id == resolution.performance_turn_id), performance, batch.base_world_fingerprint) == batch.input_fingerprint
@@ -345,7 +369,7 @@ class SceneCommitService:
             if current_batches[0].status != StateDeltaBatchStatus.VALIDATED:
                 raise ValueError("SCENE_COMMIT_DELTA_NOT_VALIDATED")
             batch = current_batches[0]
-            if batch.base_world_fingerprint != current_fingerprint or batch.validated_world_fingerprint != current_fingerprint:
+            if not branch_publish and (batch.base_world_fingerprint != current_fingerprint or batch.validated_world_fingerprint != current_fingerprint):
                 raise ValueError("SCENE_COMMIT_WORLD_STALE")
             batches.append(batch)
             batch_items = db.scalars(select(StateDeltaItem).where(StateDeltaItem.batch_id == batch.id).order_by(StateDeltaItem.ordinal, StateDeltaItem.id)).all()
@@ -362,27 +386,157 @@ class SceneCommitService:
         }, "scene-commit-source-v1")
         return CommitPreparation(project, performance, proposal, turns, decisions, resolutions, batches, items, current_fingerprint, source_fingerprint)
 
+    def stage(self, db: Session, project_id: str, performance_id: str) -> StagedSceneResult:
+        branch = ChapterWorldBranchService.active(db)
+        if not branch or branch.project_id != project_id:
+            raise ValueError("CHAPTER_WORLD_BRANCH_REQUIRED")
+        performance = db.get(ScenePerformance, performance_id)
+        if not performance or performance.project_id != project_id:
+            raise ValueError("CHAPTER_WORLD_BRANCH_PERFORMANCE_MISMATCH")
+        existing = next((scene for scene in db.scalars(select(Scene).where(
+            Scene.project_id == project_id,
+            Scene.world_branch_id == branch.id,
+        )).all() if (scene.result or {}).get("performance_id") == performance_id), None)
+        if existing:
+            batches = db.scalars(select(StateDeltaBatch).where(
+                StateDeltaBatch.source_performance_id == performance_id,
+                StateDeltaBatch.status == StateDeltaBatchStatus.VALIDATED,
+            ).order_by(StateDeltaBatch.created_at, StateDeltaBatch.id)).all()
+            items = [item for batch in batches for item in db.scalars(select(StateDeltaItem).where(
+                StateDeltaItem.batch_id == batch.id,
+            ).order_by(StateDeltaItem.ordinal, StateDeltaItem.id)).all()]
+            return StagedSceneResult(existing, batches, items, True)
+
+        prepared = self.preflight(db, project_id, performance_id)
+        if isinstance(prepared, SceneCommitResult):
+            raise ValueError("CHAPTER_WORLD_BRANCH_ALREADY_PUBLISHED")
+        next_sequence = (db.scalar(select(func.max(Scene.sequence)).where(
+            Scene.project_id == project_id,
+            Scene.history_status == "ACTIVE",
+        )) or 0) + len(branch.scene_ids or []) + 1
+        branch_service = ChapterWorldBranchService()
+        project_state = branch_service.effective_record(db, prepared.project)
+        resolutions_by_turn = {resolution.performance_turn_id: resolution for resolution in prepared.resolutions}
+        facts = [
+            fact
+            for turn in prepared.turns
+            for fact in sorted(
+                resolutions_by_turn.get(turn.id).objective_facts if resolutions_by_turn.get(turn.id) else [],
+                key=lambda value: stable_fingerprint(value, "scene-fact-v1"),
+            )
+        ]
+        scene = Scene(
+            project_id=project_id,
+            world_branch_id=branch.id,
+            sequence=next_sequence,
+            world_time=project_state.get("current_world_time"),
+            location=prepared.proposal.location_id or prepared.proposal.proposed_location,
+            participants=list(prepared.performance.participant_order or []),
+            intent=prepared.proposal.scene_goal,
+            facts=facts,
+            result={
+                "chapter_boundary_id": f"auto:{branch.run_id}:{branch.chapter_number}",
+                "proposal_id": prepared.proposal.id,
+                "performance_id": performance_id,
+                "turns": [{"decision_id": turn.character_decision_id, "turn_id": turn.id} for turn in prepared.turns],
+                "resolutions": [{"turn_id": resolution.performance_turn_id, "resolution_id": resolution.id, "outcome": getattr(resolution.outcome, "value", resolution.outcome), "outcome_summary": resolution.outcome_summary} for resolution in prepared.resolutions],
+                "state_delta_batch_ids": [batch.id for batch in prepared.batches],
+                "applied_item_count": len(prepared.items),
+            },
+            summary=None,
+            story_threads=([prepared.proposal.primary_thread_id] if prepared.proposal.primary_thread_id else []),
+            status=SceneStatus.OCCURRED,
+            history_status="STAGED",
+        )
+        previous_sync = db.info.get("formal_state_sync_in_progress")
+        db.info["formal_state_sync_in_progress"] = True
+        try:
+            db.add(scene)
+            db.flush()
+            db.add(SceneExecutionBinding(
+                project_id=project_id,
+                scene_id=scene.id,
+                performance_id=performance_id,
+                replay_session_id=None,
+                active=False,
+            ))
+            knowledge, memories = self.cognition_builder.build(
+                db, scene, prepared.performance, prepared.turns,
+                resolutions_by_turn, prepared.items,
+            )
+            for row in knowledge:
+                row.id = row.id or __import__("app.models", fromlist=["new_id"]).new_id()
+            for row in memories:
+                row.id = row.id or __import__("app.models", fromlist=["new_id"]).new_id()
+            branch_service.apply_items(db, branch, prepared.items)
+            branch_service.stage_cognition(
+                branch,
+                scene.id,
+                [self._knowledge_payload(item) for item in knowledge],
+                [self._memory_payload(item) for item in memories],
+            )
+            branch_service.add_scene(db, branch, scene, performance_id, prepared.items)
+            prepared.performance.status = PerformanceStatus.COMPLETED
+            prepared.performance.stop_reason = "SCENE_STAGED"
+            db.flush()
+        finally:
+            if previous_sync is None:
+                db.info.pop("formal_state_sync_in_progress", None)
+            else:
+                db.info["formal_state_sync_in_progress"] = previous_sync
+        return StagedSceneResult(scene, prepared.batches, prepared.items, False)
+
+    @staticmethod
+    def _knowledge_payload(row: CharacterKnowledge) -> dict[str, Any]:
+        return {"id": row.id, "character_id": row.character_id, "proposition": row.proposition, "status": getattr(row.status, "value", row.status), "source": row.source, "confidence": row.confidence}
+
+    @staticmethod
+    def _memory_payload(row: CharacterMemory) -> dict[str, Any]:
+        return {"id": row.id, "character_id": row.character_id, "content": row.content, "importance": row.importance, "emotional_weight": row.emotional_weight, "confidence": row.confidence, "distortion": row.distortion or {}, "source_scene": row.source_scene, "happened_at": row.happened_at.isoformat() if row.happened_at else None}
+
     def commit(self, db: Session, project_id: str, performance_id: str) -> SceneCommitResult:
         prepared = self.preflight(db, project_id, performance_id)
         if isinstance(prepared, SceneCommitResult):
             return prepared
+        publishing_branch = db.info.get("publishing_chapter_world_branch")
+        staged_scene = None
+        if publishing_branch and performance_id in (publishing_branch.performance_ids or []):
+            staged_scene = next((row for row in db.scalars(select(Scene).where(
+                Scene.project_id == project_id,
+                Scene.world_branch_id == publishing_branch.id,
+            )).all() if (row.result or {}).get("performance_id") == performance_id), None)
+            if not staged_scene:
+                raise ValueError("CHAPTER_WORLD_BRANCH_SCENE_MISSING")
         db.info["formal_state_sync_in_progress"] = True
         # PRE_SCENE_COMMIT remains the global legacy audit boundary.  The
         # current-history boundary is always the v3 service checkpoint.
         pre_snapshot = SceneCheckpointService().capture_formal_pre(db, project_id)
         mutation_guard = SceneCommitFormalMutationGuard(db)
+        if publishing_branch and staged_scene and publishing_branch.chapter_id:
+            branch_chapter = db.get(Chapter, publishing_branch.chapter_id)
+            if branch_chapter and branch_chapter.world_branch_id == publishing_branch.id:
+                branch_chapter.world_branch_id = None
         record = SceneCommit(project_id=project_id, proposal_id=prepared.proposal.id, performance_id=prepared.performance.id, status=SceneCommitStatus.PENDING, delta_batch_ids=[batch.id for batch in prepared.batches], pre_snapshot_id=pre_snapshot.id, pre_world_fingerprint=prepared.pre_fingerprint, source_fingerprint=prepared.source_fingerprint)
         db.add(record)
         db.flush()
         db.info["scene_commit_mutation_guard"] = mutation_guard
+        from .chapter_world_branch import BRANCH_MODE_INFO_KEY
+        active_branch = db.info.pop(BRANCH_MODE_INFO_KEY, None) if staged_scene else None
         try:
             self.apply_engine.apply(db, project_id, prepared.items)
+            if staged_scene and self.apply_verifier:
+                self.apply_verifier(db, prepared)
+                mutation_guard.observe()
+                self.apply_engine.verify(db, project_id, prepared.items)
         finally:
+            if active_branch is not None:
+                db.info[BRANCH_MODE_INFO_KEY] = active_branch
             db.info.pop("scene_commit_mutation_guard", None)
         if self.apply_verifier:
-            self.apply_verifier(db, prepared)
-            mutation_guard.observe()
-            self.apply_engine.verify(db, project_id, prepared.items)
+            if not staged_scene:
+                self.apply_verifier(db, prepared)
+                mutation_guard.observe()
+                self.apply_engine.verify(db, project_id, prepared.items)
         # The current snapshot head is committed under the same Project lock
         # and records the latest active Scene sequence.  Prefer that bounded
         # temporal boundary over an aggregate across all historical Scenes.
@@ -408,11 +562,30 @@ class SceneCommitService:
                 key=lambda value: stable_fingerprint(value, "scene-fact-v1"),
             )
         ]
-        scene = Scene(project_id=project_id, sequence=sequence, world_time=prepared.project.current_world_time, location=prepared.proposal.location_id or prepared.proposal.proposed_location, participants=list(prepared.performance.participant_order or []), intent=prepared.proposal.scene_goal, facts=facts, result={"proposal_id": prepared.proposal.id, "performance_id": prepared.performance.id, "turns": [{"decision_id": turn.character_decision_id, "turn_id": turn.id} for turn in prepared.turns], "resolutions": [{"turn_id": resolution.performance_turn_id, "resolution_id": resolution.id, "outcome": getattr(resolution.outcome, "value", resolution.outcome), "outcome_summary": resolution.outcome_summary} for resolution in prepared.resolutions], "state_delta_batch_ids": [batch.id for batch in prepared.batches], "applied_item_count": len(prepared.items)}, summary=None, story_threads=([prepared.proposal.primary_thread_id] if prepared.proposal.primary_thread_id else []), status=SceneStatus.OCCURRED, history_status="ACTIVE")
-        db.add(scene); mutation_guard.observe(); db.flush()
-        binding = SceneExecutionBinding(project_id=project_id, scene_id=scene.id, performance_id=prepared.performance.id, replay_session_id=None, active=True)
-        db.add(binding)
-        knowledge, memories = self.cognition_builder.build(db, scene, prepared.performance, prepared.turns, resolutions_by_turn, prepared.items)
+        scene = staged_scene or Scene(project_id=project_id, sequence=sequence, world_time=prepared.project.current_world_time, location=prepared.proposal.location_id or prepared.proposal.proposed_location, participants=list(prepared.performance.participant_order or []), intent=prepared.proposal.scene_goal, facts=facts, result={"proposal_id": prepared.proposal.id, "performance_id": prepared.performance.id, "turns": [{"decision_id": turn.character_decision_id, "turn_id": turn.id} for turn in prepared.turns], "resolutions": [{"turn_id": resolution.performance_turn_id, "resolution_id": resolution.id, "outcome": getattr(resolution.outcome, "value", resolution.outcome), "outcome_summary": resolution.outcome_summary} for resolution in prepared.resolutions], "state_delta_batch_ids": [batch.id for batch in prepared.batches], "applied_item_count": len(prepared.items)}, summary=None, story_threads=([prepared.proposal.primary_thread_id] if prepared.proposal.primary_thread_id else []), status=SceneStatus.OCCURRED, history_status="ACTIVE")
+        if staged_scene:
+            if scene.sequence != sequence or scene.result.get("performance_id") != performance_id:
+                raise ValueError("CHAPTER_WORLD_BRANCH_SCENE_CHANGED")
+            scene.world_branch_id = None
+            scene.history_status = "ACTIVE"
+            scene.status = SceneStatus.OCCURRED
+        else:
+            db.add(scene)
+        mutation_guard.observe(); db.flush()
+        binding = db.scalar(select(SceneExecutionBinding).where(
+            SceneExecutionBinding.project_id == project_id,
+            SceneExecutionBinding.scene_id == scene.id,
+        ))
+        if binding:
+            binding.active = True
+        else:
+            binding = SceneExecutionBinding(project_id=project_id, scene_id=scene.id, performance_id=prepared.performance.id, replay_session_id=None, active=True)
+            db.add(binding)
+        if staged_scene and publishing_branch:
+            staged_cognition = (publishing_branch.staged_cognition or {}).get("scenes", {}).get(scene.id, {})
+            knowledge, memories = self._materialize_staged_cognition(staged_cognition)
+        else:
+            knowledge, memories = self.cognition_builder.build(db, scene, prepared.performance, prepared.turns, resolutions_by_turn, prepared.items)
         db.add_all(knowledge + memories)
         # The sibling lookup below may autoflush new cognition, so capture the
         # bounded formal manifest before any query can clear Session.new.
@@ -449,6 +622,7 @@ class SceneCommitService:
             knowledge=knowledge,
             memories=memories,
             structure_chapter_ids=structure_chapter_ids,
+            allow_existing_scene=bool(staged_scene),
         )
         checkpoint, post_snapshot = SceneCheckpointService().create_normal_checkpoint(
             db, project_id, scene, pre_snapshot, items=prepared.items, knowledge=knowledge,
@@ -493,6 +667,31 @@ class SceneCommitService:
         if self.failure_injector:
             self.failure_injector("AFTER_SCENE_COMMIT_MATERIALIZATION")
         return SceneCommitResult(record, scene, prepared.batches, checkpoint, False)
+
+    @staticmethod
+    def _materialize_staged_cognition(payload: dict[str, Any]) -> tuple[list[CharacterKnowledge], list[CharacterMemory]]:
+        from .models import new_id
+
+        knowledge = [CharacterKnowledge(
+            id=item.get("id") or new_id(),
+            character_id=item["character_id"],
+            proposition=item["proposition"],
+            status=KnowledgeStatus(item["status"]),
+            source=item.get("source"),
+            confidence=float(item.get("confidence", 1.0)),
+        ) for item in (payload.get("knowledge") or [])]
+        memories = [CharacterMemory(
+            id=item.get("id") or new_id(),
+            character_id=item["character_id"],
+            content=item["content"],
+            importance=float(item.get("importance", 0.5)),
+            emotional_weight=float(item.get("emotional_weight", 0.0)),
+            confidence=float(item.get("confidence", 1.0)),
+            distortion=item.get("distortion") or {},
+            source_scene=item.get("source_scene"),
+            happened_at=datetime.fromisoformat(item["happened_at"]) if item.get("happened_at") else None,
+        ) for item in (payload.get("memories") or [])]
+        return knowledge, memories
 
     def _verify_items(self, db: Session, project_id: str, batch: StateDeltaBatch, resolution: WorldResolution, items: list[StateDeltaItem]) -> None:
         translated, translation_issues = self.delta_translator.translate(resolution)

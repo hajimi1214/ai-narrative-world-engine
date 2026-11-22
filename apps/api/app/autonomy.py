@@ -15,6 +15,7 @@ from .director import DirectorCandidateEngine, DirectorConstraintChecker, Direct
 from .models import (AutonomousRunStatus, AutonomousStepStatus, AutonomousWorldRun, AutonomousWorldStep, CharacterDecision, CharacterDecisionStatus, DecisionType, DirectorDecisionLog, ExecutionStage, ExecutionStatus, PerformanceMode, PerformanceStatus, ProposalStatus, Project, Scene, SceneProposal, ScenePerformance, ScenePerformanceTurn, ResolverMode, StateDeltaBatch, StateDeltaItem, WorldResolution)
 from .performance import TurnScheduler
 from .scene_commit import SceneCommitService
+from .chapter_world_branch import ChapterWorldBranchService
 from .versioning import WorldSnapshotBuilder
 from .retcon_apply import RetconPendingReplayGuard
 from .world_resolution import WorldResolutionContextBuilder
@@ -33,6 +34,18 @@ class AutonomousWorldLoopService:
     runnable_pause_reasons = {"QUIESCENT", "TURN_LIMIT", "INSUFFICIENT_ACTIVE_PARTICIPANTS"}
     default_stagnation_limit = 3
     failure_injector = None
+
+    @staticmethod
+    def _activate_chapter_branch(db: Session, run: AutonomousWorldRun):
+        branch_id = (run.config or {}).get("chapter_world_branch_id")
+        if not branch_id:
+            return None
+        from .models import ChapterWorldBranch
+        branch = db.get(ChapterWorldBranch, branch_id)
+        if not branch or branch.project_id != run.project_id:
+            raise ValueError("CHAPTER_WORLD_BRANCH_NOT_FOUND")
+        ChapterWorldBranchService().activate(db, branch)
+        return branch
 
     @staticmethod
     def _validate_chapter_task(db: Session, performance: ScenePerformance, proposal: SceneProposal) -> tuple[bool, dict[str, Any]]:
@@ -138,6 +151,7 @@ class AutonomousWorldLoopService:
 
     def resume(self, db: Session, run_id: str) -> AutonomousWorldRun:
         run = self._run(db, run_id)
+        self._activate_chapter_branch(db, run)
         if run.status in self.terminal: raise ValueError("AUTONOMY_RUN_NOT_RESUMABLE")
         RetconPendingReplayGuard().assert_progression_allowed(db, run.project_id)
         sequence, fingerprint = self._fingerprint(db, run.project_id)
@@ -272,6 +286,7 @@ class AutonomousWorldLoopService:
     def continue_step(self, db: Session, run: AutonomousWorldRun, step: AutonomousWorldStep, *, usage_collector=None) -> AutonomousWorldStep:
         """Resume a paused step without regenerating proposal/performance."""
         run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run.id).with_for_update())
+        branch = self._activate_chapter_branch(db, run)
         project = db.scalar(select(Project).where(Project.id == run.project_id).with_for_update())
         if not project or run.status != AutonomousRunStatus.RUNNING:
             raise ValueError("AUTONOMY_RUN_NOT_RUNNING")
@@ -293,11 +308,16 @@ class AutonomousWorldLoopService:
         if not self._drive_performance(db, run, step, performance, proposal, usage_collector=usage_collector):
             return step
         performance_stop_reason = performance.stop_reason
-        result = SceneCommitService().commit(db, run.project_id, performance.id)
+        result = SceneCommitService().stage(db, run.project_id, performance.id) if branch else SceneCommitService().commit(db, run.project_id, performance.id)
         if self.failure_injector:
             self.failure_injector("AFTER_SCENE_COMMIT_BEFORE_STEP_FINALIZATION", run, step)
         _, after = self._fingerprint(db, run.project_id)
-        step.status = AutonomousStepStatus.COMMITTED; step.stage = "COMMITTED"; step.stop_reason = performance_stop_reason; step.scene_commit_id = result.commit.id; step.scene_id = result.scene.id; step.checkpoint_id = result.checkpoint.id; step.scene_sequence_after = result.scene.sequence; step.world_fingerprint_after = after; step.turn_count = performance.turn_count; step.resolution_count = db.scalar(select(func.count(WorldResolution.id)).where(WorldResolution.performance_id == performance.id)) or 0; step.delta_batch_ids = [batch.id for batch in result.batches]; step.step_output_fingerprint = stable_fingerprint({"scene_id": result.scene.id, "sequence": result.scene.sequence, "commit": result.commit.commit_fingerprint, "checkpoint": result.checkpoint.checkpoint_fingerprint, "world": after}, "autonomous-step-output-v1"); step.completed_at = datetime.utcnow(); run.committed_scene_count += 1; run.last_committed_sequence = result.scene.sequence; run.current_world_fingerprint = after; run.current_history_fingerprint = self._history_fingerprint(db, run.project_id); run.stop_reason = None
+        scene_commit = getattr(result, "commit", None)
+        checkpoint = getattr(result, "checkpoint", None)
+        step.status = AutonomousStepStatus.COMMITTED; step.stage = "STAGED" if branch else "COMMITTED"; step.stop_reason = performance_stop_reason; step.scene_commit_id = scene_commit.id if scene_commit else None; step.scene_id = result.scene.id; step.checkpoint_id = checkpoint.id if checkpoint else None; step.scene_sequence_after = result.scene.sequence; step.world_fingerprint_after = after; step.turn_count = performance.turn_count; step.resolution_count = db.scalar(select(func.count(WorldResolution.id)).where(WorldResolution.performance_id == performance.id)) or 0; step.delta_batch_ids = [batch.id for batch in result.batches]; step.step_output_fingerprint = stable_fingerprint({"scene_id": result.scene.id, "sequence": result.scene.sequence, "commit": scene_commit.commit_fingerprint if scene_commit else None, "checkpoint": checkpoint.checkpoint_fingerprint if checkpoint else None, "branch_fingerprint": branch.current_fingerprint if branch else None, "world": after}, "autonomous-step-output-v1"); step.completed_at = datetime.utcnow(); run.committed_scene_count += 1
+        if not branch:
+            run.last_committed_sequence = result.scene.sequence
+        run.current_world_fingerprint = after; run.current_history_fingerprint = self._history_fingerprint(db, run.project_id); run.stop_reason = None
         self._refresh_run_fingerprint(db, run)
         self._apply_stagnation_guard(db, run)
         return step
@@ -305,6 +325,7 @@ class AutonomousWorldLoopService:
     def advance_one_scene(self, db: Session, run: AutonomousWorldRun, request_key: str, request_offset: int, *, usage_collector=None) -> AutonomousWorldStep:
         RetconPendingReplayGuard().assert_progression_allowed(db, run.project_id)
         run = db.scalar(select(AutonomousWorldRun).where(AutonomousWorldRun.id == run.id).with_for_update())
+        branch = self._activate_chapter_branch(db, run)
         project = db.scalar(select(Project).where(Project.id == run.project_id).with_for_update())
         if not project or run.status != AutonomousRunStatus.RUNNING:
             raise ValueError("AUTONOMY_RUN_NOT_RUNNING")
@@ -339,7 +360,8 @@ class AutonomousWorldLoopService:
             if getattr(selected.proposal_type, "value", selected.proposal_type) == "NEW_THREAD":
                 ExecutionTraceRecorder().block(trace, "AUTONOMY_AUTHOR_INTERVENTION_REQUIRED")
                 return self._blocked(step, run, "AUTONOMY_AUTHOR_INTERVENTION_REQUIRED")
-            proposal = SceneProposal(project_id=run.project_id, context_fingerprint=context["fingerprint"], status=ProposalStatus.APPROVED, **DirectorProposalFactory().create(run.project_id, context, gravity, selected))
+            proposal_data = DirectorProposalFactory().create(run.project_id, context, gravity, selected)
+            proposal = SceneProposal(project_id=run.project_id, context_fingerprint=context["fingerprint"], status=ProposalStatus.APPROVED, **proposal_data)
             if (run.config or {}).get("auto_director_run_id"):
                 proposal.entry_state = {**(proposal.entry_state or {}), "auto_director_run_id": (run.config or {}).get("auto_director_run_id")}
             db.add(proposal); db.flush()
@@ -363,12 +385,17 @@ class AutonomousWorldLoopService:
                 self._blocked(step, run, "CHAPTER_TASK_CONTRACT_FAILED", stage="TASK_VALIDATION")
                 return step
             performance_stop_reason = performance.stop_reason
-            result = SceneCommitService().commit(db, run.project_id, performance.id)
+            result = SceneCommitService().stage(db, run.project_id, performance.id) if branch else SceneCommitService().commit(db, run.project_id, performance.id)
             if self.failure_injector:
                 self.failure_injector("AFTER_SCENE_COMMIT_BEFORE_STEP_FINALIZATION", run, step)
             _, after = self._fingerprint(db, run.project_id)
             history_after = self._history_fingerprint(db, run.project_id)
-            step.status = AutonomousStepStatus.COMMITTED; step.stage = "COMMITTED"; step.stop_reason = performance_stop_reason; step.scene_commit_id = result.commit.id; step.scene_id = result.scene.id; step.checkpoint_id = result.checkpoint.id; step.scene_sequence_after = result.scene.sequence; step.world_fingerprint_after = after; step.turn_count = performance.turn_count; step.resolution_count = db.scalar(select(func.count(WorldResolution.id)).where(WorldResolution.performance_id == performance.id)) or 0; step.delta_batch_ids = [batch.id for batch in result.batches]; step.step_output_fingerprint = stable_fingerprint({"scene_id": result.scene.id, "sequence": result.scene.sequence, "commit": result.commit.commit_fingerprint, "checkpoint": result.checkpoint.checkpoint_fingerprint, "world": after}, "autonomous-step-output-v1"); step.completed_at = datetime.utcnow(); run.committed_scene_count += 1; run.last_committed_sequence = result.scene.sequence; run.current_world_fingerprint = after; run.current_history_fingerprint = history_after; run.status = AutonomousRunStatus.RUNNING; run.stop_reason = None
+            scene_commit = getattr(result, "commit", None)
+            checkpoint = getattr(result, "checkpoint", None)
+            step.status = AutonomousStepStatus.COMMITTED; step.stage = "STAGED" if branch else "COMMITTED"; step.stop_reason = performance_stop_reason; step.scene_commit_id = scene_commit.id if scene_commit else None; step.scene_id = result.scene.id; step.checkpoint_id = checkpoint.id if checkpoint else None; step.scene_sequence_after = result.scene.sequence; step.world_fingerprint_after = after; step.turn_count = performance.turn_count; step.resolution_count = db.scalar(select(func.count(WorldResolution.id)).where(WorldResolution.performance_id == performance.id)) or 0; step.delta_batch_ids = [batch.id for batch in result.batches]; step.step_output_fingerprint = stable_fingerprint({"scene_id": result.scene.id, "sequence": result.scene.sequence, "commit": scene_commit.commit_fingerprint if scene_commit else None, "checkpoint": checkpoint.checkpoint_fingerprint if checkpoint else None, "branch_fingerprint": branch.current_fingerprint if branch else None, "world": after}, "autonomous-step-output-v1"); step.completed_at = datetime.utcnow(); run.committed_scene_count += 1
+            if not branch:
+                run.last_committed_sequence = result.scene.sequence
+            run.current_world_fingerprint = after; run.current_history_fingerprint = history_after; run.status = AutonomousRunStatus.RUNNING; run.stop_reason = None
             self._refresh_run_fingerprint(db, run)
             ExecutionTraceRecorder().succeed(trace, output_fingerprint=step.step_output_fingerprint)
             self._apply_stagnation_guard(db, run)

@@ -44,7 +44,22 @@ def _resign(archive):
     return archive
 
 
-def _author_project(db):
+def _author_project(db, monkeypatch):
+    monkeypatch.setattr(
+        AuthorGuidedVolumeService,
+        "_chapter_evidence",
+        lambda self, session, chapter: {"assessment_id": "fixture", "evidence": []},
+    )
+    monkeypatch.setattr(
+        AuthorGuidedVolumeService,
+        "_chapter_scenes_published",
+        staticmethod(lambda session, chapter: True),
+    )
+    monkeypatch.setattr(
+        AuthorGuidedVolumeService,
+        "_formal_world_matches_target",
+        lambda self, session, volume: True,
+    )
     project = Project(name="卷级恢复", story_seed="渡口的秘密")
     db.add(project); db.flush()
     location = WorldEntity(project_id=project.id, entity_type="LOCATION", name="渡口")
@@ -78,8 +93,8 @@ def _author_project(db):
     return project, actor, volume, snapshot, second_volume
 
 
-def test_author_state_roundtrip_preserves_seals_and_continues_planning(db):
-    source, actor, first, original_snapshot, second = _author_project(db)
+def test_author_state_roundtrip_preserves_seals_and_continues_planning(db, monkeypatch):
+    source, actor, first, original_snapshot, second = _author_project(db, monkeypatch)
     service = ProjectBackupService()
     archive = service.export(db, source.id)
     author_tables = {"book_contracts", "volume_contracts", "chapter_planning_windows", "volume_continuity_snapshots", "foreshadowing_ledger", "author_guidance", "book_completion_proposals"}
@@ -200,8 +215,8 @@ def test_legacy_v1_archive_with_missing_draft_history_still_restores(db):
 
 
 @pytest.mark.parametrize("tamper", ["owner", "fk", "json_reference", "json_key", "duplicate", "missing_sealed_snapshot"])
-def test_restore_rejects_foreign_or_dangling_author_references_before_insertion(db, tamper):
-    source, actor, volume, snapshot, second = _author_project(db)
+def test_restore_rejects_foreign_or_dangling_author_references_before_insertion(db, tamper, monkeypatch):
+    source, actor, volume, snapshot, second = _author_project(db, monkeypatch)
     outsider = Project(name="外来项目")
     db.add(outsider); db.flush()
     outsider_actor = Character(project_id=outsider.id, name="外来角色")

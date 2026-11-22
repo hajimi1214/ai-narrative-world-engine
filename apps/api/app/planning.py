@@ -144,6 +144,11 @@ def required_event_specs(task: dict[str, Any] | None) -> list[dict[str, Any]]:
 def event_match(spec: dict[str, Any], observed_refs: set[str], text: str) -> str | None:
     if spec.get("event_ref") in observed_refs:
         return "EVENT_REF"
+    normalized_refs = {normalize_event_text(item) for item in observed_refs}
+    if normalize_event_text(spec.get("label", "")) in normalized_refs or any(
+        normalize_event_text(alias) in normalized_refs for alias in spec.get("aliases", [])
+    ):
+        return "SCENE_BEAT_REF"
     normalized_text = normalize_event_text(text)
     aliases = [*spec.get("aliases", []), spec.get("label", "")]
     if any(normalize_event_text(item) and normalize_event_text(item) in normalized_text for item in aliases):

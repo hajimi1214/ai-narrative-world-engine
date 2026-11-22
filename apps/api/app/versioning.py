@@ -31,6 +31,8 @@ class WorldSnapshotBuilder:
         for model in self.MODELS:
             if model in (CharacterKnowledge, CharacterMemory):
                 rows = db.scalars(select(model).where(model.character_id.in_(character_ids)).order_by(model.id)).all() if character_ids else []
+            elif model in (Scene, Chapter):
+                rows = db.scalars(select(model).where(model.project_id == project_id, model.world_branch_id.is_(None)).order_by(model.id)).all()
             else:
                 rows = db.scalars(select(model).where(model.project_id == project_id).order_by(model.id)).all()
             values = []

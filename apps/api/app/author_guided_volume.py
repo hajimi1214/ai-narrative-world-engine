@@ -19,13 +19,16 @@ from .models import (
     AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage,
     AutoDirectorStep, AutoDirectorStepStatus,
     BookCompletionProposal, BookCompletionProposalStatus, BookContract,
-    Chapter, ChapterPlanningWindow, ChapterWindowStatus, ForeshadowingLedger,
+    Chapter, ChapterPlanningWindow, ChapterQualityAssessment, ChapterWorldBranch,
+    ChapterWindowStatus, ChapterWriterDraft, ForeshadowingLedger,
     ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus,
     VolumeContinuitySnapshot, StoryPlan, StoryPlanChapter, StoryPlanStatus,
-    Character, CharacterKnowledge, KnowledgeStatus, PlanChapterStatus,
+    Character, CharacterKnowledge, KnowledgeStatus, PlanChapterStatus, Scene,
+    StoryThread, WorldEntity,
     StoryPlanVolume,
 )
-from .planning import _default_chapter, persist_plan, validate_plan_references
+from .planning import _default_chapter, event_spec, persist_plan, validate_plan_references
+from .revision import _record
 
 
 def _fingerprint(value: Any) -> str:
@@ -118,6 +121,179 @@ class AuthorGuidedVolumeError(RuntimeError):
 
 class AuthorGuidedVolumeService:
     WINDOW_SIZE = 5
+
+    @staticmethod
+    def _contains_state(actual: Any, expected: Any) -> bool:
+        if isinstance(expected, dict):
+            if not isinstance(actual, dict):
+                return False
+            if all(
+                key in actual and AuthorGuidedVolumeService._contains_state(actual[key], value)
+                for key, value in expected.items()
+            ):
+                return True
+            return any(
+                AuthorGuidedVolumeService._contains_state(value, expected)
+                for value in actual.values()
+                if isinstance(value, (dict, list))
+            )
+        if isinstance(expected, list):
+            return isinstance(actual, list) and actual == expected
+        if isinstance(expected, bool):
+            return isinstance(actual, bool) and actual is expected
+        return actual == expected
+
+    @staticmethod
+    def _event_requirement_ref(requirement: Any) -> str:
+        return f"must_events:{event_spec(requirement, 'must_events')['event_ref']}"
+
+    def _chapter_evidence(self, db: Session, chapter: Chapter) -> dict[str, Any] | None:
+        if (
+            chapter.status not in {"QUALITY_APPROVED", "ADOPTED"}
+            or not chapter.content
+            or chapter.world_branch_id is not None
+            or chapter.pending_world_branch_id is not None
+        ):
+            return None
+        if chapter.source_world_branch_id:
+            branch = db.get(ChapterWorldBranch, chapter.source_world_branch_id)
+            if (
+                not branch
+                or branch.project_id != chapter.project_id
+                or branch.chapter_id != chapter.id
+                or _enum(branch.status) != "ADOPTED"
+            ):
+                return None
+
+        assessment = db.get(ChapterQualityAssessment, chapter.current_quality_assessment_id) if chapter.current_quality_assessment_id else None
+        draft = db.get(ChapterWriterDraft, chapter.current_writer_draft_id) if chapter.current_writer_draft_id else None
+        if (
+            not assessment
+            or assessment.chapter_id != chapter.id
+            or assessment.active is not True
+            or _enum(assessment.status) != "PASS"
+            or not assessment.approved_at
+            or not draft
+            or _enum(draft.status) != "ADOPTED"
+            or not draft.adopted_at
+            or draft.content != chapter.content
+            or draft.content_fingerprint != assessment.content_fingerprint
+            or chapter.quality_content_fingerprint != assessment.content_fingerprint
+        ):
+            return None
+
+        try:
+            from .quality import QualityAssessmentAudit, validate_required_event_evidence
+
+            QualityAssessmentAudit().audit(db, assessment.id)
+            task = (draft.source_manifest or {}).get("planning_task")
+            if validate_required_event_evidence(
+                draft.content or "", task, assessment.critic_report,
+                draft.content_fingerprint,
+            ):
+                return None
+        except Exception:
+            return None
+
+        event_evidence = (assessment.critic_report or {}).get("mandatory_event_evidence") or {}
+        return {
+            "assessment_id": assessment.id,
+            "evidence": [
+                item for item in event_evidence.get("evidence", [])
+                if item.get("verified") is True
+                and item.get("content_fingerprint") == draft.content_fingerprint
+            ],
+        }
+
+    @staticmethod
+    def _chapter_scenes_published(db: Session, chapter: Chapter) -> bool:
+        scene_ids = list(chapter.source_scene_ids or [])
+        if not scene_ids or len(scene_ids) != len(set(scene_ids)):
+            return False
+        if chapter.source_world_branch_id:
+            branch = db.get(ChapterWorldBranch, chapter.source_world_branch_id)
+            if (
+                not branch
+                or branch.chapter_id != chapter.id
+                or _enum(branch.status) != "ADOPTED"
+                or list(branch.scene_ids or []) != scene_ids
+            ):
+                return False
+        scenes = db.scalars(select(Scene).where(
+            Scene.project_id == chapter.project_id,
+            Scene.id.in_(scene_ids),
+        )).all()
+        return len(scenes) == len(scene_ids) and all(
+            scene.history_status == "ACTIVE"
+            and _enum(scene.status) == "OCCURRED"
+            and scene.world_branch_id is None
+            for scene in scenes
+        )
+
+    def _formal_world_matches_target(self, db: Session, volume: VolumeContract) -> bool:
+        target = volume.target_closing_state or {}
+        if not isinstance(target, dict) or not target:
+            return False
+
+        project = db.get(Project, volume.project_id)
+        if not project:
+            return False
+        state = {
+            "project": _record(project),
+            "characters": [_record(row) for row in db.scalars(select(Character).where(Character.project_id == volume.project_id)).all()],
+            "world_entities": [_record(row) for row in db.scalars(select(WorldEntity).where(WorldEntity.project_id == volume.project_id)).all()],
+            "story_threads": [_record(row) for row in db.scalars(select(StoryThread).where(StoryThread.project_id == volume.project_id)).all()],
+        }
+        collections = {"characters", "world_entities", "story_threads"}
+        if any(key in target for key in ("project", *collections)):
+            for collection, expected in target.items():
+                if collection == "project":
+                    if not self._contains_state(state["project"], expected):
+                        return False
+                    continue
+                if collection not in collections or not isinstance(expected, dict):
+                    return False
+                rows = {row["id"]: row for row in state[collection]}
+                if all(key in rows for key in expected):
+                    if not all(self._contains_state(rows[key], value) for key, value in expected.items()):
+                        return False
+                elif not any(self._contains_state(row, expected) for row in state[collection]):
+                    return False
+            return True
+
+        formal_rows = [state["project"], *state["characters"], *state["world_entities"], *state["story_threads"]]
+        return any(self._contains_state(row, target) for row in formal_rows)
+
+    @staticmethod
+    def _has_event_evidence(requirement: Any, evidence_by_chapter: dict[str, dict[str, Any]]) -> bool:
+        requirement_ref = AuthorGuidedVolumeService._event_requirement_ref(requirement)
+        return any(
+            item.get("requirement_ref") == requirement_ref
+            for chapter in evidence_by_chapter.values()
+            for item in chapter["evidence"]
+        )
+
+    def _volume_chapters_and_evidence(
+        self, db: Session, volume: VolumeContract,
+    ) -> tuple[list[Chapter], list[Chapter], dict[str, dict[str, Any]]]:
+        start = volume.actual_chapter_start or volume.estimated_chapter_start or 1
+        query = select(Chapter).where(
+            Chapter.project_id == volume.project_id,
+            Chapter.number >= start,
+            Chapter.active.is_(True),
+        )
+        if volume.actual_chapter_end is not None:
+            query = query.where(Chapter.number <= volume.actual_chapter_end)
+        chapters = db.scalars(query.order_by(Chapter.number)).all()
+        adopted: list[Chapter] = []
+        evidence_by_chapter: dict[str, dict[str, Any]] = {}
+        for chapter in chapters:
+            evidence = self._chapter_evidence(db, chapter)
+            if evidence is None or not self._chapter_scenes_published(db, chapter):
+                continue
+            adopted.append(chapter)
+            evidence_by_chapter[chapter.id] = evidence
+        return chapters, adopted, evidence_by_chapter
 
     @staticmethod
     def _lock_volume(db: Session, volume: VolumeContract) -> VolumeContract:
@@ -376,7 +552,8 @@ class AuthorGuidedVolumeService:
             "volume": _volume_payload(volume), "author_note": window.author_note,
         }
         framing = {"target_words_per_chapter": project.target_chapter_words, "pov": style.get("pov", "THIRD_PERSON_LIMITED"), "author_window_id": window.id, "continuity_constraints": continuity, "author_planning_context": planning_input}
-        chapters = [{"number": number, "volume_number": volume.volume_number, "arc_number": 1, "title": f"第{number}章", "summary": goal, "objective": f"{goal}，并形成可验证的后果", "conflict": conflict, "must_events": volume.required_events or [], "forbidden_events": forbidden, "allowed_reveals": (volume.allowed_reveals or []) + continuity["touchable_foreshadowings"], "forbidden_reveals": _forbidden_reveal_refs((volume.forbidden_reveals or []) + continuity["forbidden_to_reveal"]), "foreshadow_create": [], "foreshadow_payoff": continuity["payoffable_foreshadowings"], "scene_beats": ["建立本章局势", "形成关键选择", "留下可验证后果"], "locked": False} for number in range(window.start_chapter_number, window.end_chapter_number + 1)]
+        required_events = _merge_items(volume.required_events, volume.completion_conditions)
+        chapters = [{"number": number, "volume_number": volume.volume_number, "arc_number": 1, "title": f"第{number}章", "summary": goal, "objective": f"{goal}，并形成可验证的后果", "conflict": conflict, "must_events": required_events, "forbidden_events": forbidden, "allowed_reveals": (volume.allowed_reveals or []) + continuity["touchable_foreshadowings"], "forbidden_reveals": _forbidden_reveal_refs((volume.forbidden_reveals or []) + continuity["forbidden_to_reveal"]), "foreshadow_create": [], "foreshadow_payoff": continuity["payoffable_foreshadowings"], "scene_beats": ["建立本章局势", "形成关键选择", "留下可验证后果"], "locked": False} for number in range(window.start_chapter_number, window.end_chapter_number + 1)]
         plan = persist_plan(db, project, {"framing": framing, "premise": contract.premise, "macro_plan": {"author_window": marker, "volume_goal": goal, "theme": contract.theme}, "style_guide": style, "anti_ai_rules": {}, "volumes": [{"number": volume.volume_number, "title": volume.title or f"第 {volume.volume_number} 卷", "summary": goal, "theme": contract.theme or "", "major_conflict": conflict, "start_chapter": window.start_chapter_number, "end_chapter": window.end_chapter_number}], "chapters": chapters}, report={"author_guided": True, "author_window_id": window.id, "author_window_source_snapshot_id": window.source_volume_snapshot_id}, archive_latest=False)
         plan.status = StoryPlanStatus.APPROVED
         window.plan_fingerprint = plan.source_fingerprint
@@ -465,7 +642,7 @@ class AuthorGuidedVolumeService:
                 candidate = {**raw, "number": number, "volume_number": volume.volume_number, "locked": False, "status": "READY"}
                 candidate["forbidden_events"] = _merge_items(task.forbidden_events, raw.get("forbidden_events"))
                 candidate["forbidden_reveals"] = _forbidden_reveal_refs(_merge_items(task.forbidden_reveals, raw.get("forbidden_reveals")))
-                candidate["must_events"] = _merge_items(volume.required_events, raw.get("must_events"))
+                candidate["must_events"] = _merge_items(volume.required_events, volume.completion_conditions, raw.get("must_events"))
                 candidate["allowed_reveals"] = _merge_items(task.allowed_reveals, raw.get("allowed_reveals"))
                 normalized = _default_chapter(number, framing, volume.volume_number, raw=candidate)
                 visible = {key: value for key, value in normalized.items() if key != "forbidden_reveals"}
@@ -615,25 +792,17 @@ class AuthorGuidedVolumeService:
         return item
 
     def progress(self, db: Session, volume: VolumeContract) -> dict[str, Any]:
-        start = volume.actual_chapter_start or volume.estimated_chapter_start or 1
-        end = volume.actual_chapter_end
-        query = select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.number >= start, Chapter.active.is_(True))
-        if end is not None:
-            query = query.where(Chapter.number <= end)
-        chapters = db.scalars(query.order_by(Chapter.number)).all()
-        adopted = [item for item in chapters if item.status in {"QUALITY_APPROVED", "ADOPTED"} and item.content]
-        incomplete = [item.number for item in chapters if not item.content or item.status not in {"QUALITY_APPROVED", "ADOPTED"}]
+        chapters, adopted, evidence_by_chapter = self._volume_chapters_and_evidence(db, volume)
+        adopted_ids = {item.id for item in adopted}
+        incomplete = [item.number for item in chapters if item.id not in adopted_ids]
         required = list(volume.required_events or [])
-        completed = [event for event in required if any(str(event) in (item.content or "") for item in adopted)]
+        completed = [event for event in required if self._has_event_evidence(event, evidence_by_chapter)]
         conditions = list(volume.completion_conditions or [])
-        conditions_met = all(any(str(condition) in (item.content or "") for item in adopted) for condition in conditions)
-        latest_number = max((item.number for item in adopted), default=None)
-        latest_task = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.project_id == volume.project_id, StoryPlanChapter.number == latest_number).order_by(StoryPlanChapter.created_at.desc())) if latest_number is not None else None
-        target = volume.target_closing_state or {}
-        end_state = latest_task.end_state if latest_task else {}
-        target_reached = bool(target) and bool(adopted) and all(end_state.get(key) == value for key, value in target.items())
-        ready = bool(adopted) and not incomplete and conditions_met and target_reached
-        return {"volume_goal_progress": 1.0 if ready else min(0.99, len(adopted) / max(1, len(adopted) + len(incomplete) + 1)), "protagonist_arc_progress": 1.0 if ready else (0.5 if adopted else 0.0), "conflict_progress": 1.0 if ready else (0.5 if adopted else 0.0), "required_events_completed": completed, "incomplete_chapters": incomplete, "unresolved_threads": volume.unresolved_threads or [], "pending_foreshadowings": [], "target_closing_state_reached": target_reached, "should_extend_volume": not ready, "should_prepare_seal": ready, "should_start_next_volume": False, "reason": "本卷仍需继续推进，未满足剧情目标或仍有未通过质量门的章节。" if not ready else "本卷完成条件已满足，等待作者确认封存。"}
+        completed_conditions = [condition for condition in conditions if self._has_event_evidence(condition, evidence_by_chapter)]
+        conditions_met = len(completed_conditions) == len(conditions)
+        target_reached = bool(adopted) and self._formal_world_matches_target(db, volume)
+        ready = bool(adopted) and not incomplete and len(completed) == len(required) and conditions_met and target_reached
+        return {"volume_goal_progress": 1.0 if ready else min(0.99, len(adopted) / max(1, len(adopted) + len(incomplete) + 1)), "protagonist_arc_progress": 1.0 if ready else (0.5 if adopted else 0.0), "conflict_progress": 1.0 if ready else (0.5 if adopted else 0.0), "required_events_completed": completed, "missing_required_events": [event for event in required if event not in completed], "completed_conditions": completed_conditions, "missing_completion_conditions": [condition for condition in conditions if condition not in completed_conditions], "adopted_chapter_ids": [item.id for item in adopted], "incomplete_chapters": incomplete, "unresolved_threads": volume.unresolved_threads or [], "pending_foreshadowings": [], "target_closing_state_reached": target_reached, "should_extend_volume": not ready, "should_prepare_seal": ready, "should_start_next_volume": False, "reason": "本卷仍需继续推进，未满足已采用章节、正式世界状态或剧情证据要求。" if not ready else "本卷完成条件已满足，等待作者确认封存。"}
 
     @staticmethod
     def _auto_cross_volume_enabled(contract: BookContract, request: dict[str, Any] | None = None) -> bool:
@@ -817,9 +986,16 @@ class AuthorGuidedVolumeService:
     def create_snapshot(self, db: Session, volume: VolumeContract) -> VolumeContinuitySnapshot:
         if volume.status != VolumeContractStatus.READY_TO_SEAL:
             raise AuthorGuidedVolumeError("VOLUME_NOT_READY_TO_SEAL")
+        progress = self.progress(db, volume)
+        if not progress["should_prepare_seal"]:
+            raise AuthorGuidedVolumeError("VOLUME_COMPLETION_CONDITIONS_UNMET")
         previous_version = db.scalar(select(func.max(VolumeContinuitySnapshot.snapshot_version)).where(VolumeContinuitySnapshot.volume_id == volume.id)) or 0
         snapshot_version = int(previous_version) + 1
-        chapters = db.scalars(select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.active.is_(True), Chapter.number >= (volume.actual_chapter_start or 1), Chapter.number <= (volume.actual_chapter_end or 2**31 - 1)).order_by(Chapter.number)).all()
+        adopted_chapter_ids = progress["adopted_chapter_ids"]
+        chapters = db.scalars(select(Chapter).where(
+            Chapter.project_id == volume.project_id,
+            Chapter.id.in_(adopted_chapter_ids),
+        ).order_by(Chapter.number)).all() if adopted_chapter_ids else []
         character_states = {}
         for character in db.scalars(select(Character).where(Character.project_id == volume.project_id, Character.active.is_(True))).all():
             known = db.scalars(select(CharacterKnowledge.proposition).where(CharacterKnowledge.character_id == character.id, CharacterKnowledge.status.in_([KnowledgeStatus.KNOWN, KnowledgeStatus.SUSPECTED]))).all()
@@ -863,15 +1039,11 @@ class AuthorGuidedVolumeService:
 
     def completion_proposal(self, db: Session, contract: BookContract, volume: VolumeContract) -> BookCompletionProposal:
         report = self.progress(db, volume)
-        start = volume.actual_chapter_start or volume.estimated_chapter_start or 1
-        query = select(Chapter).where(Chapter.project_id == volume.project_id, Chapter.number >= start, Chapter.active.is_(True), Chapter.content.is_not(None), Chapter.status.in_(["QUALITY_APPROVED", "ADOPTED"]))
-        if volume.actual_chapter_end is not None:
-            query = query.where(Chapter.number <= volume.actual_chapter_end)
-        adopted = db.scalars(query.order_by(Chapter.number)).all()
+        _chapters, adopted, evidence_by_chapter = self._volume_chapters_and_evidence(db, volume)
         evidence_ids = [item.id for item in adopted]
         content = "\n".join(item.content or "" for item in adopted)
-        global_required = [str(item) for item in contract.global_required_events or []]
-        missing_global = [item for item in global_required if item not in content]
+        global_required = list(contract.global_required_events or [])
+        missing_global = [event for event in global_required if not self._has_event_evidence(event, evidence_by_chapter)]
         forbidden_global = [str(item) for item in contract.global_forbidden_events or [] if str(item) in content]
         policy = contract.length_policy or {}
         allowed = policy.get("allow_completion_proposal", True)

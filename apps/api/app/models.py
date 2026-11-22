@@ -31,6 +31,7 @@ class EntityType(str, enum.Enum): CITY = "CITY"; LOCATION = "LOCATION"; SECT = "
 class KnowledgeStatus(str, enum.Enum): KNOWN = "KNOWN"; SUSPECTED = "SUSPECTED"; FALSE_BELIEF = "FALSE_BELIEF"; UNKNOWN = "UNKNOWN"
 class ThreadStatus(str, enum.Enum): OPEN = "OPEN"; PAUSED = "PAUSED"; RESOLVED = "RESOLVED"; ABANDONED = "ABANDONED"
 class SceneStatus(str, enum.Enum): PLANNED = "PLANNED"; OCCURRED = "OCCURRED"; VOID = "VOID"
+class ChapterWorldBranchStatus(str, enum.Enum): OPEN="OPEN"; READY="READY"; ADOPTED="ADOPTED"; STALE="STALE"; ABORTED="ABORTED"
 class ProposalType(str, enum.Enum): CONTINUE_THREAD = "CONTINUE_THREAD"; CHARACTER_DRIVEN = "CHARACTER_DRIVEN"; CONSEQUENCE = "CONSEQUENCE"; REVEAL = "REVEAL"; ESCALATION = "ESCALATION"; RELATIONSHIP = "RELATIONSHIP"; TRANSITION = "TRANSITION"; NEW_THREAD = "NEW_THREAD"
 class ProposalStatus(str, enum.Enum): DRAFT = "DRAFT"; VALID = "VALID"; REJECTED = "REJECTED"; APPROVED = "APPROVED"; EXECUTED = "EXECUTED"
 class RevealStatus(str, enum.Enum): LOCKED = "LOCKED"; AVAILABLE = "AVAILABLE"; REVEALED = "REVEALED"
@@ -113,6 +114,33 @@ class Project(TimestampMixin, Base):
     autonomy_settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     research_settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     current_world_time: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class ChapterWorldBranch(TimestampMixin, Base):
+    """Durable candidate world history owned by one automatic chapter run."""
+    __tablename__ = "chapter_world_branches"
+    __table_args__ = (
+        UniqueConstraint("run_id", "chapter_number", name="uq_chapter_world_branch_run_chapter"),
+        Index("ix_chapter_world_branch_project_status", "project_id", "status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("auto_director_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    chapter_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    chapter_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[ChapterWorldBranchStatus] = mapped_column(Enum(ChapterWorldBranchStatus, native_enum=False, length=20), default=ChapterWorldBranchStatus.OPEN, nullable=False, index=True)
+    base_world_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    base_history_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    current_fingerprint: Mapped[str] = mapped_column(String(120), nullable=False)
+    chapter_structure_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    state_overrides: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    staged_cognition: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    state_changes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    scene_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    performance_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    source_fingerprint: Mapped[str | None] = mapped_column(String(120))
+    writer_source_manifest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    adopted_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class BookContract(TimestampMixin, Base):
@@ -396,6 +424,7 @@ class Scene(Base):
     __table_args__ = (Index("uq_scene_active_sequence", "project_id", "sequence", unique=True, postgresql_where=text("history_status = 'ACTIVE'"), sqlite_where=text("history_status = 'ACTIVE'")),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    world_branch_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_world_branches.id"), index=True)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     world_time: Mapped[datetime | None] = mapped_column(DateTime)
     location: Mapped[str | None] = mapped_column(String(200))
@@ -414,6 +443,9 @@ class Chapter(Base):
     __table_args__ = (Index("uq_chapter_project_active_number", "project_id", "number", unique=True, postgresql_where=text("active = true"), sqlite_where=text("active = 1")),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    world_branch_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_world_branches.id"), index=True)
+    pending_world_branch_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_world_branches.id"), index=True)
+    source_world_branch_id: Mapped[str | None] = mapped_column(ForeignKey("chapter_world_branches.id"), index=True)
     number: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str | None] = mapped_column(String(200))
     source_scene_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
@@ -592,6 +624,7 @@ class NarrativeStructureSceneFeature(TimestampMixin, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id"), nullable=False, index=True)
+    chapter_boundary_id: Mapped[str | None] = mapped_column(String(36))
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     world_time: Mapped[str | None] = mapped_column(String(80))

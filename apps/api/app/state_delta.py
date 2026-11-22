@@ -93,6 +93,14 @@ class FormalWorldStateReader:
         return row
 
     def before_value(self, db: Session, project_id: str, effect: StateEffectPayload) -> tuple[Any, bool]:
+        from .chapter_world_branch import ChapterWorldBranchService
+        branch = ChapterWorldBranchService.active(db)
+        if branch:
+            if branch.project_id != project_id:
+                raise ValueError("CHAPTER_WORLD_BRANCH_SCOPE_MISMATCH")
+            return ChapterWorldBranchService().read_path(
+                db, effect.target_type, effect.target_id, effect.path,
+            )
         row = self.target(db, project_id, effect.target_type, effect.target_id)
         document = _record(row)
         current: Any = document
