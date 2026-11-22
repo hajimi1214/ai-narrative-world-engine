@@ -10,6 +10,8 @@ const errorMessages: Record<string, string> = {
   QUALITY_CRITIC_REQUIRED: "当前正文需要有效的模型审核，请重新运行质量检查。",
   WRITER_SOURCE_CHANGED: "章节来源已变化，请刷新章节后重新生成或改稿。",
   MAX_RETRIES_REACHED: "本次检查点的重试次数已用完，请查看失败原因或接管处理。",
+  AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED: "下一卷目标、核心冲突或结束状态仍未补齐。",
+  VOLUME_NEXT_SOURCE_SNAPSHOT_STALE: "承接快照与封存卷不一致，请重新检查下一卷来源。",
 };
 export async function api(path: string, options?: RequestInit) {
   const response = await fetch(`${apiUrl}${path}`, { ...options, headers: { "Content-Type": "application/json", ...options?.headers } });

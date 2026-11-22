@@ -436,22 +436,117 @@ def test_auto_cross_volume_seals_then_pauses_when_token_budget_is_exhausted(monk
         assert "增加预算" in run.next_action
 
 
-def test_auto_cross_volume_missing_successor_plan_blocks_without_creating_empty_volume(monkeypatch):
+def test_auto_cross_volume_missing_successor_plan_keeps_resumable_draft(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
-    run_id = _prepare_auto_cross_boundary(Session, project_id, processed=1, chapter_budget=5, include_next_plan=False)
+    run_id = _prepare_auto_cross_boundary(Session, project_id, processed=2, chapter_budget=5, tokens_used=41, include_next_plan=False)
     from app.author_guided_volume import AuthorGuidedVolumeService
     with Session() as db:
         run = db.get(AutoDirectorRun, run_id)
         old_volume_id = run.context["volume_id"]
+        original_context = dict(run.context)
         AuthorGuidedVolumeService().advance_run(db, run)
         db.commit()
         old_volume = db.get(VolumeContract, old_volume_id)
         successor = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 2))
         assert old_volume.status == VolumeContractStatus.SEALED
+        assert old_volume.sealed_snapshot_id
         assert run.status == AutoDirectorRunStatus.BLOCKED
         assert run.pause_reason == "AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED"
-        assert successor is None
+        assert successor.status == VolumeContractStatus.DRAFT
+        assert successor.opening_state["source_volume_snapshot_id"] == old_volume.sealed_snapshot_id
+        assert run.context["volume_id"] == old_volume_id
+        assert run.context["processed_this_run"] == original_context["processed_this_run"] == 2
+        assert run.total_tokens == 41
+        assert run.context["auto_cross_volume_checkpoint"]["next_volume_id"] == successor.id
+        assert run.context["auto_cross_volume_checkpoint"]["source_snapshot_id"] == old_volume.sealed_snapshot_id
+        assert run.context["auto_cross_volume_checkpoint"]["missing_fields"] == ["volume_goal", "core_conflict", "target_closing_state"]
+
+    volumes = client.get(f"/projects/{project_id}/volumes").json()
+    successor_payload = next(item for item in volumes if item["volume_number"] == 2)
+    assert successor_payload["auto_cross_volume_checkpoint"]["missing_fields"] == ["volume_goal", "core_conflict", "target_closing_state"]
+    assert successor_payload["source_snapshot"]["available"] is True
+    assert successor_payload["source_snapshot"]["id"] == successor_payload["opening_state"]["source_volume_snapshot_id"]
+    assert "第 2 卷缺少下一卷目标、核心冲突、结束状态" in client.get(f"/projects/{project_id}/author-guided-volume/runs/{run_id}").json()["next_action"]
+    manual_start = client.post(f"/projects/{project_id}/volumes/{successor_payload['id']}/start")
+    assert manual_start.status_code == 409
+    assert manual_start.json()["detail"]["code"] == "AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED"
+    manual_next = client.post(f"/projects/{project_id}/volumes/{old_volume_id}/next")
+    assert manual_next.status_code == 409
+    assert manual_next.json()["detail"]["code"] == "AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED"
+
+
+def test_auto_cross_volume_partial_plan_reports_only_missing_fields(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
+    run_id = _prepare_auto_cross_boundary(Session, project_id, include_next_plan=False)
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    with Session() as db:
+        plan = db.scalar(select(StoryPlan).where(StoryPlan.project_id == project_id))
+        db.add(StoryPlanVolume(
+            plan_id=plan.id,
+            number=2,
+            title="第二卷",
+            summary="",
+            start_chapter=2,
+            end_chapter=6,
+            major_conflict="档案管理局封锁原始记录",
+            end_state={},
+        ))
+        db.commit()
+        run = db.get(AutoDirectorRun, run_id)
+        AuthorGuidedVolumeService().advance_run(db, run)
+        db.commit()
+        successor = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 2))
+        assert successor.volume_goal is None
+        assert successor.core_conflict == "档案管理局封锁原始记录"
+        assert run.context["auto_cross_volume_checkpoint"]["missing_fields"] == ["volume_goal", "target_closing_state"]
+
+    payload = next(item for item in client.get(f"/projects/{project_id}/volumes").json() if item["volume_number"] == 2)
+    assert payload["auto_cross_volume_checkpoint"]["missing_fields"] == ["volume_goal", "target_closing_state"]
+
+
+def test_auto_cross_volume_plan_recovery_resumes_same_run_and_budget(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    _trust_seeded_chapters_for_volume_lifecycle(monkeypatch)
+    run_id = _prepare_auto_cross_boundary(Session, project_id, processed=2, chapter_budget=5, tokens_used=41, include_next_plan=False)
+    from app.author_guided_volume import AuthorGuidedVolumeService
+    with Session() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        AuthorGuidedVolumeService().advance_run(db, run)
+        db.commit()
+        next_volume = db.scalar(select(VolumeContract).where(VolumeContract.project_id == project_id, VolumeContract.volume_number == 2))
+        source_snapshot_id = next_volume.opening_state["source_volume_snapshot_id"]
+
+    updated = client.patch(f"/projects/{project_id}/volumes/{next_volume.id}/contract", json={
+        "volume_goal": "追查旧档案背后的失踪名单",
+        "core_conflict": "档案管理局封锁原始记录并追捕调查者",
+        "target_closing_state": {"project": {"name": "作者卷级测试"}},
+        "author_note": "补齐自动跨卷规划",
+    })
+    assert updated.status_code == 200, updated.text
+
+    resumed = client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/continue")
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["id"] == run_id
+    assert resumed.json()["status"] == "RUNNING"
+    assert resumed.json()["context"]["volume_id"] != next_volume.id
+    assert resumed.json()["context"]["processed_this_run"] == 2
+    assert resumed.json()["token_usage"]["total_tokens"] == 41
+
+    AutoDirectorWorker(Session, poll_seconds=0).run_once()
+    with Session() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        successor = db.get(VolumeContract, next_volume.id)
+        source_volume = db.get(VolumeContract, run.context["auto_cross_volume_checkpoint"]["source_volume_id"])
+        assert run.id == run_id
+        assert run.context["volume_id"] == successor.id
+        assert run.context["processed_this_run"] == 2
+        assert run.total_tokens == 41
+        assert successor.status == VolumeContractStatus.ACTIVE
+        assert successor.opening_state["source_volume_snapshot_id"] == source_snapshot_id
+        assert source_volume.sealed_snapshot_id == source_snapshot_id
+        assert db.scalar(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == successor.id)).source_volume_snapshot_id == source_snapshot_id
 
 
 def test_auto_cross_volume_transition_is_idempotent(monkeypatch):

@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, BookAutomationSettingsPayload, PlotDirectionPayload, VolumeActionPayload, VolumeContinuePayload, VolumeContractUpdatePayload
-from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _contract_payload, _enum, _volume_payload, _window_payload
+from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _auto_next_volume_missing_fields, _contract_payload, _enum, _volume_payload, _window_payload
 from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookCompletionProposalStatus, BookContract, ChapterPlanningWindow, ChapterWindowStatus, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
 from ..author_recovery import recovery_payload, revoke_claim
 from .common import get_db, require_project
@@ -36,12 +36,53 @@ def _run_payload(db: Session, run: AutoDirectorRun) -> dict:
     return {"id": run.id, "project_id": run.project_id, "status": _enum(run.status), "run_mode": run.run_mode, "current_stage": _enum(run.current_stage), "pause_reason": run.pause_reason, "next_action": run.next_action, "idempotency_key": run.idempotency_key, "context": run.context or {}, "settings": run.settings or {}, "book_policy": {"auto_cross_volume": bool(auto_cross)}, "token_usage": run.token_usage or {}, "usage_summary": usage_summary, "recovery": recovery_payload(run)}
 
 
+def _source_volume_snapshot_payload(db: Session, volume: VolumeContract) -> dict | None:
+    snapshot_id = (volume.opening_state or {}).get("source_volume_snapshot_id")
+    if not snapshot_id:
+        return None
+    snapshot = db.get(VolumeContinuitySnapshot, snapshot_id)
+    source_volume = db.get(VolumeContract, snapshot.volume_id) if snapshot else None
+    if (not snapshot or snapshot.project_id != volume.project_id or not source_volume
+            or source_volume.project_id != volume.project_id
+            or source_volume.volume_number + 1 != volume.volume_number
+            or source_volume.status != VolumeContractStatus.SEALED
+            or source_volume.sealed_snapshot_id != snapshot.id):
+        return {"id": snapshot_id, "available": False}
+    timeline = snapshot.timeline_end or {}
+    return {
+        "id": snapshot.id,
+        "available": True,
+        "volume_id": snapshot.volume_id,
+        "version": snapshot.snapshot_version,
+        "summary": snapshot.summary,
+        "source_fingerprint": snapshot.source_fingerprint,
+        "formal_world_fingerprint": timeline.get("formal_world_fingerprint"),
+        "chapter_start": timeline.get("chapter_start"),
+        "chapter_end": timeline.get("chapter_end"),
+        "adopted_chapter_count": len(timeline.get("adopted_chapters") or []),
+        "confirmed_fact_count": len(snapshot.confirmed_facts or []),
+        "character_count": len(snapshot.character_states or {}),
+        "active_thread_count": len(snapshot.active_threads or []),
+        "next_volume_hooks": snapshot.next_volume_hooks or [],
+    }
+
+
 def _volume_or_404(db: Session, project_id: str, volume_id: str) -> VolumeContract:
     require_project(db, project_id)
     volume = db.get(VolumeContract, volume_id)
     if not volume or volume.project_id != project_id:
         raise HTTPException(status_code=404, detail="Volume not found")
     return volume
+
+
+def _ensure_auto_cross_volume_uses_original_run(volume: VolumeContract) -> None:
+    checkpoint = (volume.opening_state or {}).get("auto_cross_volume_checkpoint") or {}
+    if checkpoint.get("run_id"):
+        raise HTTPException(status_code=409, detail={
+            "code": "AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED",
+            "message": "请从原自动运行检查点继续，以保留当前运行与预算。",
+            "run_id": checkpoint.get("run_id"),
+        })
 
 
 def _wake_volume_run(db: Session, project_id: str, volume_id: str) -> AutoDirectorRun | None:
@@ -239,6 +280,34 @@ def continue_author_guided_run(project_id: str, run_id: str, payload: VolumeCont
     if run.status == AutoDirectorRunStatus.RUNNING:
         return _run_payload(db, run)
     revoke_claim(run)
+    if run.pause_reason == "AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED":
+        checkpoint = dict((run.context or {}).get("auto_cross_volume_checkpoint") or {})
+        next_volume = db.get(VolumeContract, checkpoint.get("next_volume_id")) if checkpoint.get("next_volume_id") else None
+        source_volume = db.get(VolumeContract, checkpoint.get("source_volume_id")) if checkpoint.get("source_volume_id") else None
+        source_snapshot = db.get(VolumeContinuitySnapshot, checkpoint.get("source_snapshot_id")) if checkpoint.get("source_snapshot_id") else None
+        if (not checkpoint or checkpoint.get("run_id") != run.id or not next_volume
+                or next_volume.project_id != project_id or not source_volume
+                or source_volume.project_id != project_id or not source_snapshot
+                or source_snapshot.project_id != project_id or source_snapshot.volume_id != source_volume.id
+                or source_volume.status != VolumeContractStatus.SEALED
+                or source_volume.sealed_snapshot_id != source_snapshot.id
+                or (next_volume.opening_state or {}).get("source_volume_snapshot_id") != source_snapshot.id):
+            raise HTTPException(status_code=409, detail={"code": "VOLUME_NEXT_SOURCE_SNAPSHOT_STALE", "message": "承接快照与原运行检查点不一致，无法恢复自动跨卷。"})
+        missing_fields = _auto_next_volume_missing_fields(next_volume)
+        if missing_fields:
+            raise HTTPException(status_code=409, detail={
+                "code": "AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED",
+                "message": "请补齐下一卷目标、核心冲突和结束状态后继续。",
+                "missing_fields": missing_fields,
+                "volume_id": next_volume.id,
+            })
+        run.status = AutoDirectorRunStatus.RUNNING
+        run.current_stage = AutoDirectorStage.CHAPTER_WINDOW_EXECUTION
+        run.pause_reason = None
+        run.next_action = f"下一卷规划已补齐，正在从第 {source_volume.volume_number} 卷封存检查点继续。"
+        run.context = {**(run.context or {}), "execute_window": True, "stop_requested": False}
+        db.commit()
+        return _run_payload(db, run)
     if _retry_checkpoint(db, run) is not None:
         return retry_author_guided_run(project_id, run_id, db)
     _apply_token_budget_increase(db, run, payload)
@@ -310,13 +379,34 @@ def list_volumes(project_id: str, db: Session = Depends(get_db)):
     require_project(db, project_id)
     service = AuthorGuidedVolumeService()
     volumes = db.scalars(select(VolumeContract).where(VolumeContract.project_id == project_id).order_by(VolumeContract.volume_number)).all()
-    return [{**_volume_payload(volume), "progress": service.progress(db, volume), "windows": [_window_payload(item) for item in db.scalars(select(ChapterPlanningWindow).where(ChapterPlanningWindow.volume_id == volume.id).order_by(ChapterPlanningWindow.created_at)).all()]} for volume in volumes]
+    return [
+        {
+            **_volume_payload(volume),
+            "source_snapshot": _source_volume_snapshot_payload(db, volume),
+            "progress": service.progress(db, volume),
+            "windows": [
+                _window_payload(item)
+                for item in db.scalars(
+                    select(ChapterPlanningWindow)
+                    .where(ChapterPlanningWindow.volume_id == volume.id)
+                    .order_by(ChapterPlanningWindow.created_at)
+                ).all()
+            ],
+        }
+        for volume in volumes
+    ]
 
 
 @router.post("/projects/{project_id}/volumes/{volume_id}/next")
 def prepare_next_volume(project_id: str, volume_id: str, db: Session = Depends(get_db)):
     current = _volume_or_404(db, project_id, volume_id)
     if current.status != VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "CURRENT_VOLUME_NOT_SEALED"})
+    successor = db.scalar(select(VolumeContract).where(
+        VolumeContract.project_id == project_id,
+        VolumeContract.volume_number == current.volume_number + 1,
+    ))
+    if successor:
+        _ensure_auto_cross_volume_uses_original_run(successor)
     contract = db.get(BookContract, current.book_contract_id); project = db.get(Project, project_id)
     next_start = (current.actual_chapter_end or current.estimated_chapter_end or current.actual_chapter_start or 0) + 1
     next_volume = AuthorGuidedVolumeService().ensure_volume(db, project, contract, {"title": f"第 {current.volume_number + 1} 卷", "estimated_chapter_start": next_start, "opening_state": {"source_volume_snapshot_id": current.sealed_snapshot_id}}, current.volume_number + 1)
@@ -329,6 +419,7 @@ def prepare_next_volume(project_id: str, volume_id: str, db: Session = Depends(g
 @router.post("/projects/{project_id}/volumes/{volume_id}/start")
 def start_volume(project_id: str, volume_id: str, payload: VolumeContinuePayload | None = None, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id)
+    _ensure_auto_cross_volume_uses_original_run(volume)
     if volume.status == VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
     _apply_token_budget_increase(db, _wake_volume_run(db, project_id, volume.id), payload)
     run = _resume_volume_run(db, project_id, volume.id) or _run_for_volume(db, project_id, volume)
@@ -341,6 +432,7 @@ def start_volume(project_id: str, volume_id: str, payload: VolumeContinuePayload
 @router.post("/projects/{project_id}/volumes/{volume_id}/continue")
 def continue_volume(project_id: str, volume_id: str, payload: VolumeContinuePayload | None = None, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id)
+    _ensure_auto_cross_volume_uses_original_run(volume)
     if volume.status == VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
     run = _wake_volume_run(db, project_id, volume.id) or _run_for_volume(db, project_id, volume)
     _apply_token_budget_increase(db, run, payload)
@@ -353,6 +445,7 @@ def continue_volume(project_id: str, volume_id: str, payload: VolumeContinuePayl
 @router.post("/projects/{project_id}/volumes/{volume_id}/extend")
 def extend_volume(project_id: str, volume_id: str, payload: VolumeContinuePayload | None = None, db: Session = Depends(get_db)):
     volume = _volume_or_404(db, project_id, volume_id)
+    _ensure_auto_cross_volume_uses_original_run(volume)
     if volume.status == VolumeContractStatus.SEALED: raise HTTPException(status_code=409, detail={"code": "VOLUME_SEALED"})
     _apply_token_budget_increase(db, _wake_volume_run(db, project_id, volume.id), payload)
     run = _resume_volume_run(db, project_id, volume.id)

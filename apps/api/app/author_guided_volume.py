@@ -108,8 +108,27 @@ def _contract_payload(contract: BookContract) -> dict[str, Any]:
     return {"id": contract.id, "project_id": contract.project_id, "title": contract.title, "theme": contract.theme, "premise": contract.premise, "ending_direction": contract.ending_direction, "protagonist_contract": contract.protagonist_contract or {}, "global_plot_direction": contract.global_plot_direction, "global_required_events": contract.global_required_events or [], "global_forbidden_events": contract.global_forbidden_events or [], "style_contract": contract.style_contract or {}, "author_locked_constraints": contract.author_locked_constraints or [], "length_policy": contract.length_policy or {}, "version": contract.version, "fingerprint": contract.fingerprint, "status": contract.status}
 
 
+def _auto_next_volume_missing_fields(volume: VolumeContract) -> list[str]:
+    missing = []
+    goal = (volume.volume_goal or "").strip()
+    conflict = (volume.core_conflict or "").strip()
+    if not goal or goal == "推进本卷核心目标并改变主角状态。":
+        missing.append("volume_goal")
+    if not conflict or conflict == "当前目标与外部阻力形成冲突":
+        missing.append("core_conflict")
+    has_target_state = isinstance(volume.target_closing_state, dict) and bool(volume.target_closing_state)
+    has_completion_conditions = bool(volume.completion_conditions)
+    if not has_target_state and not has_completion_conditions:
+        missing.append("target_closing_state")
+    return missing
+
+
 def _volume_payload(volume: VolumeContract) -> dict[str, Any]:
-    return {"id": volume.id, "project_id": volume.project_id, "book_contract_id": volume.book_contract_id, "volume_number": volume.volume_number, "title": volume.title, "status": _enum(volume.status), "estimated_chapter_start": volume.estimated_chapter_start, "estimated_chapter_end": volume.estimated_chapter_end, "actual_chapter_start": volume.actual_chapter_start, "actual_chapter_end": volume.actual_chapter_end, "volume_goal": volume.volume_goal, "core_conflict": volume.core_conflict, "opening_state": volume.opening_state or {}, "target_closing_state": volume.target_closing_state or {}, "completion_conditions": volume.completion_conditions or [], "protagonist_arc": volume.protagonist_arc or {}, "main_cast": volume.main_cast or [], "new_cast": volume.new_cast or [], "required_events": volume.required_events or [], "forbidden_events": volume.forbidden_events or [], "allowed_reveals": volume.allowed_reveals or [], "forbidden_reveals": volume.forbidden_reveals or [], "foreshadowing_seed_refs": volume.foreshadowing_seed_refs or [], "foreshadowing_payoff_refs": volume.foreshadowing_payoff_refs or [], "unresolved_threads": volume.unresolved_threads or [], "next_volume_hooks": volume.next_volume_hooks or [], "version": volume.version, "fingerprint": volume.fingerprint, "sealed_at": volume.sealed_at.isoformat() if volume.sealed_at else None, "sealed_snapshot_id": volume.sealed_snapshot_id}
+    opening = volume.opening_state or {}
+    checkpoint = opening.get("auto_cross_volume_checkpoint")
+    if checkpoint:
+        checkpoint = {**checkpoint, "missing_fields": _auto_next_volume_missing_fields(volume)}
+    return {"id": volume.id, "project_id": volume.project_id, "book_contract_id": volume.book_contract_id, "volume_number": volume.volume_number, "title": volume.title, "status": _enum(volume.status), "estimated_chapter_start": volume.estimated_chapter_start, "estimated_chapter_end": volume.estimated_chapter_end, "actual_chapter_start": volume.actual_chapter_start, "actual_chapter_end": volume.actual_chapter_end, "volume_goal": volume.volume_goal, "core_conflict": volume.core_conflict, "opening_state": opening, "auto_cross_volume_checkpoint": checkpoint, "target_closing_state": volume.target_closing_state or {}, "completion_conditions": volume.completion_conditions or [], "protagonist_arc": volume.protagonist_arc or {}, "main_cast": volume.main_cast or [], "new_cast": volume.new_cast or [], "required_events": volume.required_events or [], "forbidden_events": volume.forbidden_events or [], "allowed_reveals": volume.allowed_reveals or [], "forbidden_reveals": volume.forbidden_reveals or [], "foreshadowing_seed_refs": volume.foreshadowing_seed_refs or [], "foreshadowing_payoff_refs": volume.foreshadowing_payoff_refs or [], "unresolved_threads": volume.unresolved_threads or [], "next_volume_hooks": volume.next_volume_hooks or [], "version": volume.version, "fingerprint": volume.fingerprint, "sealed_at": volume.sealed_at.isoformat() if volume.sealed_at else None, "sealed_snapshot_id": volume.sealed_snapshot_id}
 
 
 def _window_payload(window: ChapterPlanningWindow) -> dict[str, Any]:
@@ -1177,13 +1196,7 @@ class AuthorGuidedVolumeService:
         return bool(request.get("auto_cross_volume") is True or request.get("continuous_volume_progression") is True)
 
     def _next_volume_payload(self, db: Session, project: Project, contract: BookContract, volume: VolumeContract, snapshot_id: str) -> dict[str, Any]:
-        """Build the next volume from an existing book plan when available.
-
-        Automatic progression must have a real goal and closing state.  A
-        preplanned StoryPlanVolume supplies those fields; without one we
-        create a bounded continuation contract that starts safely but pauses
-        before another automatic boundary can be crossed.
-        """
+        """Use only authored or preplanned fields for an automatic successor."""
         next_number = volume.volume_number + 1
         next_start = (volume.actual_chapter_end or volume.estimated_chapter_end or volume.actual_chapter_start or 0) + 1
         plan = db.scalar(select(StoryPlanVolume).where(
@@ -1194,8 +1207,8 @@ class AuthorGuidedVolumeService:
             "title": f"第 {next_number} 卷",
             "estimated_chapter_start": next_start,
             "opening_state": {"source_volume_snapshot_id": snapshot_id},
-            "volume_goal": "承接上一卷的后续冲突",
-            "core_conflict": "上一卷的后果继续施加压力",
+            "volume_goal": None,
+            "core_conflict": None,
             "target_closing_state": {},
             "completion_conditions": [],
         }
@@ -1211,32 +1224,56 @@ class AuthorGuidedVolumeService:
                 "title": plan.title or payload["title"],
                 "estimated_chapter_start": plan.start_chapter or next_start,
                 "estimated_chapter_end": plan.end_chapter,
-                "volume_goal": plan.summary or payload["volume_goal"],
-                "core_conflict": plan.major_conflict or payload["core_conflict"],
+                "volume_goal": plan.summary or None,
+                "core_conflict": plan.major_conflict or None,
                 "target_closing_state": closing_state,
                 "next_volume_hooks": plan.foreshadowing or [],
             })
         return payload
 
-    def _prepare_auto_next_volume(self, db: Session, project: Project, contract: BookContract, sealed: VolumeContract) -> tuple[VolumeContract, ChapterPlanningWindow]:
+    def _prepare_auto_next_volume(self, db: Session, project: Project, contract: BookContract, sealed: VolumeContract, run_id: str) -> tuple[VolumeContract, ChapterPlanningWindow | None, list[str]]:
         """Prepare a successor for a volume already sealed in this transaction."""
         next_number = sealed.volume_number + 1
+        snapshot_id = sealed.sealed_snapshot_id
+        snapshot = db.get(VolumeContinuitySnapshot, snapshot_id) if snapshot_id else None
+        if not snapshot or snapshot.project_id != project.id or snapshot.volume_id != sealed.id:
+            raise AuthorGuidedVolumeError("VOLUME_NEXT_SOURCE_SNAPSHOT_STALE")
         next_volume = db.scalar(select(VolumeContract).where(
             VolumeContract.project_id == project.id,
             VolumeContract.volume_number == next_number,
         ).with_for_update())
-        payload = self._next_volume_payload(db, project, contract, sealed, sealed.sealed_snapshot_id or "")
+        payload = self._next_volume_payload(db, project, contract, sealed, snapshot_id)
         if next_volume is None:
-            if not payload.get("volume_goal") or not payload.get("target_closing_state"):
-                raise AuthorGuidedVolumeError("AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED")
-            next_volume = self.ensure_volume(db, project, contract, payload, next_number)
+            next_volume = VolumeContract(
+                project_id=project.id,
+                book_contract_id=contract.id,
+                volume_number=next_number,
+                title=payload["title"],
+                status=VolumeContractStatus.DRAFT,
+                estimated_chapter_start=payload["estimated_chapter_start"],
+                estimated_chapter_end=payload.get("estimated_chapter_end"),
+                volume_goal=payload.get("volume_goal"),
+                core_conflict=payload.get("core_conflict"),
+                opening_state=payload["opening_state"],
+                target_closing_state=payload.get("target_closing_state") or {},
+                completion_conditions=payload.get("completion_conditions") or [],
+                protagonist_arc=contract.protagonist_contract or {},
+                next_volume_hooks=payload.get("next_volume_hooks") or [],
+            )
+            db.add(next_volume)
+            db.flush()
+            next_volume.fingerprint = _fingerprint(_volume_payload(next_volume))
         else:
             opening = dict(next_volume.opening_state or {})
             source_snapshot_id = opening.get("source_volume_snapshot_id")
-            if source_snapshot_id and source_snapshot_id != sealed.sealed_snapshot_id:
+            if source_snapshot_id and source_snapshot_id != snapshot_id:
                 raise AuthorGuidedVolumeError("VOLUME_NEXT_SOURCE_SNAPSHOT_STALE")
             if next_volume.status == VolumeContractStatus.SEALED:
                 raise AuthorGuidedVolumeError("VOLUME_NEXT_ALREADY_SEALED")
+            if next_volume.volume_goal == "推进本卷核心目标并改变主角状态。":
+                next_volume.volume_goal = None
+            if next_volume.core_conflict == "当前目标与外部阻力形成冲突":
+                next_volume.core_conflict = None
             if not next_volume.volume_goal and payload.get("volume_goal"):
                 next_volume.volume_goal = payload["volume_goal"]
             if not next_volume.core_conflict and payload.get("core_conflict"):
@@ -1246,21 +1283,29 @@ class AuthorGuidedVolumeService:
             if not next_volume.completion_conditions and payload.get("completion_conditions"):
                 next_volume.completion_conditions = payload["completion_conditions"]
             if not source_snapshot_id:
-                opening["source_volume_snapshot_id"] = sealed.sealed_snapshot_id
+                opening["source_volume_snapshot_id"] = snapshot_id
                 next_volume.opening_state = opening
-                next_volume.version += 1
-                next_volume.fingerprint = _fingerprint(_volume_payload(next_volume))
             if next_volume.estimated_chapter_start is None:
                 next_volume.estimated_chapter_start = payload["estimated_chapter_start"]
-            if next_volume.fingerprint != _fingerprint(_volume_payload(next_volume)):
-                next_volume.version += 1
-                next_volume.fingerprint = _fingerprint(_volume_payload(next_volume))
-            if not next_volume.volume_goal or not (next_volume.target_closing_state or next_volume.completion_conditions):
-                raise AuthorGuidedVolumeError("AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED")
+        missing = _auto_next_volume_missing_fields(next_volume)
+        opening = dict(next_volume.opening_state or {})
+        opening["auto_cross_volume_checkpoint"] = {
+            "status": "AWAITING_AUTHOR_PLAN" if missing else "READY",
+            "run_id": run_id,
+            "source_volume_id": sealed.id,
+            "source_snapshot_id": snapshot_id,
+        }
+        next_volume.opening_state = opening
+        if next_volume.fingerprint != _fingerprint(_volume_payload(next_volume)):
+            next_volume.version += 1
+            next_volume.fingerprint = _fingerprint(_volume_payload(next_volume))
+        if missing:
+            next_volume.status = VolumeContractStatus.DRAFT
+            return next_volume, None, missing
         next_volume.status = VolumeContractStatus.ACTIVE
         window = self.ensure_window(db, project, next_volume, size=None)
         window.status = ChapterWindowStatus.ACTIVE
-        return next_volume, window
+        return next_volume, window, []
 
     def _transition_auto_cross_volume(self, db: Session, run: AutoDirectorRun, project: Project, contract: BookContract, volume: VolumeContract, request: dict[str, Any], context: dict[str, Any], operational_budget: int, *, progress: dict[str, Any] | None = None) -> bool:
         """Move a completed volume to its successor without resetting usage."""
@@ -1293,7 +1338,29 @@ class AuthorGuidedVolumeService:
         # author input. Only the successor preparation is rolled back.
         savepoint = db.begin_nested()
         try:
-            next_volume, next_window = self._prepare_auto_next_volume(db, project, contract, sealed)
+            next_volume, next_window, missing_fields = self._prepare_auto_next_volume(db, project, contract, sealed, run.id)
+            if missing_fields:
+                savepoint.commit()
+                field_labels = {
+                    "volume_goal": "下一卷目标",
+                    "core_conflict": "核心冲突",
+                    "target_closing_state": "结束状态",
+                }
+                missing_labels = [field_labels[field] for field in missing_fields]
+                checkpoint = {
+                    "status": "AWAITING_AUTHOR_PLAN",
+                    "run_id": run.id,
+                    "source_volume_id": sealed.id,
+                    "source_snapshot_id": sealed.sealed_snapshot_id,
+                    "next_volume_id": next_volume.id,
+                    "missing_fields": missing_fields,
+                }
+                run.status = AutoDirectorRunStatus.BLOCKED
+                run.current_stage = AutoDirectorStage.BLOCKED
+                run.pause_reason = "AUTO_CROSS_VOLUME_NEXT_PLAN_REQUIRED"
+                run.next_action = f"第 {sealed.volume_number + 1} 卷缺少{'、'.join(missing_labels)}。请在卷总览补齐后，从原运行检查点继续。"
+                run.context = {**context, "window_complete": True, "auto_cross_volume_blocked": run.pause_reason, "auto_cross_volume_checkpoint": checkpoint}
+                return True
             next_tasks = self.ensure_window_tasks(db, project, next_volume, next_window, contract)
         except AuthorGuidedVolumeError as exc:
             savepoint.rollback()
