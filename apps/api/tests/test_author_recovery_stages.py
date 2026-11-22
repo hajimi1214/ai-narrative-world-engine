@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -10,7 +11,9 @@ import app.runtime as runtime_module
 from app.ai.errors import MODEL_RATE_LIMITED, ModelProviderError
 from app.ai.provider import ModelResult
 from app.author_guided_volume import AuthorGuidedVolumeService
-from app.models import AutoDirectorRun, AutoDirectorStage, AutoDirectorStep, AutonomousWorldRun, Chapter, ChapterQualityAssessment, ChapterWriterDraft, Scene
+from app.models import AutoDirectorRun, AutoDirectorStage, AutoDirectorStep, AutonomousWorldRun, Chapter, ChapterQualityAssessment, ChapterWorldBranch, ChapterWriterDraft, Scene
+from app.author_recovery import recovery_payload, utc_now
+from app.auto_director_worker import AutoDirectorWorker
 from test_author_guided_volume import _setup
 
 
@@ -135,6 +138,62 @@ def test_restart_reuses_draft_and_critic_report_until_adoption_commits(author_ru
         scene_count = db.scalar(select(func.count(Scene.id)).where(Scene.project_id == project_id))
         assert scene_count == 5
     assert (provider.actor_calls, provider.writer_calls, provider.critic_calls) == (actor_calls, 1, 2)
+
+
+def test_expired_worker_claim_resumes_same_run_and_chapter_branch(author_run):
+    client, sessions, project_id, run_id, provider, _, through = author_run
+    through(AutoDirectorStage.CHAPTER_EXECUTION)
+
+    with sessions() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        branch_id = run.context["chapter_world_branch_id"]
+        branch = db.get(ChapterWorldBranch, branch_id)
+        chapter_number = branch.chapter_number
+        assert branch.run_id == run_id
+        assert branch.status.value in {"OPEN", "READY"}
+        assert provider.writer_calls == 1
+
+    crashed_worker = AutoDirectorWorker(sessions, poll_seconds=0, lease_seconds=45)
+    stale_claim = crashed_worker._claim()
+    assert stale_claim and stale_claim[0] == run_id
+    with sessions() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        run.worker_lease_until = utc_now() - timedelta(seconds=1)
+        db.commit()
+
+    restarted_worker = AutoDirectorWorker(sessions, poll_seconds=0, lease_seconds=45)
+    assert restarted_worker.run_once() is True
+    with sessions() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        branch = db.get(ChapterWorldBranch, branch_id)
+        chapter = db.get(Chapter, branch.chapter_id)
+        assert run.id == run_id
+        assert run.context["chapter_world_branch_id"] == branch_id
+        assert run.context["current_chapter_number"] == chapter_number
+        assert branch.run_id == run.id and branch.chapter_number == chapter_number
+        assert chapter.pending_world_branch_id == branch_id
+        assert db.scalar(select(func.count(ChapterWorldBranch.id)).where(ChapterWorldBranch.run_id == run_id)) == 1
+        assert recovery_payload(run)["last_checkpoint"] is not None
+        assert run.recovery_usage_uncertain is True
+        assert int(run.context.get("recovery_reserved_tokens") or 0) > 0
+        assert provider.writer_calls == 1
+
+    taken_over = client.post(
+        f"/projects/{project_id}/author-guided-volume/runs/{run_id}/takeover"
+    )
+    assert taken_over.status_code == 200
+    assert taken_over.json()["id"] == run_id
+    resumed = client.post(
+        f"/projects/{project_id}/author-guided-volume/runs/{run_id}/continue"
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["id"] == run_id
+    assert resumed.json()["status"] == "RUNNING"
+    assert resumed.json()["context"]["chapter_world_branch_id"] == branch_id
+    with sessions() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        assert run.context["chapter_world_branch_id"] == branch_id
+        assert db.get(ChapterWorldBranch, branch_id).chapter_number == chapter_number
 
 
 def test_critic_rate_limit_preserves_typed_failure_and_retries_only_critic(author_run):

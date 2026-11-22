@@ -263,14 +263,15 @@ def test_foreshadowing_context_respects_payoff_window_and_status_transitions(mon
     assert paid.json()["status"] == ForeshadowingStatus.PAID_OFF.value
 
 
-def test_author_run_takeover_and_retry_are_durable(monkeypatch):
+def test_author_run_takeover_and_continue_are_durable(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
     created = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"idempotency_key": "controls"}).json()
     run_id = created["id"]
     takeover = client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/takeover")
     assert takeover.status_code == 200 and takeover.json()["pause_reason"] == "AUTHOR_TAKEOVER"
-    retry = client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/retry")
-    assert retry.status_code == 200 and retry.json()["status"] == "RUNNING"
+    continued = client.post(f"/projects/{project_id}/author-guided-volume/runs/{run_id}/continue")
+    assert continued.status_code == 200
+    assert continued.json()["id"] == run_id and continued.json()["status"] == "RUNNING"
     with Session() as db:
         assert db.get(AutoDirectorRun, run_id).context["execute_window"] is True
 
