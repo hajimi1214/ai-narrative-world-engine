@@ -14,9 +14,10 @@ from app.ai.fake import FakeModelProvider
 from app.db import Base
 from app.main import app
 from app.models import (
-    AntiAIBible, Chapter, ChapterQualityAssessment, ChapterQualityFinding,
-    ChapterWriterDraft, Character, ExecutionTrace, Project, Scene,
-    ProjectModelConfig, VolumeContract, VolumeContractStatus, WriterDraftOrigin, WriterDraftStatus,
+    AntiAIBible, AutoDirectorRun, Chapter, ChapterQualityAssessment,
+    ChapterQualityFinding, ChapterWorldBranch, ChapterWriterDraft, Character,
+    ChapterWorldBranchStatus, ExecutionTrace, Project, Scene, ProjectModelConfig,
+    VolumeContract, VolumeContractStatus, WriterDraftOrigin, WriterDraftStatus,
 )
 from app.narrative_structure import NarrativeStructureService
 from app.quality import (
@@ -285,6 +286,58 @@ def test_required_event_evidence_is_reviewed_content_bound_and_fail_closed():
     assert validate_required_event_evidence(prose + "她松开手。", task, critic, "writer-content:changed")
     unconfirmed = {**review, "confirmed": False}
     assert not build_required_event_evidence(prose, task, [unconfirmed], "writer-content:test")["verified"]
+
+
+def test_quality_repair_adoption_cannot_bypass_pending_chapter_world_branch(quality_project, session):
+    project, _actor, _scene, chapter, source = quality_project
+    run = AutoDirectorRun(
+        project_id=project.id,
+        idempotency_key="repair-branch-adoption",
+        run_mode="AUTHOR_GUIDED_VOLUME",
+    )
+    session.add(run); session.flush()
+    branch = ChapterWorldBranch(
+        project_id=project.id,
+        run_id=run.id,
+        chapter_id=chapter.id,
+        chapter_number=chapter.number,
+        status=ChapterWorldBranchStatus.OPEN,
+        base_world_fingerprint="base-world",
+        base_history_fingerprint="base-history",
+        current_fingerprint="branch-world",
+    )
+    session.add(branch); session.flush()
+    chapter.pending_world_branch_id = branch.id
+    repair = ChapterWriterDraft(
+        project_id=project.id,
+        chapter_id=chapter.id,
+        version=source.version + 1,
+        status=WriterDraftStatus.VALIDATED,
+        origin=WriterDraftOrigin.QUALITY_REPAIR,
+        request_fingerprint="repair-request",
+        chapter_structure_fingerprint=source.chapter_structure_fingerprint,
+        chapter_source_fingerprint=source.chapter_source_fingerprint,
+        writer_context_fingerprint=source.writer_context_fingerprint,
+        source_structure_status=source.source_structure_status,
+        source_scene_ids=source.source_scene_ids,
+        source_manifest=source.source_manifest,
+        writing_bible_fingerprint=source.writing_bible_fingerprint,
+        pov_mode=source.pov_mode,
+        pov_character_id=source.pov_character_id,
+        content="未经分支采用的修复正文",
+        content_fingerprint="repair-content-fingerprint",
+        word_count=10,
+        scene_coverage=source.scene_coverage,
+        source_refs=source.source_refs,
+        validation_report={"valid": True},
+    )
+    session.add(repair); session.flush()
+
+    with pytest.raises(QualityDomainError, match="CHAPTER_WORLD_BRANCH_REQUIRES_REVIEW_ADOPTION"):
+        QualityRepairService().adopt(session, repair.id)
+
+    assert chapter.content == source.content
+    assert chapter.current_writer_draft_id == source.id
 
 
 def test_quality_context_uses_current_adopted_draft(quality_project, session):

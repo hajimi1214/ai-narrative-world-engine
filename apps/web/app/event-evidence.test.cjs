@@ -47,3 +47,27 @@ test("event evidence maps code-point offsets after supplementary characters", ()
   assert.equal(result.status, "CONFIRMED");
   assert.equal(prose.slice(result.span.start, result.span.end), excerpt);
 });
+
+test("every required event and foreshadow payoff gets a row even when review is missing", () => {
+  const result = api.requiredEventEvidenceRows({
+    must_events: ["找到钥匙"],
+    event_contracts: { must_events: [{ event_ref: "key-found", label: "找到钥匙", aliases: [] }] },
+    foreshadow_payoff: [{ foreshadow_ref: "letter-mark", label: "回收信件缺口" }],
+  }, [{
+    requirement_ref: "must_events:key-found",
+    requirement_type: "must_events",
+    event_ref: "key-found",
+    label: "找到钥匙",
+    confirmed: true,
+    start_offset: 4,
+    end_offset: 8,
+    excerpt: "找到钥匙",
+  }]);
+  const rows = JSON.parse(JSON.stringify(result.rows));
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].review.confirmed, true);
+  assert.equal(rows[1].requirement_type, "foreshadow_payoff");
+  assert.equal(rows[1].label, "回收信件缺口");
+  assert.equal(rows[1].review, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.unmatchedReviews)), []);
+});

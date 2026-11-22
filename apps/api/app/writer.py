@@ -253,19 +253,26 @@ class WriterChapterSourceBuilder:
             raise WriterDomainError("NARRATIVE_STRUCTURE_REQUIRED")
         if branch and branch.writer_source_manifest:
             manifest = dict(branch.writer_source_manifest)
-            frozen_ids = [item.get("scene_id") for item in manifest.get("scenes", [])]
-            if chapter.source_world_branch_id == branch.id:
-                current_bindings = [item.scene_id for item in db.scalars(select(ChapterSceneBinding).where(ChapterSceneBinding.chapter_id == chapter.id).order_by(ChapterSceneBinding.ordinal)).all()]
-                if current_bindings != frozen_ids:
+            saved_branch_fingerprint = manifest.get("world_branch_fingerprint")
+            if saved_branch_fingerprint != branch.current_fingerprint:
+                if branch_chapter:
+                    branch_service.invalidate_writer_source(branch)
+                else:
                     raise WriterDomainError("WRITER_SOURCE_CHANGED")
-            revision = db.scalar(select(__import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision).where(
-                __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.project_id == chapter.project_id,
-                __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.active.is_(True)))
-            source_fp = str(manifest.get("source_fingerprint") or branch.source_fingerprint or "")
-            if not source_fp:
-                raise WriterDomainError("WRITER_SOURCE_CHANGED")
-            scenes = list(manifest.get("scenes") or [])
-            return {"chapter": chapter, "revision": revision, "source_scene_ids": frozen_ids, "scenes": scenes, "manifest": manifest, "source_fingerprint": source_fp, "structure_fingerprint": manifest.get("chapter_structure_fingerprint")}
+            else:
+                frozen_ids = [item.get("scene_id") for item in manifest.get("scenes", [])]
+                if chapter.source_world_branch_id == branch.id:
+                    current_bindings = [item.scene_id for item in db.scalars(select(ChapterSceneBinding).where(ChapterSceneBinding.chapter_id == chapter.id).order_by(ChapterSceneBinding.ordinal)).all()]
+                    if current_bindings != frozen_ids:
+                        raise WriterDomainError("WRITER_SOURCE_CHANGED")
+                revision = db.scalar(select(__import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision).where(
+                    __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.project_id == chapter.project_id,
+                    __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.active.is_(True)))
+                source_fp = str(manifest.get("source_fingerprint") or branch.source_fingerprint or "")
+                if not source_fp:
+                    raise WriterDomainError("WRITER_SOURCE_CHANGED")
+                scenes = list(manifest.get("scenes") or [])
+                return {"chapter": chapter, "revision": revision, "source_scene_ids": frozen_ids, "scenes": scenes, "manifest": manifest, "source_fingerprint": source_fp, "structure_fingerprint": manifest.get("chapter_structure_fingerprint")}
         revision = db.scalar(select(__import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision).where(
             __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.project_id == chapter.project_id,
             __import__("app.models", fromlist=["NarrativeStructureRevision"]).NarrativeStructureRevision.active.is_(True)))
@@ -303,6 +310,7 @@ class WriterChapterSourceBuilder:
             "chapter_structure_fingerprint": branch.chapter_structure_fingerprint if branch_chapter and branch.chapter_structure_fingerprint else chapter.structure_fingerprint,
             "structure_status": _value(chapter.structure_status),
             "world_branch_id": branch.id if branch_chapter else None,
+            "world_branch_fingerprint": branch.current_fingerprint if branch_chapter else None,
             "scenes": scenes,
         }
         source_fp = _fp(manifest, self.protocol)

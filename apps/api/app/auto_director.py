@@ -1166,6 +1166,14 @@ class AutoDirectorOrchestrator:
                 raise AutoDirectorError("AUTO_ADOPTION_WORLD_BRANCH_MISMATCH")
             if branch.status.value != "READY":
                 raise AutoDirectorError("AUTO_ADOPTION_WORLD_BRANCH_NOT_READY")
+            source_manifest = draft.source_manifest or {}
+            if (
+                draft.chapter_source_fingerprint != branch.source_fingerprint
+                or source_manifest.get("world_branch_id") != branch.id
+                or source_manifest.get("world_branch_fingerprint") != branch.current_fingerprint
+                or (branch.writer_source_manifest or {}).get("source_fingerprint") != draft.chapter_source_fingerprint
+            ):
+                raise AutoDirectorError("AUTO_ADOPTION_WORLD_BRANCH_SOURCE_STALE")
             branch_service.activate(db, branch)
         AutoDirectorAdoptionService().adopt(db, draft, assessment)
         if branch and branch_service:

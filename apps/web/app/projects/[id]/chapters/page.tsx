@@ -9,7 +9,7 @@ import { EmptyState, ErrorState, LoadingState, PageHeader, SectionCard, StatusBa
 import styles from "./authoring.module.css";
 import { compareDraftLines } from "../../../draft-diff";
 import { mapFindingSpan } from "../../../finding-span";
-import { assessEventEvidence } from "../../../event-evidence";
+import { assessEventEvidence, requiredEventEvidenceRows } from "../../../event-evidence";
 
 type PlanChapter = Record<string, any> & { id: string; number: number; title: string };
 type Evaluation = { enabled: boolean; status: string; chapters: Array<Record<string, any>>; summary?: Record<string, any>; continuity?: Record<string, any> };
@@ -98,7 +98,8 @@ export default function ChaptersPage({ params }: { params: { id: string } }) {
     quality.current_assessment.content_fingerprint === draft?.content_fingerprint,
   );
   const eventReviews = list(quality?.current_assessment?.critic_report?.mandatory_event_reviews);
-  const requiredEventCount = list(task?.must_events).length + list(task?.foreshadow_payoff).length;
+  const eventEvidence = requiredEventEvidenceRows(task, eventReviews);
+  const requiredEventCount = eventEvidence.rows.length;
 
   const loadChapterData = async (selectedRow = row) => {
     const selectedChapterId = selectedRow?.chapter?.id;
@@ -249,24 +250,24 @@ export default function ChaptersPage({ params }: { params: { id: string } }) {
             const severity = String(finding.severity || "INFO");
             return <article key={finding.id} className={styles.findingCard}><div className={styles.findingTitle}><StatusBadge value={severity === "BLOCKING" ? "必须修改" : severity === "MAJOR" ? "建议修复" : severity === "MINOR" ? "小建议" : "参考"} /><strong>{finding.message}</strong></div>{finding.excerpt ? <blockquote className={styles.findingExcerpt}>{finding.excerpt}</blockquote> : null}<div className={styles.findingFooter}><small>{finding.source === "DETERMINISTIC" ? "规则检查" : "模型审核"} · {finding.rule_code}</small>{span && isCurrentDraft && findingsMatchDraft ? <button className="secondary" onClick={() => locateFinding(finding)} disabled={busy}><MapPin size={13} />跳到正文</button> : span && !findingsMatchDraft ? <small>质量意见对应的稿件版本已变化，请刷新并重新运行质量检查。</small> : span ? <small>当前正在查看历史版本；请先回到工作稿再定位。</small> : !draft && quality?.current_assessment?.writer_draft_id ? <small>正在读取正文并核对审阅版本。</small> : <small>没有可验证的正文原句，需根据意见手动查看。</small>}</div></article>;
           })}</div></SectionCard>}
-          {(requiredEventCount > 0 || eventReviews.length > 0) && <SectionCard title="必需剧情事件证据" description="每条证据对应本次审核稿的原文范围；未确认、缺少引用或引用不匹配正文的事件不会作为已完成。"><div className={styles.eventEvidenceList}>
+          {(requiredEventCount > 0 || eventReviews.length > 0) && <SectionCard title="必需剧情事件证据" description="必需事件和伏笔回收逐项对应审核稿原文；未确认、缺少引用或引用不匹配正文的项目不会作为已完成。"><div className={styles.eventEvidenceList}>
             {!findingsMatchDraft && <div className={styles.eventEvidenceNotice} role="status">当前打开的草稿与审核记录不匹配。请切换到审核对应版本，核对事件原文。</div>}
-            {findingsMatchDraft && requiredEventCount > eventReviews.length && <div className={styles.eventEvidenceNotice} role="status">审核记录缺少 {requiredEventCount - eventReviews.length} 条必需事件确认。</div>}
-            {findingsMatchDraft && requiredEventCount > 0 && eventReviews.length === 0 && <div className={styles.eventEvidenceNotice} role="status">此审核记录没有逐条剧情事件证据。</div>}
-            {eventReviews.map((review: any, index: number) => {
-              const evidence = assessEventEvidence(draft?.content || draft?.prose, review, findingsMatchDraft);
-              const statusText = evidence.status === "CONFIRMED" ? "审核确认" : evidence.status === "NOT_CONFIRMED" ? "未确认" : evidence.status === "INVALID_EVIDENCE" ? "引用不匹配正文" : "稿件版本不匹配";
+            {findingsMatchDraft && eventEvidence.unmatchedReviews.length > 0 && <div className={styles.eventEvidenceNotice} role="status">有 {eventEvidence.unmatchedReviews.length} 条审核记录无法对应当前章节任务。</div>}
+            {eventEvidence.rows.map((item, index) => {
+              const review = item.review;
+              const evidence = review ? assessEventEvidence(draft?.content || draft?.prose, review, findingsMatchDraft) : { status: "MISSING_REVIEW" as const, span: null };
+              const statusText = evidence.status === "CONFIRMED" ? "审核确认" : evidence.status === "NOT_CONFIRMED" ? "未确认" : evidence.status === "INVALID_EVIDENCE" ? "引用不匹配正文" : evidence.status === "MISSING_REVIEW" ? "缺少审核记录" : "稿件版本不匹配";
               const statusClass = evidence.status === "CONFIRMED" ? styles.eventEvidenceConfirmed : styles.eventEvidenceBlocked;
-              const reference = String(review.requirement_ref || `${review.requirement_type || "event"}:${review.event_ref || index}`);
-              const eventType = review.requirement_type === "foreshadow_payoff" ? "伏笔回收" : "必需事件";
+              const reference = String(review?.requirement_ref || item.requirement_ref || `${item.requirement_type}:${item.event_ref || index}`);
+              const eventType = item.requirement_type === "foreshadow_payoff" ? "伏笔回收" : "必需事件";
               return <article className={styles.eventEvidenceItem} key={reference}>
                 <div className={styles.eventEvidenceHeader}><span className={`${styles.eventEvidenceStatus} ${statusClass}`}>{statusText}</span><span className={styles.eventEvidenceKind}>{eventType}</span></div>
-                <strong>{review.label || review.event_ref || "未命名事件"}</strong>
-                {evidence.span && review.excerpt ? <blockquote className={styles.eventEvidenceQuote}>{review.excerpt}</blockquote> : null}
-                {review.reason ? <p className={styles.eventEvidenceReason}>{review.reason}</p> : null}
+                <strong>{item.label || review?.label || item.event_ref || "未命名事件"}</strong>
+                {evidence.span && review?.excerpt ? <blockquote className={styles.eventEvidenceQuote}>{review.excerpt}</blockquote> : null}
+                {review?.reason ? <p className={styles.eventEvidenceReason}>{review.reason}</p> : null}
                 <div className={styles.eventEvidenceFooter}>
-                  <small>{review.event_ref || reference}</small>
-                  {evidence.span && isCurrentDraft ? <button className="secondary" onClick={() => locateFinding({ id: reference, start_offset: review.start_offset, end_offset: review.end_offset, excerpt: review.excerpt })} disabled={busy}><MapPin size={13} />跳到正文</button> : evidence.span && !isCurrentDraft ? <small>证据对应历史稿；恢复为工作稿后可定位编辑。</small> : evidence.status === "STALE" ? <small>切换到审核对应的稿件版本以查看原句。</small> : null}
+                  <small>{item.event_ref || review?.event_ref || reference}</small>
+                  {evidence.span && isCurrentDraft ? <button className="secondary" onClick={() => locateFinding({ id: reference, start_offset: review?.start_offset, end_offset: review?.end_offset, excerpt: review?.excerpt })} disabled={busy}><MapPin size={13} />跳到正文</button> : evidence.span && !isCurrentDraft ? <small>证据对应历史稿；恢复为工作稿后可定位编辑。</small> : evidence.status === "STALE" ? <small>切换到审核对应的稿件版本以查看原句。</small> : evidence.status === "MISSING_REVIEW" ? <small>此项尚无逐条正文确认，不能作为已完成事实。</small> : null}
                 </div>
               </article>;
             })}

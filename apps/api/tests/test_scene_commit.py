@@ -507,6 +507,7 @@ def test_chapter_branch_publish_is_atomic_and_reuses_staged_scene(session, monke
     service.activate(session, branch)
     staged = SceneCommitService().stage(session, project.id, performance.id)
     branch.status = ChapterWorldBranchStatus.READY
+    WriterChapterSourceBuilder().build(session, branch.chapter_id)
     session.flush()
     original_profile = copy.deepcopy(location.profile)
     baseline = branch.base_world_fingerprint
@@ -618,9 +619,15 @@ def test_chapter_branch_keeps_later_scenes_and_writer_on_one_candidate_world(ses
     second_character_context = CharacterContextBuilder().build(session, project.id, actor.id, proposal)
     assert second_character_context["character"]["current_state"]["trust"] == "opened-file"
 
+    first_writer_source = WriterChapterSourceBuilder().build(session, branch.chapter_id)
+    first_writer_source_fingerprint = first_writer_source["source_fingerprint"]
+    assert first_writer_source["manifest"]["world_branch_fingerprint"] == branch.current_fingerprint
     second_staged = SceneCommitService().stage(session, project.id, second_performance.id)
+    assert branch.writer_source_manifest == {}
+    assert branch.source_fingerprint is None
     chapter = session.get(Chapter, branch.chapter_id)
     writer_source = WriterChapterSourceBuilder().build(session, chapter.id)
+    assert writer_source["source_fingerprint"] != first_writer_source_fingerprint
     assert writer_source["source_scene_ids"] == [first_staged.scene.id, second_staged.scene.id]
     first_writer_scene = writer_source["scenes"][0]
     second_writer_scene = writer_source["scenes"][1]
@@ -633,6 +640,29 @@ def test_chapter_branch_keeps_later_scenes_and_writer_on_one_candidate_world(ses
     assert not any(row["id"] in {first_staged.scene.id, second_staged.scene.id} for row in formal_payload["scenes"])
     assert not any(row["id"] == chapter.id for row in formal_payload["chapters"])
     assert session.scalar(select(TimelineEvent.id).where(TimelineEvent.scene_id.in_([first_staged.scene.id, second_staged.scene.id]))) is None
+
+
+def test_chapter_branch_publish_rejects_expired_formal_baseline(session, monkeypatch):
+    project, location, _actor, _other, _proposal, performance, _turn, _resolution, _batch, _client = prepared_commit(session, monkeypatch)
+    from app.chapter_world_branch import ChapterWorldBranchService
+
+    service = ChapterWorldBranchService()
+    _run, branch = prepare_chapter_branch(session, project)
+    service.activate(session, branch)
+    staged = SceneCommitService().stage(session, project.id, performance.id)
+    branch.status = ChapterWorldBranchStatus.READY
+    WriterChapterSourceBuilder().build(session, branch.chapter_id)
+    session.flush()
+
+    location.profile = {**location.profile, "unrelated_author_change": True}
+    session.flush()
+    with pytest.raises(ValueError, match="CHAPTER_WORLD_BRANCH_BASELINE_CHANGED"):
+        service.publish(session, branch)
+
+    session.flush()
+    assert staged.scene.history_status == "STAGED"
+    assert session.scalar(select(SceneCommit.id).where(SceneCommit.project_id == project.id)) is None
+    assert session.scalar(select(SceneStateCheckpoint.id).where(SceneStateCheckpoint.project_id == project.id)) is None
 
 
 def test_normal_checkpoint_uses_anchor_then_reference_and_compact_delta(session, monkeypatch):

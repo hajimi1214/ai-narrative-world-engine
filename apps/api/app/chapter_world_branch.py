@@ -158,6 +158,12 @@ class ChapterWorldBranchService:
             "scene_ids": branch.scene_ids or [],
         }, "chapter-world-branch-state-v1")
 
+    @staticmethod
+    def invalidate_writer_source(branch: ChapterWorldBranch) -> None:
+        if branch.writer_source_manifest:
+            branch.writer_source_manifest = {}
+            branch.source_fingerprint = None
+
     def effective_record(self, db: Session, row: Any) -> dict[str, Any]:
         branch = self.active(db)
         record = _record(row)
@@ -255,6 +261,7 @@ class ChapterWorldBranchService:
         } for item in items)
         branch.state_changes = changes
         branch.current_fingerprint = self.fingerprint(branch)
+        self.invalidate_writer_source(branch)
 
     @staticmethod
     def stage_cognition(branch: ChapterWorldBranch, scene_id: str, knowledge: list[Any], memories: list[Any]) -> None:
@@ -309,6 +316,7 @@ class ChapterWorldBranchService:
         branch.scene_ids = scenes
         branch.performance_ids = performances
         branch.current_fingerprint = self.fingerprint(branch)
+        self.invalidate_writer_source(branch)
         db.flush()
 
     def scene_context(self, db: Session, branch: ChapterWorldBranch | None = None) -> list[dict[str, Any]]:
@@ -347,6 +355,12 @@ class ChapterWorldBranchService:
         ).with_for_update())
         if not branch or branch.status != ChapterWorldBranchStatus.READY:
             raise ValueError("CHAPTER_WORLD_BRANCH_NOT_READY")
+        if (
+            not branch.writer_source_manifest
+            or branch.writer_source_manifest.get("world_branch_fingerprint") != branch.current_fingerprint
+            or branch.writer_source_manifest.get("source_fingerprint") != branch.source_fingerprint
+        ):
+            raise ValueError("CHAPTER_WORLD_BRANCH_SOURCE_STALE")
         if not db.scalar(select(Project).where(Project.id == branch.project_id).with_for_update()):
             raise ValueError("CHAPTER_WORLD_BRANCH_PROJECT_NOT_FOUND")
 

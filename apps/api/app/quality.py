@@ -1310,6 +1310,8 @@ class QualityRepairService:
             return chapter
         if _value(draft.status) != "VALIDATED":
             raise QualityDomainError("QUALITY_REPAIR_DRAFT_NOT_VALIDATED")
+        if chapter.pending_world_branch_id or chapter.world_branch_id:
+            raise QualityDomainError("CHAPTER_WORLD_BRANCH_REQUIRES_REVIEW_ADOPTION")
         from .authoring import ensure_chapter_unsealed
         try:
             ensure_chapter_unsealed(db, chapter)
