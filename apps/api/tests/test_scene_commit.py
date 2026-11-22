@@ -23,6 +23,7 @@ from app.models import (
     FormalStateLeaf, StoryThread, ThreadStatus, WorldEntity, WorldResolution, WorldSnapshot,
 )
 from app.formal_state import FormalStateIdentityAudit, FormalStateIdentityService
+from app.character_mind import ActiveCharacterCognitionReader, CharacterContextBuilder
 from app.scene_commit import SceneCommitService
 from app.narrative_structure import NarrativeStructureAudit
 from app.narrative_structure_projection import NarrativeStructureProjectionService
@@ -31,7 +32,8 @@ from app.snapshot_storage import CompactSnapshotAudit, ProjectWorldSnapshotHeadS
 from app.state_delta import FormalWorldStateReader, StateDeltaCandidateBuilder
 from app.state_delta_validation import StateDeltaValidator
 from app.versioning import WorldSnapshotBuilder
-from app.world_resolution import WorldResolutionPayload
+from app.world_resolution import WorldResolutionContextBuilder, WorldResolutionPayload
+from app.writer import WriterChapterSourceBuilder
 from test_character_mind import seed
 
 
@@ -65,7 +67,7 @@ def structured_effect(target_type, target_id, domain, operation, path, value):
     }
 
 
-def prepared_commit(session, monkeypatch, *, effects=None, requires_resolution=True, outcome=ResolutionOutcome.SUCCESS):
+def prepared_commit(session, monkeypatch, *, effects=None, objective_facts=None, requires_resolution=True, outcome=ResolutionOutcome.SUCCESS):
     project, location, actor, other, _outsider, proposal = seed(session)
     location.profile = {"openable": True, "opened": False, "locked": False}
     proposal.status = ProposalStatus.APPROVED
@@ -101,10 +103,12 @@ def prepared_commit(session, monkeypatch, *, effects=None, requires_resolution=T
     resolution = None
     batch = None
     if requires_resolution:
+        resolved_effects = effects(project, location, actor) if callable(effects) else effects if effects is not None else [effect(location.id)]
+        resolved_facts = objective_facts(project, location, actor) if callable(objective_facts) else objective_facts
         payload = WorldResolutionPayload.model_validate({
             "outcome": outcome, "outcome_summary": "The entity opens.",
-            "objective_facts": [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "opened", "value": True}],
-            "state_effects": effects if effects is not None else [effect(location.id)],
+            "objective_facts": resolved_facts if resolved_facts is not None else [{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "opened", "value": True}],
+            "state_effects": resolved_effects,
             "actor_observation": "The entity opens.", "public_observation": "The entity opens.",
             "canon_fact_ids_used": [], "world_entity_ids_used": [location.id],
             "resolution_basis_summary": "structured", "missing_information": [],
@@ -543,6 +547,92 @@ def test_chapter_branch_publish_is_atomic_and_reuses_staged_scene(session, monke
     assert session.scalar(select(SceneStateCheckpoint.id).where(SceneStateCheckpoint.scene_id == scene.id)) is not None
     assert session.scalar(select(TimelineEvent.id).where(TimelineEvent.scene_id == scene.id)) is not None
     assert session.scalar(select(CharacterKnowledge.id).where(CharacterKnowledge.character_id == actor.id)) is not None
+
+
+def test_chapter_branch_keeps_later_scenes_and_writer_on_one_candidate_world(session, monkeypatch):
+    project, location, actor, _other, proposal, first_performance, first_turn, _resolution, _batch, _client = prepared_commit(
+        session,
+        monkeypatch,
+        effects=lambda _project, entity, character: [
+            effect(entity.id),
+            structured_effect("CHARACTER", character.id, "CHARACTER_CURRENT_STATE", "UPSERT", "/current_state/trust", "opened-file"),
+        ],
+        objective_facts=lambda _project, entity, character: [
+            {"subject_type": "ENTITY", "subject_id": entity.id, "predicate": "opened", "value": True},
+            {"subject_type": "CHARACTER", "subject_id": character.id, "predicate": "trust", "value": "opened-file"},
+        ],
+    )
+    branch_service = __import__("app.chapter_world_branch", fromlist=["ChapterWorldBranchService"]).ChapterWorldBranchService()
+    formal_before = FormalStateIdentityService().current(session, project.id)[0]
+    run, branch = prepare_chapter_branch(session, project)
+    branch_service.activate(session, branch)
+    first_staged = SceneCommitService().stage(session, project.id, first_performance.id)
+
+    assert location.profile["opened"] is False
+    assert actor.current_state.get("trust") is None
+    assert any("trust" in row.proposition and "opened-file" in row.proposition for row in ActiveCharacterCognitionReader().knowledge(session, project.id, actor.id))
+
+    next_context = DirectorContextBuilder().build(session, project.id)
+    proposal.context_fingerprint = next_context["fingerprint"]
+    second_performance = ScenePerformance(
+        project_id=project.id,
+        scene_proposal_id=proposal.id,
+        take_number=2,
+        proposal_context_fingerprint=proposal.context_fingerprint,
+        mode=PerformanceMode.HEURISTIC,
+        status=PerformanceStatus.RUNNING,
+        participant_order=[actor.id],
+        active_participant_ids=[actor.id],
+        max_turns=1,
+        turn_count=0,
+    )
+    session.add(second_performance)
+    session.commit()
+    second_turn, _second_resolution, second_batch = add_resolution_turn(
+        session,
+        project,
+        location,
+        proposal,
+        second_performance,
+        actor,
+        1,
+        [effect(location.id, value=False)],
+        facts=[{"subject_type": "ENTITY", "subject_id": location.id, "predicate": "opened", "value": False}],
+    )
+    second_item = session.scalar(select(StateDeltaItem).where(StateDeltaItem.batch_id == second_batch.id))
+    assert second_item.before_value is True
+    assert FormalWorldStateReader().before_value(
+        session,
+        project.id,
+        __import__("app.state_effect_contract", fromlist=["StateEffectPayload"]).StateEffectPayload.model_validate(second_item.evidence["state_effect"]),
+    ) == (True, True)
+
+    second_world_context = WorldResolutionContextBuilder().build(
+        session,
+        second_performance,
+        second_turn,
+        proposal,
+        second_turn.world_resolution_request,
+    )
+    assert second_world_context["location"]["profile"]["opened"] is True
+    second_character_context = CharacterContextBuilder().build(session, project.id, actor.id, proposal)
+    assert second_character_context["character"]["current_state"]["trust"] == "opened-file"
+
+    second_staged = SceneCommitService().stage(session, project.id, second_performance.id)
+    chapter = session.get(Chapter, branch.chapter_id)
+    writer_source = WriterChapterSourceBuilder().build(session, chapter.id)
+    assert writer_source["source_scene_ids"] == [first_staged.scene.id, second_staged.scene.id]
+    first_writer_scene = writer_source["scenes"][0]
+    second_writer_scene = writer_source["scenes"][1]
+    assert any(change["path"] == "/current_state/trust" and change["after_value"] == "opened-file" for change in first_writer_scene["state_changes"])
+    assert any(change["path"] == "/profile/opened" and change["before_value"] is True for change in second_writer_scene["state_changes"])
+
+    branch_service.clear(session)
+    formal_payload, _ = WorldSnapshotBuilder().build(session, project.id)
+    assert FormalStateIdentityService().current(session, project.id)[0] == formal_before
+    assert not any(row["id"] in {first_staged.scene.id, second_staged.scene.id} for row in formal_payload["scenes"])
+    assert not any(row["id"] == chapter.id for row in formal_payload["chapters"])
+    assert session.scalar(select(TimelineEvent.id).where(TimelineEvent.scene_id.in_([first_staged.scene.id, second_staged.scene.id]))) is None
 
 
 def test_normal_checkpoint_uses_anchor_then_reference_and_compact_delta(session, monkeypatch):

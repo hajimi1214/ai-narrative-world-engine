@@ -13,7 +13,7 @@ from .execution_trace import stable_fingerprint
 from .formal_state import FormalStateIdentityService
 from .models import (
     Chapter, ChapterSceneBinding, ChapterStructureStatus, ChapterWorldBranch,
-    ChapterWorldBranchStatus, Character, Project, Scene, SceneStatus,
+    ChapterWorldBranchStatus, Character, KnowledgeStatus, Project, Scene, SceneStatus,
     StoryThread, StateDeltaItem, StateDeltaTargetType, WorldEntity,
 )
 from .revision import _pointer, _record
@@ -276,7 +276,10 @@ class ChapterWorldBranchService:
             staged = (branch.staged_cognition or {}).get("scenes", {}).get(scene_id, {})
             for values in staged.get(key, []):
                 if values.get("character_id") == character_id:
-                    rows.append(SimpleNamespace(**copy.deepcopy(values)))
+                    row = copy.deepcopy(values)
+                    if key == "knowledge":
+                        row["status"] = KnowledgeStatus(row["status"])
+                    rows.append(SimpleNamespace(**row))
         return rows
 
     def scene_ids(self, db: Session, branch: ChapterWorldBranch | None = None) -> list[str]:
