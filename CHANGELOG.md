@@ -12,6 +12,9 @@
 - Required chapter events and foreshadowing payoffs need critic-confirmed, fingerprint-bound excerpts from the exact prose draft before automatic adoption. Foreshadowing is marked paid off only after adoption.
 - Book-level automatic cross-volume continuation remains disabled by default. A passing volume is sealed with a continuity snapshot before the same run advances, and a missing next-volume contract pauses for author action.
 - Character voice guidance is optional and author-controlled. It does not constitute evidence of improved literary quality.
+- Explicit author POV-character selections now take precedence over chapter-task and writing-bible character references in Writer context and automatic runs.
+- Full-auto and author-guided run creation reject POV-character IDs owned by another project before queuing work.
+- Automatic adoption relies on the current audited quality assessment for forbidden-event evidence and ignores Writer self-reports as authorization evidence.
 
 ## 0.3.0 - 2026-11-21
 

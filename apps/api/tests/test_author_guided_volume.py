@@ -78,10 +78,14 @@ def _trust_seeded_chapters_for_volume_lifecycle(monkeypatch):
     )
 def test_author_guided_run_creates_contract_and_bounded_window(monkeypatch):
     client, Session, project_id = _setup(monkeypatch)
-    response = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"title": "长夜记", "theme": "记忆与选择", "premise": "追查失踪记忆", "estimated_chapters": 600, "estimated_volumes": 12, "window_size": 5, "idempotency_key": "book-1"})
+    with Session() as db:
+        pov_character = Character(project_id=project_id, name="作者指定视角")
+        db.add(pov_character); db.commit(); pov_character_id = pov_character.id
+    response = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={"title": "长夜记", "theme": "记忆与选择", "premise": "追查失踪记忆", "pov": "FIRST_PERSON", "pov_character_id": pov_character_id, "estimated_chapters": 600, "estimated_volumes": 12, "window_size": 5, "idempotency_key": "book-1"})
     assert response.status_code == 201, response.text
     run_id = response.json()["id"]
     assert response.json()["run_mode"] == "AUTHOR_GUIDED_VOLUME"
+    assert response.json()["context"]["request"]["pov_character_id"] == pov_character_id
     assert AutoDirectorWorker(Session, poll_seconds=0).run_once() is True
     with Session() as db:
         contract = db.scalar(select(BookContract).where(BookContract.project_id == project_id))
@@ -93,6 +97,23 @@ def test_author_guided_run_creates_contract_and_bounded_window(monkeypatch):
         tasks = db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.id.in_(db.get(AutoDirectorRun, run_id).context["window_task_ids"])).order_by(StoryPlanChapter.number)).all()
         assert len(tasks) == 5 and [item.number for item in tasks] == [1, 2, 3, 4, 5]
         assert db.get(AutoDirectorRun, run_id).status.value == "PAUSED"
+
+
+def test_author_guided_run_rejects_pov_character_from_another_project(monkeypatch):
+    client, Session, project_id = _setup(monkeypatch)
+    with Session() as db:
+        other_project = Project(name="其他作品")
+        db.add(other_project); db.flush()
+        foreign_character = Character(project_id=other_project.id, name="外部视角")
+        db.add(foreign_character); db.commit(); foreign_character_id = foreign_character.id
+
+    response = client.post(f"/projects/{project_id}/author-guided-volume/runs", json={
+        "title": "合成测试", "pov": "FIRST_PERSON", "pov_character_id": foreign_character_id,
+        "idempotency_key": "foreign-author-pov",
+    })
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "WRITER_POV_REQUIRED"
 
 
 def test_book_auto_cross_volume_setting_is_explicit_and_exposed(monkeypatch):

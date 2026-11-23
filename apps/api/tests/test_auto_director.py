@@ -45,16 +45,37 @@ def _client(monkeypatch, directions):
 def test_auto_director_creates_and_pauses_for_direction(monkeypatch):
     directions = [{"title": f"方向 {i}", "premise": "可兑现的主线", "core_conflict": "目标与代价"} for i in range(3)]
     client, project_id = _client(monkeypatch, directions)
-    response = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "修复师追查失踪记录", "idempotency_key": "same-run"})
+    with api_module.SessionLocal() as db:
+        pov_character = Character(project_id=project_id, name="作者视角人物")
+        db.add(pov_character); db.commit(); pov_character_id = pov_character.id
+    response = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "修复师追查失踪记录", "pov": "FIRST_PERSON", "pov_character_id": pov_character_id, "idempotency_key": "same-run"})
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["status"] == "RUNNING"
     assert body["current_stage"] == "IDEA"
     assert body["run_mode"] == "FULL_AUTO"
+    assert body["context"]["request"]["pov_character_id"] == pov_character_id
 
     duplicate = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "不同输入", "idempotency_key": "same-run"})
     assert duplicate.status_code == 201
     assert duplicate.json()["id"] == body["id"]
+
+
+def test_auto_director_rejects_pov_character_from_another_project(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    with api_module.SessionLocal() as db:
+        other_project = Project(name="其他作品")
+        db.add(other_project); db.flush()
+        foreign_character = Character(project_id=other_project.id, name="外部视角")
+        db.add(foreign_character); db.commit(); foreign_character_id = foreign_character.id
+
+    response = client.post(f"/projects/{project_id}/auto-director/runs", json={
+        "pov": "FIRST_PERSON", "pov_character_id": foreign_character_id,
+        "idempotency_key": "foreign-pov-character",
+    })
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "WRITER_POV_REQUIRED"
 
 
 def test_full_auto_api_uses_finite_budget_by_default_and_keeps_explicit_unlimited_opt_in(monkeypatch):
@@ -700,6 +721,7 @@ def test_auto_writer_preserves_author_pov_over_generated_chapter_pov(monkeypatch
             from app.ai.provider import ModelResult
             context = json.loads(messages[-1]["content"])["context"]
             observed_modes.append(context["rendering_contract"]["pov_mode"])
+            observed_pov_characters.append(context["rendering_contract"]["pov_character_id"])
             payload = {
                 "chapter_title": "门边",
                 "prose": "我在门边等候。",
@@ -714,6 +736,7 @@ def test_auto_writer_preserves_author_pov_over_generated_chapter_pov(monkeypatch
             )
 
     provider = WriterProvider()
+    observed_pov_characters = []
     monkeypatch.setattr(auto_module.ModelRouter, "resolve", lambda self, *args, **kwargs: SimpleNamespace(provider="fake", model="writer", base_url="https://example.invalid"))
     monkeypatch.setattr(auto_module.ProviderCredentialResolver, "generation_key", lambda self, *args, **kwargs: "test-key")
     monkeypatch.setattr(auto_module, "get_model_provider", lambda *args, **kwargs: provider)
@@ -726,10 +749,11 @@ def test_auto_writer_preserves_author_pov_over_generated_chapter_pov(monkeypatch
         project = Project(name="POV", min_chapter_words=None, max_chapter_words=None)
         db.add(project); db.flush()
         actor = Character(project_id=project.id, name="林岚")
-        db.add(actor); db.flush()
+        author_pov_character = Character(project_id=project.id, name="顾遥")
+        db.add_all([actor, author_pov_character]); db.flush()
         db.add(Scene(
             project_id=project.id, sequence=1, world_time=datetime(2026, 1, 1),
-            location="档案馆", participants=[actor.id], facts=[], result={},
+            location="档案馆", participants=[actor.id, author_pov_character.id], facts=[], result={},
             summary="场景", intent="等候", story_threads=[], status="OCCURRED",
             history_status="ACTIVE",
         ))
@@ -749,7 +773,7 @@ def test_auto_writer_preserves_author_pov_over_generated_chapter_pov(monkeypatch
             project_id=project.id, idempotency_key="author-pov", run_mode="AUTHOR_GUIDED_VOLUME",
             status="RUNNING", current_stage=AutoDirectorStage.CHAPTER_EXECUTION,
             settings={"max_tokens": 0},
-            context={"plan_id": plan.id, "request": {"pov": "FIRST_PERSON"}, "foundation": {"character_ids": [actor.id]}},
+            context={"plan_id": plan.id, "request": {"pov": "FIRST_PERSON", "pov_character_id": author_pov_character.id}, "foundation": {"character_ids": [actor.id, author_pov_character.id]}},
         )
         db.add(run); db.flush()
 
@@ -758,6 +782,7 @@ def test_auto_writer_preserves_author_pov_over_generated_chapter_pov(monkeypatch
         )
 
         assert observed_modes == ["FIRST_PERSON"]
+        assert observed_pov_characters == [author_pov_character.id]
         assert run.current_stage == AutoDirectorStage.QUALITY_REVIEW
 
 

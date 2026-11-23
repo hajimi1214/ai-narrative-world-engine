@@ -157,8 +157,6 @@ class AutoDirectorAdoptionService:
         report = draft.validation_report or {}
         if report.get("valid") is False:
             raise AutoDirectorError("AUTO_ADOPTION_DRAFT_VALIDATION_FAILED")
-        if report.get("task_forbidden_hits") or report.get("forbidden_event_check", {}).get("forbidden_events"):
-            raise AutoDirectorError("AUTO_ADOPTION_FORBIDDEN_EVENT")
         task = (draft.source_manifest or {}).get("planning_task") or {}
         from .quality import QualityAssessmentAudit, validate_required_event_evidence
         evidence_issues = validate_required_event_evidence(
@@ -1088,7 +1086,8 @@ class AutoDirectorOrchestrator:
             self._check_budget(run)
             settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "WRITER")
             key = ProviderCredentialResolver().generation_key(db, project.id, settings)
-            pov_character_id = (run.context.get("foundation") or {}).get("character_ids", [None])[0]
+            request = run.context.get("request") or {}
+            pov_character_id = request.get("pov_character_id") or (run.context.get("foundation") or {}).get("character_ids", [None])[0]
             writer_provider = _UsageTrackingProvider(self._routed_provider(db, project.id, settings, route, key), db.info.get("author_model_call_guard"), self._pending_usage_callback(db, run))
             writer_live = self._live_begin(run, f"第 {chapter_number} 章：正文写作", "WRITER", provider=route.provider, model=route.model)
             live_execution_broker.phase(writer_live, "WRITING", "Writer 正在依据角色 Agent 行动和章节任务生成正文")
@@ -1098,7 +1097,7 @@ class AutoDirectorOrchestrator:
                 # persisted FAILED draft without making another model call.
                 writer_request_key = f"{run.id}-chapter-{chapter_number}-writer-attempt-{writer_step.attempt}"
                 planning_task = chapter_task_context(db, project.id, chapter_number, required=True) or {}
-                author_pov = (run.context.get("request") or {}).get("pov")
+                author_pov = request.get("pov")
                 writer_request = {
                     "idempotency_key": writer_request_key,
                     "pov_mode": author_pov or planning_task.get("pov_mode"),

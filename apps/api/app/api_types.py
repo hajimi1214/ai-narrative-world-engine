@@ -12,6 +12,7 @@ class AutoDirectorRunCreatePayload(BaseModel):
     target_chapters: int = Field(default=10, ge=1, le=100000)
     target_words_per_chapter: int = Field(default=3000, ge=500, le=20000)
     pov: str = "THIRD_PERSON_LIMITED"
+    pov_character_id: str | None = None
     tone: str = ""
     max_chapters: int | None = Field(default=None, ge=1, le=100000)
     max_repairs: int = Field(default=2, ge=0, le=10)
@@ -40,6 +41,7 @@ class AuthorGuidedRunCreatePayload(BaseModel):
     premise: str | None = Field(default=None, max_length=12000)
     ending_direction: str | None = Field(default=None, max_length=12000)
     protagonist_contract: dict[str, Any] = Field(default_factory=dict)
+    pov_character_id: str | None = None
     global_plot_direction: str | None = Field(default=None, max_length=12000)
     global_required_events: list[Any] = Field(default_factory=list)
     global_forbidden_events: list[Any] = Field(default_factory=list)

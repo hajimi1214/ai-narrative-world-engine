@@ -10,7 +10,7 @@ from ..api_types import AutoDirectorResumePayload, AutoDirectorRunCreatePayload,
 from ..models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, Project
 from ..author_recovery import recovery_payload, revoke_claim
 from ..author_recovery import budget_usage, configured_token_budget
-from .common import get_db, require_project
+from .common import get_db, require_project, validate_pov_character
 
 router = APIRouter(tags=["auto-director"])
 
@@ -81,6 +81,7 @@ def create_run(project_id: str, payload: AutoDirectorRunCreatePayload, db: Sessi
     existing = db.scalar(select(AutoDirectorRun).where(AutoDirectorRun.project_id == project_id, AutoDirectorRun.idempotency_key == idempotency_key))
     if existing:
         return _payload(db, existing)
+    validate_pov_character(db, project_id, payload.pov_character_id)
     if payload.name and project.name == "未命名小说": project.name = payload.name
     if payload.inspiration: project.story_seed = payload.inspiration
     try:

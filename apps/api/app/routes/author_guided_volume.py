@@ -10,7 +10,7 @@ from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGui
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _auto_next_volume_missing_fields, _contract_payload, _enum, _volume_payload, _window_payload
 from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookCompletionProposalStatus, BookContract, ChapterPlanningWindow, ChapterWindowStatus, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
 from ..author_recovery import budget_usage, configured_token_budget, recovery_payload, revoke_claim
-from .common import get_db, require_project
+from .common import get_db, require_project, validate_pov_character
 from .auto_director import _retry_checkpoint, _retry_limit_reached
 
 router = APIRouter(tags=["author-guided-volume"])
@@ -243,6 +243,7 @@ def create_author_guided_run(project_id: str, payload: AuthorGuidedRunCreatePayl
     existing = db.scalar(select(AutoDirectorRun).where(AutoDirectorRun.project_id == project_id, AutoDirectorRun.idempotency_key == key))
     if existing:
         return _run_payload(db, existing)
+    validate_pov_character(db, project_id, payload.pov_character_id)
     contract = AuthorGuidedVolumeService().ensure_contract(db, project, data)
     volume = AuthorGuidedVolumeService().ensure_volume(db, project, contract, data.get("volume") or {})
     auto_cross_volume = bool(data.get("auto_cross_volume") or (data.get("length_policy") or {}).get("auto_cross_volume") or data.get("continuous_volume_progression") or (data.get("length_policy") or {}).get("continuous_volume_progression"))

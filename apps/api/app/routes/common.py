@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..model_router import ProviderCredentialResolver
-from ..models import Project, ProjectModelConfig
+from ..models import Character, Project, ProjectModelConfig
 
 
 class Payload(BaseModel):
@@ -51,6 +51,17 @@ def require_project(db: Session, project_id: str) -> Project:
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+def validate_pov_character(db: Session, project_id: str, character_id: str | None) -> None:
+    if not character_id:
+        return
+    character = db.get(Character, character_id)
+    if not character or character.project_id != project_id:
+        raise HTTPException(status_code=422, detail={
+            "code": "WRITER_POV_REQUIRED",
+            "message": "叙事视角人物必须属于当前作品。",
+        })
 
 
 def routed_provider(settings, route, db: Session | None = None, project_id: str | None = None):

@@ -239,9 +239,11 @@ class WriterPOVResolver:
             mode = WriterPOVMode(raw_mode) if raw_mode else WriterPOVMode.THIRD_PERSON_LIMITED
         except ValueError as exc:
             raise WriterDomainError("WRITER_POV_MODE_INVALID", {"pov_mode": raw_mode}) from exc
-        character_id = request.get("pov_character_id") or rules.get("pov_character_id")
+        # Keep the author-selected character aligned with the author-selected
+        # POV mode. A planning reference is the fallback, not an override.
+        character_id = request.get("pov_character_id") or planning_task.get("pov_character_ref") or rules.get("pov_character_id")
         planning_ref = planning_task.get("pov_character_ref")
-        if planning_ref:
+        if planning_ref and not request.get("pov_character_id"):
             character = db.get(Character, str(planning_ref))
             if not character:
                 matches = db.scalars(select(Character).where(

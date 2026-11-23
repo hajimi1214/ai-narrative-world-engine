@@ -204,6 +204,26 @@ def test_explicit_author_pov_overrides_planning_mode(writer_project, session):
     assert mode == WriterPOVMode.FIRST_PERSON and character_id == actor.id
 
 
+def test_explicit_author_pov_character_overrides_planning_character_and_bible(writer_project, session):
+    project, actor, scene, chapter = writer_project
+    author_pov_character = Character(project_id=project.id, name="Author POV")
+    session.add(author_pov_character)
+    session.flush()
+    scene.participants = [actor.id, author_pov_character.id]
+    session.flush()
+
+    mode, character_id = WriterPOVResolver().resolve(
+        session,
+        chapter,
+        {"pov_mode": "FIRST_PERSON", "pov_character_id": author_pov_character.id},
+        bible=WritingBible(project_id=project.id, version=1, rules={"pov_character_id": actor.id}, active=False),
+        planning_task={"pov_mode": "THIRD_PERSON_LIMITED", "pov_character_ref": actor.id},
+    )
+
+    assert mode == WriterPOVMode.FIRST_PERSON
+    assert character_id == author_pov_character.id
+
+
 def test_invalid_pov_mode_fails_with_domain_error(writer_project, session):
     with pytest.raises(WriterDomainError, match="WRITER_POV_MODE_INVALID"):
         WriterPOVResolver().resolve(session, writer_project[3], {"pov_mode": "first-person"})
@@ -384,6 +404,26 @@ def test_adopt_updates_chapter_atomically(writer_project, session):
     chapter = writer_project[3]; draft = render(session, chapter)
     WriterProjectionService().adopt(session, draft.id)
     assert chapter.current_writer_draft_id == draft.id and chapter.content == draft.content and chapter.word_count == draft.word_count
+
+
+def test_auto_adoption_does_not_treat_writer_self_report_as_forbidden_event_evidence(writer_project, session):
+    from app.auto_director import AutoDirectorAdoptionService
+    from app.quality import QualityGateService
+
+    chapter = writer_project[3]
+    draft = render(session, chapter)
+    draft.validation_report["task_forbidden_hits"] = ["模型自报发现了禁止事件"]
+    draft.validation_report["forbidden_event_check"] = {"forbidden_events": ["旧版自报命中"]}
+    assessment = QualityGateService().assess(
+        session,
+        chapter.id,
+        {"config": {"require_critic": False}},
+        draft=draft,
+        require_current=False,
+    )
+
+    assert assessment.status.value == "PASS"
+    AutoDirectorAdoptionService().adopt(session, draft, assessment)
 
 
 def test_adopt_keeps_chapter_draft_status(writer_project, session):
