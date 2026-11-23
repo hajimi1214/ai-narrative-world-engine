@@ -22,7 +22,7 @@ from app.models import (
 from app.narrative_structure import NarrativeStructureService
 from app.planning import chapter_task_context, persist_plan
 from app.quality import (
-    AntiAIBibleResolver, AntiAIStyleRuleEngine, CriticOutputValidator, build_required_event_evidence,
+    AntiAIBibleResolver, AntiAIStyleRuleEngine, CriticOutputValidator, CriticPromptBuilder, build_required_event_evidence,
     build_forbidden_event_evidence, forbidden_event_specs,
     NarrativeRepetitionDetector, QualityAssessmentAudit, QualityContextBuilder,
     QualityAssessmentFreshnessChecker, QualityDecisionEngine, QualityDomainError, QualityGateConfigResolver, QualityGateService,
@@ -249,6 +249,17 @@ def test_critic_visible_ref_is_accepted():
     finding = {"category": "CONTINUITY", "severity": "INFO", "message": "note", "start_offset": None, "end_offset": None, "excerpt": None, "source_refs": [{"source_type": "SCENE", "source_id": "s"}]}
     value = CriticOutputValidator().parse(critic_response(findings=[finding]), "text", [{"source_type": "SCENE", "source_id": "s"}])
     assert value["findings"][0]["source_refs"][0]["source_id"] == "s"
+
+
+def test_critic_voice_review_uses_only_supplied_preferences_without_forcing_tics():
+    messages = CriticPromptBuilder().build({
+        "writer_safe_context": {"character_voice_profiles": {"character-1": {"voice": {"register": "简短克制"}}}},
+        "prose": "“明天再说。”她把账本合上。",
+    })
+    system = messages[0]["content"]
+    assert "character_voice_profiles" in system
+    assert "Do not require repeated catchphrases" in system
+    assert "When no profile exists, do not invent a voice contract" in system
 
 
 def test_critic_required_event_review_requires_exact_prose_evidence():

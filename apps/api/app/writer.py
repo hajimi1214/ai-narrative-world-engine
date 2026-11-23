@@ -36,6 +36,27 @@ from .retcon_apply import has_pending_replay
 from .planning import chapter_task_context
 
 
+VOICE_PROFILE_FIELDS = (
+    "register", "diction", "sentence_length", "rhythm", "directness",
+    "metaphor_style", "dialogue_habits", "verbal_tics", "avoid",
+)
+
+
+def _safe_character_voice_profile(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key in VOICE_PROFILE_FIELDS:
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            safe[key] = item.strip()[:400]
+        elif isinstance(item, list):
+            entries = [str(entry).strip()[:300] for entry in item if isinstance(entry, str) and entry.strip()]
+            if entries:
+                safe[key] = entries[:8]
+    return safe
+
+
 class WriterDomainError(ValueError):
     def __init__(self, code: str, detail: Any | None = None):
         super().__init__(code)
@@ -203,6 +224,8 @@ class WriterContextFingerprintBuilder:
             "planning_task": context.get("planning_task"),
             "fingerprints": context.get("fingerprints"),
         }
+        if context.get("character_voice_profiles"):
+            semantic["character_voice_profiles"] = context["character_voice_profiles"]
         return _fp(semantic, self.protocol)
 
 
@@ -436,6 +459,25 @@ class WriterContextBuilder:
             "source_manifest": manifest,
             "fingerprints": {"chapter_structure": source["structure_fingerprint"], "chapter_source": source["source_fingerprint"], "writing_bible": bible_fp},
         }
+        participant_ids = sorted({
+            str(character_id)
+            for scene in safe_scenes
+            for character_id in scene.get("participants", [])
+            if character_id
+        })
+        if participant_ids:
+            characters = db.scalars(select(Character).where(
+                Character.project_id == chapter.project_id,
+                Character.id.in_(participant_ids),
+                Character.active.is_(True),
+            ).order_by(Character.id)).all()
+            voice_profiles = {
+                character.id: {"name": character.name, "voice": profile}
+                for character in characters
+                if (profile := _safe_character_voice_profile(character.voice_profile))
+            }
+            if voice_profiles:
+                context["character_voice_profiles"] = voice_profiles
         context["writing_bible"] = bible
         context["pov_mode"] = mode
         context["pov_character_id"] = pov_character_id
@@ -553,7 +595,7 @@ class WriterProjectionService:
 
     @staticmethod
     def prompt_fingerprint(context: dict[str, Any]) -> str:
-        return _fp(WriterPromptBuilder().build(context), "writer-prompt-v2")
+        return _fp(WriterPromptBuilder().build(context), "writer-prompt-v3")
 
     def render(self, db: Session, chapter_id: str, request: dict[str, Any] | None = None, *, provider=None, model: str | None = None, settings=None) -> ChapterWriterDraft:
         request = dict(request or {})
@@ -760,6 +802,6 @@ class WriterPromptBuilder:
     def build(self, context: dict[str, Any]) -> list[dict[str, str]]:
         safe = {key: value for key, value in context.items() if key not in {"writing_bible", "pov_mode", "pov_character_id"}}
         return [
-            {"role": "system", "content": "You are a prose renderer, not a plot planner. FORMAL_HISTORY is factual authority. SUBJECTIVE_POV may be mistaken. PLANNING_TASK is a binding chapter contract: fulfill its objective, start/end state, scene beats, mandatory events, reveal limits, and consequences without inventing facts. Each prose scene must be grounded in the recorded character actions that cite the corresponding scene beat; do not invent a beat completion that is absent from formal turns. WRITING_RULES are style only. RENDERING_FREEDOM applies only to prose expression. Do not invent events, outcomes, decisions, knowledge, secrets, items, injuries, locations, relationships, or causal facts. Do not reveal information outside the POV visibility contract. Avoid formulaic AI phrasing, generic summary, symmetrical slogans, and empty transitions. Return exactly one JSON object matching the output contract."},
+            {"role": "system", "content": "You are a prose renderer, not a plot planner. FORMAL_HISTORY is factual authority. SUBJECTIVE_POV may be mistaken. PLANNING_TASK is a binding chapter contract: fulfill its objective, start/end state, scene beats, mandatory events, reveal limits, and consequences without inventing facts. Each prose scene must be grounded in the recorded character actions that cite the corresponding scene beat; do not invent a beat completion that is absent from formal turns. Where the task and recorded actions provide a want or resistance, make it concrete, let supported choices change what characters can do next, and show the consequences those actions actually produce. Use supplied character voice profiles only as dialogue style guidance. Distinguish speakers through their stated diction, rhythm, and directness when those profiles exist, without turning profile notes into story facts or catchphrases. When a profile is absent, use the character's recorded action and context without inventing a fixed verbal tic. Let emotion emerge through action, attention, silence, and dialogue as the scene warrants. Vary sentence and paragraph rhythm with the moment instead of applying a repeated pattern. WRITING_RULES are style only. RENDERING_FREEDOM applies only to prose expression. Do not invent events, outcomes, decisions, knowledge, secrets, items, injuries, locations, relationships, or causal facts. Do not reveal information outside the POV visibility contract. Avoid formulaic AI phrasing, generic summary, symmetrical slogans, and empty transitions. Return exactly one JSON object matching the output contract."},
             {"role": "user", "content": _canonical({"context": safe, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene id array", "source_refs": "visible structured source references", "pov_character_id": "string|null", "task_coverage": "optional diagnostic self-report; never evidence that an event happened", "task_forbidden_hits": "optional diagnostic self-report; Critic independently reviews forbidden events"}})},
         ]

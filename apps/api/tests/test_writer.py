@@ -238,6 +238,48 @@ def test_writer_context_has_required_partitions(writer_project, session):
     assert {"writing_rules", "chapter", "formal_history", "pov_subjective_context", "entity_labels", "rendering_contract", "source_manifest", "fingerprints"} <= set(context)
 
 
+def test_writer_context_uses_explicit_participant_voice_profiles_without_unapproved_fields(writer_project, session):
+    project, actor, _scene, chapter = writer_project
+    actor.voice_profile = {
+        "register": "礼貌克制",
+        "sentence_length": "短句为主，遇到心虚时会补充解释",
+        "dialogue_habits": ["先确认事实再回答"],
+        "sample_lines": ["这句对白包含未公开剧情：地下室里有遗嘱。"],
+        "director_only": "不要放进 Writer 上下文",
+        "secret": "不能由声线字段泄露的情节秘密",
+        "unknown_extension": "忽略未定义字段",
+    }
+    context = WriterContextBuilder().build(
+        session, WriterChapterSourceBuilder().build(session, chapter.id), {"pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": actor.id},
+    )
+    profile = context["character_voice_profiles"][actor.id]
+    assert profile == {
+        "name": actor.name,
+        "voice": {
+            "register": "礼貌克制",
+            "sentence_length": "短句为主，遇到心虚时会补充解释",
+            "dialogue_habits": ["先确认事实再回答"],
+        },
+    }
+    encoded = json.dumps(context, ensure_ascii=False, default=str)
+    assert "不能由声线字段泄露" not in encoded
+    assert "地下室里有遗嘱" not in encoded
+    prompt = WriterPromptBuilder().build(context)
+    assert "character voice profiles" in prompt[0]["content"]
+    payload = json.loads(prompt[1]["content"])
+    assert payload["context"]["character_voice_profiles"][actor.id]["voice"]["dialogue_habits"] == ["先确认事实再回答"]
+
+
+def test_character_voice_profile_changes_writer_context_fingerprint(writer_project, session):
+    project, actor, _scene, chapter = writer_project
+    source = WriterChapterSourceBuilder().build(session, chapter.id)
+    request = {"pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": actor.id}
+    first = WriterContextBuilder().build(session, source, request)
+    actor.voice_profile = {"register": "少言，直说结论"}
+    second = WriterContextBuilder().build(session, source, request)
+    assert first["writer_context_fingerprint"] != second["writer_context_fingerprint"]
+
+
 def test_context_excludes_scene_summary(writer_project, session):
     context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
     assert "forbidden summary" not in json.dumps(context, default=str)
