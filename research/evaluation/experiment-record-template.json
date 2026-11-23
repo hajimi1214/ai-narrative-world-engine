@@ -1,0 +1,25 @@
+{
+  "experiment_id": "2026-11-pilot-001",
+  "status": "PLANNED",
+  "corpus_manifest": "research/evaluation/pilot-manifest.json",
+  "conditions": ["A_BASELINE", "B_MEMORY", "C_ENGINE"],
+  "generation": {
+    "model_provider": "",
+    "model_name": "",
+    "prompt_fingerprint": "",
+    "sampling": {"temperature": null, "top_p": null, "seed": null},
+    "per_condition_token_budget": null,
+    "failure_and_retry_policy": ""
+  },
+  "outputs": [],
+  "human_ratings": [],
+  "model_judgments": [],
+  "engineering_metrics": [],
+  "cost_and_editing": [],
+  "analysis": {
+    "human_status": "NOT_COLLECTED",
+    "reader_blind_order_seed": 0,
+    "missing_data_policy": "report_missing_and_exclude_pairwise_item_only",
+    "model_judge_cannot_replace_human": true
+  }
+}

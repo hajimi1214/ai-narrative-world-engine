@@ -1,0 +1,37 @@
+{
+  "item_id": "mist_harbor_identity.chapter_01",
+  "condition": "A_BASELINE",
+  "anonymous_text_id": "text-0001",
+  "rater_id": "rater-0001",
+  "scores": {
+    "character_credibility": 0,
+    "character_growth": 0,
+    "motivation": 0,
+    "plot_engagement": 0,
+    "conflict": 0,
+    "emotion": 0,
+    "pacing": 0,
+    "chapter_structure": 0,
+    "style_naturalness": 0,
+    "continuity": 0,
+    "reading_willingness": 0
+  },
+  "evidence": {
+    "character_credibility": "",
+    "character_growth": "",
+    "motivation": "",
+    "plot_engagement": "",
+    "conflict": "",
+    "emotion": "",
+    "pacing": "",
+    "chapter_structure": "",
+    "style_naturalness": "",
+    "continuity": "",
+    "reading_willingness": ""
+  },
+  "confidence": 0,
+  "next_chapter_willing": null,
+  "felt_ai_like": null,
+  "revision_burden_minutes": null,
+  "notes": ""
+}

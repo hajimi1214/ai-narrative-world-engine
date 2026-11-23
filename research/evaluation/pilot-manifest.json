@@ -1,0 +1,66 @@
+{
+  "schema_version": "literary-eval-pilot-v1",
+  "status": "PLANNED_SYNTHETIC_PILOT",
+  "language": "zh-CN",
+  "provenance": "原创合成任务设计，不是出版小说，不含第三方正文",
+  "conditions": [
+    {"id": "A_BASELINE", "label": "基础大纲写作", "memory": false, "formal_world": false},
+    {"id": "B_MEMORY", "label": "增强记忆写作", "memory": true, "formal_world": false},
+    {"id": "C_ENGINE", "label": "完整世界引擎", "memory": true, "formal_world": true}
+  ],
+  "fixed_generation_contract": {
+    "chapters_per_task": 3,
+    "target_chars_per_chapter": 1800,
+    "max_chars_per_chapter": 2600,
+    "model_and_prompt_must_be_frozen": true,
+    "human_rating_required_for_literary_claim": true
+  },
+  "tasks": [
+    {
+      "id": "mist_harbor_identity",
+      "genre": "悬疑",
+      "premise": "修复师在旧档案中发现一封写给尚未出生之人的信。",
+      "core_tension": "查明信件来源会暴露主角曾经隐瞒的身份。",
+      "chapters": [
+        {"number": 1, "promise": "发现信件日期与收件人年龄冲突", "must_events": ["发现日期矛盾"], "forbidden_reveals": ["直接揭示寄信人身份"]},
+        {"number": 2, "promise": "守馆人提供相互矛盾的记忆", "must_events": ["获得矛盾证词"], "forbidden_reveals": ["确认主角真实身份"]},
+        {"number": 3, "promise": "主角选择公开部分证据并承担代价", "must_events": ["公开部分证据", "承担关系代价"], "forbidden_reveals": []}
+      ]
+    },
+    {
+      "id": "river_town_kinship",
+      "genre": "现实情感",
+      "premise": "返乡的女儿整理父亲遗物，发现家人共同隐瞒的一次搬迁。",
+      "core_tension": "追问真相可能让仍在照护病人的兄长失去支持。",
+      "chapters": [
+        {"number": 1, "promise": "遗物显示家庭叙述有缺口", "must_events": ["发现叙述缺口"], "forbidden_reveals": ["解释全部隐瞒原因"]},
+        {"number": 2, "promise": "兄长提出一个看似合理但不完整的解释", "must_events": ["兄长给出不完整解释"], "forbidden_reveals": ["病人最终记忆真相"]},
+        {"number": 3, "promise": "主角在照护责任和追问之间作出具体选择", "must_events": ["作出带代价的选择"], "forbidden_reveals": []}
+      ]
+    },
+    {
+      "id": "winter_archive_oath",
+      "genre": "历史奇幻",
+      "premise": "抄写员发现王朝禁书的缺页正在改变城中人的记忆。",
+      "core_tension": "补回缺页会恢复旧罪证，也会让无辜者承担连带后果。",
+      "chapters": [
+        {"number": 1, "promise": "禁书缺页与一名活人记忆同步消失", "must_events": ["确认同步消失"], "forbidden_reveals": ["说明禁书全部规则"]},
+        {"number": 2, "promise": "抄写员与守书人对同一段历史产生不同记忆", "must_events": ["呈现记忆分歧"], "forbidden_reveals": ["揭示王朝灭亡原因"]},
+        {"number": 3, "promise": "主角选择保留一处空白并记录代价", "must_events": ["保留空白", "记录代价"], "forbidden_reveals": []}
+      ]
+    },
+    {
+      "id": "night_train_oath",
+      "genre": "科幻成长",
+      "premise": "夜行列车上的维修员收到来自未来班次的故障报告。",
+      "core_tension": "修复故障会改变同伴的职业选择，放任故障则会危及乘客。",
+      "chapters": [
+        {"number": 1, "promise": "未来报告准确描述一个尚未发生的故障", "must_events": ["验证报告部分准确"], "forbidden_reveals": ["证明未来绝对固定"]},
+        {"number": 2, "promise": "同伴发现报告中有一处无法解释的署名", "must_events": ["发现署名异常"], "forbidden_reveals": ["确认报告发送者"]},
+        {"number": 3, "promise": "主角选择先救人还是先保留证据", "must_events": ["作出救援选择", "留下证据后果"], "forbidden_reveals": []}
+      ]
+    }
+  ],
+  "human_data": {"status": "NOT_COLLECTED", "rater_count": 0, "reader_blind_review": "NOT_STARTED"},
+  "model_judge_data": {"status": "NOT_COLLECTED"}
+}
