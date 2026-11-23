@@ -6,7 +6,7 @@ from sqlalchemy import select
 from app.ai.errors import MODEL_AUTH_FAILED, MODEL_PROVIDER_NOT_CONFIGURED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MODEL_UPSTREAM_ERROR
 from app.author_recovery import LostRunClaim, recovery_payload, utc_now
 from app.auto_director_worker import AutoDirectorWorker
-from app.models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, Project
+from app.models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, Project
 from test_author_guided_volume import _setup
 
 
@@ -64,7 +64,7 @@ def test_provider_failure_is_retried_only_when_temporary(active_run, code, statu
     with sessions() as db:
         run = db.get(AutoDirectorRun, run_id)
         run.settings = {"max_retries": 2, "operational_token_budget": 10000}
-        worker._handle_failure(run, code=code, stage="QUALITY_REVIEW", upstream_status=status, step_id="review-1")
+        worker._handle_failure(db, run, code=code, stage="QUALITY_REVIEW", upstream_status=status, step_id="review-1")
         if expected:
             assert run.status == AutoDirectorRunStatus.RUNNING
             assert run.recovery_attempts == 1 and run.next_retry_at > utc_now()
@@ -82,11 +82,11 @@ def test_retry_exhaustion_stops_and_requires_author_action(active_run):
     worker = AutoDirectorWorker(sessions)
     with sessions() as db:
         run = db.get(AutoDirectorRun, run_id)
-        run.settings = {"max_retries": 1, "operational_token_budget": 1000}
-        worker._handle_failure(run, code=MODEL_RATE_LIMITED, stage="QUALITY_REVIEW", step_id="review-1")
+        run.settings = {"max_retries": 1, "operational_token_budget": 10000}
+        worker._handle_failure(db, run, code=MODEL_RATE_LIMITED, stage="QUALITY_REVIEW", step_id="review-1")
         assert run.recovery_attempts == 1 and run.next_retry_at
         run.next_retry_at = None
-        worker._handle_failure(run, code=MODEL_RATE_LIMITED, stage="QUALITY_REVIEW", step_id="review-1")
+        worker._handle_failure(db, run, code=MODEL_RATE_LIMITED, stage="QUALITY_REVIEW", step_id="review-1")
         assert run.recovery_attempts == 1
         assert run.status == AutoDirectorRunStatus.BLOCKED
         assert run.pause_reason == "AUTO_RETRY_EXHAUSTED"
@@ -104,10 +104,32 @@ def test_budget_includes_uncertain_usage_reserve_and_stops_at_saved_checkpoint(a
         run.current_stage = AutoDirectorStage.QUALITY_REVIEW
         run.checkpoint_stage = AutoDirectorStage.CHAPTER_EXECUTION.value
         run.checkpoint_saved_at = datetime.utcnow()
-        worker._handle_failure(run, code=MODEL_TIMEOUT, stage="QUALITY_REVIEW", step_id="review-timeout")
+        worker._handle_failure(db, run, code=MODEL_TIMEOUT, stage="QUALITY_REVIEW", step_id="review-timeout")
         assert run.status == AutoDirectorRunStatus.PAUSED
         assert run.pause_reason == "TOKEN_BUDGET_EXCEEDED"
         assert run.recovery_usage_uncertain
         state = recovery_payload(run)
         assert state["usage_uncertain"] and state["last_checkpoint"]["stage"] == AutoDirectorStage.CHAPTER_EXECUTION.value
         assert run.current_stage == AutoDirectorStage.PAUSED
+
+
+def test_recorded_unknown_usage_is_not_reserved_twice_on_retry(active_run):
+    _, sessions, _, run_id = active_run
+    worker = AutoDirectorWorker(sessions)
+    with sessions() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        run.settings = {"max_retries": 2, "operational_token_budget": 10000, "target_words_per_chapter": 1500}
+        run.context = {"recovery_reserved_tokens": 3000}
+        step = AutoDirectorStep(
+            run_id=run.id, stage=AutoDirectorStage.QUALITY_REVIEW,
+            status="FAILED", attempt=1, input_fingerprint="critic-unknown-usage",
+            calls=1, total_tokens=0,
+            token_usage={"calls": 1, "unknown_usage_calls": 1, "usage_status": "UNKNOWN"},
+        )
+        db.add(step); db.flush()
+        run.context = {**run.context, "failed_step_id": step.id}
+        worker._handle_failure(db, run, code=MODEL_TIMEOUT, stage="QUALITY_REVIEW", step_id=step.id, accounted_calls=1)
+
+        assert run.context["recovery_reserved_tokens"] == 3000
+        assert run.recovery_usage_uncertain
+        assert run.recovery_attempts == 1

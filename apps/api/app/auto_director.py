@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from .ai.errors import ModelProviderError
 from .ai.factory import get_model_provider
+from .ai.provider import classify_usage
 from .api_types import AutoDirectorRunCreatePayload
 from .creation import generate_creation_directions
 from .model_router import ModelRouter, ProviderCredentialResolver
@@ -27,10 +28,11 @@ from .writer import WriterProjectionService
 from .autonomy import AutonomousWorldLoopService
 from .narrative_structure import NarrativeStructureConfig
 from .live_execution import live_execution_broker
+from .author_recovery import is_transient, provider_failure
 from .models import (
     AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep,
     AutoDirectorStepStatus, Chapter, ChapterWriterDraft, ChapterQualityAssessment, ChapterQualityFinding,
-    Project, StoryPlan, StoryPlanChapter, StoryPlanVolume, StoryPlanArc, StoryPlanStatus, WriterDraftStatus, Character,
+    Project, ProjectModelConfig, StoryPlan, StoryPlanChapter, StoryPlanVolume, StoryPlanArc, StoryPlanStatus, WriterDraftStatus, Character,
     WorldEntity, StoryThread, CanonFact, StoryArc, EntityType, CanonType, AutonomousRunStatus, AutonomousWorldRun,
     AutonomousWorldStep, SceneProposal, ScenePerformance, ResolverMode,
 )
@@ -95,7 +97,7 @@ class AutoDirectorError(RuntimeError):
 class _UsageTrackingProvider:
     """Delegates a model provider while exposing the last real ModelResult."""
 
-    def __init__(self, provider, guard=None):
+    def __init__(self, provider, guard=None, on_usage=None):
         self.provider = provider
         self.name = getattr(provider, "name", None)
         self.last_result = None
@@ -103,6 +105,7 @@ class _UsageTrackingProvider:
         self.results = []
         self.errors = []
         self.guard = guard
+        self.on_usage = on_usage
 
     def generate(self, messages, model):
         if self.guard:
@@ -116,10 +119,14 @@ class _UsageTrackingProvider:
         except ModelProviderError as exc:
             self.last_error = exc
             self.errors.append(exc)
+            if self.on_usage:
+                self.on_usage(exc)
             raise
         self.last_error = None
         self.last_result = result
         self.results.append(result)
+        if self.on_usage:
+            self.on_usage(result)
         return result
 
 
@@ -173,6 +180,46 @@ class AutoDirectorAdoptionService:
 
 class AutoDirectorOrchestrator:
     @staticmethod
+    def _routed_provider(db: Session, project_id: str, settings, route, key: str | None):
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        return get_model_provider(
+            settings, route.provider, route.base_url, key,
+            timeout_seconds=config.request_timeout_seconds if config else None,
+            max_retries=config.max_retries if config else 0,
+            rate_limit_per_minute=config.rate_limit_per_minute if config else 0,
+        )
+
+    @classmethod
+    def _pending_usage_callback(cls, db: Session, run: AutoDirectorRun):
+        def record(event: Any) -> None:
+            metrics = cls._tracked_metrics(event)
+            db.info["auto_pending_total_tokens"] = int(db.info.get("auto_pending_total_tokens") or 0) + int(metrics["tokens"] or 0)
+            unknown_calls = int((metrics.get("usage") or {}).get("unknown_usage_calls") or 0)
+            if unknown_calls:
+                from .author_recovery import unknown_call_reserve
+                db.info["auto_pending_reserved_tokens"] = int(db.info.get("auto_pending_reserved_tokens") or 0) + unknown_call_reserve(run) * unknown_calls
+            db.info.setdefault("auto_pending_usage_events", []).append(metrics)
+        return record
+
+    @classmethod
+    def _persist_usage_metrics(cls, db: Session, run: AutoDirectorRun, step: AutoDirectorStep, metrics: dict[str, Any]) -> None:
+        cls._merge_step_usage(step, metrics)
+        cls._add_usage_metrics(run, metrics, db=db)
+
+    @classmethod
+    def _persist_pending_failure_usage(cls, db: Session, run: AutoDirectorRun, stage: str) -> None:
+        events = list(db.info.get("auto_pending_usage_events") or [])
+        if not events:
+            return
+        metrics = cls._tracked_metrics(events)
+        step_id = (run.context or {}).get("active_step_id") or (run.context or {}).get("failed_step_id")
+        step = db.get(AutoDirectorStep, step_id) if step_id else None
+        if step and step.run_id == run.id:
+            cls._merge_step_usage(step, metrics)
+        cls._add_usage_metrics(run, metrics, db=db)
+        run.context = {**(run.context or {}), "last_failed_usage": {**metrics, "stage": stage}}
+
+    @staticmethod
     def _chapter_limit(payload: dict[str, Any]) -> int:
         target = int(payload.get("target_chapters") or 10)
         maximum = payload.get("max_chapters")
@@ -180,29 +227,69 @@ class AutoDirectorOrchestrator:
 
     @staticmethod
     def _model_tokens(result: Any) -> int:
-        usage = getattr(result, "usage", None) or {}
-        return int(usage.get("total_tokens", usage.get("tokens", 0)) or 0)
+        return int(AutoDirectorOrchestrator._model_usage(result)["total_tokens"])
 
     @staticmethod
-    def _model_usage(result: Any) -> dict[str, int]:
-        usage = getattr(result, "usage", None) or {}
-        return {"prompt_tokens": int(usage.get("prompt_tokens", 0) or 0), "completion_tokens": int(usage.get("completion_tokens", 0) or 0), "total_tokens": int(usage.get("total_tokens", usage.get("tokens", 0)) or 0)}
+    def _model_usage(result: Any) -> dict[str, Any]:
+        calls = getattr(result, "attempts", None)
+        if calls is None:
+            calls = getattr(result, "accounted_calls", 1)
+        return classify_usage(getattr(result, "usage", None), calls)
 
     @classmethod
-    def _tracked_metrics(cls, *trackers: _UsageTrackingProvider) -> dict[str, Any]:
-        results = [result for tracker in trackers for result in tracker.results]
-        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        for result in results:
-            current = cls._model_usage(result)
-            for key in usage:
-                usage[key] += current[key]
-        for error in (error for tracker in trackers for error in tracker.errors):
-            current = cls._model_usage(error)
-            for key in usage:
-                usage[key] += current[key]
-        providers = sorted({str(getattr(item, "provider", "")) for item in [*results, *(error for tracker in trackers for error in tracker.errors)] if getattr(item, "provider", None)})
-        models = sorted({str(getattr(item, "model", "")) for item in [*results, *(error for tracker in trackers for error in tracker.errors)] if getattr(item, "model", None)})
-        return {"calls": len(results) + sum(int(getattr(error, "accounted_calls", 1)) for tracker in trackers for error in tracker.errors), "latency_ms": sum(int(getattr(result, "latency_ms", 0) or 0) for result in results), "tokens": usage["total_tokens"], "usage": usage, "provider": ",".join(providers) or None, "model": ",".join(models) or None}
+    def _tracked_metrics(cls, *trackers: Any) -> dict[str, Any]:
+        results, errors, supplied_metrics = [], [], []
+        for tracker in trackers:
+            if tracker is None:
+                continue
+            if isinstance(tracker, list):
+                items = tracker
+            elif hasattr(tracker, "results") and hasattr(tracker, "errors"):
+                results.extend(tracker.results)
+                errors.extend(tracker.errors)
+                continue
+            else:
+                items = [tracker]
+            for item in items:
+                if isinstance(item, dict) and "calls" in item:
+                    supplied_metrics.append(item)
+                elif isinstance(item, BaseException):
+                    errors.append(item)
+                else:
+                    results.append(item)
+        details = [cls._model_usage(item) for item in [*results, *errors]]
+        details.extend(
+            {
+                "prompt_tokens": int(item["usage"].get("prompt_tokens", 0) or 0) if isinstance(item.get("usage"), dict) else int(item.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(item["usage"].get("completion_tokens", 0) or 0) if isinstance(item.get("usage"), dict) else int(item.get("completion_tokens", 0) or 0),
+                "total_tokens": int(item["usage"].get("total_tokens", 0) or 0) if isinstance(item.get("usage"), dict) else int(item.get("total_tokens", item.get("tokens", 0)) or 0),
+                "unknown_usage_calls": int(item["usage"].get("unknown_usage_calls", 0) or 0) if isinstance(item.get("usage"), dict) else int(item.get("unknown_usage_calls", 0) or 0),
+                "usage_status": (item.get("usage") or {}).get("usage_status", "UNKNOWN") if isinstance(item.get("usage"), dict) else item.get("usage_status", "UNKNOWN"),
+            }
+            for item in supplied_metrics
+        )
+        usage = {
+            key: sum(int(item.get(key, 0) or 0) for item in details)
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens", "unknown_usage_calls")
+        }
+        tracked_items = [*results, *errors]
+        providers = {
+            str(item.get("provider")) if isinstance(item, dict) else str(getattr(item, "provider", ""))
+            for item in [*tracked_items, *supplied_metrics]
+            if (item.get("provider") if isinstance(item, dict) else getattr(item, "provider", None))
+        }
+        models = {
+            str(item.get("model")) if isinstance(item, dict) else str(getattr(item, "model", ""))
+            for item in [*tracked_items, *supplied_metrics]
+            if (item.get("model") if isinstance(item, dict) else getattr(item, "model", None))
+        }
+        calls = sum(int(getattr(result, "attempts", 1) or 0) for result in results)
+        calls += sum(int(getattr(error, "accounted_calls", 1) or 0) for error in errors)
+        calls += sum(int(item.get("calls", 0) or 0) for item in supplied_metrics)
+        usage["usage_status"] = "UNKNOWN" if usage["unknown_usage_calls"] else "CONFIRMED" if calls else "NOT_SENT"
+        latency = sum(int(getattr(result, "latency_ms", 0) or 0) for result in results)
+        latency += sum(int(item.get("latency_ms", 0) or 0) for item in supplied_metrics)
+        return {"calls": calls, "latency_ms": latency, "tokens": usage["total_tokens"], "usage": usage, "provider": ",".join(sorted(providers)) or None, "model": ",".join(sorted(models)) or None}
 
     @staticmethod
     def _steps(db: Session, run: AutoDirectorRun) -> list[AutoDirectorStep]:
@@ -231,10 +318,11 @@ class AutoDirectorOrchestrator:
         live_execution_broker.fail(session_id, code, message)
 
     def _check_budget(self, run: AutoDirectorRun) -> None:
-        limit = int((run.settings or {}).get("max_tokens", 0) or 0)
-        used = int((run.token_usage or {}).get("total_tokens", 0) or 0)
+        from .author_recovery import budget_usage, configured_token_budget
+        limit = configured_token_budget(run)
+        used = budget_usage(run)
         if limit and used >= limit:
-            raise AutoDirectorError("TOKEN_BUDGET_EXCEEDED", f"已达到本次运行 token 预算 {limit}")
+            raise AutoDirectorError("TOKEN_BUDGET_EXCEEDED", f"确认用量与未知用量预留已达到本次运行 token 预算 {limit}")
 
     def _step(self, db: Session, run: AutoDirectorRun, stage: AutoDirectorStage, input_data: Any) -> AutoDirectorStep:
         fp = fingerprint(input_data)
@@ -253,13 +341,16 @@ class AutoDirectorOrchestrator:
         run.context = {**(run.context or {}), "active_step_id": step.id}
         return step
 
-    def _commit_step(self, step: AutoDirectorStep, payload: dict[str, Any], artifact_id: str | None = None, *, calls: int = 0, latency_ms: int = 0, tokens: int = 0, usage: dict[str, int] | None = None, provider: str | None = None, model: str | None = None) -> None:
+    def _commit_step(self, step: AutoDirectorStep, payload: dict[str, Any], artifact_id: str | None = None, *, calls: int = 0, latency_ms: int = 0, tokens: int = 0, usage: dict[str, Any] | None = None, provider: str | None = None, model: str | None = None) -> None:
         step.status = AutoDirectorStepStatus.COMMITTED
         step.error_code = None
         step.error_summary = None
         step.output_payload = payload
         step.output_artifact_id = artifact_id
-        token_usage = {**(usage or {}), "calls": calls, "tokens": tokens, "latency_ms": latency_ms, "provider": provider, "model": model, "estimated_cost": None, "cost_status": "UNKNOWN"}
+        usage_details = dict(usage or {})
+        usage_status = usage_details.get("usage_status", "UNKNOWN" if calls else "NOT_SENT")
+        unknown_calls = int(usage_details.get("unknown_usage_calls", calls if usage_status == "UNKNOWN" else 0) or 0)
+        token_usage = {**usage_details, "calls": calls, "tokens": tokens, "latency_ms": latency_ms, "provider": provider, "model": model, "estimated_cost": None, "cost_status": "UNKNOWN", "usage_status": usage_status, "unknown_usage_calls": unknown_calls}
         step.token_usage = token_usage
         step.calls = calls
         step.prompt_tokens = int(token_usage.get("prompt_tokens", 0))
@@ -279,7 +370,7 @@ class AutoDirectorOrchestrator:
         step.status = AutoDirectorStepStatus.BLOCKED if blocked else AutoDirectorStepStatus.FAILED
         step.error_code = str(code)
         step.error_summary = f"{str(exc)[:900]}{f' (HTTP {upstream_status})' if upstream_status else ''}"
-        step.output_payload = {**(step.output_payload or {}), "upstream_status": upstream_status}
+        step.output_payload = {**(step.output_payload or {}), "upstream_status": upstream_status, "retry_after": getattr(exc, "retry_after", None)}
         step.completed_at = datetime.utcnow()
         run.status = AutoDirectorRunStatus.BLOCKED if blocked else AutoDirectorRunStatus.FAILED
         run.current_stage = AutoDirectorStage.BLOCKED if blocked else AutoDirectorStage.FAILED
@@ -287,16 +378,24 @@ class AutoDirectorOrchestrator:
         run.context = {**(run.context or {}), "failed_step_id": step.id, "failed_stage": enum_value(step.stage)}
         run.next_action = "检查错误后重试或接管运行。"
 
-    def _add_usage(self, run: AutoDirectorRun, step: AutoDirectorStep) -> None:
-        self._add_usage_metrics(run, {**(step.token_usage or {}), "provider": step.provider, "model": step.model})
+    def _add_usage(self, run: AutoDirectorRun, step: AutoDirectorStep, *, db: Session | None = None) -> None:
+        self._add_usage_metrics(run, {**(step.token_usage or {}), "provider": step.provider, "model": step.model}, db=db)
 
-    def _add_usage_metrics(self, run: AutoDirectorRun, metrics: dict[str, Any]) -> None:
+    @staticmethod
+    def _add_usage_metrics(run: AutoDirectorRun, metrics: dict[str, Any], *, db: Session | None = None) -> None:
         usage = dict(run.token_usage or {})
-        total = int(metrics.get("total_tokens", metrics.get("tokens", 0)) or 0)
-        usage["prompt_tokens"] = int(usage.get("prompt_tokens", 0)) + int(metrics.get("prompt_tokens", 0) or 0)
-        usage["completion_tokens"] = int(usage.get("completion_tokens", 0)) + int(metrics.get("completion_tokens", 0) or 0)
+        legacy_unknown_calls = 0
+        if "usage_status" not in usage:
+            legacy_unknown_calls = max(int(usage.get("total_calls", 0) or 0), int(run.total_calls or 0))
+        details = metrics.get("usage") if isinstance(metrics.get("usage"), dict) else metrics
+        total = int(details.get("total_tokens", metrics.get("tokens", 0)) or 0)
+        unknown_calls = int(details.get("unknown_usage_calls", 0) or 0)
+        usage["prompt_tokens"] = int(usage.get("prompt_tokens", 0)) + int(details.get("prompt_tokens", metrics.get("prompt_tokens", 0)) or 0)
+        usage["completion_tokens"] = int(usage.get("completion_tokens", 0)) + int(details.get("completion_tokens", metrics.get("completion_tokens", 0)) or 0)
         usage["total_tokens"] = int(usage.get("total_tokens", 0)) + total
         usage["total_calls"] = int(usage.get("total_calls", 0)) + int(metrics.get("calls", 0) or 0)
+        usage["unknown_usage_calls"] = int(usage.get("unknown_usage_calls", 0)) + legacy_unknown_calls + unknown_calls
+        usage["usage_status"] = "UNKNOWN" if usage["unknown_usage_calls"] else "CONFIRMED" if usage["total_calls"] else "NOT_SENT"
         usage["latency_ms"] = int(usage.get("latency_ms", 0)) + int(metrics.get("latency_ms", 0) or 0)
         providers = set(usage.get("providers") or [])
         models = set(usage.get("models") or [])
@@ -306,6 +405,14 @@ class AutoDirectorOrchestrator:
         usage["models"] = sorted(models)
         usage["estimated_cost"] = None
         usage["cost_status"] = "UNKNOWN"
+        if unknown_calls or legacy_unknown_calls:
+            from .author_recovery import unknown_call_reserve
+            context = dict(run.context or {})
+            context["recovery_reserved_tokens"] = int(context.get("recovery_reserved_tokens") or 0) + unknown_call_reserve(run) * (unknown_calls + legacy_unknown_calls)
+            run.context = context
+            run.recovery_usage_uncertain = True
+        usage["reserved_tokens"] = int((run.context or {}).get("recovery_reserved_tokens") or 0)
+        usage["budgeted_tokens"] = usage["total_tokens"] + usage["reserved_tokens"]
         run.token_usage = usage
         run.total_calls = int(usage["total_calls"])
         run.prompt_tokens = int(usage["prompt_tokens"])
@@ -314,14 +421,22 @@ class AutoDirectorOrchestrator:
         run.latency_ms = int(usage["latency_ms"])
         run.estimated_cost = None
         run.cost_status = "UNKNOWN"
+        if db is not None:
+            db.info["auto_pending_total_tokens"] = 0
+            db.info["auto_pending_reserved_tokens"] = 0
+            db.info["auto_pending_usage_events"] = []
 
     @staticmethod
     def _merge_step_usage(step: AutoDirectorStep, metrics: dict[str, Any]) -> None:
         current = dict(step.token_usage or {})
-        current["prompt_tokens"] = int(current.get("prompt_tokens", 0)) + int(metrics.get("prompt_tokens", 0) or 0)
-        current["completion_tokens"] = int(current.get("completion_tokens", 0)) + int(metrics.get("completion_tokens", 0) or 0)
-        current["total_tokens"] = int(current.get("total_tokens", current.get("tokens", 0))) + int(metrics.get("total_tokens", metrics.get("tokens", 0)) or 0)
+        legacy_unknown_calls = max(0, int(step.calls or 0)) if "usage_status" not in current else 0
+        details = metrics.get("usage") if isinstance(metrics.get("usage"), dict) else metrics
+        current["prompt_tokens"] = int(current.get("prompt_tokens", 0)) + int(details.get("prompt_tokens", 0) or 0)
+        current["completion_tokens"] = int(current.get("completion_tokens", 0)) + int(details.get("completion_tokens", 0) or 0)
+        current["total_tokens"] = int(current.get("total_tokens", current.get("tokens", 0))) + int(details.get("total_tokens", metrics.get("tokens", 0)) or 0)
+        current["unknown_usage_calls"] = int(current.get("unknown_usage_calls", 0)) + legacy_unknown_calls + int(details.get("unknown_usage_calls", 0) or 0)
         current["calls"] = int(current.get("calls", 0)) + int(metrics.get("calls", 0) or 0)
+        current["usage_status"] = "UNKNOWN" if current["unknown_usage_calls"] else "CONFIRMED" if current["calls"] else "NOT_SENT"
         current["latency_ms"] = int(current.get("latency_ms", 0)) + int(metrics.get("latency_ms", 0) or 0)
         providers = set(current.get("providers") or [])
         models = set(current.get("models") or [])
@@ -401,15 +516,27 @@ class AutoDirectorOrchestrator:
                     settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
                     live_session = self._live_begin(run, "自动导演：生成整书方向", "FRAMING", provider=route.provider, model=route.model)
                     live_execution_broker.phase(live_session, "GENERATING_DIRECTIONS", "正在生成并比较整书方向、角色和世界设定")
+                    usage_events: list[Any] = []
+
+                    def record_usage(event: Any) -> None:
+                        usage_events.append(event)
+                        self._pending_usage_callback(db, run)(event)
+
                     try:
-                        result, model_result = generate_creation_directions(db, project.id, request, on_delta=lambda content: live_execution_broker.append(live_session, content))
+                        result, model_result = generate_creation_directions(db, project.id, request, on_delta=lambda content: live_execution_broker.append(live_session, content), on_usage=record_usage)
                         self._live_complete(live_session, "方向、主要角色和世界边界已生成")
                     except Exception as exc:
                         self._live_fail(live_session, exc)
+                        if usage_events:
+                            self._persist_usage_metrics(db, run, step, self._tracked_metrics(usage_events))
                         raise
                     data = result
-                    self._commit_step(step, data, calls=1, latency_ms=getattr(model_result, "latency_ms", 0), tokens=self._model_tokens(model_result), usage=self._model_usage(model_result), provider=getattr(model_result, "provider", None), model=getattr(model_result, "model", None))
-                    self._add_usage(run, step)
+                    if not usage_events and model_result is not None:
+                        record_usage(model_result)
+                    metrics = self._tracked_metrics(usage_events)
+                    self._commit_step(step, data, **metrics)
+                    self._add_usage(run, step, db=db)
+                    db.info["auto_pending_total_tokens"] = 0; db.info["auto_pending_reserved_tokens"] = 0
                 directions = data.get("directions", [])[:3]
                 scored = [score_direction(item) for item in directions]
                 valid_indices = [index for index, (_, report) in enumerate(scored) if report.get("valid")]
@@ -418,12 +545,26 @@ class AutoDirectorOrchestrator:
                     repair_step = self._step(db, run, AutoDirectorStage.FRAMING, repair_input)
                     if repair_step.status != AutoDirectorStepStatus.COMMITTED:
                         self._check_budget(run)
-                        repaired, repair_result = generate_creation_directions(db, project.id, {**request, "repair_context": repair_input})
+                        repair_events: list[Any] = []
+
+                        def record_repair_usage(event: Any) -> None:
+                            repair_events.append(event)
+                            self._pending_usage_callback(db, run)(event)
+
+                        try:
+                            repaired, repair_result = generate_creation_directions(db, project.id, {**request, "repair_context": repair_input}, on_usage=record_repair_usage)
+                        except Exception:
+                            if repair_events:
+                                self._persist_usage_metrics(db, run, repair_step, self._tracked_metrics(repair_events))
+                            raise
+                        if not repair_events and repair_result is not None:
+                            record_repair_usage(repair_result)
                         repaired_directions = repaired.get("directions", [])[:3]
                         repair_scored = [score_direction(item) for item in repaired_directions]
                         repair_valid = [i for i, (_, report) in enumerate(repair_scored) if report.get("valid")]
-                        self._commit_step(repair_step, {"directions": repaired_directions, "reports": [report for _, report in repair_scored], "repair_reason": "ALL_DIRECTIONS_INVALID"}, calls=1, latency_ms=getattr(repair_result, "latency_ms", 0), tokens=self._model_tokens(repair_result), usage=self._model_usage(repair_result), provider=getattr(repair_result, "provider", None), model=getattr(repair_result, "model", None))
-                        self._add_usage(run, repair_step)
+                        repair_metrics = self._tracked_metrics(repair_events)
+                        self._commit_step(repair_step, {"directions": repaired_directions, "reports": [report for _, report in repair_scored], "repair_reason": "ALL_DIRECTIONS_INVALID"}, **repair_metrics)
+                        self._add_usage(run, repair_step, db=db)
                         directions, scored, valid_indices = repaired_directions, repair_scored, repair_valid
                     else:
                         directions = (repair_step.output_payload or {}).get("directions", [])
@@ -449,7 +590,7 @@ class AutoDirectorOrchestrator:
                 return run
             self._plan_and_first_chapter(db, run, project)
         except Exception as exc:
-            if db.info.get("author_recovery") and run.run_mode == "AUTHOR_GUIDED_VOLUME":
+            if run.run_mode in {"AUTHOR_GUIDED_VOLUME", "FULL_AUTO"}:
                 from .author_recovery import LostRunClaim, provider_failure
                 if isinstance(exc, LostRunClaim) or getattr(exc, "code", None) == "TOKEN_BUDGET_EXCEEDED":
                     raise
@@ -645,7 +786,7 @@ class AutoDirectorOrchestrator:
         runtime.resume(db, autonomous.id)
 
     def _plan_and_first_chapter(self, db: Session, run: AutoDirectorRun, project: Project) -> None:
-        durable_stages = bool(db.info.get("author_recovery") and run.run_mode == "AUTHOR_GUIDED_VOLUME")
+        durable_stages = run.run_mode in {"AUTHOR_GUIDED_VOLUME", "FULL_AUTO"}
         direction = run.context["selected_direction"]
         framing = dict(run.context.get("request") or {})
         # Book length defines the macro plan. max_chapters only defines how
@@ -657,13 +798,21 @@ class AutoDirectorOrchestrator:
             self._check_budget(run)
             settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
             live_session = self._live_begin(run, "自动导演：生成整书规划", "STORY_PLAN", provider=route.provider, model=route.model)
+            usage_events: list[Any] = []
+
+            def record_usage(event: Any) -> None:
+                usage_events.append(event)
+                self._pending_usage_callback(db, run)(event)
+
             def update_plan_phase(phase: str, message: str) -> None:
                 live_execution_broker.phase(live_session, phase, message)
             try:
-                generated, result = generate_plan(db, project, framing, direction.get("premise"), author_style, {"forbidden_patterns": []}, on_phase=update_plan_phase, on_delta=lambda content: live_execution_broker.append(live_session, content))
+                generated, result = generate_plan(db, project, framing, direction.get("premise"), author_style, {"forbidden_patterns": []}, on_phase=update_plan_phase, on_delta=lambda content: live_execution_broker.append(live_session, content), on_usage=record_usage)
                 self._live_complete(live_session, "整书主线、卷纲、故事弧和首批章节任务已生成")
             except Exception as exc:
                 self._live_fail(live_session, exc)
+                if usage_events:
+                    self._persist_usage_metrics(db, run, step, self._tracked_metrics(usage_events))
                 raise
             generated["framing"] = {**(generated.get("framing") or {}), **framing}
             generated.setdefault("premise", direction.get("premise"))
@@ -674,11 +823,21 @@ class AutoDirectorOrchestrator:
             generated["chapters"] = [{**chapter, "forbidden_events": _merge_forbidden_events(chapter.get("forbidden_events"), forbidden_content)} for chapter in chapters]
             errors = validate_plan_references(db, project.id, generated)
             if errors: raise AutoDirectorError("PLAN_REFERENCE_INVALID", str(errors))
-            plan = persist_plan(db, project, generated, provider=result.provider, model=result.model, request_id=result.request_id, report={"auto_director": True, "latency_ms": result.latency_ms})
+            plan = persist_plan(
+                db, project, generated,
+                provider=getattr(result, "provider", None),
+                model=getattr(result, "model", None),
+                request_id=getattr(result, "request_id", None),
+                report={"auto_director": True, "latency_ms": getattr(result, "latency_ms", 0), "generation_warning": generated.get("generation_warning")},
+            )
             plan.status = StoryPlanStatus.APPROVED
             for planned_chapter in db.scalars(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id)).all():
                 planned_chapter.locked = True
-            db.flush(); self._commit_step(step, {"plan_id": plan.id}, plan.id, calls=1, latency_ms=result.latency_ms, tokens=self._model_tokens(result), usage=self._model_usage(result), provider=result.provider, model=result.model); self._add_usage(run, step)
+            if not usage_events and result is not None:
+                record_usage(result)
+            metrics = self._tracked_metrics(usage_events)
+            db.flush(); self._commit_step(step, {"plan_id": plan.id}, plan.id, **metrics); self._add_usage(run, step, db=db)
+            db.info["auto_pending_total_tokens"] = 0; db.info["auto_pending_reserved_tokens"] = 0
             run.context = {**(run.context or {}), "plan_id": plan.id}
             run.current_stage = AutoDirectorStage.STORY_MACRO
             run.next_action = "整书规划已保存；正在准备卷纲、章节任务和第一章世界运行。"
@@ -704,8 +863,9 @@ class AutoDirectorOrchestrator:
             plan_chapter, detail_result = self._generate_next_chapter_task(db, run, project, plan, chapter_number, framing)
             detail_step = self._step(db, run, AutoDirectorStage.CHAPTER_DETAIL, {"plan_id": plan_id, "chapter_number": chapter_number, "task_id": plan_chapter.id})
             if detail_step.status != AutoDirectorStepStatus.COMMITTED:
-                self._commit_step(detail_step, {"plan_id": plan_id, "chapter_number": chapter_number, "chapter_task_id": plan_chapter.id}, plan_chapter.id, calls=1, latency_ms=detail_result.latency_ms, tokens=self._model_tokens(detail_result), usage=self._model_usage(detail_result), provider=detail_result.provider, model=detail_result.model)
-                self._add_usage(run, detail_step)
+                metrics = self._tracked_metrics(detail_result)
+                self._commit_step(detail_step, {"plan_id": plan_id, "chapter_number": chapter_number, "chapter_task_id": plan_chapter.id}, plan_chapter.id, **metrics)
+                self._add_usage(run, detail_step, db=db)
         world_identity = {"plan_id": plan_id, "chapter_number": chapter_number, "plan_chapter_id": plan_chapter.id}
         world_step = self._step(db, run, AutoDirectorStage.CHAPTER_WINDOW_EXECUTION, world_identity) if durable_stages else None
         if world_step is not None and world_step.status == AutoDirectorStepStatus.COMMITTED:
@@ -773,8 +933,11 @@ class AutoDirectorOrchestrator:
         scene_events: list[dict[str, Any]] = []
         def collect_scene_usage(event: dict[str, Any]) -> None:
             scene_events.append(dict(event))
-            if db.info.get("author_recovery"):
-                db.info["author_pending_total_tokens"] = int(db.info.get("author_pending_total_tokens") or 0) + int(event.get("total_tokens") or 0)
+            db.info["auto_pending_total_tokens"] = int(db.info.get("auto_pending_total_tokens") or 0) + int(event.get("total_tokens") or 0)
+            unknown_calls = int(event.get("unknown_usage_calls") or 0)
+            if unknown_calls:
+                from .author_recovery import unknown_call_reserve
+                db.info["auto_pending_reserved_tokens"] = int(db.info.get("auto_pending_reserved_tokens") or 0) + unknown_call_reserve(run) * unknown_calls
 
         def persist_scene_usage(session: Session) -> None:
             if not scene_events:
@@ -784,18 +947,31 @@ class AutoDirectorOrchestrator:
                 "prompt_tokens": sum(int(item.get("prompt_tokens", 0) or 0) for item in scene_events),
                 "completion_tokens": sum(int(item.get("completion_tokens", 0) or 0) for item in scene_events),
                 "total_tokens": sum(int(item.get("total_tokens", 0) or 0) for item in scene_events),
+                "unknown_usage_calls": sum(int(item.get("unknown_usage_calls", 0) or 0) for item in scene_events),
+                "usage_status": "UNKNOWN" if any(item.get("usage_status") == "UNKNOWN" for item in scene_events) else "CONFIRMED",
                 "latency_ms": sum(int(item.get("latency_ms", 0) or 0) for item in scene_events),
                 "provider": ",".join(sorted({str(item.get("provider")) for item in scene_events if item.get("provider")})),
                 "model": ",".join(sorted({str(item.get("model")) for item in scene_events if item.get("model")})),
             }
             self._merge_step_usage(detail_step, metrics)
-            self._add_usage_metrics(run, metrics)
+            self._add_usage_metrics(run, metrics, db=session)
+            failure_codes = sorted({str(item.get("error_code")) for item in scene_events if item.get("error_code")})
+            context = dict(run.context or {})
+            if failure_codes:
+                context["last_persisted_failure_usage"] = {
+                    "stage": AutoDirectorStage.CHAPTER_WINDOW_EXECUTION.value,
+                    "error_codes": failure_codes,
+                    "calls": metrics["calls"],
+                    "unknown_usage_calls": metrics["unknown_usage_calls"],
+                }
+            else:
+                context.pop("last_persisted_failure_usage", None)
+            run.context = context
             scene_events.clear()
-            if session.info.get("author_recovery"):
-                session.info["author_pending_total_tokens"] = 0
+            session.info["auto_pending_total_tokens"] = 0
+            session.info["auto_pending_reserved_tokens"] = 0
 
-        if durable_stages:
-            db.info["author_scene_usage_flush"] = persist_scene_usage
+        db.info["author_scene_usage_flush"] = persist_scene_usage
         runtime_request_id = f"{run.id}-chapter-{chapter_number}"
         existing_autonomous = db.scalar(select(AutonomousWorldRun).where(
             AutonomousWorldRun.project_id == project.id,
@@ -842,12 +1018,10 @@ class AutoDirectorOrchestrator:
                 self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
             elif enum_value(autonomous.status) == "BLOCKED" and autonomous.stop_reason == "AUTONOMY_BASELINE_CHANGED" and int(autonomous.committed_scene_count or 0) == 0:
                 self._resume_runtime_after_auto_context_seed(db, runtime, autonomous)
-            elif durable_stages and enum_value(autonomous.status) == "PAUSED":
+            elif enum_value(autonomous.status) == "PAUSED":
                 from .author_recovery import recoverable_provider_failure
                 last_error = self._runtime_provider_error(autonomous.last_error_code, autonomous.last_error_detail)
-                if last_error and last_error.code == "TOKEN_BUDGET_EXCEEDED":
-                    raise last_error
-                if last_error and recoverable_provider_failure(last_error):
+                if last_error and (last_error.code == "TOKEN_BUDGET_EXCEEDED" or recoverable_provider_failure(last_error)):
                     runtime.resume(db, autonomous.id)
             result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
             if result.get("run", {}).get("stop_reason") == "WORLD_INFORMATION_MISSING":
@@ -858,21 +1032,19 @@ class AutoDirectorOrchestrator:
                 result = runtime.advance(db, autonomous.id, max_scenes=scene_count, request_key=f"{run.id}-chapter-{chapter_number}", request_offset=0, usage_collector=collect_scene_usage)
             self._live_complete(runtime_live, "角色行动与世界裁定已暂存，正在形成待审核章节")
         except Exception as exc:
-            if durable_stages:
-                db.info.pop("author_scene_usage_flush", None)
+            persist_scene_usage(db)
+            db.info.pop("author_scene_usage_flush", None)
             self._live_fail(runtime_live, exc)
             raise
         else:
-            if durable_stages:
-                persist_scene_usage(db)
-                db.info.pop("author_scene_usage_flush", None)
+            persist_scene_usage(db)
+            db.info.pop("author_scene_usage_flush", None)
         committed_scene_steps = [item for item in result.get("steps", []) if item.get("scene_id")]
         scene_step = committed_scene_steps[-1] if committed_scene_steps else None
         if len(committed_scene_steps) < scene_count:
-            if durable_stages:
-                runtime_error = self._runtime_provider_error((result.get("run") or {}).get("last_error_code"), autonomous.last_error_detail)
-                if runtime_error:
-                    raise runtime_error
+            runtime_error = self._runtime_provider_error((result.get("run") or {}).get("last_error_code"), autonomous.last_error_detail)
+            if runtime_error:
+                raise runtime_error
             raise AutoDirectorError("CHAPTER_SCENE_NOT_COMMITTED", str(result))
         run.context = {**(run.context or {}), "autonomous_run_ids": list(dict.fromkeys([*(run.context or {}).get("autonomous_run_ids", []), *autonomous_run_ids]))}
         if branch:
@@ -897,7 +1069,7 @@ class AutoDirectorOrchestrator:
     @staticmethod
     def _runtime_provider_error(code: str | None, detail: dict[str, Any] | None) -> ModelProviderError | None:
         if code in {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "TOKEN_BUDGET_EXCEEDED"}:
-            return ModelProviderError(code, upstream_status=(detail or {}).get("upstream_status"))
+            return ModelProviderError(code, upstream_status=(detail or {}).get("upstream_status"), retry_after=(detail or {}).get("retry_after"))
         return None
 
     def _advance_chapter_prose(self, db: Session, run: AutoDirectorRun, project: Project, plan_id: str, chapter: Chapter, chapter_number: int, *, durable_stages: bool) -> None:
@@ -917,7 +1089,7 @@ class AutoDirectorOrchestrator:
             settings = get_settings(); route = ModelRouter().resolve(db, project.id, settings, "WRITER")
             key = ProviderCredentialResolver().generation_key(db, project.id, settings)
             pov_character_id = (run.context.get("foundation") or {}).get("character_ids", [None])[0]
-            writer_provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key), db.info.get("author_model_call_guard"))
+            writer_provider = _UsageTrackingProvider(self._routed_provider(db, project.id, settings, route, key), db.info.get("author_model_call_guard"), self._pending_usage_callback(db, run))
             writer_live = self._live_begin(run, f"第 {chapter_number} 章：正文写作", "WRITER", provider=route.provider, model=route.model)
             live_execution_broker.phase(writer_live, "WRITING", "Writer 正在依据角色 Agent 行动和章节任务生成正文")
             try:
@@ -936,18 +1108,21 @@ class AutoDirectorOrchestrator:
                 self._live_complete(writer_live, "正文草稿已生成，正在进入质量审计")
             except Exception as exc:
                 self._live_fail(writer_live, exc)
+                failure_metrics = self._tracked_metrics(writer_provider)
+                if failure_metrics["calls"]:
+                    self._persist_usage_metrics(db, run, writer_step, failure_metrics)
                 raise
             if draft.status not in {WriterDraftStatus.VALIDATED, WriterDraftStatus.ADOPTED}:
-                failure = writer_provider.last_error if durable_stages else None
-                if durable_stages:
-                    failure_metrics = self._tracked_metrics(writer_provider)
-                    self._merge_step_usage(writer_step, failure_metrics)
-                    self._add_usage_metrics(run, failure_metrics)
+                failure = writer_provider.last_error
+                failure_metrics = self._tracked_metrics(writer_provider)
+                if failure_metrics["calls"]:
+                    self._persist_usage_metrics(db, run, writer_step, failure_metrics)
                 message = "正文稿未通过 Writer 验证。" if durable_stages else str(draft.validation_report)
                 self._fail(run, writer_step, failure or AutoDirectorError("WRITER_DRAFT_FAILED", message))
                 return
             metrics = self._tracked_metrics(writer_provider)
-            self._commit_step(writer_step, {"draft_id": draft.id, "chapter_id": chapter.id}, draft.id, **metrics); self._add_usage(run, writer_step)
+            self._commit_step(writer_step, {"draft_id": draft.id, "chapter_id": chapter.id}, draft.id, **metrics); self._add_usage(run, writer_step, db=db)
+            db.info["auto_pending_total_tokens"] = 0; db.info["auto_pending_reserved_tokens"] = 0
             if durable_stages:
                 run.current_stage = AutoDirectorStage.QUALITY_REVIEW
                 run.next_action = "正文草稿已保存，下一检查点运行质量审核。"
@@ -987,7 +1162,7 @@ class AutoDirectorOrchestrator:
             draft = db.get(ChapterWriterDraft, draft_id)
             if not draft:
                 raise AutoDirectorError("WRITER_DRAFT_NOT_FOUND")
-            critic_provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key), db.info.get("author_model_call_guard"))
+            critic_provider = _UsageTrackingProvider(self._routed_provider(db, project.id, settings, route, key), db.info.get("author_model_call_guard"), self._pending_usage_callback(db, run))
             critic_live = self._live_begin(run, f"第 {chapter_number} 章：质量审计", "CRITIC", provider=route.provider, model=route.model)
             live_execution_broker.phase(critic_live, "REVIEWING", "质量 Agent 正在审计任务覆盖、连续性和正文问题")
             try:
@@ -999,9 +1174,13 @@ class AutoDirectorOrchestrator:
                 self._live_complete(critic_live, f"质量审计完成：{enum_value(assessment.status)}")
             except Exception as exc:
                 self._live_fail(critic_live, exc)
+                metrics = self._tracked_metrics(critic_provider)
+                if metrics["calls"]:
+                    self._persist_usage_metrics(db, run, quality_step, metrics)
                 raise
             metrics = self._tracked_metrics(critic_provider)
-            self._commit_step(quality_step, {"assessment_id": assessment.id, "status": enum_value(assessment.status)}, assessment.id, **metrics); self._add_usage(run, quality_step)
+            self._commit_step(quality_step, {"assessment_id": assessment.id, "status": enum_value(assessment.status)}, assessment.id, **metrics); self._add_usage(run, quality_step, db=db)
+            db.info["auto_pending_total_tokens"] = 0; db.info["auto_pending_reserved_tokens"] = 0
             provider_error = critic_provider.last_error if durable_stages else None
         assessment = db.get(ChapterQualityAssessment, quality_step.output_payload["assessment_id"])
         if assessment is None:
@@ -1059,23 +1238,27 @@ class AutoDirectorOrchestrator:
         settings = get_settings()
         route = ModelRouter().resolve(db, project.id, settings, "REPAIR")
         key = ProviderCredentialResolver().generation_key(db, project.id, settings)
-        provider = _UsageTrackingProvider(get_model_provider(settings, route.provider, route.base_url, key), db.info.get("author_model_call_guard"))
+        provider = _UsageTrackingProvider(self._routed_provider(db, project.id, settings, route, key), db.info.get("author_model_call_guard"), self._pending_usage_callback(db, run))
         try:
             draft, _ = QualityRepairService().repair(db, assessment.id, {"idempotency_key": f"{run.id}-chapter-{chapter_number}-repair-{repair_count + 1}-attempt-{step.attempt}"}, repair_provider=provider, repair_model=route.model, settings=settings, assess_child=False)
         except Exception as exc:
             if getattr(exc, "code", None) != "QUALITY_REPAIR_LIMIT_REACHED":
+                metrics = self._tracked_metrics(provider)
+                if metrics["calls"]:
+                    self._persist_usage_metrics(db, run, step, metrics)
                 raise
             self._commit_step(step, {"skipped": True, "debt": "MAX_REPAIRS_REACHED"})
             return step
         metrics = self._tracked_metrics(provider)
         if provider.last_error:
             self._merge_step_usage(step, metrics)
-            self._add_usage_metrics(run, metrics)
+            self._add_usage_metrics(run, metrics, db=db)
             self._fail(run, step, provider.last_error)
             return None
         valid = enum_value(draft.status) == "VALIDATED"
         self._commit_step(step, {"draft_id": draft.id if valid else None, "rejected_draft_id": None if valid else draft.id}, draft.id, **metrics)
-        self._add_usage(run, step)
+        self._add_usage(run, step, db=db)
+        db.info["auto_pending_total_tokens"] = 0; db.info["auto_pending_reserved_tokens"] = 0
         db.info["author_checkpoint_stage"] = AutoDirectorStage.QUALITY_REPAIR.value
         run.current_stage = AutoDirectorStage.QUALITY_REVIEW if valid else AutoDirectorStage.AUTHOR_ADOPTION
         run.next_action = "修复稿已保存，下一检查点处理修复结果。"
@@ -1094,13 +1277,28 @@ class AutoDirectorOrchestrator:
                     try:
                         self._check_budget(run)
                         settings = get_settings(); repair_route = ModelRouter().resolve(db, project.id, settings, "REPAIR"); critic_route = ModelRouter().resolve(db, project.id, settings, "CRITIC"); key = ProviderCredentialResolver().generation_key(db, project.id, settings)
-                        repair_provider = _UsageTrackingProvider(get_model_provider(settings, repair_route.provider, repair_route.base_url, key), db.info.get("author_model_call_guard"))
-                        repair_critic_provider = _UsageTrackingProvider(get_model_provider(settings, critic_route.provider, critic_route.base_url, key), db.info.get("author_model_call_guard"))
+                        usage_callback = self._pending_usage_callback(db, run)
+                        repair_provider = _UsageTrackingProvider(self._routed_provider(db, project.id, settings, repair_route, key), db.info.get("author_model_call_guard"), usage_callback)
+                        repair_critic_provider = _UsageTrackingProvider(self._routed_provider(db, project.id, settings, critic_route, key), db.info.get("author_model_call_guard"), usage_callback)
                         draft, repaired = QualityRepairService().repair(db, assessment.id, {"idempotency_key": f"{run.id}-chapter-{chapter_number}-repair-{repair_count + 1}"}, repair_provider=repair_provider, repair_model=repair_route.model, critic_provider=repair_critic_provider, critic_model=critic_route.model, settings=settings)
                         metrics = self._tracked_metrics(repair_provider, repair_critic_provider)
-                        self._commit_step(repair_step, {"draft_id": draft.id, "assessment_id": repaired.id if repaired else None}, draft.id, **metrics); self._add_usage(run, repair_step)
+                        provider_error = repair_provider.last_error or repair_critic_provider.last_error
+                        if provider_error and (is_transient(provider_error.code, provider_error.upstream_status) or provider_error.code == "TOKEN_BUDGET_EXCEEDED"):
+                            self._persist_usage_metrics(db, run, repair_step, metrics)
+                            raise provider_error
+                        self._commit_step(repair_step, {"draft_id": draft.id, "assessment_id": repaired.id if repaired else None}, draft.id, **metrics); self._add_usage(run, repair_step, db=db)
+                        db.info["auto_pending_total_tokens"] = 0; db.info["auto_pending_reserved_tokens"] = 0
                     except Exception as repair_exc:
-                        self._commit_step(repair_step, {"skipped": True, "debt": "REPAIR_FAILED", "error": str(repair_exc)[:500]})
+                        failure = provider_failure(repair_exc)
+                        if failure and (is_transient(failure.code, failure.upstream_status) or failure.code == "TOKEN_BUDGET_EXCEEDED"):
+                            raise failure
+                        repair_metrics = self._tracked_metrics(repair_provider, repair_critic_provider)
+                        if repair_metrics["calls"] and repair_step.status != AutoDirectorStepStatus.COMMITTED:
+                            self._commit_step(repair_step, {"skipped": True, "debt": "REPAIR_FAILED", "error": str(repair_exc)[:500]}, **repair_metrics)
+                            self._add_usage(run, repair_step, db=db)
+                        else:
+                            self._commit_step(repair_step, {"skipped": True, "debt": "REPAIR_FAILED", "error": str(repair_exc)[:500]})
+                        db.info["auto_pending_total_tokens"] = 0; db.info["auto_pending_reserved_tokens"] = 0
                         run.context = {**(run.context or {}), "quality_debts": [*(run.context or {}).get("quality_debts", []), "REPAIR_FAILED"]}
         run.current_stage = AutoDirectorStage.AUTHOR_ADOPTION
         run.next_action = "质量门通过后自动采用正文并准备下一章。"
@@ -1249,10 +1447,10 @@ class AutoDirectorOrchestrator:
         settings = get_settings()
         route = ModelRouter().resolve(db, project.id, settings, "DIRECTOR")
         key = ProviderCredentialResolver().generation_key(db, project.id, settings)
-        provider = get_model_provider(settings, route.provider, route.base_url, key)
-        if db.info.get("author_model_call_guard"):
-            from .author_recovery import guarded_provider
-            provider = guarded_provider(provider, db.info["author_model_call_guard"])
+        provider = _UsageTrackingProvider(
+            self._routed_provider(db, project.id, settings, route, key),
+            db.info.get("author_model_call_guard"), self._pending_usage_callback(db, run),
+        )
         volume = db.scalar(select(StoryPlanVolume).where(StoryPlanVolume.plan_id == plan.id, StoryPlanVolume.start_chapter <= chapter_number, StoryPlanVolume.end_chapter >= chapter_number))
         arc = db.scalar(select(StoryPlanArc).where(StoryPlanArc.plan_id == plan.id, StoryPlanArc.volume_number == (volume.number if volume else 1)).order_by(StoryPlanArc.number))
         previous = db.scalar(select(StoryPlanChapter).where(StoryPlanChapter.plan_id == plan.id, StoryPlanChapter.number == chapter_number - 1))

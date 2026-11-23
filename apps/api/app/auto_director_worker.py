@@ -51,7 +51,7 @@ class AutoDirectorWorker:
                 return None
             token = str(uuid4())
             values = {"worker_claim_token": token, "worker_lease_until": now + timedelta(seconds=self.lease_seconds), "next_retry_at": None}
-            if candidate.worker_claim_token and candidate.run_mode == "AUTHOR_GUIDED_VOLUME":
+            if candidate.worker_claim_token:
                 values["recovery_usage_uncertain"] = True
                 values["context"] = {
                     **(candidate.context or {}),
@@ -106,30 +106,67 @@ class AutoDirectorWorker:
 
     @staticmethod
     def _stop_for_budget(run: AutoDirectorRun) -> None:
+        context = dict(run.context or {})
+        if run.current_stage != AutoDirectorStage.PAUSED:
+            context["resume_stage"] = getattr(run.current_stage, "value", run.current_stage)
+        run.context = context
         run.status = AutoDirectorRunStatus.PAUSED
         run.current_stage = AutoDirectorStage.PAUSED
         run.pause_reason = "TOKEN_BUDGET_EXCEEDED"
         run.recovery_error_code = run.pause_reason
         run.next_action = "提高本次 token 预算后从已保存的检查点继续，或接管运行。"
+        release_claim(run)
 
-    def _handle_failure(self, run: AutoDirectorRun, *, code: str, stage: str,
+    def _handle_failure(self, db, run: AutoDirectorRun, *, code: str, stage: str,
                         upstream_status: int | None = None, step_id: str | None = None,
-                        retry_after: int | None = None, reserve: int = 0) -> None:
-        if code == "TOKEN_BUDGET_EXCEEDED" and run.run_mode == "AUTHOR_GUIDED_VOLUME":
+                        retry_after: int | None = None, reserve: int = 0,
+                        accounted_calls: int = 1) -> None:
+        pending_events = list(db.info.get("auto_pending_usage_events") or [])
+        pending_metrics = None
+        if pending_events:
+            orchestrator = AutoDirectorOrchestrator()
+            pending_metrics = orchestrator._tracked_metrics(pending_events)
+            orchestrator._persist_pending_failure_usage(db, run, stage)
+        if code == "TOKEN_BUDGET_EXCEEDED":
             self._stop_for_budget(run)
             return
-        if run.run_mode == "AUTHOR_GUIDED_VOLUME" and (
-            code == MODEL_TIMEOUT or code == MODEL_UPSTREAM_ERROR and is_transient(code, upstream_status)
-        ):
-            run.recovery_usage_uncertain = True
+        if is_transient(code, upstream_status):
+            failed_step = db.get(AutoDirectorStep, step_id) if step_id else None
+            usage = (failed_step.token_usage or {}) if failed_step and failed_step.run_id == run.id else {}
+            already_reserved = bool(int(usage.get("unknown_usage_calls") or 0))
+            usage_uncertain = already_reserved or bool(pending_metrics and pending_metrics["usage"].get("usage_status") == "UNKNOWN")
+            persisted_call_usage = (run.context or {}).get("last_failed_usage") or {}
+            persisted_failure_usage = (run.context or {}).get("last_persisted_failure_usage") or {}
+            step_has_call_usage = int(usage.get("calls", 0) or 0) > 0
+            run_has_call_usage = (
+                persisted_call_usage.get("stage") == stage
+                and int(persisted_call_usage.get("calls", 0) or 0) > 0
+            )
+            persisted_for_failure = (
+                persisted_failure_usage.get("stage") == stage
+                and code in (persisted_failure_usage.get("error_codes") or [])
+                and int(persisted_failure_usage.get("calls") or 0) >= max(0, int(accounted_calls or 0))
+            )
+            if not pending_metrics and not already_reserved and not persisted_for_failure and not step_has_call_usage and not run_has_call_usage:
+                calls = max(0, int(accounted_calls or 0))
+                reserve_tokens = reserve or unknown_call_reserve(run) * calls
+                context = dict(run.context or {})
+                context["recovery_reserved_tokens"] = int(context.get("recovery_reserved_tokens") or 0) + reserve_tokens
+                run.context = context
+                usage_uncertain = reserve_tokens > 0
+            elif persisted_for_failure:
+                usage_uncertain = int(persisted_failure_usage.get("unknown_usage_calls") or 0) > 0
+            elif run_has_call_usage:
+                usage_uncertain = int((persisted_call_usage.get("usage") or {}).get("unknown_usage_calls", 0) or 0) > 0
+            if usage_uncertain:
+                run.recovery_usage_uncertain = True
             context = dict(run.context or {})
-            context["recovery_reserved_tokens"] = int(context.get("recovery_reserved_tokens") or 0) + (reserve or unknown_call_reserve(run))
+            context.pop("last_persisted_failure_usage", None)
             run.context = context
-        if run.run_mode == "AUTHOR_GUIDED_VOLUME" and is_transient(code, upstream_status):
+        if is_transient(code, upstream_status):
             budget = configured_token_budget(run)
             if budget and budget_usage(run) >= budget:
                 self._stop_for_budget(run)
-                release_claim(run)
                 return
             chapter = (run.context or {}).get("current_chapter_number")
             key = str(step_id or f"{stage}:{chapter or 0}")
@@ -142,6 +179,10 @@ class AutoDirectorWorker:
                 run.next_retry_at = utc_now() + timedelta(seconds=seconds)
                 run.status = AutoDirectorRunStatus.RUNNING
                 run.pause_reason = None
+                try:
+                    run.current_stage = AutoDirectorStage(stage)
+                except ValueError:
+                    pass
                 run.next_action = "模型服务暂时不可用。到达重试时间后从当前检查点自动继续。"
                 return
             run.status = AutoDirectorRunStatus.BLOCKED
@@ -169,21 +210,23 @@ class AutoDirectorWorker:
         db.info["author_commit_fence"] = lambda session: self._fence(session, run_id, token)
         if author:
             db.info["author_recovery"] = True
-            db.info["author_pending_total_tokens"] = 0
-            db.info["author_model_call_guard"] = lambda: self._check_model_call_budget(db, run)
-            budget = configured_token_budget(run)
-            if budget and budget_usage(run) >= budget:
-                self._stop_for_budget(run)
-                return
+        db.info["auto_pending_total_tokens"] = 0
+        db.info["auto_pending_reserved_tokens"] = 0
+        db.info["author_model_call_guard"] = lambda: self._check_model_call_budget(db, run)
+        budget = configured_token_budget(run)
+        if budget and budget_usage(run) >= budget:
+            self._stop_for_budget(run)
+            return
+        if author:
             AuthorGuidedVolumeService().advance_run(db, run)
         else:
             AutoDirectorOrchestrator().advance_to_pause(db, run)
         self._save_checkpoint(db, run)
-        if author and run.status == AutoDirectorRunStatus.RUNNING:
+        if run.status == AutoDirectorRunStatus.RUNNING:
             budget = configured_token_budget(run)
             if budget and budget_usage(run) >= budget:
                 self._stop_for_budget(run)
-        if author and run.status in {AutoDirectorRunStatus.FAILED, AutoDirectorRunStatus.BLOCKED, AutoDirectorRunStatus.PAUSED}:
+        if run.status in {AutoDirectorRunStatus.FAILED, AutoDirectorRunStatus.BLOCKED, AutoDirectorRunStatus.PAUSED}:
             step_id = (run.context or {}).get("failed_step_id")
             step = db.get(AutoDirectorStep, step_id) if step_id else None
             details = (step.output_payload or {}) if step and step.run_id == run.id else {}
@@ -193,11 +236,12 @@ class AutoDirectorWorker:
                 "TOKEN_BUDGET_EXCEEDED",
             }:
                 stage = getattr(step.stage, "value", step.stage) if step else getattr(run.current_stage, "value", run.current_stage)
-                self._handle_failure(run, code=code, stage=stage, upstream_status=details.get("upstream_status"),
-                                     step_id=step_id, retry_after=details.get("retry_after"))
+                self._handle_failure(db, run, code=code, stage=stage, upstream_status=details.get("upstream_status"),
+                                     step_id=step_id, retry_after=details.get("retry_after"),
+                                     accounted_calls=int((details.get("last_failed_usage") or {}).get("calls", 1) or 0))
                 release_claim(run)
                 return
-        if run.status == AutoDirectorRunStatus.RUNNING or run.pause_reason in {
+        if (run.status == AutoDirectorRunStatus.RUNNING and run.next_retry_at is None) or run.pause_reason in {
             "WINDOW_COMPLETE", "RUN_CHAPTER_BUDGET_REACHED", "AUTHOR_WINDOW_READY",
         }:
             clear_retry(run)
@@ -206,8 +250,11 @@ class AutoDirectorWorker:
     @staticmethod
     def _check_model_call_budget(db, run) -> None:
         budget = configured_token_budget(run)
-        if budget and budget_usage(run) + int(db.info.get("author_pending_total_tokens") or 0) >= budget:
-            raise ModelProviderError("TOKEN_BUDGET_EXCEEDED")
+        pending = int(db.info.get("auto_pending_total_tokens") or 0)
+        pending += int(db.info.get("auto_pending_reserved_tokens") or 0)
+        if budget and budget_usage(run) + pending >= budget:
+            error = ModelProviderError("TOKEN_BUDGET_EXCEEDED", accounted_calls=0)
+            raise error
 
     def run_once(self) -> bool:
         try:
@@ -250,10 +297,11 @@ class AutoDirectorWorker:
                         run = db.get(AutoDirectorRun, run_id, populate_existing=True)
                         upstream = provider_failure(exc)
                         code = (upstream.code if upstream else getattr(exc, "code", None)) or "WORKER_UNEXPECTED_ERROR"
-                        self._handle_failure(run, code=code, stage=initial_stage,
+                        self._handle_failure(db, run, code=code, stage=initial_stage,
                                              upstream_status=upstream.upstream_status if upstream else None,
                                              retry_after=getattr(upstream, "retry_after", None),
-                                             reserve=getattr(upstream, "reserved_tokens", 0))
+                                             reserve=getattr(upstream, "reserved_tokens", 0),
+                                             accounted_calls=getattr(upstream, "accounted_calls", 1))
                         context = dict(run.context or {})
                         context.update({"worker_error": str(exc)[:1000], "worker_error_code": code, "worker_stage": initial_stage})
                         run.context = context

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..auto_director import AutoDirectorError, AutoDirectorOrchestrator, enum_value, fingerprint, score_direction
-from ..api_types import AutoDirectorRunCreatePayload, DirectionSelectionPayload
+from ..api_types import AutoDirectorResumePayload, AutoDirectorRunCreatePayload, DirectionSelectionPayload
 from ..models import AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, Project
 from ..author_recovery import recovery_payload, revoke_claim
+from ..author_recovery import budget_usage, configured_token_budget
 from .common import get_db, require_project
 
 router = APIRouter(tags=["auto-director"])
@@ -51,7 +52,8 @@ def _retry_limit_reached(run: AutoDirectorRun, checkpoint: AutoDirectorStep | No
     configured = (run.settings or {}).get("max_retries", 2)
     maximum = int(configured if configured is not None else 2)
     # attempt 1 is the initial generation; max_retries counts recoveries.
-    return checkpoint is not None and checkpoint.attempt > maximum
+    budget_retries = int((checkpoint.token_usage or {}).get("budget_extension_retries", 0) or 0) if checkpoint else 0
+    return checkpoint is not None and checkpoint.attempt - budget_retries > maximum
 
 
 def _payload(db: Session, run: AutoDirectorRun, *, step_limit: int | None = None) -> dict:
@@ -65,10 +67,10 @@ def _payload(db: Session, run: AutoDirectorRun, *, step_limit: int | None = None
         "current_chapter_id": run.current_chapter_id, "run_mode": run.run_mode, "pause_reason": run.pause_reason,
         "next_action": run.next_action, "idempotency_key": run.idempotency_key, "token_usage": run.token_usage or {},
         "recovery": recovery_payload(run),
-        "usage_metrics": {"calls": run.total_calls, "prompt_tokens": run.prompt_tokens, "completion_tokens": run.completion_tokens, "total_tokens": run.total_tokens, "latency_ms": run.latency_ms, "provider": ",".join(run.token_usage.get("providers", [])) or None, "model": ",".join(run.token_usage.get("models", [])) or None, "estimated_cost": run.estimated_cost, "cost_status": run.cost_status},
+        "usage_metrics": {"calls": run.total_calls, "prompt_tokens": run.prompt_tokens, "completion_tokens": run.completion_tokens, "total_tokens": run.total_tokens, "unknown_usage_calls": int((run.token_usage or {}).get("unknown_usage_calls") or 0), "reserved_tokens": int((run.context or {}).get("recovery_reserved_tokens") or 0), "usage_status": (run.token_usage or {}).get("usage_status", "NOT_SENT"), "latency_ms": run.latency_ms, "provider": ",".join(run.token_usage.get("providers", [])) or None, "model": ",".join(run.token_usage.get("models", [])) or None, "estimated_cost": run.estimated_cost, "cost_status": run.cost_status},
         "settings": run.settings or {}, "context": run.context or {}, "created_at": run.created_at.isoformat() if run.created_at else None,
         "updated_at": run.updated_at.isoformat() if run.updated_at else None, "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-        "steps": [{"id": s.id, "stage": enum_value(s.stage), "status": enum_value(s.status), "attempt": s.attempt, "input_fingerprint": s.input_fingerprint, "output_artifact_id": s.output_artifact_id, "output_payload": s.output_payload or {}, "error_code": s.error_code, "error_summary": s.error_summary, "token_usage": s.token_usage or {}, "usage_metrics": {"calls": s.calls, "prompt_tokens": s.prompt_tokens, "completion_tokens": s.completion_tokens, "total_tokens": s.total_tokens, "latency_ms": s.latency_ms, "provider": s.provider, "model": s.model, "estimated_cost": s.estimated_cost, "cost_status": s.cost_status}, "started_at": s.started_at.isoformat() if s.started_at else None, "completed_at": s.completed_at.isoformat() if s.completed_at else None} for s in steps],
+        "steps": [{"id": s.id, "stage": enum_value(s.stage), "status": enum_value(s.status), "attempt": s.attempt, "input_fingerprint": s.input_fingerprint, "output_artifact_id": s.output_artifact_id, "output_payload": s.output_payload or {}, "error_code": s.error_code, "error_summary": s.error_summary, "token_usage": s.token_usage or {}, "usage_metrics": {"calls": s.calls, "prompt_tokens": s.prompt_tokens, "completion_tokens": s.completion_tokens, "total_tokens": s.total_tokens, "unknown_usage_calls": int((s.token_usage or {}).get("unknown_usage_calls") or 0), "usage_status": (s.token_usage or {}).get("usage_status", "NOT_SENT"), "latency_ms": s.latency_ms, "provider": s.provider, "model": s.model, "estimated_cost": s.estimated_cost, "cost_status": s.cost_status}, "started_at": s.started_at.isoformat() if s.started_at else None, "completed_at": s.completed_at.isoformat() if s.completed_at else None} for s in steps],
     }
 
 
@@ -107,11 +109,43 @@ def pause_run(project_id: str, run_id: str, payload: dict | None = None, db: Ses
 
 
 @router.post("/projects/{project_id}/auto-director/runs/{run_id}/resume")
-def resume_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
+def resume_run(project_id: str, run_id: str, payload: AutoDirectorResumePayload | None = Body(default=None), db: Session = Depends(get_db)):
     run = _run_or_404(db, project_id, run_id)
+    if run.status == AutoDirectorRunStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail={"code": "RUN_ALREADY_COMPLETED"})
     if run.status == AutoDirectorRunStatus.RUNNING:
         return _payload(db, run)
     revoke_claim(run)
+    if run.pause_reason == "TOKEN_BUDGET_EXCEEDED":
+        requested = payload.max_tokens if payload else None
+        current_budget = configured_token_budget(run)
+        used_tokens = budget_usage(run)
+        if requested is None:
+            raise HTTPException(status_code=409, detail={
+                "code": "TOKEN_BUDGET_INCREASE_REQUIRED",
+                "message": "Token 预算已到上限。请填写更高的新预算后从已保存检查点继续。",
+                "current_budget": current_budget,
+                "used_tokens": used_tokens,
+                "reserved_tokens": int((run.context or {}).get("recovery_reserved_tokens") or 0),
+            })
+        if requested <= max(current_budget, used_tokens):
+            raise HTTPException(status_code=422, detail={
+                "code": "TOKEN_BUDGET_MUST_INCREASE",
+                "message": "新 token 预算必须高于当前预算和已确认用量及预留量。",
+                "current_budget": current_budget,
+                "used_tokens": used_tokens,
+            })
+        settings = dict(run.settings or {})
+        settings["max_tokens"] = requested
+        run.settings = settings
+        budget_checkpoint = _retry_checkpoint(db, run)
+        if budget_checkpoint:
+            usage = dict(budget_checkpoint.token_usage or {})
+            usage["budget_extension_retries"] = int(usage.get("budget_extension_retries", 0) or 0) + 1
+            budget_checkpoint.token_usage = usage
+        run.pause_reason = None
+        run.recovery_error_code = None
+        run.next_action = f"Token 预算已提高到 {requested:,}；将从已保存检查点继续。"
     if _retry_checkpoint(db, run) is not None:
         return retry_run(project_id, run_id, db)
     if run.current_stage == AutoDirectorStage.PAUSED:
@@ -133,6 +167,8 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail={"code": "RUN_ALREADY_COMPLETED", "message": "已采用正文的运行不可重新生成。"})
     if run.status == AutoDirectorRunStatus.RUNNING:
         return _payload(db, run)
+    if run.pause_reason == "TOKEN_BUDGET_EXCEEDED":
+        raise HTTPException(status_code=409, detail={"code": "TOKEN_BUDGET_INCREASE_REQUIRED", "message": "Token 预算已到上限。请使用继续操作提交更高预算。", "used_tokens": budget_usage(run), "current_budget": configured_token_budget(run)})
     revoke_claim(run)
     checkpoint = _retry_checkpoint(db, run)
     retry_stage = checkpoint.stage if checkpoint else None
@@ -148,6 +184,8 @@ def retry_run(project_id: str, run_id: str, db: Session = Depends(get_db)):
         run.pause_reason = None
     if run.current_stage in {AutoDirectorStage.FAILED, AutoDirectorStage.BLOCKED}:
         run.current_stage = retry_stage or (AutoDirectorStage.CHAPTER_EXECUTION if run.current_chapter_id else AutoDirectorStage.FRAMING)
+    elif run.current_stage == AutoDirectorStage.PAUSED and retry_stage is not None:
+        run.current_stage = retry_stage
     run.next_action = "已加入本地自动导演队列，等待 worker 重试。"; db.commit(); return _payload(db, run)
 
 

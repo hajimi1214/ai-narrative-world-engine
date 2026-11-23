@@ -1367,7 +1367,14 @@ class QualityGateService:
         settings = settings or __import__("app.settings", fromlist=["get_settings"]).get_settings()
         route = ModelRouter().resolve(db, project_id, settings, "CRITIC")
         key = ProviderCredentialResolver().generation_key(db, project_id, settings)
-        return get_model_provider(settings, route.provider, route.base_url, key), model or route.model, route.provider
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        provider = get_model_provider(
+            settings, route.provider, route.base_url, key,
+            timeout_seconds=config.request_timeout_seconds if config else None,
+            max_retries=config.max_retries if config else 0,
+            rate_limit_per_minute=config.rate_limit_per_minute if config else 0,
+        )
+        return provider, model or route.model, route.provider
 
 
 class QualityRepairPromptBuilder:
@@ -1571,7 +1578,14 @@ class QualityRepairService:
         settings = settings or __import__("app.settings", fromlist=["get_settings"]).get_settings()
         route = ModelRouter().resolve(db, project_id, settings, "REPAIR")
         key = ProviderCredentialResolver().generation_key(db, project_id, settings)
-        return get_model_provider(settings, route.provider, route.base_url, key), model or route.model, route.provider
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        provider = get_model_provider(
+            settings, route.provider, route.base_url, key,
+            timeout_seconds=config.request_timeout_seconds if config else None,
+            max_retries=config.max_retries if config else 0,
+            rate_limit_per_minute=config.rate_limit_per_minute if config else 0,
+        )
+        return provider, model or route.model, route.provider
 
 
 def assessment_payload(db: Session, assessment: ChapterQualityAssessment, *, include_findings: bool = False) -> dict[str, Any]:

@@ -2,6 +2,9 @@
 export const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 export class ApiError extends Error { constructor(message: string, public detail?: unknown, public status?: number) { super(message); } }
 const errorMessages: Record<string, string> = {
+  MODEL_PROVIDER_NOT_CONFIGURED: "请填写模型服务地址与密钥，或检查本地模型环境配置。",
+  MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED: "本地密钥库尚未配置，模型密钥无法保存。请配置 AI_CREDENTIAL_MASTER_KEY 后重试，或使用环境级模型密钥。",
+  MODEL_CREDENTIAL_INVALID: "本地密钥库无法解密已保存的模型密钥，请检查 AI_CREDENTIAL_MASTER_KEY。",
   AUTHOR_EDIT_CONFLICT: "当前工作稿已经更新。请保留修改内容，刷新并比较最新版本后再保存。",
   AUTHOR_EDIT_REQUIRES_PAUSE: "自动创作正在运行，请先到导演台暂停，再保存人工修改。",
   AUTHOR_CONTENT_EMPTY: "正文不能为空。",

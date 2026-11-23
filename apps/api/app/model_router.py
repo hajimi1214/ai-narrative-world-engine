@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
+from .ai.errors import MODEL_CREDENTIAL_INVALID, MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED, ModelProviderError
 from .models import ProjectModelConfig, ProjectProviderCredential, ProviderCredentialPurpose
 
 
@@ -113,5 +114,11 @@ class ProviderCredentialResolver:
         credential = db.scalar(select(ProjectProviderCredential).where(ProjectProviderCredential.project_id == project_id, ProjectProviderCredential.purpose == ProviderCredentialPurpose.GENERATION))
         if credential:
             from .embeddings import CredentialVault
-            return CredentialVault(os.getenv("AI_CREDENTIAL_MASTER_KEY")).decrypt(credential.secret_ciphertext)
+            try:
+                return CredentialVault(os.getenv("AI_CREDENTIAL_MASTER_KEY")).decrypt(credential.secret_ciphertext)
+            except ValueError as exc:
+                code = str(exc)
+                if code not in {MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED, MODEL_CREDENTIAL_INVALID}:
+                    code = MODEL_CREDENTIAL_INVALID
+                raise ModelProviderError(code) from exc
         return settings.ai_api_key.get_secret_value() if settings.ai_api_key else None

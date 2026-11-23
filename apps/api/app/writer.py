@@ -29,6 +29,7 @@ from .models import (
     WritingBible, WriterDraftStatus, WriterPOVMode, ChapterWriterDraft,
     WriterDraftOrigin, ChapterQualityAssessment, QualityAssessmentStatus,
     RevealConstraint, RevealStatus, WorldEntity,
+    ProjectModelConfig,
 )
 from .narrative_structure import NarrativeStructureAudit
 from .retcon_apply import has_pending_replay
@@ -705,7 +706,14 @@ class WriterProjectionService:
         settings = settings or __import__("app.settings", fromlist=["get_settings"]).get_settings()
         route = ModelRouter().resolve(db, project_id, settings, "WRITER")
         key = ProviderCredentialResolver().generation_key(db, project_id, settings)
-        return get_model_provider(settings, route.provider, route.base_url, key), model or route.model
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        provider = get_model_provider(
+            settings, route.provider, route.base_url, key,
+            timeout_seconds=config.request_timeout_seconds if config else None,
+            max_retries=config.max_retries if config else 0,
+            rate_limit_per_minute=config.rate_limit_per_minute if config else 0,
+        )
+        return provider, model or route.model
 
     @staticmethod
     def _parse(content: str) -> dict[str, Any]:

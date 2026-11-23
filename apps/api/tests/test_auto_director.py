@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +12,7 @@ import app.api as api_module
 import app.auto_director as auto_module
 import app.runtime as runtime_module
 from app.ai.fake import FakeModelProvider
+from app.ai.errors import MODEL_RATE_LIMITED, ModelProviderError
 from app.db import Base
 from app.main import app
 from app.models import (
@@ -20,7 +21,8 @@ from app.models import (
     VolumeContractStatus,
 )
 from app.auto_director_worker import AutoDirectorWorker
-from app.auto_director import AutoDirectorError, AutoDirectorOrchestrator, fingerprint
+from app.author_recovery import utc_now
+from app.auto_director import AutoDirectorError, AutoDirectorOrchestrator, _UsageTrackingProvider, fingerprint
 from app.autonomy import AutonomousWorldLoopService
 from app.planning import persist_plan
 from app.narrative_structure import NarrativeStructureService
@@ -53,6 +55,169 @@ def test_auto_director_creates_and_pauses_for_direction(monkeypatch):
     duplicate = client.post(f"/projects/{project_id}/auto-director/runs", json={"inspiration": "不同输入", "idempotency_key": "same-run"})
     assert duplicate.status_code == 201
     assert duplicate.json()["id"] == body["id"]
+
+
+def test_full_auto_api_uses_finite_budget_by_default_and_keeps_explicit_unlimited_opt_in(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    bounded = client.post(f"/projects/{project_id}/auto-director/runs", json={"idempotency_key": "default-bounded-budget"})
+    assert bounded.status_code == 201, bounded.text
+    assert bounded.json()["settings"]["max_tokens"] == 100000
+
+    explicit_unlimited = client.post(f"/projects/{project_id}/auto-director/runs", json={
+        "max_tokens": 0, "idempotency_key": "explicit-unlimited-budget",
+    })
+    assert explicit_unlimited.status_code == 201, explicit_unlimited.text
+    assert explicit_unlimited.json()["settings"]["max_tokens"] == 0
+
+
+def test_unknown_usage_is_reserved_and_stops_full_auto_budget(monkeypatch):
+    _client(monkeypatch, [])
+    with api_module.SessionLocal() as db:
+        project = db.scalar(select(Project).limit(1))
+        run = AutoDirectorRun(
+            project_id=project.id, idempotency_key="unknown-usage-budget",
+            status="RUNNING", current_stage=AutoDirectorStage.FRAMING,
+            settings={"max_tokens": 1024, "target_words_per_chapter": 300},
+            context={},
+        )
+        db.add(run); db.flush()
+        step = AutoDirectorStep(run_id=run.id, stage=AutoDirectorStage.FRAMING, status=AutoDirectorStepStatus.RUNNING, input_fingerprint="unknown-usage")
+        db.add(step); db.flush()
+        tracker = _UsageTrackingProvider(FakeModelProvider('{"ok":true}'), on_usage=AutoDirectorOrchestrator._pending_usage_callback(db, run))
+        tracker.generate([], "fake-model")
+        metrics = AutoDirectorOrchestrator._tracked_metrics(tracker)
+        AutoDirectorOrchestrator()._commit_step(step, {"ok": True}, calls=metrics["calls"], usage=metrics["usage"], tokens=metrics["tokens"], provider=metrics["provider"], model=metrics["model"])
+        AutoDirectorOrchestrator()._add_usage(run, step, db=db)
+
+        assert run.total_tokens == 0
+        assert run.token_usage["unknown_usage_calls"] == 1
+        assert run.token_usage["usage_status"] == "UNKNOWN"
+        assert run.context["recovery_reserved_tokens"] == 1024
+        assert run.cost_status == "UNKNOWN" and run.estimated_cost is None
+        with pytest.raises(AutoDirectorError) as budget_error:
+            AutoDirectorOrchestrator()._check_budget(run)
+        assert budget_error.value.code == "TOKEN_BUDGET_EXCEEDED"
+
+
+def test_legacy_run_usage_is_conservatively_classified_once(monkeypatch):
+    _client(monkeypatch, [])
+    with api_module.SessionLocal() as db:
+        project = db.scalar(select(Project).limit(1))
+        run = AutoDirectorRun(
+            project_id=project.id, idempotency_key="legacy-usage",
+            status="RUNNING", current_stage=AutoDirectorStage.FRAMING,
+            settings={"max_tokens": 100000, "target_words_per_chapter": 1000},
+            token_usage={"total_tokens": 90, "total_calls": 3},
+            total_tokens=90, total_calls=3, context={},
+        )
+        db.add(run); db.flush()
+        AutoDirectorOrchestrator()._add_usage_metrics(run, {
+            "calls": 1, "prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10,
+            "usage_status": "CONFIRMED", "unknown_usage_calls": 0,
+        }, db=db)
+        assert run.token_usage["unknown_usage_calls"] == 3
+        assert run.token_usage["usage_status"] == "UNKNOWN"
+        assert run.context["recovery_reserved_tokens"] == 6000
+        AutoDirectorOrchestrator()._add_usage_metrics(run, {
+            "calls": 1, "total_tokens": 5, "usage_status": "CONFIRMED", "unknown_usage_calls": 0,
+        }, db=db)
+        assert run.token_usage["unknown_usage_calls"] == 3
+        assert run.context["recovery_reserved_tokens"] == 6000
+
+
+def test_full_auto_retry_backoff_survives_worker_stage_handling(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={
+        "max_tokens": 100000, "max_retries": 2, "idempotency_key": "full-auto-backoff",
+    }).json()
+    run_id = created["id"]
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        run.status = "RUNNING"
+        run.current_stage = AutoDirectorStage.FRAMING
+        run.settings = {**run.settings, "max_tokens": 100000, "max_retries": 2}
+        db.commit()
+
+    def fail_at_checkpoint(_self, db, run):
+        step = AutoDirectorStep(
+            run_id=run.id, stage=AutoDirectorStage.FRAMING,
+            status=AutoDirectorStepStatus.FAILED, attempt=1,
+            input_fingerprint="temporary-failure", error_code=MODEL_RATE_LIMITED,
+            output_payload={"upstream_status": 429},
+        )
+        db.add(step); db.flush()
+        run.status = "FAILED"
+        run.current_stage = AutoDirectorStage.FAILED
+        run.pause_reason = MODEL_RATE_LIMITED
+        run.context = {**run.context, "failed_step_id": step.id, "failed_stage": "FRAMING"}
+
+    monkeypatch.setattr(AutoDirectorOrchestrator, "advance_to_pause", fail_at_checkpoint)
+    worker = AutoDirectorWorker(api_module.SessionLocal, poll_seconds=0)
+    assert worker.run_once()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        assert run.status.value == "RUNNING"
+        assert run.current_stage == AutoDirectorStage.FRAMING
+        assert run.next_retry_at is not None
+        assert run.recovery_attempts == 1
+        assert run.pause_reason is None
+
+    assert not worker.run_once()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        run.next_retry_at = utc_now() - timedelta(seconds=1)
+        db.commit()
+
+    def resume_checkpoint(_self, _db, run):
+        run.status = auto_module.AutoDirectorRunStatus.RUNNING
+        run.current_stage = AutoDirectorStage.NEXT_CHAPTER
+        run.pause_reason = None
+
+    monkeypatch.setattr(AutoDirectorOrchestrator, "advance_to_pause", resume_checkpoint)
+    assert worker.run_once()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, run_id)
+        assert run.current_stage == AutoDirectorStage.NEXT_CHAPTER
+        assert run.next_retry_at is None and run.recovery_attempts == 0
+
+
+def test_transient_retry_schedule_is_not_cleared_in_same_worker_pass(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={
+        "max_tokens": 100000, "max_retries": 2, "idempotency_key": "retry-backoff-state",
+    }).json()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        run.run_mode = "FULL_AUTO"
+        run.status = "RUNNING"
+        run.current_stage = AutoDirectorStage.FRAMING
+        run.settings = {**run.settings, "max_tokens": 100000, "max_retries": 2}
+        db.commit()
+
+    def fail_stage(_self, db, run):
+        step = AutoDirectorStep(
+            run_id=run.id, stage=AutoDirectorStage.FRAMING,
+            status=AutoDirectorStepStatus.FAILED, attempt=1,
+            input_fingerprint="retry-backoff-step", error_code=MODEL_RATE_LIMITED,
+            output_payload={"upstream_status": 429},
+        )
+        db.add(step); db.flush()
+        run.status = "FAILED"
+        run.current_stage = AutoDirectorStage.FAILED
+        run.pause_reason = MODEL_RATE_LIMITED
+        run.context = {**run.context, "failed_step_id": step.id, "failed_stage": "FRAMING"}
+
+    monkeypatch.setattr(AutoDirectorOrchestrator, "advance_to_pause", fail_stage)
+    worker = AutoDirectorWorker(api_module.SessionLocal, poll_seconds=0)
+    assert worker.run_once()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        scheduled = run.next_retry_at
+        assert run.status.value == "RUNNING"
+        assert scheduled and scheduled > utc_now()
+        assert run.recovery_attempts == 1
+        assert run.recovery_key == run.context["failed_step_id"]
+    assert not worker.run_once()
 
 
 def test_auto_runs_are_idempotent_within_each_project(monkeypatch):
@@ -166,6 +331,43 @@ def test_retry_budget_tracks_checkpoint_attempts_and_duplicate_requests(monkeypa
     blocked = client.post(f"{url}/retry").json()
     assert blocked["status"] == "BLOCKED" and blocked["pause_reason"] == "MAX_RETRIES_REACHED"
     assert client.post(f"{url}/resume").json()["status"] == "BLOCKED"
+
+
+def test_full_auto_budget_resume_requires_higher_budget_and_keeps_checkpoint(monkeypatch):
+    client, project_id = _client(monkeypatch, [])
+    created = client.post(f"/projects/{project_id}/auto-director/runs", json={
+        "max_tokens": 1000, "max_retries": 1, "idempotency_key": "budget-resume",
+    }).json()
+    with api_module.SessionLocal() as db:
+        run = db.get(AutoDirectorRun, created["id"])
+        run.status = "PAUSED"
+        run.current_stage = AutoDirectorStage.PAUSED
+        run.pause_reason = "TOKEN_BUDGET_EXCEEDED"
+        run.settings = {**run.settings, "max_tokens": 1000}
+        run.token_usage = {"total_tokens": 700, "unknown_usage_calls": 1, "usage_status": "UNKNOWN"}
+        run.context = {"recovery_reserved_tokens": 300, "current_chapter_number": 4}
+        step = AutoDirectorStep(
+            run_id=run.id, stage=AutoDirectorStage.CHAPTER_EXECUTION,
+            status=AutoDirectorStepStatus.FAILED, attempt=1,
+            input_fingerprint="budget-checkpoint", error_code="TOKEN_BUDGET_EXCEEDED",
+        )
+        db.add(step); db.flush()
+        run.context = {**run.context, "failed_step_id": step.id}
+        db.commit()
+
+    url = f"/projects/{project_id}/auto-director/runs/{created['id']}/resume"
+    client_state = client.post(url)
+    assert client_state.status_code == 409
+    assert client_state.json()["detail"]["code"] == "TOKEN_BUDGET_INCREASE_REQUIRED"
+    assert client_state.json()["detail"]["used_tokens"] == 1000
+    unchanged = client.post(url, json={"max_tokens": 1000})
+    assert unchanged.status_code == 422
+    resumed = client.post(url, json={"max_tokens": 2500})
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["status"] == "RUNNING"
+    assert resumed.json()["current_stage"] == "CHAPTER_EXECUTION"
+    assert resumed.json()["settings"]["max_tokens"] == 2500
+    assert resumed.json()["token_usage"]["total_tokens"] == 700
 
 
 def test_zero_retry_budget_blocks_first_recovery(monkeypatch):

@@ -233,9 +233,13 @@ AI_WORLD_MODEL=deepseek-v4-pro
 AI_CRITIC_MODEL=deepseek-v4-pro
 AI_REPAIR_MODEL=deepseek-v4-pro
 AI_TIMEOUT_SECONDS=120
+# 页面保存项目密钥时使用的本地 Fernet 主密钥。请生成后持久保存，不能更换后再读取旧密钥。
+AI_CREDENTIAL_MASTER_KEY=生成后持久保存的Fernet密钥
 ```
 
 单用户本地创作可以让导演、角色、世界、Writer、审核和修复共用同一个 DeepSeek 模型。
+
+自动导演默认带有限 token 预算。作者可以在新书向导中明确选择不限预算。模型未返回 usage 时，系统会把调用标记为未知并按保守预留计入预算。预算耗尽后，运行会停在检查点，作者提交更高预算后继续。
 
 ### 向量模型配置
 

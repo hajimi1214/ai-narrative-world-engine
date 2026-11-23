@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from ..api_types import AuthorCharacterPayload, AuthorGuidancePayload, AuthorGuidedRunCreatePayload, BookAutomationSettingsPayload, PlotDirectionPayload, VolumeActionPayload, VolumeContinuePayload, VolumeContractUpdatePayload
 from ..author_guided_volume import AuthorGuidedVolumeError, AuthorGuidedVolumeService, _auto_next_volume_missing_fields, _contract_payload, _enum, _volume_payload, _window_payload
 from ..models import AuthorGuidance, AutoDirectorRun, AutoDirectorRunStatus, AutoDirectorStage, AutoDirectorStep, BookCompletionProposal, BookCompletionProposalStatus, BookContract, ChapterPlanningWindow, ChapterWindowStatus, Character, ForeshadowingLedger, ForeshadowingStatus, Project, VolumeContract, VolumeContractStatus, VolumeContinuitySnapshot
-from ..author_recovery import recovery_payload, revoke_claim
+from ..author_recovery import budget_usage, configured_token_budget, recovery_payload, revoke_claim
 from .common import get_db, require_project
 from .auto_director import _retry_checkpoint, _retry_limit_reached
 
@@ -19,7 +19,8 @@ router = APIRouter(tags=["author-guided-volume"])
 def _run_payload(db: Session, run: AutoDirectorRun) -> dict:
     steps = db.scalars(select(AutoDirectorStep).where(AutoDirectorStep.run_id == run.id)).all()
     def metrics(rows):
-        return {"calls": sum(item.calls or 0 for item in rows), "prompt_tokens": sum(item.prompt_tokens or 0 for item in rows), "completion_tokens": sum(item.completion_tokens or 0 for item in rows), "total_tokens": sum(item.total_tokens or 0 for item in rows), "latency_ms": sum(item.latency_ms or 0 for item in rows), "estimated_cost": None, "cost_status": "UNKNOWN"}
+        unknown_calls = sum(int((item.token_usage or {}).get("unknown_usage_calls") or 0) for item in rows)
+        return {"calls": sum(item.calls or 0 for item in rows), "prompt_tokens": sum(item.prompt_tokens or 0 for item in rows), "completion_tokens": sum(item.completion_tokens or 0 for item in rows), "total_tokens": sum(item.total_tokens or 0 for item in rows), "unknown_usage_calls": unknown_calls, "usage_status": "UNKNOWN" if unknown_calls else "CONFIRMED" if any(item.calls for item in rows) else "NOT_SENT", "latency_ms": sum(item.latency_ms or 0 for item in rows), "estimated_cost": None, "cost_status": "UNKNOWN"}
     context = run.context or {}
     current_chapter = context.get("last_adopted_chapter_number") or context.get("current_chapter_number")
     chapter_rows = [item for item in steps if current_chapter is not None and (item.output_payload or {}).get("chapter_number") == current_chapter]
@@ -27,7 +28,7 @@ def _run_payload(db: Session, run: AutoDirectorRun) -> dict:
     volume_id = context.get("volume_id")
     window_rows = [item for item in steps if (item.output_payload or {}).get("window_id") == window_id]
     volume_rows = [item for item in steps if (item.output_payload or {}).get("volume_id") == volume_id]
-    usage_summary = {"chapter": metrics(chapter_rows), "window": metrics(window_rows), "volume": metrics(volume_rows), "book": metrics(steps)}
+    usage_summary = {"chapter": metrics(chapter_rows), "window": metrics(window_rows), "volume": metrics(volume_rows), "book": {**metrics(steps), "reserved_tokens": int((run.context or {}).get("recovery_reserved_tokens") or 0)}}
     contract = db.get(BookContract, context.get("book_contract_id")) if context.get("book_contract_id") else None
     policy = contract.length_policy if contract else {}
     auto_cross = (policy or {}).get("auto_cross_volume")
@@ -205,16 +206,18 @@ def _apply_token_budget_increase(db: Session, run: AutoDirectorRun | None, paylo
         raise HTTPException(status_code=409, detail={
             "code": "TOKEN_BUDGET_INCREASE_REQUIRED",
             "message": "本次 token 预算已耗尽。请填写更高的新预算后再继续；运行会从已保存检查点恢复。",
-            "used_tokens": max(int(run.total_tokens or 0), int((run.token_usage or {}).get("total_tokens", 0) or 0)),
-            "current_budget": int((run.settings or {}).get("operational_token_budget") or (run.settings or {}).get("max_tokens") or 0),
+            "used_tokens": budget_usage(run),
+            "confirmed_tokens": max(int(run.total_tokens or 0), int((run.token_usage or {}).get("total_tokens", 0) or 0)),
+            "reserved_tokens": int((run.context or {}).get("recovery_reserved_tokens") or 0),
+            "current_budget": configured_token_budget(run),
         })
-    used = max(int(run.total_tokens or 0), int((run.token_usage or {}).get("total_tokens", 0) or 0))
+    used = budget_usage(run)
     settings = dict(run.settings or {})
-    current_budget = int(settings.get("operational_token_budget") or settings.get("max_tokens") or 0)
+    current_budget = configured_token_budget(run)
     if requested <= max(used, current_budget):
         raise HTTPException(status_code=422, detail={
             "code": "TOKEN_BUDGET_MUST_INCREASE",
-            "message": "新 token 预算必须高于当前预算和已用 token 数。",
+            "message": "新 token 预算必须高于当前预算以及已确认用量和预留量。",
             "used_tokens": used,
             "current_budget": current_budget,
         })

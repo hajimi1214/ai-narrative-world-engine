@@ -84,6 +84,8 @@ export function RunRecoveryPanel({
         ? "恢复阶段"
         : "当前阶段";
   const budget = runBudgetSummary(run);
+  const usage = run.token_usage || {};
+  const unknownUsageCalls = Math.max(0, Math.floor(Number(usage.unknown_usage_calls || 0)));
   const branchStatus = String(context.chapter_world_branch_status || "");
   const branchId = String(context.chapter_world_branch_id || "");
   const branchChapter =
@@ -164,7 +166,7 @@ export function RunRecoveryPanel({
       {action && <p>{action}</p>}
       {recovery?.usage_uncertain && (
         <p className="muted">
-          上一次请求的用量待核对
+          上一次请求的用量待核对{unknownUsageCalls ? `（${unknownUsageCalls} 次调用）` : ""}
           {recovery.reserved_tokens
             ? `，当前预算已预留 ${recovery.reserved_tokens.toLocaleString()} tokens`
             : ""}

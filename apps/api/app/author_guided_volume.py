@@ -979,9 +979,10 @@ class AuthorGuidedVolumeService:
             usage = orchestrator._model_usage(result)
             metrics = {**usage, "calls": calls, "latency_ms": int(getattr(result, "latency_ms", 0) or 0), "provider": getattr(result, "provider", None), "model": getattr(result, "model", None)}
             previous = step.token_usage or {}
-            cumulative = {key: int(previous.get(key, 0) or 0) + usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
+            cumulative = {key: int(previous.get(key, 0) or 0) + int(usage.get(key, 0) or 0) for key in ("prompt_tokens", "completion_tokens", "total_tokens", "unknown_usage_calls")}
+            cumulative["usage_status"] = "UNKNOWN" if cumulative["unknown_usage_calls"] else "CONFIRMED"
             orchestrator._commit_step(step, {"window_id": window.id, "volume_id": volume.id}, plan.id, calls=int(previous.get("calls", 0) or 0) + calls, latency_ms=int(previous.get("latency_ms", 0) or 0) + metrics["latency_ms"], tokens=cumulative["total_tokens"], usage=cumulative, provider=metrics["provider"], model=metrics["model"])
-            orchestrator._add_usage_metrics(run, metrics)
+            orchestrator._add_usage_metrics(run, metrics, db=db)
             recorded = True
 
         try:

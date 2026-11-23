@@ -1517,11 +1517,19 @@ def test_generation_config(project_id: str, payload: Payload, db: Session = Depe
     provider_name = values.get("provider") or settings.ai_provider
     base_url = values.get("base_url") or settings.ai_base_url
     model = values.get("model") or values.get("writer_model") or settings.ai_writer_model
-    api_key = values.get("api_key") or ProviderCredentialResolver().generation_key(db, project_id, settings)
     try:
+        if values.get("api_key") and not _credential_storage_available():
+            raise ValueError("MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED")
+        api_key = values.get("api_key") or ProviderCredentialResolver().generation_key(db, project_id, settings)
         if not provider_name or not base_url or not model or not api_key:
             raise ValueError("MODEL_PROVIDER_NOT_CONFIGURED")
-        provider = get_model_provider(settings, provider_name, base_url, api_key)
+        config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+        provider = get_model_provider(
+            settings, provider_name, base_url, api_key,
+            timeout_seconds=config.request_timeout_seconds if config else None,
+            max_retries=config.max_retries if config else 0,
+            rate_limit_per_minute=config.rate_limit_per_minute if config else 0,
+        )
         result = provider.generate(
             [
                 {"role": "system", "content": "Return only a compact JSON object with the key ok set to true."},
@@ -1531,8 +1539,12 @@ def test_generation_config(project_id: str, payload: Payload, db: Session = Depe
         )
         return {"ok": True, "provider": result.provider, "model": result.model, "chars": len(result.content), "latency_ms": result.latency_ms, "request_id": result.request_id}
     except ModelProviderError as exc:
-        safe_codes = {MODEL_TIMEOUT, MODEL_RATE_LIMITED, MODEL_AUTH_FAILED, "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_UPSTREAM_ERROR", MODEL_OUTPUT_INVALID}
+        safe_codes = {MODEL_TIMEOUT, MODEL_RATE_LIMITED, MODEL_AUTH_FAILED, "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID", "MODEL_UPSTREAM_ERROR", MODEL_OUTPUT_INVALID}
         code = exc.code if exc.code in safe_codes else "MODEL_UPSTREAM_ERROR"
+        raise HTTPException(status_code=409, detail={"code": code}) from exc
+    except ValueError as exc:
+        safe_codes = {"MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID"}
+        code = str(exc) if str(exc) in safe_codes else "MODEL_PROVIDER_NOT_CONFIGURED"
         raise HTTPException(status_code=409, detail={"code": code}) from exc
 
 @router.post("/model-config/test-generation")
@@ -1545,6 +1557,8 @@ def test_generation_config_preview(payload: Payload):
     model = values.get("model") or settings.ai_writer_model
     api_key = values.get("api_key") or (settings.ai_api_key.get_secret_value() if settings.ai_api_key else None)
     try:
+        if values.get("api_key") and not _credential_storage_available():
+            raise ValueError("MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED")
         if not provider_name or not base_url or not model or not api_key:
             raise ValueError("MODEL_PROVIDER_NOT_CONFIGURED")
         provider = get_model_provider(settings, provider_name, base_url, api_key)
@@ -1555,19 +1569,29 @@ def test_generation_config_preview(payload: Payload):
             ],
             model,
         )
-        return {"ok": True, "provider": result.provider, "model": result.model, "chars": len(result.content), "latency_ms": result.latency_ms, "request_id": result.request_id}
+        return {"ok": True, "provider": result.provider, "model": result.model, "chars": len(result.content), "latency_ms": result.latency_ms, "request_id": result.request_id, "credential_storage_ready": not bool(values.get("api_key")) or _credential_storage_available()}
     except ModelProviderError as exc:
-        safe_codes = {MODEL_TIMEOUT, MODEL_RATE_LIMITED, MODEL_AUTH_FAILED, "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_UPSTREAM_ERROR", MODEL_OUTPUT_INVALID}
+        safe_codes = {MODEL_TIMEOUT, MODEL_RATE_LIMITED, MODEL_AUTH_FAILED, "MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID", "MODEL_UPSTREAM_ERROR", MODEL_OUTPUT_INVALID}
         code = exc.code if exc.code in safe_codes else "MODEL_UPSTREAM_ERROR"
         raise HTTPException(status_code=409, detail={"code": code}) from exc
     except ValueError as exc:
-        code = str(exc) if str(exc) in {"MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED"} else "MODEL_PROVIDER_NOT_CONFIGURED"
+        safe_codes = {"MODEL_PROVIDER_NOT_CONFIGURED", "MODEL_PROVIDER_UNSUPPORTED", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID"}
+        code = str(exc) if str(exc) in safe_codes else "MODEL_PROVIDER_NOT_CONFIGURED"
         raise HTTPException(status_code=409, detail={"code": code}) from exc
+
+
+def _credential_storage_available() -> bool:
+    import os
+    try:
+        CredentialVault(os.getenv("AI_CREDENTIAL_MASTER_KEY")).encrypt("local-credential-preflight")
+    except ValueError:
+        return False
+    return True
 
 
 def _safe_embedding_error(exc: Exception) -> str:
     code = embedding_error_code(exc, "EMBEDDING_INDEX_FAILED")
-    allowed = {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_CONFIG_INCOMPLETE", "EMBEDDING_DIMENSION_MISMATCH", "MODEL_CREDENTIAL_INVALID", "EMBEDDING_INDEX_FAILED"}
+    allowed = {"MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_AUTH_FAILED", "MODEL_UPSTREAM_ERROR", "EMBEDDING_OUTPUT_INVALID", "EMBEDDING_CONFIG_INCOMPLETE", "EMBEDDING_DIMENSION_MISMATCH", "MODEL_CREDENTIAL_VAULT_NOT_CONFIGURED", "MODEL_CREDENTIAL_INVALID", "EMBEDDING_INDEX_FAILED"}
     return code if code in allowed else "EMBEDDING_INDEX_FAILED"
 
 

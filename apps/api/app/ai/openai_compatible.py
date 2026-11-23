@@ -4,7 +4,7 @@ from collections import defaultdict, deque
 from threading import Lock
 import httpx
 from .errors import ModelProviderError, MODEL_AUTH_FAILED, MODEL_RATE_LIMITED, MODEL_TIMEOUT, MODEL_UPSTREAM_ERROR
-from .provider import ModelResult
+from .provider import ModelResult, reported_usage
 
 
 class OpenAICompatibleProvider:
@@ -29,7 +29,7 @@ class OpenAICompatibleProvider:
             while window and now - window[0] >= 60:
                 window.popleft()
             if len(window) >= self.rate_limit_per_minute:
-                raise ModelProviderError(MODEL_RATE_LIMITED)
+                raise ModelProviderError(MODEL_RATE_LIMITED, accounted_calls=0)
             window.append(now)
 
     def generate(self, messages: list[dict[str, str]], model: str) -> ModelResult:
@@ -47,28 +47,31 @@ class OpenAICompatibleProvider:
                 if response.status_code not in {429, 500, 502, 503, 504} or attempt >= self.max_retries:
                     break
             except httpx.TimeoutException as exc:
-                if attempt >= self.max_retries: raise ModelProviderError(MODEL_TIMEOUT) from exc
+                if attempt >= self.max_retries: raise ModelProviderError(MODEL_TIMEOUT, accounted_calls=attempt + 1) from exc
             except httpx.HTTPError as exc:
-                if attempt >= self.max_retries: raise ModelProviderError(MODEL_UPSTREAM_ERROR) from exc
+                if attempt >= self.max_retries: raise ModelProviderError(MODEL_UPSTREAM_ERROR, accounted_calls=attempt + 1) from exc
         if response is None:
-            raise ModelProviderError(MODEL_UPSTREAM_ERROR)
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR, accounted_calls=self.max_retries + 1)
         latency_ms = int((time.perf_counter() - started) * 1000)
+        retry_after_header = response.headers.get("retry-after")
+        try:
+            retry_after = max(0, int(float(retry_after_header))) if retry_after_header else None
+        except (ValueError, OverflowError):
+            retry_after = None
         if response.status_code in (401, 403):
-            raise ModelProviderError(MODEL_AUTH_FAILED, upstream_status=response.status_code)
+            raise ModelProviderError(MODEL_AUTH_FAILED, upstream_status=response.status_code, accounted_calls=attempt + 1)
         if response.status_code == 429:
-            raise ModelProviderError(MODEL_RATE_LIMITED, upstream_status=response.status_code)
+            raise ModelProviderError(MODEL_RATE_LIMITED, upstream_status=response.status_code, accounted_calls=attempt + 1, retry_after=retry_after)
         if response.status_code >= 500:
-            raise ModelProviderError(MODEL_UPSTREAM_ERROR, upstream_status=response.status_code)
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR, upstream_status=response.status_code, accounted_calls=attempt + 1)
         if response.status_code >= 400:
-            raise ModelProviderError(MODEL_UPSTREAM_ERROR, f"Upstream HTTP status {response.status_code}", response.status_code)
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR, f"Upstream HTTP status {response.status_code}", response.status_code, accounted_calls=attempt + 1)
         try:
             body = response.json()
             content = body["choices"][0]["message"]["content"]
         except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise ModelProviderError(MODEL_UPSTREAM_ERROR) from exc
-        usage = body.get("usage") if isinstance(body, dict) else {}
-        usage = usage if isinstance(usage, dict) else {}
-        return ModelResult(content=str(content), latency_ms=latency_ms, request_id=response.headers.get("x-request-id"), provider=self.name, model=model, usage={key: int(usage.get(key, 0) or 0) for key in ("prompt_tokens", "completion_tokens", "total_tokens")})
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR, accounted_calls=attempt + 1) from exc
+        return ModelResult(content=str(content), latency_ms=latency_ms, request_id=response.headers.get("x-request-id"), provider=self.name, model=model, usage=reported_usage(body.get("usage")), attempts=attempt + 1)
 
     def generate_stream(self, messages: list[dict[str, str]], model: str, on_delta) -> ModelResult:
         """Consume provider SSE server-side; callers receive only a safe preview callback."""
@@ -77,10 +80,15 @@ class OpenAICompatibleProvider:
         try:
             with httpx.stream("POST", f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}, json={"model": model, "messages": messages, "stream": True}, timeout=self.timeout_seconds) as response:
                 request_id = response.headers.get("x-request-id")
-                if response.status_code in (401, 403): raise ModelProviderError(MODEL_AUTH_FAILED, upstream_status=response.status_code)
-                if response.status_code == 429: raise ModelProviderError(MODEL_RATE_LIMITED, upstream_status=response.status_code)
-                if response.status_code >= 500: raise ModelProviderError(MODEL_UPSTREAM_ERROR, upstream_status=response.status_code)
-                if response.status_code >= 400: raise ModelProviderError(MODEL_UPSTREAM_ERROR, f"Upstream HTTP status {response.status_code}", response.status_code)
+                retry_after_header = response.headers.get("retry-after")
+                try:
+                    retry_after = max(0, int(float(retry_after_header))) if retry_after_header else None
+                except (ValueError, OverflowError):
+                    retry_after = None
+                if response.status_code in (401, 403): raise ModelProviderError(MODEL_AUTH_FAILED, upstream_status=response.status_code, accounted_calls=1)
+                if response.status_code == 429: raise ModelProviderError(MODEL_RATE_LIMITED, upstream_status=response.status_code, retry_after=retry_after)
+                if response.status_code >= 500: raise ModelProviderError(MODEL_UPSTREAM_ERROR, upstream_status=response.status_code, accounted_calls=1)
+                if response.status_code >= 400: raise ModelProviderError(MODEL_UPSTREAM_ERROR, f"Upstream HTTP status {response.status_code}", response.status_code, accounted_calls=1)
                 for line in response.iter_lines():
                     if not line or not line.startswith("data:"): continue
                     data = line[5:].strip()
@@ -92,11 +100,11 @@ class OpenAICompatibleProvider:
                         text = str(delta); chunks.append(text); on_delta(text)
                     if isinstance(body.get("usage"), dict): usage = body["usage"]
         except httpx.TimeoutException as exc:
-            raise ModelProviderError(MODEL_TIMEOUT) from exc
+            raise ModelProviderError(MODEL_TIMEOUT, accounted_calls=1) from exc
         except ModelProviderError:
             raise
         except httpx.HTTPError as exc:
-            raise ModelProviderError(MODEL_UPSTREAM_ERROR) from exc
+            raise ModelProviderError(MODEL_UPSTREAM_ERROR, accounted_calls=1) from exc
         content = "".join(chunks)
-        if not content: raise ModelProviderError(MODEL_UPSTREAM_ERROR, "Stream completed without content")
-        return ModelResult(content=content, latency_ms=int((time.perf_counter() - started) * 1000), request_id=request_id, provider=self.name, model=model, usage={key: int(usage.get(key, 0) or 0) for key in ("prompt_tokens", "completion_tokens", "total_tokens")})
+        if not content: raise ModelProviderError(MODEL_UPSTREAM_ERROR, "Stream completed without content", accounted_calls=1)
+        return ModelResult(content=content, latency_ms=int((time.perf_counter() - started) * 1000), request_id=request_id, provider=self.name, model=model, usage=reported_usage(usage))

@@ -382,7 +382,7 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
         if on_phase: on_phase("VALIDATING_MACRO", "正在校验全书结构")
         macro = _extract_single_json_object(macro_result.content)
     except (ModelProviderError, ValueError, TypeError, json.JSONDecodeError):
-        if db.info.get("author_recovery"):
+        if db.info.get("author_model_call_guard"):
             raise
         if on_phase: on_phase("FALLBACK", "模型未返回可用结构，正在整理作者已保存的十卷大纲")
         return _local_macro_fallback(project, framing, premise), None
@@ -398,6 +398,8 @@ def generate_plan(db: Session, project: Project, framing: dict[str, Any], premis
         macro["chapters"] = (details.get("chapters") or [])[:detailed_chapters]
         return macro, details_result
     except (ModelProviderError, ValueError, TypeError, json.JSONDecodeError):
+        if db.info.get("author_model_call_guard"):
+            raise
         if on_phase: on_phase("CHAPTER_FALLBACK", "章节任务将以可编辑草稿继续，后续可按窗口深化")
         macro["chapters"] = _fallback_chapter_window(framing, detailed_chapters)
         macro["generation_warning"] = "CHAPTER_DETAIL_DEFERRED"

@@ -108,7 +108,9 @@ export default function VolumeDirectorPage({ params, searchParams }: { params: {
   const canTakeover = canOperate && !sealed && Boolean(run) && state !== "COMPLETED";
   const progress = volume.progress || {};
   const usage = run?.usage_summary?.window || {};
-  const usedTokens = Math.max(Number(run?.token_usage?.total_tokens || 0), Number(run?.usage_summary?.book?.total_tokens || 0));
+  const confirmedTokens = Math.max(Number(run?.token_usage?.total_tokens || 0), Number(run?.usage_summary?.book?.total_tokens || 0));
+  const reservedTokens = Number(run?.recovery?.reserved_tokens || 0);
+  const usedTokens = confirmedTokens + reservedTokens;
   const tokenBudget = Number(run?.settings?.operational_token_budget || run?.settings?.max_tokens || 0);
   const processedThisRun = run?.context?.processed_this_run ?? run?.context?.adopted_this_run ?? 0;
   const chapterBudget = Number(run?.settings?.operational_run_chapter_budget || run?.settings?.max_chapters || 0);

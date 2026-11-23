@@ -15,8 +15,8 @@ class AutoDirectorRunCreatePayload(BaseModel):
     tone: str = ""
     max_chapters: int | None = Field(default=None, ge=1, le=100000)
     max_repairs: int = Field(default=2, ge=0, le=10)
-    # Zero means unlimited for the local single-user workflow.
-    max_tokens: int = Field(default=0, ge=0, le=10000000)
+    # A caller may explicitly pass zero to opt out of the token limit.
+    max_tokens: int = Field(default=100000, ge=0, le=10000000)
     max_retries: int = Field(default=2, ge=0, le=10)
     require_direction_confirmation: bool = True
     idempotency_key: str | None = Field(default=None, max_length=200)
@@ -26,6 +26,11 @@ class DirectionSelectionPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
     direction_index: int | None = Field(default=None, ge=0, le=2)
     direction: dict[str, Any] | None = None
+
+
+class AutoDirectorResumePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    max_tokens: int | None = Field(default=None, ge=1, le=10000000)
 
 
 class AuthorGuidedRunCreatePayload(BaseModel):
@@ -44,7 +49,7 @@ class AuthorGuidedRunCreatePayload(BaseModel):
     estimated_chapters: int | None = Field(default=None, ge=1)
     estimated_volumes: int | None = Field(default=None, ge=1)
     operational_run_chapter_budget: int | None = Field(default=20, ge=1, le=100)
-    operational_token_budget: int | None = Field(default=None, ge=1)
+    operational_token_budget: int | None = Field(default=100000, ge=1, le=10000000)
     continuous_chapter_progression: bool = False
     # Book-level opt-in.  A completed volume is sealed before the same
     # durable run is allowed to enter the next volume.

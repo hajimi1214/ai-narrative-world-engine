@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from .ai.errors import MODEL_OUTPUT_INVALID, ModelProviderError
 from .ai.factory import get_model_provider
+from .ai.provider import classify_usage
 from .character_mind import ActorPerceptionSanitizer, CharacterDecisionConstraintChecker
 from .director import DirectorContextBuilder
 from .execution_trace import ExecutionTraceRecorder, stable_fingerprint
@@ -21,7 +22,7 @@ from .model_router import ModelRouter, ProviderCredentialResolver
 from .models import (
     Character, CharacterDecision, CharacterDecisionStatus, ExecutionStage,
     PerformanceMode, PerformanceStatus, ResolverMode, ResolutionOutcome,
-    ResolutionStatus, ScenePerformance, ScenePerformanceTurn, SceneProposal,
+    ResolutionStatus, ScenePerformance, ScenePerformanceTurn, SceneProposal, ProjectModelConfig,
     WorldEntity, WorldResolution,
 )
 from .performance import (
@@ -65,6 +66,17 @@ def _guarded_provider(db: Session, provider):
     return GuardedProvider()
 
 
+def _routed_provider(db: Session, settings, project_id: str, route):
+    key = ProviderCredentialResolver().generation_key(db, project_id, settings)
+    config = db.scalar(select(ProjectModelConfig).where(ProjectModelConfig.project_id == project_id))
+    return get_model_provider(
+        settings, route.provider, route.base_url, key,
+        timeout_seconds=config.request_timeout_seconds if config else None,
+        max_retries=config.max_retries if config else 0,
+        rate_limit_per_minute=config.rate_limit_per_minute if config else 0,
+    )
+
+
 def _emit_usage(
     collector: Callable[[dict[str, Any]], None] | None,
     result: Any = None,
@@ -75,17 +87,17 @@ def _emit_usage(
 ) -> None:
     if not collector:
         return
-    usage = getattr(result, "usage", None) if result is not None else getattr(error, "usage", None)
-    usage = usage if isinstance(usage, dict) else {}
+    source = result if result is not None else error
+    calls = int(getattr(result, "attempts", 1) if result is not None else getattr(error, "accounted_calls", 1))
+    usage = classify_usage(getattr(source, "usage", None), calls)
     collector({
-        "calls": int(getattr(error, "accounted_calls", 1) if error is not None else 1),
+        "calls": calls,
         "provider": getattr(result, "provider", None) or getattr(error, "provider", None) or fallback_provider,
         "model": getattr(result, "model", None) or getattr(error, "model", None) or fallback_model,
-        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
-        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
-        "total_tokens": int(usage.get("total_tokens", usage.get("tokens", 0)) or 0),
+        **usage,
         "latency_ms": int(getattr(result, "latency_ms", 0) or 0),
         "error_code": getattr(error, "code", None),
+        "retry_after": getattr(error, "retry_after", None),
     })
 
 
@@ -183,7 +195,7 @@ class PerformanceRuntimeService:
                 route = ModelRouter().resolve(db, project_id, settings, "CHARACTER")
                 route_provider, route_model = route.provider, route.model
                 trace.provider, trace.model = route.provider, route.model
-                provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
+                provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else _routed_provider(db, settings, project_id, route)
                 provider = _guarded_provider(db, provider)
                 performer = LLMCharacterPerformer(provider, route.model)
                 try:
@@ -195,7 +207,7 @@ class PerformanceRuntimeService:
             _emit_usage(usage_collector, error=exc, fallback_provider=route_provider, fallback_model=route_model)
             ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status)
             performance.status, performance.stop_reason = initial_status, initial_stop_reason
-            raise RuntimeFailure(exc.code, {"upstream_status": exc.upstream_status}) from exc
+            raise RuntimeFailure(exc.code, {"upstream_status": exc.upstream_status, "retry_after": exc.retry_after}) from exc
         try:
             action = PerformanceActionPayload.model_validate(raw["action"])
         except Exception as exc:
@@ -290,7 +302,7 @@ class WorldResolutionRuntimeService:
                 route = ModelRouter().resolve(db, project_id, settings, "WORLD")
                 route_provider, route_model = route.provider, route.model
                 trace.provider, trace.model = route.provider, route.model
-                provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else get_model_provider(settings, route.provider, route.base_url, ProviderCredentialResolver().generation_key(db, project_id, settings))
+                provider = model_provider_factory(settings, route.provider, route.base_url) if model_provider_factory else _routed_provider(db, settings, project_id, route)
                 provider = _guarded_provider(db, provider)
                 resolver = LLMWorldResolver(provider, route.model)
                 try:
@@ -302,7 +314,7 @@ class WorldResolutionRuntimeService:
         except ModelProviderError as exc:
             _emit_usage(usage_collector, error=exc, fallback_provider=route_provider, fallback_model=route_model)
             ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status)
-            raise RuntimeFailure(exc.code, {"upstream_status": exc.upstream_status}) from exc
+            raise RuntimeFailure(exc.code, {"upstream_status": exc.upstream_status, "retry_after": exc.retry_after}) from exc
         except Exception as exc:
             ExecutionTraceRecorder().block(trace, MODEL_OUTPUT_INVALID)
             raise RuntimeFailure(MODEL_OUTPUT_INVALID) from exc
