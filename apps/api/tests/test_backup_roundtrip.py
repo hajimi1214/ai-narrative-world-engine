@@ -309,6 +309,7 @@ def test_full_auto_fake_engine_backup_restores_written_chapters(monkeypatch):
     import app.api as api
     from app.causal_ledger import CurrentCausalLedgerAudit
     from app.models import AutoDirectorRun, AutonomousWorldRun
+    from app.routes.manuscript import export_manuscript
 
     run_fake_book(monkeypatch)
     with api.SessionLocal() as db:
@@ -334,6 +335,15 @@ def test_full_auto_fake_engine_backup_restores_written_chapters(monkeypatch):
         review = QualityGateService().assess(db, chapter.id, provider=FakeModelProvider(json.dumps({"decision": "PASS", "scores": scores, "findings": []})), model="fake-critic-after-import")
         QualityGateService().approve(db, review.id)
         QualityAssessmentAudit().audit(db, review.id)
+        manuscript = export_manuscript(restored.id, "md", None, False, db)
+        approved_manuscript = export_manuscript(restored.id, "md", None, True, db)
+        assert manuscript.status_code == 200
+        assert manuscript.headers["X-Manuscript-Chapters"] == "2"
+        assert manuscript.body.startswith(b"\xef\xbb\xbf")
+        approved_count = int(approved_manuscript.headers["X-Manuscript-Chapters"])
+        assert 1 <= approved_count <= len(chapters)
+        assert chapters[0].title.encode("utf-8") in manuscript.body
+        assert chapters[0].content.encode("utf-8") in manuscript.body
         assert service.export(db, source.id)["tables"] == source_tables
         assert db.scalar(select(func.count(AutoDirectorRun.id)).where(AutoDirectorRun.project_id == restored.id)) == 0
         assert db.scalar(select(func.count(AutonomousWorldRun.id)).where(AutonomousWorldRun.project_id == restored.id)) == 0

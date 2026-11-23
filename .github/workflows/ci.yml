@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      AI_PROVIDER: disabled
+      AI_API_KEY: ""
+      AI_EMBEDDING_API_KEY: ""
+      AI_CREDENTIAL_MASTER_KEY: ""
+      DATABASE_URL: sqlite:///./ci-narrative.db
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.19"
+          enable-cache: true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.6.0"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Install locked Python dependencies
+        run: uv sync --locked --extra test --python 3.12
+
+      - name: Install locked web dependencies
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile
+
+      - name: Run API tests
+        run: uv run --locked python -m pytest -q apps/api/tests
+
+      - name: Run web utility tests
+        working-directory: apps/web
+        run: pnpm test
+
+      - name: Type-check web app
+        working-directory: apps/web
+        run: pnpm exec tsc --noEmit --incremental false
+
+      - name: Build web app
+        working-directory: apps/web
+        run: pnpm build
