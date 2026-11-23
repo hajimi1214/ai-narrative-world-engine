@@ -1,6 +1,5 @@
 import json
 
-from app.planning import validate_task_output
 from app.writer import WriterPromptBuilder
 from app.models import Project, ProjectModelConfig
 from app.ai.fake import FakeModelProvider
@@ -12,18 +11,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
-
-def test_phase3_task_output_requires_mandatory_events_and_rejects_forbidden_hits():
-    task = {"must_events": ["接案", "发现矛盾"], "forbidden_events": ["揭示真相"]}
-    missing = validate_task_output({"task_coverage": ["接案"], "task_forbidden_hits": []}, task)
-    assert {item["code"] for item in missing} == {"PLAN_REQUIRED_EVENT_MISSING"}
-    forbidden = validate_task_output({"task_coverage": ["接案", "发现矛盾"], "task_forbidden_hits": ["揭示真相"]}, task)
-    assert {item["code"] for item in forbidden} == {"PLAN_FORBIDDEN_EVENT_PRESENT"}
-
-
-def test_phase3_output_without_approved_plan_keeps_legacy_writer_contract():
-    assert validate_task_output({"prose": "旧项目正文"}, None) == []
 
 
 def test_writer_prompt_declares_planning_task_as_binding_contract():

@@ -925,7 +925,14 @@ class AutoDirectorOrchestrator:
                 # the initial request key would deterministically return its
                 # persisted FAILED draft without making another model call.
                 writer_request_key = f"{run.id}-chapter-{chapter_number}-writer-attempt-{writer_step.attempt}"
-                draft = WriterProjectionService().render(db, chapter.id, {"idempotency_key": writer_request_key, "pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": pov_character_id}, provider=writer_provider, model=route.model, settings=settings)
+                planning_task = chapter_task_context(db, project.id, chapter_number, required=True) or {}
+                author_pov = (run.context.get("request") or {}).get("pov")
+                writer_request = {
+                    "idempotency_key": writer_request_key,
+                    "pov_mode": author_pov or planning_task.get("pov_mode"),
+                    "pov_character_id": pov_character_id,
+                }
+                draft = WriterProjectionService().render(db, chapter.id, writer_request, provider=writer_provider, model=route.model, settings=settings)
                 self._live_complete(writer_live, "正文草稿已生成，正在进入质量审计")
             except Exception as exc:
                 self._live_fail(writer_live, exc)

@@ -35,7 +35,7 @@ from .writer import (
     WriterGroundingValidator, WriterOutputPayload, WriterProjectionAudit,
     WriterProjectionService, WriterWordCounter, WriterContextFingerprintBuilder,
 )
-from .planning import chapter_task_context, required_event_specs, validate_task_output
+from .planning import chapter_task_context, required_event_specs, task_event_specs
 
 
 QUALITY_CATEGORIES = {
@@ -348,6 +348,103 @@ def validate_required_event_evidence(prose: str, task: dict[str, Any] | None, cr
     return []
 
 
+FORBIDDEN_EVENT_REVIEW_PROTOCOL = "forbidden-event-review-v1"
+
+
+def forbidden_event_specs(task: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return [
+        {
+            **spec,
+            "requirement_type": "forbidden_events",
+            "requirement_ref": f"forbidden_events:{spec['event_ref']}",
+        }
+        for spec in task_event_specs(task, "forbidden_events")
+    ]
+
+
+def build_forbidden_event_evidence(
+    prose: str,
+    task: dict[str, Any] | None,
+    reviews: list[dict[str, Any]] | None,
+    content_fingerprint: str | None = None,
+    *,
+    reviewer_enabled: bool = True,
+) -> dict[str, Any]:
+    """Bind semantic forbidden-event review to one exact prose revision."""
+    specs = forbidden_event_specs(task)
+    evidence: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    by_ref: dict[str, dict[str, Any]] = {}
+    for review in reviews or []:
+        if not isinstance(review, dict):
+            continue
+        ref = str(review.get("requirement_ref") or "")
+        if not ref or ref in by_ref:
+            issues.append({"code": "CRITIC_FORBIDDEN_EVENT_REVIEW_INVALID", "requirement_ref": ref})
+            continue
+        by_ref[ref] = review
+
+    for spec in specs:
+        ref = spec["requirement_ref"]
+        if not reviewer_enabled:
+            issues.append({"code": "CRITIC_FORBIDDEN_EVENT_REVIEW_REQUIRED", "requirement_ref": ref, "event_ref": spec["event_ref"], "label": spec["label"]})
+            continue
+        review = by_ref.get(ref)
+        if not review:
+            issues.append({"code": "CRITIC_FORBIDDEN_EVENT_REVIEW_MISSING", "requirement_ref": ref, "event_ref": spec["event_ref"], "label": spec["label"]})
+            continue
+        if review.get("event_ref") != spec["event_ref"] or review.get("label") != spec["label"]:
+            issues.append({"code": "CRITIC_FORBIDDEN_EVENT_REVIEW_INVALID", "requirement_ref": ref, "event_ref": spec["event_ref"], "label": spec["label"]})
+            continue
+        present = review.get("present")
+        start, end, excerpt = review.get("start_offset"), review.get("end_offset"), review.get("excerpt")
+        if not isinstance(present, bool):
+            issues.append({"code": "CRITIC_FORBIDDEN_EVENT_REVIEW_INVALID", "requirement_ref": ref})
+            continue
+        if present:
+            if not isinstance(start, int) or not isinstance(end, int) or start < 0 or start >= end or end > len(prose or "") or not isinstance(excerpt, str) or not excerpt or (prose or "")[start:end] != excerpt:
+                issues.append({"code": "CRITIC_FORBIDDEN_EVENT_EVIDENCE_INVALID", "requirement_ref": ref})
+                continue
+        elif start is not None or end is not None or excerpt is not None:
+            issues.append({"code": "CRITIC_FORBIDDEN_EVENT_REVIEW_INVALID", "requirement_ref": ref})
+            continue
+        evidence.append({
+            "requirement_ref": ref,
+            "requirement_type": "forbidden_events",
+            "event_ref": spec["event_ref"],
+            "label": spec["label"],
+            "present": present,
+            "start_offset": start,
+            "end_offset": end,
+            "excerpt": excerpt,
+            "reason": str(review.get("reason") or ""),
+            "content_fingerprint": content_fingerprint,
+            "reviewed": True,
+        })
+
+    unknown = set(by_ref) - {spec["requirement_ref"] for spec in specs}
+    issues.extend({"code": "CRITIC_FORBIDDEN_EVENT_REVIEW_UNKNOWN", "requirement_ref": ref} for ref in sorted(unknown))
+    report = {
+        "protocol": FORBIDDEN_EVENT_REVIEW_PROTOCOL,
+        "content_fingerprint": content_fingerprint,
+        "required_count": len(specs),
+        "reviewed_count": len(evidence),
+        "confirmed_present_count": sum(item["present"] for item in evidence),
+        "verified": not issues and len(evidence) == len(specs),
+        "evidence": evidence,
+        "issues": issues,
+    }
+    report["fingerprint"] = _fp(report, FORBIDDEN_EVENT_REVIEW_PROTOCOL)
+    return report
+
+
+def persisted_continuity_report(continuity: dict[str, Any]) -> dict[str, Any]:
+    fields = ["protocol", "enabled", "metrics", "event_evidence"]
+    if "forbidden_event_evidence" in continuity:
+        fields.append("forbidden_event_evidence")
+    return {key: continuity[key] for key in fields}
+
+
 def finding_fingerprint(finding: dict[str, Any]) -> str:
     semantic = {key: finding.get(key) for key in ("source", "category", "severity", "rule_code", "message", "start_offset", "end_offset", "excerpt", "source_refs", "metadata")}
     return _fp(semantic, "quality-finding-v1")
@@ -517,7 +614,7 @@ class NovelContinuityQualityChecker:
 
     protocol = "novel-continuity-v1"
 
-    def evaluate(self, db: Session, context: dict[str, Any], *, mandatory_event_reviews: list[dict[str, Any]] | None = None, reviewer_enabled: bool = False) -> dict[str, Any]:
+    def evaluate(self, db: Session, context: dict[str, Any], *, mandatory_event_reviews: list[dict[str, Any]] | None = None, forbidden_event_reviews: list[dict[str, Any]] | None = None, reviewer_enabled: bool = False, review_forbidden_events: bool = False) -> dict[str, Any]:
         chapter = context["chapter"]
         task = context.get("writer_safe_context", {}).get("planning_task")
         if not task:
@@ -533,6 +630,11 @@ class NovelContinuityQualityChecker:
             getattr(draft, "content_fingerprint", None) if draft else None,
             reviewer_enabled=reviewer_enabled,
         )
+        forbidden_evidence = build_forbidden_event_evidence(
+            prose, task, forbidden_event_reviews,
+            getattr(draft, "content_fingerprint", None) if draft else None,
+            reviewer_enabled=reviewer_enabled,
+        ) if review_forbidden_events else None
         planned_beats = {str(item) for item in (task.get("scene_beats") or []) if str(item).strip()}
         executed_beats = {str(beat) for scene in ((context.get("writer_safe_context", {}).get("source_manifest") or {}).get("scenes") or []) for turn in (scene.get("turns") or []) for beat in (turn.get("scene_beat_refs") or [])}
         for beat in sorted(planned_beats - executed_beats):
@@ -547,10 +649,29 @@ class NovelContinuityQualityChecker:
                 start_offset=issue.get("start_offset"), end_offset=issue.get("end_offset"), excerpt=issue.get("excerpt"),
                 metadata={**issue, "chapter_number": chapter.number},
             ))
-        forbidden_hits = {str(item) for item in validation.get("task_forbidden_hits", [])}
-        for event in task.get("forbidden_events", []):
-            if str(event) in forbidden_hits:
-                findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="PLAN_FORBIDDEN_EVENT_PRESENT", message="Chapter task sheet forbidden event was reported by Writer.", metadata={"event": event, "chapter_number": chapter.number}))
+        if forbidden_evidence is not None:
+            for issue in forbidden_evidence["issues"]:
+                findings.append(_finding(
+                    source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING",
+                    rule_code=issue["code"],
+                    message="章节禁用事件缺少独立正文审核记录。",
+                    metadata={**issue, "chapter_number": chapter.number},
+                ))
+            for item in forbidden_evidence["evidence"]:
+                if item["present"]:
+                    findings.append(_finding(
+                        source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING",
+                        rule_code="PLAN_FORBIDDEN_EVENT_PRESENT",
+                        message="质量审核确认章节禁用事件实际发生在正文中。",
+                        start_offset=item["start_offset"], end_offset=item["end_offset"], excerpt=item["excerpt"],
+                        metadata={**item, "chapter_number": chapter.number},
+                    ))
+        elif not validation.get("forbidden_event_review_protocol"):
+            # Older assessments retain their persisted Writer-declaration semantics.
+            forbidden_hits = {str(item) for item in validation.get("task_forbidden_hits", [])}
+            for event in task.get("forbidden_events", []):
+                if str(event) in forbidden_hits:
+                    findings.append(_finding(source="DETERMINISTIC", category="CONTINUITY", severity="BLOCKING", rule_code="PLAN_FORBIDDEN_EVENT_PRESENT", message="Chapter task sheet forbidden event was reported by Writer.", metadata={"event": event, "chapter_number": chapter.number}))
         for phrase in task.get("forbidden_reveals", []) or []:
             if isinstance(phrase, str) and phrase and phrase in prose:
                 findings.append(_finding(source="DETERMINISTIC", category="REVEAL_SAFETY", severity="BLOCKING", rule_code="PLAN_FORBIDDEN_REVEAL_PRESENT", message="正文出现了章节任务禁止揭示的内容。", excerpt=phrase, metadata={"reveal": phrase}))
@@ -605,7 +726,14 @@ class NovelContinuityQualityChecker:
                     if not row or row.character_id != character_id or row.status.value not in set(reference.get("accepted_statuses", [row.status.value]) if isinstance(reference, dict) and row else [row.status.value] if row else []):
                         findings.append(_finding(source="DETERMINISTIC", category="FACTUAL_GROUNDING", severity="BLOCKING", rule_code="KNOWLEDGE_LEAK", message="角色使用了不属于其认知范围的知识。", source_refs=[{"source_type": "CHARACTER_KNOWLEDGE", "source_id": str(knowledge_id)}], metadata={"character_id": character_id}))
         findings.sort(key=lambda item: (item["rule_code"], item["finding_fingerprint"]))
-        return {"protocol": self.protocol, "enabled": True, "metrics": {"scene_count": len(scenes), "timeline_errors": timeline_errors, "location_conflicts": location_conflicts, "mandatory_event_count": event_evidence["required_count"], "verified_event_count": event_evidence["verified_count"], "literal_candidate_count": event_candidates["verified_count"], "declared_task_coverage": len(coverage), "planned_scene_beat_count": len(planned_beats), "executed_scene_beat_count": len(executed_beats)}, "event_evidence": event_evidence, "findings": findings}
+        metrics = {"scene_count": len(scenes), "timeline_errors": timeline_errors, "location_conflicts": location_conflicts, "mandatory_event_count": event_evidence["required_count"], "verified_event_count": event_evidence["verified_count"], "literal_candidate_count": event_candidates["verified_count"], "declared_task_coverage": len(coverage), "planned_scene_beat_count": len(planned_beats), "executed_scene_beat_count": len(executed_beats)}
+        if forbidden_evidence is not None:
+            metrics["forbidden_event_count"] = forbidden_evidence["required_count"]
+            metrics["reviewed_forbidden_event_count"] = forbidden_evidence["reviewed_count"]
+        report = {"protocol": self.protocol, "enabled": True, "metrics": metrics, "event_evidence": event_evidence, "findings": findings}
+        if forbidden_evidence is not None:
+            report["forbidden_event_evidence"] = forbidden_evidence
+        return report
 
 
 class CriticScores(BaseModel):
@@ -641,6 +769,22 @@ class CriticMandatoryEventReviewPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     requirement_ref: str = Field(min_length=1)
     confirmed: bool
+    requirement_type: str | None = None
+    event_ref: str | None = None
+    label: str | None = None
+    start_offset: int | None = None
+    end_offset: int | None = None
+    excerpt: str | None = None
+    reason: str = ""
+
+
+class CriticForbiddenEventReviewPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    requirement_ref: str = Field(min_length=1)
+    event_ref: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    requirement_type: str | None = None
+    present: bool
     start_offset: int | None = None
     end_offset: int | None = None
     excerpt: str | None = None
@@ -653,6 +797,7 @@ class CriticOutputPayload(BaseModel):
     scores: CriticScores
     findings: list[CriticFindingPayload]
     mandatory_event_reviews: list[CriticMandatoryEventReviewPayload] = Field(default_factory=list)
+    forbidden_event_reviews: list[CriticForbiddenEventReviewPayload] = Field(default_factory=list)
 
 
 class CriticOutputValidator:
@@ -705,6 +850,8 @@ class CriticOutputValidator:
             spec = by_requirement.get(ref)
             if not spec or ref in seen_reviews:
                 raise QualityDomainError("CRITIC_MANDATORY_EVENT_REVIEW_INVALID")
+            if any(review.get(key) not in (None, spec.get(key)) for key in ("requirement_type", "event_ref", "label")):
+                raise QualityDomainError("CRITIC_MANDATORY_EVENT_REVIEW_INVALID")
             seen_reviews.add(ref)
             start, end, excerpt = review["start_offset"], review["end_offset"], review["excerpt"]
             has_span = start is not None or end is not None or excerpt is not None
@@ -719,6 +866,30 @@ class CriticOutputValidator:
         if seen_reviews != set(by_requirement):
             raise QualityDomainError("CRITIC_MANDATORY_EVENT_REVIEW_INCOMPLETE")
         result["mandatory_event_reviews"] = normalized_reviews
+        forbidden_specs = forbidden_event_specs(task)
+        forbidden_by_ref = {item["requirement_ref"]: item for item in forbidden_specs}
+        normalized_forbidden_reviews = []
+        seen_forbidden_reviews: set[str] = set()
+        for review in result["forbidden_event_reviews"]:
+            ref = review["requirement_ref"]
+            spec = forbidden_by_ref.get(ref)
+            if not spec or ref in seen_forbidden_reviews:
+                raise QualityDomainError("CRITIC_FORBIDDEN_EVENT_REVIEW_INVALID")
+            if review.get("requirement_type") not in (None, "forbidden_events"):
+                raise QualityDomainError("CRITIC_FORBIDDEN_EVENT_REVIEW_INVALID")
+            seen_forbidden_reviews.add(ref)
+            start, end, excerpt = review["start_offset"], review["end_offset"], review["excerpt"]
+            has_span = start is not None or end is not None or excerpt is not None
+            if review["present"] and not has_span:
+                raise QualityDomainError("CRITIC_FORBIDDEN_EVENT_EVIDENCE_REQUIRED")
+            if review["present"] and (start is None or end is None or excerpt is None or start < 0 or start >= end or end > len(prose) or prose[start:end] != excerpt):
+                raise QualityDomainError("CRITIC_FORBIDDEN_EVENT_EVIDENCE_INVALID")
+            if not review["present"] and has_span:
+                raise QualityDomainError("CRITIC_FORBIDDEN_EVENT_REVIEW_INVALID")
+            normalized_forbidden_reviews.append({**review, "requirement_type": "forbidden_events"})
+        if seen_forbidden_reviews != set(forbidden_by_ref):
+            raise QualityDomainError("CRITIC_FORBIDDEN_EVENT_REVIEW_INCOMPLETE")
+        result["forbidden_event_reviews"] = normalized_forbidden_reviews
         return result
 
 
@@ -727,8 +898,8 @@ class CriticPromptBuilder:
         safe = {key: value for key, value in context.items() if key not in {"anti_ai_bible", "writer_draft", "chapter"}}
         task = safe.get("writer_safe_context", {}).get("planning_task") or {}
         return [
-            {"role": "system", "content": "You are a CRITIC, not an AI detector and not a rewriter. PROSE_CANDIDATE may contain errors. WRITER_SAFE_CONTEXT is the only grounding and reveal authority. ANTI_AI_RULES and WRITING_RULES are style authority. Review whether each required event actually happened in the prose; scene actions and the Writer's task_coverage declaration are not proof. For every required event, return exactly one review. Confirm only when the prose supports it; quote an exact prose span with zero-based Unicode code-point offsets. Return exactly one JSON assessment; never return revised prose."},
-            {"role": "user", "content": _canonical({"quality_context": safe, "mandatory_event_contract": required_event_specs(task), "output_contract": {"decision": "PASS|REPAIR_REQUIRED|BLOCKED", "scores": "eight integer scores from 0 to 100", "findings": "grounded quality findings only", "mandatory_event_reviews": "one item per required event: requirement_ref, confirmed, start_offset, end_offset, excerpt, reason"}})},
+            {"role": "system", "content": "You are a CRITIC, not an AI detector and not a rewriter. PROSE_CANDIDATE may contain errors. WRITER_SAFE_CONTEXT is the only grounding and reveal authority. ANTI_AI_RULES and WRITING_RULES are style authority. Review whether each required event actually happened in the prose; scene actions and the Writer's task_coverage declaration are not proof. Review whether each task-declared forbidden event actually occurs; the Writer's task_forbidden_hits declaration is not proof. Mere mention, negation, hypothetical consideration, metaphor or quoted denial does not necessarily mean the forbidden event occurred. For every required and forbidden event, return exactly one review. Confirm only when the prose supports it; quote an exact prose span for confirmed events with zero-based Unicode code-point offsets. Preserve reasonable inference, interiority and literary expression not explicitly forbidden by the task. Return exactly one JSON assessment; never return revised prose."},
+            {"role": "user", "content": _canonical({"quality_context": safe, "mandatory_event_contract": required_event_specs(task), "forbidden_event_contract": forbidden_event_specs(task), "output_contract": {"decision": "PASS|REPAIR_REQUIRED|BLOCKED", "scores": "eight integer scores from 0 to 100", "findings": "grounded quality findings only", "mandatory_event_reviews": "one item per required event: requirement_ref, confirmed, start_offset, end_offset, excerpt, reason", "forbidden_event_reviews": "one item per forbidden event: requirement_ref, event_ref, label, present, start_offset/end_offset/excerpt when present, reason"}})},
         ]
 
 
@@ -781,7 +952,11 @@ class QualityContextBuilder:
         # A deterministic-only assessment has no critic input at all. Keeping
         # a provider/model in this fingerprint would incorrectly make a route
         # change stale an assessment that never used that route.
-        route = {"provider": critic_provider, "model": critic_model, "protocol": "critic-output-v1"} if config_value["require_critic"] else None
+        if forbidden_event_specs(writer_context.get("planning_task")):
+            critic_protocol = "critic-output-v2-forbidden-events"
+        else:
+            critic_protocol = "critic-output-v1"
+        route = {"provider": critic_provider, "model": critic_model, "protocol": critic_protocol} if config_value["require_critic"] else None
         semantic = {"content_fingerprint": draft.content_fingerprint, "writer_context_fingerprint": draft.writer_context_fingerprint, "chapter_source_fingerprint": draft.chapter_source_fingerprint, "writing_bible_fingerprint": draft.writing_bible_fingerprint, "anti_ai_bible_fingerprint": anti_ai["fingerprint"], "quality_config_fingerprint": config_fp, "critic": route}
         return {"chapter": chapter, "writer_draft": draft, "prose": draft.content, "writer_safe_context": safe_writer, "writing_rules": writer_context["writing_rules"], "anti_ai_rules": anti_ai["rules"], "anti_ai_bible": anti_ai, "quality_contract": {"prose_is_truth": False, "critic_may_rewrite": False, "formal_mutation": False}, "source_fingerprints": semantic, "quality_config": config_envelope, "resolved_quality_config": config_value, "quality_config_fingerprint": config_fp, "quality_context_fingerprint": _fp(semantic, self.protocol), "renderable_source_refs": writer_context["renderable_source_refs"]}
 
@@ -933,19 +1108,37 @@ class QualityAssessmentAudit:
             values.append(value)
         rules = _assessment_bible_rules(db, assessment)
         deterministic = AntiAIStyleRuleEngine().evaluate(draft.content or "", rules)
+        critic = assessment.critic_report or {}
+        forbidden_review_enabled = critic.get("forbidden_event_review_protocol") == FORBIDDEN_EVENT_REVIEW_PROTOCOL
+        task = (draft.source_manifest or {}).get("planning_task")
+        if forbidden_event_specs(task) and not forbidden_review_enabled:
+            try:
+                current_context = QualityContextBuilder().build(
+                    db, chapter.id,
+                    {"config": _assessment_explicit_overrides(assessment.quality_config)},
+                    draft=draft,
+                    critic_provider=assessment.critic_provider,
+                    critic_model=assessment.critic_model,
+                    require_current=False,
+                )
+            except QualityDomainError:
+                current_context = None
+            if current_context and current_context["quality_context_fingerprint"] == assessment.quality_context_fingerprint:
+                raise QualityDomainError("QUALITY_FORBIDDEN_EVENT_REVIEW_REQUIRED")
         continuity = NovelContinuityQualityChecker().evaluate(
             db,
             {"chapter": chapter, "writer_draft": draft, "prose": draft.content or "", "writer_safe_context": {"planning_task": (draft.source_manifest or {}).get("planning_task"), "source_manifest": draft.source_manifest or {}}},
-            mandatory_event_reviews=(assessment.critic_report or {}).get("mandatory_event_reviews"),
+            mandatory_event_reviews=critic.get("mandatory_event_reviews"),
+            forbidden_event_reviews=critic.get("forbidden_event_reviews"),
             reviewer_enabled=bool(config["require_critic"]),
+            review_forbidden_events=forbidden_review_enabled,
         )
         deterministic["findings"].extend(continuity["findings"])
         deterministic["findings"].sort(key=lambda item: (item["rule_code"], item["finding_fingerprint"]))
-        expected_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"]), **({"continuity": {key: continuity[key] for key in ("protocol", "enabled", "metrics", "event_evidence")}} if continuity["enabled"] else {})}
+        expected_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"]), **({"continuity": persisted_continuity_report(continuity)} if continuity["enabled"] else {})}
         deterministic_rows = [item["finding_fingerprint"] for item in values if item["source"] == "DETERMINISTIC"]
         if assessment.deterministic_report != expected_report or sorted(deterministic_rows) != sorted(item["finding_fingerprint"] for item in deterministic["findings"]):
             raise QualityDomainError("QUALITY_DETERMINISTIC_REPORT_INVALID")
-        critic = assessment.critic_report or {}
         critic_rows = [item["finding_fingerprint"] for item in values if item["source"] == "CRITIC"]
         if not config["require_critic"]:
             sentinel = {"skipped": True, "reason": "CRITIC_DISABLED"}
@@ -958,7 +1151,10 @@ class QualityAssessmentAudit:
                 # but cannot authorize adoption when a critic was required.
                 raise QualityDomainError("QUALITY_CRITIC_REQUIRED")
             try:
-                CriticOutputPayload.model_validate({key: value for key, value in critic.items() if key != "mandatory_event_evidence"})
+                CriticOutputPayload.model_validate({
+                    key: value for key, value in critic.items()
+                    if key not in {"mandatory_event_evidence", "forbidden_event_evidence", "forbidden_event_review_protocol"}
+                })
             except ValidationError as exc:
                 raise QualityDomainError("QUALITY_CRITIC_REPORT_INVALID") from exc
             task = (draft.source_manifest or {}).get("planning_task")
@@ -970,6 +1166,16 @@ class QualityAssessmentAudit:
                 )
                 if critic.get("mandatory_event_evidence") != expected_evidence or not expected_evidence["verified"]:
                     raise QualityDomainError("QUALITY_REQUIRED_EVENT_EVIDENCE_INVALID")
+            if forbidden_review_enabled:
+                expected_forbidden_evidence = build_forbidden_event_evidence(
+                    draft.content or "", task, critic.get("forbidden_event_reviews"),
+                    draft.content_fingerprint, reviewer_enabled=True,
+                )
+                if (
+                    not expected_forbidden_evidence["verified"]
+                    or critic.get("forbidden_event_evidence") != expected_forbidden_evidence
+                ):
+                    raise QualityDomainError("QUALITY_FORBIDDEN_EVENT_EVIDENCE_INVALID", expected_forbidden_evidence["issues"])
             expected_critic = [_finding(source="CRITIC", category=item["category"], severity=item["severity"], rule_code=f"CRITIC_{item['category']}", message=item["message"], start_offset=item["start_offset"], end_offset=item["end_offset"], excerpt=item["excerpt"], source_refs=item["source_refs"]) for item in critic.get("findings", [])]
             if sorted(critic_rows) != sorted(item["finding_fingerprint"] for item in expected_critic) or assessment.overall_score != float(critic["scores"]["overall"]):
                 raise QualityDomainError("QUALITY_CRITIC_REPORT_INVALID")
@@ -984,9 +1190,12 @@ class QualityAssessmentAudit:
             if _value(assessment.status) != "PASS" or not assessment.active or chapter.quality_content_fingerprint != assessment.content_fingerprint or chapter.content != draft.content:
                 raise QualityDomainError("QUALITY_APPROVAL_INTEGRITY_INVALID")
             freshness = QualityAssessmentFreshnessChecker().check(db, assessment, require_current=True)
-            if not freshness["fresh"]:
-                raise QualityDomainError("QUALITY_APPROVAL_FRESHNESS_INVALID", freshness)
             WriterProjectionAudit().audit(db, chapter.id)
+            if not freshness["fresh"]:
+                task = (draft.source_manifest or {}).get("planning_task")
+                if not forbidden_review_enabled and forbidden_event_specs(task):
+                    return {"valid": True, "assessment_id": assessment.id, "finding_count": len(findings), "fresh": False, "freshness": freshness}
+                raise QualityDomainError("QUALITY_APPROVAL_FRESHNESS_INVALID", freshness)
         return {"valid": True, "assessment_id": assessment.id, "finding_count": len(findings)}
 
 
@@ -994,7 +1203,11 @@ class QualityGateService:
     def preview(self, db: Session, chapter_id: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
         context = QualityContextBuilder().build(db, chapter_id, request, critic_provider="preview", critic_model="preview")
         report = AntiAIStyleRuleEngine().evaluate(context["prose"], context["anti_ai_rules"])
-        continuity = NovelContinuityQualityChecker().evaluate(db, context)
+        continuity = NovelContinuityQualityChecker().evaluate(
+            db, context,
+            reviewer_enabled=False,
+            review_forbidden_events=bool(forbidden_event_specs(context.get("writer_safe_context", {}).get("planning_task"))),
+        )
         return {"chapter_id": chapter_id, "content_fingerprint": context["writer_draft"].content_fingerprint, "anti_ai_bible": {"id": context["anti_ai_bible"]["id"], "version": context["anti_ai_bible"]["version"], "fingerprint": context["anti_ai_bible"]["fingerprint"]}, "deterministic_report": report, "continuity_report": continuity, "quality_config": context["resolved_quality_config"], "quality_context_fingerprint": context["quality_context_fingerprint"]}
 
     def assess(self, db: Session, chapter_id: str, request: dict[str, Any] | None = None, *, provider=None, model: str | None = None, settings=None, draft: ChapterWriterDraft | None = None, require_current: bool = True) -> ChapterQualityAssessment:
@@ -1006,7 +1219,7 @@ class QualityGateService:
             raise QualityDomainError("CHAPTER_NOT_FOUND")
         project = db.get(Project, chapter.project_id)
         event_task = (draft.source_manifest or {}).get("planning_task") if draft else chapter_task_context(db, chapter.project_id, chapter.number)
-        if required_event_specs(event_task):
+        if required_event_specs(event_task) or forbidden_event_specs(event_task):
             request["config"] = {**(request.get("config") or {}), "require_critic": True}
         requested_config = QualityGateConfigResolver().resolve(project, request)
         if requested_config.require_critic:
@@ -1059,7 +1272,7 @@ class QualityGateService:
                         assessment.critic_report = {"failed": True, "reason": "CRITIC_OUTPUT_INVALID", "validation_error": second_error.code, "attempts": 2}
                         raise QualityDomainError("CRITIC_OUTPUT_INVALID") from second_error
                 assessment.critic_request_id = result.request_id
-                ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms, request_id=result.request_id, output_fingerprint=_fp(critic, "critic-output-v1"))
+                ExecutionTraceRecorder().succeed(trace, latency_ms=result.latency_ms, request_id=result.request_id, output_fingerprint=_fp(critic, "critic-output-v2"))
             except ModelProviderError as exc:
                 assessment.status = QualityAssessmentStatus.FAILED; assessment.active = False; assessment.decision_reason_codes = [exc.code]; assessment.completed_at = datetime.utcnow(); ExecutionTraceRecorder().fail(trace, exc.code, upstream_status=exc.upstream_status); db.flush(); return assessment
             except QualityDomainError as exc:
@@ -1068,13 +1281,20 @@ class QualityGateService:
             assessment.critic_report = {"skipped": True, "reason": "CRITIC_DISABLED"}
         assessment.critic_report = critic if critic is not None else assessment.critic_report
         if critic is not None:
+            task = context.get("writer_safe_context", {}).get("planning_task")
             critic["mandatory_event_evidence"] = build_required_event_evidence(
                 context["prose"],
-                context.get("writer_safe_context", {}).get("planning_task"),
+                task,
                 critic.get("mandatory_event_reviews"),
                 context["writer_draft"].content_fingerprint,
                 reviewer_enabled=True,
             )
+            if forbidden_event_specs(task):
+                critic["forbidden_event_review_protocol"] = FORBIDDEN_EVENT_REVIEW_PROTOCOL
+                critic["forbidden_event_evidence"] = build_forbidden_event_evidence(
+                    context["prose"], task, critic.get("forbidden_event_reviews"),
+                    context["writer_draft"].content_fingerprint, reviewer_enabled=True,
+                )
             assessment.critic_report = critic
         # Rebuild continuity after the critic response so mandatory-event
         # evidence is judged against both the saved prose and explicit review.
@@ -1082,11 +1302,13 @@ class QualityGateService:
         continuity = NovelContinuityQualityChecker().evaluate(
             db, context,
             mandatory_event_reviews=(critic or {}).get("mandatory_event_reviews") if critic else None,
+            forbidden_event_reviews=(critic or {}).get("forbidden_event_reviews") if critic else None,
             reviewer_enabled=bool(context["resolved_quality_config"]["require_critic"]),
+            review_forbidden_events=bool(forbidden_event_specs(context.get("writer_safe_context", {}).get("planning_task"))) and critic is not None,
         )
         deterministic["findings"].extend(continuity["findings"])
         deterministic["findings"].sort(key=lambda item: (item["rule_code"], item["finding_fingerprint"]))
-        assessment.deterministic_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"]), **({"continuity": {key: continuity[key] for key in ("protocol", "enabled", "metrics", "event_evidence")}} if continuity["enabled"] else {})}
+        assessment.deterministic_report = {"protocol": deterministic["protocol"], "metrics": deterministic["metrics"], "finding_count": len(deterministic["findings"]), **({"continuity": persisted_continuity_report(continuity)} if continuity["enabled"] else {})}
         findings = list(deterministic["findings"])
         for item in (critic or {}).get("findings", []):
             findings.append(_finding(source="CRITIC", category=item["category"], severity=item["severity"], rule_code=f"CRITIC_{item['category']}", message=item["message"], start_offset=item["start_offset"], end_offset=item["end_offset"], excerpt=item["excerpt"], source_refs=item["source_refs"]))
@@ -1151,7 +1373,7 @@ class QualityGateService:
 class QualityRepairPromptBuilder:
     def build(self, context: dict[str, Any], findings: list[dict[str, Any]]) -> list[dict[str, str]]:
         safe = {key: value for key, value in context.items() if key not in {"anti_ai_bible", "writer_draft", "chapter"}}
-        return [{"role": "system", "content": "You are a REPAIR prose editor. Correct only the listed prose defects. WRITER_SAFE_CONTEXT is absolute authority. Do not add events, facts, knowledge, secrets, outcomes, or source references. Preserve the chapter planning task and return exact task coverage fields."}, {"role": "user", "content": _canonical({"quality_context": safe, "findings": findings, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene ids", "source_refs": "safe refs only", "pov_character_id": "string|null", "task_coverage": "completed mandatory task labels", "task_forbidden_hits": "forbidden task labels present"}})}]
+        return [{"role": "system", "content": "You are a REPAIR prose editor. Correct only the listed prose defects. WRITER_SAFE_CONTEXT is absolute authority. Do not add events, facts, knowledge, secrets, outcomes, or source references. Preserve the chapter planning task. Task coverage fields are optional diagnostics and never evidence that an event happened. The Critic independently reviews forbidden events in the prose."}, {"role": "user", "content": _canonical({"quality_context": safe, "findings": findings, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene ids", "source_refs": "safe refs only", "pov_character_id": "string|null", "task_coverage": "optional diagnostic self-report", "task_forbidden_hits": "optional diagnostic self-report; not evidence"}})}]
 
 
 class QualityRepairService:
@@ -1266,14 +1488,10 @@ class QualityRepairService:
         try:
             result = provider.generate(prompt, model)
             try:
-                parsed = WriterOutputPayload.model_validate_json(result.content).model_dump(mode="json")
-            except ValidationError as exc:
-                raise QualityDomainError(MODEL_OUTPUT_INVALID) from exc
+                parsed = WriterProjectionService._parse(result.content)
+            except ValueError as exc:
+                raise QualityDomainError(str(exc) or MODEL_OUTPUT_INVALID) from exc
             report = WriterGroundingValidator().validate(parsed, context["writer_safe_context"])
-            task_issues = validate_task_output(parsed, context["writer_safe_context"].get("planning_task"))
-            if task_issues:
-                report["issues"].extend(task_issues)
-                report["valid"] = False
             report["task_coverage"] = parsed.get("task_coverage", [])
             report["task_forbidden_hits"] = parsed.get("task_forbidden_hits", [])
             draft.provider = result.provider; draft.model = result.model; draft.model_request_id = result.request_id

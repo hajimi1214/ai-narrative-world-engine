@@ -207,28 +207,6 @@ def next_chapter_task_context(db: Session, project_id: str) -> dict[str, Any] | 
     return chapter_task_context(db, project_id, int(latest or 0) + 1)
 
 
-def validate_task_output(output: dict[str, Any], task: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Validate task metadata; required-event coverage is checked against reviewed prose later."""
-    if not task:
-        return []
-    coverage = output.get("task_coverage")
-    if not isinstance(coverage, list):
-        return [{"code": "PLAN_TASK_COVERAGE_MISSING", "blocking": True}]
-    issues = []
-    covered = {str(item) for item in coverage}
-    coverage_text = "\n".join(covered)
-    for spec in task_event_specs(task, "must_events"):
-        matched = "EVENT_REF" if spec["event_ref"] in covered else event_match(spec, set(), coverage_text)
-        if not matched:
-            issues.append({"code": "PLAN_REQUIRED_EVENT_MISSING", "blocking": True, "event": spec["label"], "event_ref": spec["event_ref"]})
-    forbidden_hits = output.get("task_forbidden_hits") or []
-    forbidden_text = "\n".join(str(item) for item in forbidden_hits)
-    for spec in task_event_specs(task, "forbidden_events"):
-        if spec["event_ref"] in {str(item) for item in forbidden_hits} or event_match(spec, set(), forbidden_text):
-            issues.append({"code": "PLAN_FORBIDDEN_EVENT_PRESENT", "blocking": True, "event": spec["label"], "event_ref": spec["event_ref"]})
-    return issues
-
-
 def validate_plan_references(db: Session, project_id: str, data: dict[str, Any]) -> list[dict[str, Any]]:
     """Validate explicit IDs while allowing human-readable refs for a new project."""
     errors: list[dict[str, Any]] = []

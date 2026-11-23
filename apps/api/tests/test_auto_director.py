@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -15,14 +16,14 @@ from app.db import Base
 from app.main import app
 from app.models import (
     AutoDirectorRun, AutoDirectorStage, AutoDirectorStep, AutoDirectorStepStatus, AutonomousWorldRun, Chapter, ChapterQualityAssessment,
-    ChapterWriterDraft, Project, SceneProposal, VolumeContract,
+    ChapterWriterDraft, Character, Project, Scene, SceneProposal, StoryPlanStatus, VolumeContract,
     VolumeContractStatus,
 )
 from app.auto_director_worker import AutoDirectorWorker
 from app.auto_director import AutoDirectorError, AutoDirectorOrchestrator, fingerprint
 from app.autonomy import AutonomousWorldLoopService
-from app.planning import validate_task_output
 from app.planning import persist_plan
+from app.narrative_structure import NarrativeStructureService
 from app.runtime import _emit_usage
 from app.live_execution import live_execution_broker
 
@@ -368,22 +369,6 @@ def test_chapter_task_validation_rejects_missing_and_forbidden_events():
     assert "烧毁档案" in report["forbidden_events"]
 
 
-def test_task_event_contract_accepts_event_ref_and_aliases():
-    task = {
-        "must_events": [{"event_ref": "key-obtained", "label": "取得钥匙", "aliases": ["拿到钥匙", "钥匙到手"]}],
-        "forbidden_events": [{"event_ref": "archive-burned", "label": "烧毁档案", "aliases": ["焚毁档案"]}],
-    }
-    assert validate_task_output({"task_coverage": ["key-obtained"], "task_forbidden_hits": []}, task) == []
-    assert validate_task_output({"task_coverage": ["钥匙到手"], "task_forbidden_hits": []}, task) == []
-    assert validate_task_output({"task_coverage": ["取得钥匙"], "task_forbidden_hits": ["焚毁档案"]}, task)[0]["code"] == "PLAN_FORBIDDEN_EVENT_PRESENT"
-
-
-def test_task_event_contract_still_blocks_missing_event():
-    task = {"must_events": [{"event_ref": "must-a", "label": "找到入口", "aliases": ["发现入口"]}]}
-    issues = validate_task_output({"task_coverage": ["无关事件"], "task_forbidden_hits": []}, task)
-    assert issues and issues[0]["code"] == "PLAN_REQUIRED_EVENT_MISSING"
-
-
 def test_runtime_task_validation_reports_event_ref_and_alias_matches():
     from types import SimpleNamespace
     turns = [SimpleNamespace(observable_action="拿到钥匙。", spoken_content="", scene_beat_refs=["beat-entry"])]
@@ -498,6 +483,80 @@ def test_auto_director_uses_runtime_scene_before_writer(monkeypatch):
     AutoDirectorWorker(api_module.SessionLocal, poll_seconds=0).run_once()
     body = client.get(f"/projects/{project_id}/auto-director/runs/{created['id']}").json()
     assert body["status"] in {"RUNNING", "COMPLETED", "FAILED", "BLOCKED"}
+
+
+def test_auto_writer_preserves_author_pov_over_generated_chapter_pov(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    observed_modes = []
+
+    class WriterProvider:
+        name = "fake"
+
+        def generate(self, messages, model):
+            from app.ai.provider import ModelResult
+            context = json.loads(messages[-1]["content"])["context"]
+            observed_modes.append(context["rendering_contract"]["pov_mode"])
+            payload = {
+                "chapter_title": "门边",
+                "prose": "我在门边等候。",
+                "scene_coverage": [item["scene_id"] for item in context["source_manifest"]["scenes"]],
+                "source_refs": [],
+                "pov_character_id": context["rendering_contract"]["pov_character_id"],
+            }
+            return ModelResult(
+                content=json.dumps(payload, ensure_ascii=False), latency_ms=1,
+                request_id="writer-pov", provider="fake", model=model,
+                usage={"total_tokens": 5},
+            )
+
+    provider = WriterProvider()
+    monkeypatch.setattr(auto_module.ModelRouter, "resolve", lambda self, *args, **kwargs: SimpleNamespace(provider="fake", model="writer", base_url="https://example.invalid"))
+    monkeypatch.setattr(auto_module.ProviderCredentialResolver, "generation_key", lambda self, *args, **kwargs: "test-key")
+    monkeypatch.setattr(auto_module, "get_model_provider", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(auto_module, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(AutoDirectorOrchestrator, "_live_begin", staticmethod(lambda *args, **kwargs: "writer-live"))
+    monkeypatch.setattr(AutoDirectorOrchestrator, "_live_complete", staticmethod(lambda *args, **kwargs: None))
+    monkeypatch.setattr(auto_module.live_execution_broker, "phase", lambda *args, **kwargs: None)
+
+    with Session() as db:
+        project = Project(name="POV", min_chapter_words=None, max_chapter_words=None)
+        db.add(project); db.flush()
+        actor = Character(project_id=project.id, name="林岚")
+        db.add(actor); db.flush()
+        db.add(Scene(
+            project_id=project.id, sequence=1, world_time=datetime(2026, 1, 1),
+            location="档案馆", participants=[actor.id], facts=[], result={},
+            summary="场景", intent="等候", story_threads=[], status="OCCURRED",
+            history_status="ACTIVE",
+        ))
+        db.flush()
+        NarrativeStructureService().sync(db, project.id)
+        chapter = db.scalar(select(Chapter).where(Chapter.project_id == project.id, Chapter.active.is_(True)))
+        plan = persist_plan(db, project, {
+            "framing": {"target_chapters": 1, "target_words_per_chapter": 3000, "pov": "FIRST_PERSON"},
+            "chapters": [{
+                "number": 1, "volume_number": 1, "arc_number": 1,
+                "title": "门边", "summary": "等候", "objective": "等待", "conflict": "不确定",
+                "pov_mode": "THIRD_PERSON_LIMITED", "pov_character_ref": actor.id,
+            }],
+        })
+        plan.status = StoryPlanStatus.APPROVED
+        run = AutoDirectorRun(
+            project_id=project.id, idempotency_key="author-pov", run_mode="AUTHOR_GUIDED_VOLUME",
+            status="RUNNING", current_stage=AutoDirectorStage.CHAPTER_EXECUTION,
+            settings={"max_tokens": 0},
+            context={"plan_id": plan.id, "request": {"pov": "FIRST_PERSON"}, "foundation": {"character_ids": [actor.id]}},
+        )
+        db.add(run); db.flush()
+
+        AutoDirectorOrchestrator()._advance_chapter_prose(
+            db, run, project, plan.id, chapter, 1, durable_stages=True,
+        )
+
+        assert observed_modes == ["FIRST_PERSON"]
+        assert run.current_stage == AutoDirectorStage.QUALITY_REVIEW
 
 
 def test_full_auto_pauses_at_operational_budget_without_completing_book(monkeypatch):

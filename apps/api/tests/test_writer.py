@@ -186,6 +186,29 @@ def test_limited_pov_accepts_participant(writer_project, session):
     assert mode == WriterPOVMode.THIRD_PERSON_LIMITED and character_id == writer_project[1].id
 
 
+def test_planning_task_pov_is_used_when_request_has_no_mode(writer_project, session):
+    actor = writer_project[1]
+    mode, character_id = WriterPOVResolver().resolve(
+        session, writer_project[3], {},
+        planning_task={"pov_mode": "FIRST_PERSON", "pov_character_ref": actor.id},
+    )
+    assert mode == WriterPOVMode.FIRST_PERSON and character_id == actor.id
+
+
+def test_explicit_author_pov_overrides_planning_mode(writer_project, session):
+    actor = writer_project[1]
+    mode, character_id = WriterPOVResolver().resolve(
+        session, writer_project[3], {"pov_mode": "FIRST_PERSON", "pov_character_id": actor.id},
+        planning_task={"pov_mode": "THIRD_PERSON_LIMITED"},
+    )
+    assert mode == WriterPOVMode.FIRST_PERSON and character_id == actor.id
+
+
+def test_invalid_pov_mode_fails_with_domain_error(writer_project, session):
+    with pytest.raises(WriterDomainError, match="WRITER_POV_MODE_INVALID"):
+        WriterPOVResolver().resolve(session, writer_project[3], {"pov_mode": "first-person"})
+
+
 def test_foreign_pov_rejected(writer_project, session):
     foreign = Project(name="Foreign"); session.add(foreign); session.flush(); actor = Character(project_id=foreign.id, name="Other"); session.add(actor); session.flush()
     with pytest.raises(WriterDomainError, match="WRITER_POV_REQUIRED"):
@@ -228,42 +251,6 @@ def test_context_excludes_scene_intent(writer_project, session):
 def test_grounding_accepts_empty_structured_claims(writer_project, session):
     context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
     assert WriterGroundingValidator().validate(grounded(context), context)["valid"]
-
-
-def test_grounding_rejects_unknown_event(writer_project, session):
-    context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
-    report = WriterGroundingValidator().validate(grounded(context, events=[{"event_id": "unknown"}]), context)
-    assert report["issues"][0]["code"] == "WRITER_UNGROUNDED_EVENT"
-
-
-def test_grounding_rejects_unknown_location(writer_project, session):
-    context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
-    assert WriterGroundingValidator().validate(grounded(context, locations=["elsewhere"]), context)["issues"][0]["code"] == "WRITER_UNGROUNDED_LOCATION"
-
-
-def test_grounding_rejects_unknown_entity(writer_project, session):
-    context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
-    assert WriterGroundingValidator().validate(grounded(context, entities=["stranger"]), context)["issues"][0]["code"] == "WRITER_UNGROUNDED_ENTITY"
-
-
-def test_grounding_rejects_unbound_action(writer_project, session):
-    context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
-    assert WriterGroundingValidator().validate(grounded(context, events=[{"action": "jumps"}]), context)["issues"][0]["code"] == "WRITER_UNGROUNDED_ACTION"
-
-
-def test_grounding_rejects_unbound_knowledge(writer_project, session):
-    context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
-    assert WriterGroundingValidator().validate(grounded(context, knowledge=[{}]), context)["issues"][0]["code"] == "WRITER_UNGROUNDED_KNOWLEDGE"
-
-
-def test_grounding_rejects_unbound_memory(writer_project, session):
-    context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
-    assert WriterGroundingValidator().validate(grounded(context, memories=[{}]), context)["issues"][0]["code"] == "WRITER_UNGROUNDED_MEMORY"
-
-
-def test_grounding_rejects_unbound_outcome(writer_project, session):
-    context = WriterContextBuilder().build(session, WriterChapterSourceBuilder().build(session, writer_project[3].id), {"pov_mode": "OBJECTIVE"})
-    assert WriterGroundingValidator().validate(grounded(context, outcomes=[{}]), context)["issues"][0]["code"] == "WRITER_UNGROUNDED_OUTCOME"
 
 
 def test_render_creates_validated_draft(writer_project, session):
@@ -476,7 +463,7 @@ def test_parser_rejects_unclosed_markdown_wrapper():
 
 def test_parser_rejects_extra_server_fields():
     raw = response(scene_ids=["scene"])
-    value = json.loads(raw); value["status"] = "VALIDATED"
+    value = json.loads(raw); value["status"] = "VALIDATED"; value["events"] = [{"event_id": "scene-event"}]
     with pytest.raises(ValueError, match="MODEL_OUTPUT_INVALID"):
         WriterProjectionService._parse(json.dumps(value))
 
@@ -484,6 +471,18 @@ def test_parser_rejects_extra_server_fields():
 def test_parser_rejects_empty_prose():
     with pytest.raises(ValueError, match="WRITER_OUTPUT_INVALID"):
         WriterProjectionService._parse(response(content="", scene_ids=["scene"]))
+
+
+def test_parser_rejects_whitespace_only_prose():
+    with pytest.raises(ValueError, match="WRITER_OUTPUT_INVALID"):
+        WriterProjectionService._parse(response(content="  \n\t ", scene_ids=["scene"]))
+
+
+def test_parser_rejects_missing_required_output_fields():
+    value = json.loads(response(scene_ids=["scene"]))
+    del value["scene_coverage"]
+    with pytest.raises(ValueError, match="MODEL_OUTPUT_INVALID"):
+        WriterProjectionService._parse(json.dumps(value))
 
 
 def test_prompt_labels_fact_and_subjective_authority(writer_project, session):

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,7 @@ from .models import (
 )
 from .narrative_structure import NarrativeStructureAudit
 from .retcon_apply import has_pending_replay
-from .planning import chapter_task_context, validate_task_output
+from .planning import chapter_task_context
 
 
 class WriterDomainError(ValueError):
@@ -51,7 +51,7 @@ class WriterSourceRef(BaseModel):
 class WriterOutputPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     chapter_title: str | None
-    prose: str
+    prose: str = Field(min_length=1)
     scene_coverage: list[str]
     source_refs: list[WriterSourceRef]
     pov_character_id: str | None
@@ -206,13 +206,30 @@ class WriterContextFingerprintBuilder:
 
 
 class WriterPOVResolver:
-    def resolve(self, db: Session, chapter: Chapter, request: dict[str, Any] | None = None, bible: WritingBible | None = None) -> tuple[WriterPOVMode, str | None]:
+    def resolve(self, db: Session, chapter: Chapter, request: dict[str, Any] | None = None, bible: WritingBible | None = None, planning_task: dict[str, Any] | None = None) -> tuple[WriterPOVMode, str | None]:
         request = request or {}
-        raw_mode = request.get("pov_mode")
-        mode = WriterPOVMode(raw_mode) if raw_mode else None
+        planning_task = planning_task or {}
         rules = (bible.rules or {}) if bible else {}
-        mode = mode or (WriterPOVMode(rules["pov_mode"]) if rules.get("pov_mode") in {item.value for item in WriterPOVMode} else WriterPOVMode.THIRD_PERSON_LIMITED)
+        raw_mode = request.get("pov_mode") or planning_task.get("pov_mode") or rules.get("pov_mode")
+        try:
+            mode = WriterPOVMode(raw_mode) if raw_mode else WriterPOVMode.THIRD_PERSON_LIMITED
+        except ValueError as exc:
+            raise WriterDomainError("WRITER_POV_MODE_INVALID", {"pov_mode": raw_mode}) from exc
         character_id = request.get("pov_character_id") or rules.get("pov_character_id")
+        planning_ref = planning_task.get("pov_character_ref")
+        if planning_ref:
+            character = db.get(Character, str(planning_ref))
+            if not character:
+                matches = db.scalars(select(Character).where(
+                    Character.project_id == chapter.project_id,
+                    Character.name == str(planning_ref),
+                    Character.active.is_(True),
+                ).order_by(Character.id)).all()
+                if len(matches) == 1:
+                    character = matches[0]
+            if not character or character.project_id != chapter.project_id:
+                raise WriterDomainError("WRITER_POV_REQUIRED", {"pov_character_ref": planning_ref})
+            character_id = character.id
         if mode in {WriterPOVMode.FIRST_PERSON, WriterPOVMode.THIRD_PERSON_LIMITED}:
             if not character_id or not any(str(character_id) in _ids(scene.participants) for scene in self._chapter_scenes(db, chapter)):
                 raise WriterDomainError("WRITER_POV_REQUIRED")
@@ -379,17 +396,17 @@ class WriterContextBuilder:
         if len(bibles) > 1:
             raise WriterDomainError("WRITING_BIBLE_AMBIGUOUS")
         bible = bibles[0] if bibles else None
-        mode, pov_character_id = WriterPOVResolver().resolve(db, chapter, request, bible)
+        try:
+            planning_task = chapter_task_context(db, chapter.project_id, chapter.number, required=True)
+        except ValueError as exc:
+            raise WriterDomainError(str(exc)) from exc
+        mode, pov_character_id = WriterPOVResolver().resolve(db, chapter, request, bible, planning_task)
         project = db.get(__import__("app.models", fromlist=["Project"]).Project, chapter.project_id)
         rules = bible.rules if bible else {"protocol": "writer-default-v1"}
         bible_fp = _fp({"version": bible.version, "rules": rules}, "writing-bible-v2") if bible else "writer-default-v1"
         config = WriterRenderConfigResolver().resolve(project, request)
         allowed_reveals: list[str] = []
         safe_scenes = WriterVisibilityProjector().project(source["scenes"], mode, pov_character_id)
-        try:
-            planning_task = chapter_task_context(db, chapter.project_id, chapter.number, required=True)
-        except ValueError as exc:
-            raise WriterDomainError(str(exc)) from exc
         if planning_task:
             from .models import StoryPlan
             plan = db.get(StoryPlan, planning_task["plan_id"])
@@ -483,9 +500,6 @@ class WriterGroundingValidator:
     def validate(self, output: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         source = context.get("source_manifest", {})
         scenes = {item["scene_id"]: item for item in source.get("scenes", [])}
-        event_ids = {event["id"] for item in scenes.values() for event in item.get("state_changes", [])}
-        turn_ids = {turn["id"] for item in scenes.values() for turn in item.get("turns", [])}
-        known_entities = set(context.get("entity_labels", {}))
         issues: list[dict[str, Any]] = []
         expected_coverage = [item["scene_id"] for item in source.get("scenes", [])]
         if output.get("scene_coverage") != expected_coverage:
@@ -499,32 +513,6 @@ class WriterGroundingValidator:
         expected_pov = context.get("pov_character_id")
         if output.get("pov_character_id") != expected_pov:
             issues.append({"code": "WRITER_POV_MISMATCH", "blocking": True})
-        for event in output.get("events", []) or []:
-            if not isinstance(event, dict):
-                issues.append({"code": "WRITER_UNGROUNDED_EVENT", "blocking": True}); continue
-            ref = event.get("source_ref") or event.get("event_id")
-            if ref and ref not in event_ids and ref not in turn_ids:
-                issues.append({"code": "WRITER_UNGROUNDED_EVENT", "blocking": True, "reference": ref})
-            if event.get("scene_id") and event["scene_id"] not in scenes:
-                issues.append({"code": "WRITER_UNGROUNDED_EVENT", "blocking": True, "reference": event["scene_id"]})
-            if event.get("action") and not ref:
-                issues.append({"code": "WRITER_UNGROUNDED_ACTION", "blocking": True})
-        for entity in output.get("entities", []) or []:
-            entity_id = entity.get("id") if isinstance(entity, dict) else entity
-            if entity_id not in known_entities and not any(entity_id in scene.get("participants", []) for scene in scenes.values()):
-                issues.append({"code": "WRITER_UNGROUNDED_ENTITY", "blocking": True, "reference": entity_id})
-        for location in output.get("locations", []) or []:
-            if location not in {scene.get("location") for scene in scenes.values()}:
-                issues.append({"code": "WRITER_UNGROUNDED_LOCATION", "blocking": True, "reference": location})
-        valid_reveals = set(context.get("rendering_contract", {}).get("allowed_reveal_ids", []) or [])
-        for reveal in output.get("reveals", []) or []:
-            rid = reveal.get("canon_fact_id") if isinstance(reveal, dict) else reveal
-            if rid not in valid_reveals:
-                issues.append({"code": "WRITER_UNGROUNDED_REVEAL", "blocking": True, "reference": rid})
-        for key, code in (("knowledge", "WRITER_UNGROUNDED_KNOWLEDGE"), ("memories", "WRITER_UNGROUNDED_MEMORY"), ("outcomes", "WRITER_UNGROUNDED_OUTCOME")):
-            for item in output.get(key, []) or []:
-                if not isinstance(item, dict) or not item.get("source_ref"):
-                    issues.append({"code": code, "blocking": True})
         return {"valid": not any(item.get("blocking", True) for item in issues), "issues": issues}
 
 
@@ -619,10 +607,6 @@ class WriterProjectionService:
                 result = route_provider.generate(repair_messages, route_model)
                 parsed = self._parse(result.content)
             report = WriterGroundingValidator().validate(parsed, context)
-            task_issues = validate_task_output(parsed, context.get("planning_task"))
-            if task_issues:
-                report["issues"].extend(task_issues)
-                report["valid"] = False
             report["task_coverage"] = parsed.get("task_coverage", [])
             report["task_forbidden_hits"] = parsed.get("task_forbidden_hits", [])
             draft.provider = result.provider; draft.model = result.model; draft.model_request_id = result.request_id; draft.prompt_fingerprint = self.prompt_fingerprint(context); draft.title_candidate = parsed.get("chapter_title"); draft.content = parsed.get("prose", "")
@@ -756,6 +740,8 @@ class WriterProjectionService:
                 raise ValueError("MODEL_OUTPUT_INVALID")
             value = WriterOutputPayload.model_validate(objects[0])
         except ValidationError as exc:
+            if any(tuple(item.get("loc") or ()) == ("prose",) and item.get("type") == "string_too_short" for item in exc.errors()):
+                raise ValueError("WRITER_OUTPUT_INVALID") from exc
             raise ValueError("MODEL_OUTPUT_INVALID") from exc
         if not value.prose.strip():
             raise ValueError("WRITER_OUTPUT_INVALID")
@@ -767,5 +753,5 @@ class WriterPromptBuilder:
         safe = {key: value for key, value in context.items() if key not in {"writing_bible", "pov_mode", "pov_character_id"}}
         return [
             {"role": "system", "content": "You are a prose renderer, not a plot planner. FORMAL_HISTORY is factual authority. SUBJECTIVE_POV may be mistaken. PLANNING_TASK is a binding chapter contract: fulfill its objective, start/end state, scene beats, mandatory events, reveal limits, and consequences without inventing facts. Each prose scene must be grounded in the recorded character actions that cite the corresponding scene beat; do not invent a beat completion that is absent from formal turns. WRITING_RULES are style only. RENDERING_FREEDOM applies only to prose expression. Do not invent events, outcomes, decisions, knowledge, secrets, items, injuries, locations, relationships, or causal facts. Do not reveal information outside the POV visibility contract. Avoid formulaic AI phrasing, generic summary, symmetrical slogans, and empty transitions. Return exactly one JSON object matching the output contract."},
-            {"role": "user", "content": _canonical({"context": safe, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene id array", "source_refs": "visible structured source references", "pov_character_id": "string|null", "task_coverage": "exact list of completed mandatory task event labels", "task_forbidden_hits": "list of forbidden task event labels that appeared"}})},
+            {"role": "user", "content": _canonical({"context": safe, "output_contract": {"chapter_title": "string|null", "prose": "non-empty string", "scene_coverage": "ordered scene id array", "source_refs": "visible structured source references", "pov_character_id": "string|null", "task_coverage": "optional diagnostic self-report; never evidence that an event happened", "task_forbidden_hits": "optional diagnostic self-report; Critic independently reviews forbidden events"}})},
         ]

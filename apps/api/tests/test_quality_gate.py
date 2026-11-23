@@ -17,11 +17,13 @@ from app.models import (
     AntiAIBible, AutoDirectorRun, Chapter, ChapterQualityAssessment,
     ChapterQualityFinding, ChapterWorldBranch, ChapterWriterDraft, Character,
     ChapterWorldBranchStatus, ExecutionTrace, Project, Scene, ProjectModelConfig,
-    VolumeContract, VolumeContractStatus, WriterDraftOrigin, WriterDraftStatus,
+    StoryPlanStatus, VolumeContract, VolumeContractStatus, WriterDraftOrigin, WriterDraftStatus,
 )
 from app.narrative_structure import NarrativeStructureService
+from app.planning import chapter_task_context, persist_plan
 from app.quality import (
     AntiAIBibleResolver, AntiAIStyleRuleEngine, CriticOutputValidator, build_required_event_evidence,
+    build_forbidden_event_evidence, forbidden_event_specs,
     NarrativeRepetitionDetector, QualityAssessmentAudit, QualityContextBuilder,
     QualityAssessmentFreshnessChecker, QualityDecisionEngine, QualityDomainError, QualityGateConfigResolver, QualityGateService,
     QualityRepairService, assessment_payload, finding_fingerprint, validate_required_event_evidence,
@@ -261,6 +263,130 @@ def test_critic_required_event_review_requires_exact_prose_evidence():
     raw["mandatory_event_reviews"][0]["excerpt"] = "没有这句话"
     with pytest.raises(QualityDomainError, match="CRITIC_MANDATORY_EVENT_EVIDENCE_INVALID"):
         CriticOutputValidator().parse(json.dumps(raw, ensure_ascii=False), "她终于拿到钥匙。", [], task)
+
+
+def test_critic_forbidden_event_review_requires_exact_prose_evidence():
+    task = {"forbidden_events": [{"event_ref": "archive-burned", "label": "烧毁档案"}]}
+    prose = "她烧毁档案。"
+    start = prose.index("烧毁档案")
+    raw = json.loads(critic_response())
+    raw["forbidden_event_reviews"] = [{
+        "requirement_ref": "forbidden_events:archive-burned",
+        "event_ref": "archive-burned", "label": "烧毁档案", "present": True,
+        "start_offset": start, "end_offset": start + 4,
+        "excerpt": prose[start:start + 4], "reason": "正文明确写出。",
+    }]
+    value = CriticOutputValidator().parse(json.dumps(raw, ensure_ascii=False), prose, [], task)
+    assert value["forbidden_event_reviews"][0]["requirement_type"] == "forbidden_events"
+
+    raw["forbidden_event_reviews"][0]["excerpt"] = "未烧毁档案"
+    with pytest.raises(QualityDomainError, match="CRITIC_FORBIDDEN_EVENT_EVIDENCE_INVALID"):
+        CriticOutputValidator().parse(json.dumps(raw, ensure_ascii=False), prose, [], task)
+
+    raw["forbidden_event_reviews"] = []
+    with pytest.raises(QualityDomainError, match="CRITIC_FORBIDDEN_EVENT_REVIEW_INCOMPLETE"):
+        CriticOutputValidator().parse(json.dumps(raw, ensure_ascii=False), prose, [], task)
+
+
+def _install_forbidden_event_task(session, project, chapter):
+    plan = persist_plan(session, project, {
+        "framing": {"target_chapters": chapter.number, "target_words_per_chapter": 3000, "pov": "OBJECTIVE"},
+        "chapters": [{
+            "number": chapter.number, "volume_number": 1, "arc_number": 1,
+            "title": "档案", "summary": "处理档案", "objective": "保管档案",
+            "conflict": "档案面临损毁", "pov_mode": "OBJECTIVE",
+            "forbidden_events": [{"event_ref": "archive-burned", "label": "烧毁档案"}],
+        }],
+    })
+    plan.status = StoryPlanStatus.APPROVED
+    session.flush()
+    return chapter_task_context(session, project.id, chapter.number, required=True)
+
+
+@pytest.mark.parametrize(
+    ("prose", "present", "expected_status"),
+    [
+        ("她把档案锁进柜中。", False, "PASS"),
+        ("她烧毁档案。", True, "REPAIR_REQUIRED"),
+    ],
+)
+def test_forbidden_event_evidence_controls_quality_gate_and_is_auditable(quality_project, session, prose, present, expected_status):
+    project, _, _, chapter, _ = quality_project
+    task = _install_forbidden_event_task(session, project, chapter)
+    project.autonomy_settings = {"quality_gate": {"require_critic": False}}
+    writer = WriterProjectionService().render(
+        session, chapter.id, {"pov_mode": "OBJECTIVE"},
+        provider=FakeModelProvider(writer_response(chapter, prose)), model="writer-test",
+    )
+    WriterProjectionService().adopt(session, writer.id)
+    spec = forbidden_event_specs(task)[0]
+    start = prose.index("烧毁档案") if present else None
+    critic = json.loads(critic_response())
+    critic["forbidden_event_reviews"] = [{
+        "requirement_ref": spec["requirement_ref"], "event_ref": spec["event_ref"],
+        "label": spec["label"], "present": present,
+        "start_offset": start, "end_offset": start + 4 if present else None,
+        "excerpt": prose[start:start + 4] if present else None,
+        "reason": "正文证据已逐项核对。",
+    }]
+    assessment = QualityGateService().assess(
+        session, chapter.id, {}, provider=FakeModelProvider(json.dumps(critic, ensure_ascii=False)), model="critic-test",
+    )
+    assert assessment.status.value == expected_status
+    assert assessment.critic_report["forbidden_event_review_protocol"]
+    assert assessment.critic_report["forbidden_event_evidence"]["verified"]
+    assert QualityAssessmentAudit().audit(session, assessment.id)["valid"]
+    if present:
+        assert any(item.rule_code == "PLAN_FORBIDDEN_EVENT_PRESENT" for item in session.scalars(
+            select(ChapterQualityFinding).where(ChapterQualityFinding.assessment_id == assessment.id)
+        ).all())
+        with pytest.raises(QualityDomainError, match="QUALITY_ASSESSMENT_NOT_PASS"):
+            QualityGateService().approve(session, assessment.id)
+    else:
+        QualityGateService().approve(session, assessment.id)
+
+
+def test_forbidden_event_evidence_is_bound_to_exact_prose_and_review():
+    task = {"forbidden_events": [{"event_ref": "archive-burned", "label": "烧毁档案"}]}
+    prose = "她把档案锁进柜中。"
+    review = {
+        "requirement_ref": "forbidden_events:archive-burned",
+        "event_ref": "archive-burned", "label": "烧毁档案", "present": False,
+        "start_offset": None, "end_offset": None, "excerpt": None, "reason": "未发生。",
+    }
+    report = build_forbidden_event_evidence(prose, task, [review], "writer-content:test")
+    assert report["verified"] and report["confirmed_present_count"] == 0
+    assert not build_forbidden_event_evidence(prose, task, [], "writer-content:test")["verified"]
+    assert build_forbidden_event_evidence(prose + "后来档案被烧毁。", task, [review], "writer-content:changed")["content_fingerprint"] != report["content_fingerprint"]
+
+
+def test_quality_audit_rejects_removed_forbidden_event_protocol(quality_project, session):
+    project, _, _, chapter, _ = quality_project
+    _install_forbidden_event_task(session, project, chapter)
+    writer = WriterProjectionService().render(
+        session, chapter.id, {"pov_mode": "OBJECTIVE"},
+        provider=FakeModelProvider(writer_response(chapter, "她把档案锁进柜中。")), model="writer-test",
+    )
+    WriterProjectionService().adopt(session, writer.id)
+    critic = json.loads(critic_response())
+    critic["forbidden_event_reviews"] = [{
+        "requirement_ref": "forbidden_events:archive-burned", "event_ref": "archive-burned",
+        "label": "烧毁档案", "present": False, "reason": "未发生。",
+    }]
+    assessment = QualityGateService().assess(
+        session, chapter.id, {}, provider=FakeModelProvider(json.dumps(critic, ensure_ascii=False)), model="critic-test",
+    )
+    assessment.critic_report.pop("forbidden_event_review_protocol")
+    assessment.critic_report.pop("forbidden_event_evidence")
+    assessment.deterministic_report["continuity"].pop("forbidden_event_evidence")
+    assessment.deterministic_report["continuity"]["metrics"].pop("forbidden_event_count")
+    assessment.deterministic_report["continuity"]["metrics"].pop("reviewed_forbidden_event_count")
+
+    with pytest.raises(QualityDomainError, match="QUALITY_FORBIDDEN_EVENT_REVIEW_REQUIRED"):
+        QualityAssessmentAudit().audit(session, assessment.id)
+    with pytest.raises(QualityDomainError, match="QUALITY_FORBIDDEN_EVENT_REVIEW_REQUIRED"):
+        QualityGateService().approve(session, assessment.id)
+    assert chapter.status == "DRAFT"
 
 
 def test_required_event_evidence_blocks_adoption_without_critic_confirmation(quality_project, session):

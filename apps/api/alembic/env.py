@@ -7,7 +7,9 @@ from alembic import context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 config = context.config
-if os.getenv("DATABASE_URL"):
+configured_url = config.get_main_option("sqlalchemy.url")
+default_url = "postgresql+psycopg://narrative:narrative@localhost:5432/narrative"
+if os.getenv("DATABASE_URL") and configured_url == default_url:
     config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
 if config.config_file_name and config.get_section("loggers"):
     fileConfig(config.config_file_name)
