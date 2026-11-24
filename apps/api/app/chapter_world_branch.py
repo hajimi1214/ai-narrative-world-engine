@@ -273,13 +273,26 @@ class ChapterWorldBranchService:
         }
         branch.staged_cognition = staged
 
-    def cognition_rows(self, db: Session, character_id: str, resource_type: str) -> list[Any]:
-        branch = self.active(db)
+    def cognition_rows(
+        self,
+        db: Session,
+        character_id: str,
+        resource_type: str,
+        *,
+        branch: ChapterWorldBranch | None = None,
+        before_scene_id: str | None = None,
+    ) -> list[Any]:
+        branch = branch or self.active(db)
         if not branch:
             return []
         key = "knowledge" if resource_type == "KNOWLEDGE" else "memories"
         rows = []
-        for scene_id in branch.scene_ids or []:
+        scene_ids = list(branch.scene_ids or [])
+        if before_scene_id is not None and before_scene_id not in scene_ids:
+            return []
+        for scene_id in scene_ids:
+            if scene_id == before_scene_id:
+                break
             staged = (branch.staged_cognition or {}).get("scenes", {}).get(scene_id, {})
             for values in staged.get(key, []):
                 if values.get("character_id") == character_id:

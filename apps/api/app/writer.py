@@ -21,7 +21,7 @@ from .ai.factory import get_model_provider
 from .execution_trace import ExecutionTraceRecorder, TraceSanitizer, stable_fingerprint
 from .model_router import ModelRouter, ProviderCredentialResolver
 from .models import (
-    CanonFact, CanonType, Chapter, ChapterSceneBinding, ChapterStructureStatus, Character,
+    CanonFact, CanonType, Chapter, ChapterSceneBinding, ChapterStructureStatus, ChapterWorldBranch, Character,
     CharacterDecision, CharacterKnowledge, CharacterMemory, Scene,
     SceneExecutionBinding, ScenePerformance, ScenePerformanceTurn,
     SceneStateCheckpoint, StateDeltaBatch, StateDeltaBatchStatus, StateDeltaItem,
@@ -450,11 +450,16 @@ class WriterContextBuilder:
         manifest["rendering_config"] = {**config, "pov_mode": mode.value, "pov_character_id": pov_character_id}
         if manifest.get("world_branch_id"):
             manifest["source_fingerprint"] = source["source_fingerprint"]
+        branch_id = manifest.get("world_branch_id")
+        branch = db.get(ChapterWorldBranch, branch_id) if branch_id else None
         context = {
             "writing_rules": rules,
             "chapter": {"id": chapter.id, "number": chapter.number, "title": chapter.title, "structure_status": source["manifest"].get("structure_status", _value(chapter.structure_status))},
             "formal_history": {"scenes": safe_scenes},
-            "pov_subjective_context": self._subjective(db, safe_scenes, pov_character_id, mode, chapter.project_id, set(allowed_reveals)),
+            "pov_subjective_context": self._subjective(
+                db, safe_scenes, pov_character_id, mode, chapter.project_id,
+                set(allowed_reveals), branch=branch,
+            ),
             "planning_task": planning_task,
             "entity_labels": self._labels(db, safe_scenes),
             "rendering_contract": {"pov_mode": mode.value, "pov_character_id": pov_character_id, "grounding": "structured references only", "allowed_reveal_ids": [], "no_formal_mutation": True, "visibility_protocol": config["visibility_protocol"], "secret_policy": config["secret_policy"]},
@@ -514,28 +519,77 @@ class WriterContextBuilder:
         labels.update({item: db.get(WorldEntity, item).name for item in entity_ids if db.get(WorldEntity, item)})
         return labels
 
-    def _subjective(self, db: Session, scenes: list[dict[str, Any]], pov_character_id: str | None, mode: WriterPOVMode, project_id: str, allowed_reveals: set[str]) -> list[dict[str, Any]]:
+    def _subjective(
+        self,
+        db: Session,
+        scenes: list[dict[str, Any]],
+        pov_character_id: str | None,
+        mode: WriterPOVMode,
+        project_id: str,
+        allowed_reveals: set[str],
+        *,
+        branch: ChapterWorldBranch | None = None,
+    ) -> list[dict[str, Any]]:
         if mode == WriterPOVMode.OBJECTIVE or not pov_character_id:
             return []
+        branch_service = None
+        if branch:
+            from .chapter_world_branch import ChapterWorldBranchService
+            branch_service = ChapterWorldBranchService()
         rows = []
         for scene in scenes:
+            scene_id = scene["scene_id"]
+            staged_knowledge = {
+                item.id: item
+                for item in branch_service.cognition_rows(
+                    db, pov_character_id, "KNOWLEDGE",
+                    branch=branch, before_scene_id=scene_id,
+                )
+            } if branch_service else {}
+            staged_memories = {
+                item.id: item
+                for item in branch_service.cognition_rows(
+                    db, pov_character_id, "MEMORY",
+                    branch=branch, before_scene_id=scene_id,
+                )
+            } if branch_service else {}
             for turn in scene["turns"]:
                 decision = turn.get("decision")
                 if decision and decision.get("character_id") == pov_character_id:
                     formal = db.get(CharacterDecision, decision["id"])
                     knowledge_ids = [item.get("knowledge_id") for item in (decision.get("knowledge_used") or []) if isinstance(item, dict) and item.get("knowledge_id")]
                     memory_ids = [item.get("memory_id") if isinstance(item, dict) else item for item in (decision.get("memory_refs") or [])]
-                    knowledge = db.scalars(select(CharacterKnowledge).where(CharacterKnowledge.id.in_(knowledge_ids), CharacterKnowledge.character_id == pov_character_id).order_by(CharacterKnowledge.id)).all() if knowledge_ids else []
+                    knowledge_by_id = {
+                        item.id: item
+                        for item in db.scalars(select(CharacterKnowledge).where(
+                            CharacterKnowledge.id.in_(knowledge_ids),
+                            CharacterKnowledge.character_id == pov_character_id,
+                        )).all()
+                    } if knowledge_ids else {}
+                    knowledge_by_id.update(staged_knowledge)
                     blocked_secret_propositions = set(db.scalars(select(CanonFact.proposition).where(CanonFact.project_id == project_id, CanonFact.fact_type == CanonType.SECRET_CANON, CanonFact.id.not_in(allowed_reveals))).all())
-                    knowledge = [item for item in knowledge if item.proposition not in blocked_secret_propositions]
-                    memories = db.scalars(select(CharacterMemory).where(CharacterMemory.id.in_(memory_ids), CharacterMemory.character_id == pov_character_id).order_by(CharacterMemory.id)).all() if memory_ids else []
+                    knowledge = [
+                        knowledge_by_id[item_id]
+                        for item_id in knowledge_ids
+                        if item_id in knowledge_by_id
+                        and knowledge_by_id[item_id].proposition not in blocked_secret_propositions
+                    ]
+                    memory_by_id = {
+                        item.id: item
+                        for item in db.scalars(select(CharacterMemory).where(
+                            CharacterMemory.id.in_(memory_ids),
+                            CharacterMemory.character_id == pov_character_id,
+                        )).all()
+                    } if memory_ids else {}
+                    memory_by_id.update(staged_memories)
+                    memories = [memory_by_id[item_id] for item_id in memory_ids if item_id in memory_by_id]
                     has_unresolved_secret = bool(db.scalar(select(CanonFact.id).where(CanonFact.project_id == project_id, CanonFact.fact_type == CanonType.SECRET_CANON).limit(1)))
                     visible_memories = []
                     for memory in memories:
                         # Without a structured proof, any secret canon makes raw memory unsafe.
                         blocked = has_unresolved_secret
                         visible_memories.append({"id": memory.id, "content": None if blocked else memory.content, "confidence": memory.confidence, "content_redacted": blocked, "renderable": not blocked})
-                    rows.append({"scene_id": scene["scene_id"], "character_id": pov_character_id, "chosen_action": decision.get("chosen_action"), "motivation": formal.motivation if formal else None, "knowledge": [{"id": item.id, "proposition": item.proposition, "status": _value(item.status), "confidence": item.confidence} for item in knowledge], "memories": visible_memories})
+                    rows.append({"scene_id": scene_id, "character_id": pov_character_id, "chosen_action": decision.get("chosen_action"), "motivation": formal.motivation if formal else None, "knowledge": [{"id": item.id, "proposition": item.proposition, "status": _value(item.status), "confidence": item.confidence} for item in knowledge], "memories": visible_memories})
         return rows
 
 

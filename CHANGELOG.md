@@ -16,6 +16,7 @@
 - Full-auto and author-guided run creation reject POV-character IDs owned by another project before queuing work.
 - Automatic adoption relies on the current audited quality assessment for forbidden-event evidence and ignores Writer self-reports as authorization evidence.
 - Expanded the Chinese long-form literary rubric to 21 dimensions, added a condition-masked reader packet workflow, frozen-record validation, task-level paired analysis, rater-agreement summaries, and explicit NOT_EVALUATED output when no reader data exists.
+- Restored POV-referenced knowledge and memory from earlier scenes in an unpublished chapter branch to Writer context, while excluding current/future scene cognition and other characters' cognition.
 
 ## 0.3.0 - 2026-11-21
 

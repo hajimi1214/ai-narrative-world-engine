@@ -762,6 +762,147 @@ def test_subjective_memory_is_conservatively_redacted_when_secret_exists(writer_
     assert any(item["id"] == memory.id and item["content_redacted"] for row in context["pov_subjective_context"] for item in row["memories"])
 
 
+def test_writer_pov_reads_only_prior_chapter_branch_cognition(formal_writer_project, session):
+    from app.chapter_world_branch import ChapterWorldBranchService
+    from app.director import DirectorContextBuilder
+    from app.models import AutoDirectorRun
+
+    values = formal_writer_project
+    project, actor, scene, chapter = (values[key] for key in ("project", "actor", "scene", "chapter"))
+    decision = values["decision"]
+    knowledge_id = "staged-knowledge-prior"
+    memory_id = "staged-memory-prior"
+    decision.knowledge_used = [{
+        "knowledge_id": knowledge_id,
+        "proposition": "ENTITY door: opened = true",
+        "accepted_statuses": ["KNOWN"],
+    }, {
+        "knowledge_id": "staged-knowledge-current",
+        "proposition": "ENTITY hall: window = broken",
+        "accepted_statuses": ["KNOWN"],
+    }, {
+        "knowledge_id": "staged-knowledge-other-character",
+        "proposition": "ENTITY key: belongs_to = hidden actor",
+        "accepted_statuses": ["KNOWN"],
+    }, {
+        "knowledge_id": "staged-knowledge-future",
+        "proposition": "ENTITY vault: contains = letter",
+        "accepted_statuses": ["KNOWN"],
+    }]
+    decision.memory_refs = [
+        memory_id,
+        {"memory_id": "staged-memory-current"},
+        {"memory_id": "staged-memory-future"},
+    ]
+    run = AutoDirectorRun(
+        project_id=project.id,
+        idempotency_key=f"writer-branch-cognition-{project.id}",
+        run_mode="AUTHOR_GUIDED_VOLUME",
+    )
+    session.add(run)
+    session.flush()
+    branch_service = ChapterWorldBranchService()
+    branch = branch_service.get_or_create(
+        session,
+        project.id,
+        run.id,
+        chapter.number,
+        history_fingerprint=DirectorContextBuilder().build(session, project.id)["current_history_fingerprint"],
+    )
+    prior_scene_id = "staged-prior-scene"
+    future_scene_id = "staged-future-scene"
+    branch_service.stage_cognition(
+        branch,
+        prior_scene_id,
+        [{
+            "id": knowledge_id,
+            "character_id": actor.id,
+            "proposition": "ENTITY door: opened = true",
+            "status": "KNOWN",
+            "confidence": 1.0,
+        }, {
+            "id": "staged-knowledge-other-character",
+            "character_id": values["hidden_actor"].id,
+            "proposition": "ENTITY key: belongs_to = hidden actor",
+            "status": "KNOWN",
+            "confidence": 1.0,
+        }],
+        [{
+            "id": memory_id,
+            "character_id": actor.id,
+            "content": "The door opened when she pressed the brass latch.",
+            "confidence": 1.0,
+        }],
+    )
+    branch_service.stage_cognition(
+        branch,
+        future_scene_id,
+        [{
+            "id": "staged-knowledge-future",
+            "character_id": actor.id,
+            "proposition": "ENTITY vault: contains = letter",
+            "status": "KNOWN",
+            "confidence": 1.0,
+        }],
+        [{
+            "id": "staged-memory-future",
+            "character_id": actor.id,
+            "content": "A memory from a later chapter scene.",
+            "confidence": 1.0,
+        }],
+    )
+    branch_service.stage_cognition(
+        branch,
+        scene.id,
+        [{
+            "id": "staged-knowledge-current",
+            "character_id": actor.id,
+            "proposition": "ENTITY hall: window = broken",
+            "status": "KNOWN",
+            "confidence": 1.0,
+        }],
+        [{
+            "id": "staged-memory-current",
+            "character_id": actor.id,
+            "content": "A memory created at the end of this scene.",
+            "confidence": 1.0,
+        }],
+    )
+    branch.scene_ids = [prior_scene_id, scene.id, future_scene_id]
+    branch.current_fingerprint = branch_service.fingerprint(branch)
+    branch_service.activate(session, branch)
+    session.flush()
+
+    source = WriterChapterSourceBuilder().build(session, chapter.id)
+    context = WriterContextBuilder().build(
+        session,
+        source,
+        {"pov_mode": "THIRD_PERSON_LIMITED", "pov_character_id": actor.id},
+    )
+
+    subjective = context["pov_subjective_context"][0]
+    assert subjective["knowledge"] == [{
+        "id": knowledge_id,
+        "proposition": "ENTITY door: opened = true",
+        "status": "KNOWN",
+        "confidence": 1.0,
+    }]
+    assert subjective["memories"][0]["id"] == memory_id
+    assert subjective["memories"][0]["content"] == "The door opened when she pressed the brass latch."
+    assert {
+        ("CHARACTER_KNOWLEDGE", knowledge_id),
+        ("CHARACTER_MEMORY", memory_id),
+    } <= {
+        (item["source_type"], item["source_id"])
+        for item in context["renderable_source_refs"]
+    }
+    assert {
+        item["source_id"] for item in context["renderable_source_refs"]
+        if item["source_type"] in {"CHARACTER_KNOWLEDGE", "CHARACTER_MEMORY"}
+    } == {knowledge_id, memory_id}
+    assert "ENTITY vault: contains = letter" not in json.dumps(context, ensure_ascii=False)
+
+
 def test_adopt_title_policy(writer_project, session):
     chapter = writer_project[3]; chapter.title = "Existing"
     first = render(session, chapter); WriterProjectionService().adopt(session, first.id)
