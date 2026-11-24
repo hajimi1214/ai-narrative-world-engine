@@ -1,25 +1,96 @@
 {
   "experiment_id": "2026-11-pilot-001",
+  "schema_version": "long-form-literary-experiment-v2",
   "status": "PLANNED",
-  "corpus_manifest": "research/evaluation/pilot-manifest.json",
-  "conditions": ["A_BASELINE", "B_MEMORY", "C_ENGINE"],
+  "system_revision": "",
+  "corpus_manifest": "pilot-manifest.json",
+  "corpus_manifest_sha256": "108c9a180e5ba6c2a0e0f667638c584ee6add4a6b255acd253d64c6fcb299a81",
+  "conditions": [
+    {
+      "id": "A_BASELINE",
+      "label": "基础章节规划写作",
+      "memory": false,
+      "formal_world": false,
+      "critic": false,
+      "author_review": "manual"
+    },
+    {
+      "id": "B_MEMORY",
+      "label": "同 Writer 加已采用摘要与角色记忆",
+      "memory": true,
+      "formal_world": false,
+      "critic": false,
+      "author_review": "manual"
+    },
+    {
+      "id": "C_ENGINE",
+      "label": "完整世界引擎",
+      "memory": true,
+      "formal_world": true,
+      "critic": true,
+      "author_review": "manual"
+    }
+  ],
   "generation": {
     "model_provider": "",
     "model_name": "",
     "prompt_fingerprint": "",
-    "sampling": {"temperature": null, "top_p": null, "seed": null},
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "seed": null
+    },
     "per_condition_token_budget": null,
-    "failure_and_retry_policy": ""
+    "failure_and_retry_policy": "",
+    "condition_model_names": {},
+    "condition_prompt_fingerprints": {},
+    "condition_implementation_fingerprints": {}
   },
+  "output_record_fields": [
+    "item_id",
+    "task_id",
+    "condition",
+    "status",
+    "model_name",
+    "prompt_fingerprint",
+    "text_path",
+    "text_sha256",
+    "output_chars",
+    "attempts",
+    "confirmed_tokens",
+    "unknown_usage_calls",
+    "reserved_tokens",
+    "elapsed_seconds"
+  ],
+  "rating_schema": "blind-reader-rating-v2",
   "outputs": [],
+  "blind_ratings": [],
+  "blind_assignments": [],
+  "unblinding_map": [],
   "human_ratings": [],
   "model_judgments": [],
   "engineering_metrics": [],
   "cost_and_editing": [],
+  "blind_preparation": null,
+  "tasks": [
+    {"id": "mist_harbor_identity", "chapters": 3, "genre": "悬疑"},
+    {"id": "river_town_kinship", "chapters": 3, "genre": "现实情感"},
+    {"id": "winter_archive_oath", "chapters": 3, "genre": "历史奇幻"},
+    {"id": "night_train_oath", "chapters": 3, "genre": "科幻成长"}
+  ],
   "analysis": {
     "human_status": "NOT_COLLECTED",
     "reader_blind_order_seed": 0,
     "missing_data_policy": "report_missing_and_exclude_pairwise_item_only",
-    "model_judge_cannot_replace_human": true
+    "baseline_condition": "A_BASELINE",
+    "comparison_condition": "C_ENGINE",
+    "bootstrap_seed": 0,
+    "model_judge_cannot_replace_human": true,
+    "bootstrap_unit": "task_id",
+    "minimum_raters_per_text": 2,
+    "missing_generation_outcome_required": true,
+    "items_per_condition": 4,
+    "minimum_independent_tasks_for_exploratory_interval": 4,
+    "minimum_items_for_descriptive_rater_agreement": 5
   }
 }

@@ -1,0 +1,146 @@
+{
+  "status": "passed",
+  "date": "2026-11-23",
+  "data": "synthetic project and isolated SQLite fixture",
+  "model_provider": "disabled",
+  "viewports_css_px": [
+    320,
+    390,
+    768,
+    1024,
+    1440,
+    1920
+  ],
+  "pages": {
+    "library": [
+      {
+        "viewport": 320,
+        "document": 320,
+        "body": 320
+      },
+      {
+        "viewport": 390,
+        "document": 390,
+        "body": 390
+      },
+      {
+        "viewport": 768,
+        "document": 768,
+        "body": 768
+      },
+      {
+        "viewport": 1024,
+        "document": 1024,
+        "body": 1024
+      },
+      {
+        "viewport": 1440,
+        "document": 1440,
+        "body": 1440
+      },
+      {
+        "viewport": 1920,
+        "document": 1920,
+        "body": 1920
+      }
+    ],
+    "new-book-wizard": [
+      {
+        "viewport": 320,
+        "document": 320,
+        "body": 320
+      },
+      {
+        "viewport": 390,
+        "document": 390,
+        "body": 390
+      },
+      {
+        "viewport": 768,
+        "document": 768,
+        "body": 768
+      },
+      {
+        "viewport": 1024,
+        "document": 1024,
+        "body": 1024
+      },
+      {
+        "viewport": 1440,
+        "document": 1440,
+        "body": 1440
+      },
+      {
+        "viewport": 1920,
+        "document": 1920,
+        "body": 1920
+      }
+    ],
+    "project-navigation": [
+      {
+        "viewport": 320,
+        "document": 320,
+        "body": 320
+      },
+      {
+        "viewport": 390,
+        "document": 390,
+        "body": 390
+      },
+      {
+        "viewport": 768,
+        "document": 768,
+        "body": 768
+      },
+      {
+        "viewport": 1024,
+        "document": 1024,
+        "body": 1024
+      },
+      {
+        "viewport": 1440,
+        "document": 1440,
+        "body": 1440
+      },
+      {
+        "viewport": 1920,
+        "document": 1920,
+        "body": 1920
+      }
+    ],
+    "chapter-reader-editor": [
+      {
+        "viewport": 320,
+        "document": 320,
+        "body": 320
+      },
+      {
+        "viewport": 390,
+        "document": 390,
+        "body": 390
+      },
+      {
+        "viewport": 768,
+        "document": 768,
+        "body": 768
+      },
+      {
+        "viewport": 1024,
+        "document": 1024,
+        "body": 1024
+      },
+      {
+        "viewport": 1440,
+        "document": 1440,
+        "body": 1440
+      },
+      {
+        "viewport": 1920,
+        "document": 1920,
+        "body": 1920
+      }
+    ]
+  },
+  "page_errors": [],
+  "chapter_editor_controls": 1
+}
