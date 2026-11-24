@@ -1,0 +1,12 @@
+{
+  "date": "2026-11-24",
+  "status": "passed",
+  "model_provider": "disabled",
+  "isolated_sqlite": true,
+  "api_health": "ok",
+  "api_projects": 200,
+  "web_home": 200,
+  "service_process_count": 2,
+  "cleanup": "temporary_workspace_removed",
+  "error": null
+}
